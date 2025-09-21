@@ -1,0 +1,10 @@
+name: cubefit-env
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.8
+  - numpy
+  - matplotlib
+  - zarr
+  - numcodecs
+  - tqdm
