@@ -1,0 +1,132 @@
+[2025-09-02 13:59:20] [CubeFit] CubeFit logger initialised to /home/poci/work/CubeFit/kz_run.log
+[2025-09-02 13:59:28] Data Spectral Range=[ 5100.268,  5999.386]
+[2025-09-02 13:59:28] Data Shape=[ 724,  2854]
+[2025-09-02 13:59:29] Reading binned data...
+[2025-09-02 13:59:29] Using SMILES library...
+[2025-09-02 13:59:30] Generating SSP template library...
+[2025-09-02 13:59:30] Template Range=[ 4648.400,  6451.100]
+[2025-09-02 13:59:30] Metals:   0%|          | 0/8 [00:00<?, ?it/s]
+[2025-09-02 13:59:30] Metals:  25%|##5       | 2/8 [00:00<00:00, 14.76it/s]
+[2025-09-02 13:59:30] Metals:  50%|#####     | 4/8 [00:00<00:00, 17.23it/s]
+[2025-09-02 13:59:30] Metals:  88%|########7 | 7/8 [00:00<00:00, 19.09it/s]
+[2025-09-02 13:59:30] Metals: 100%|##########| 8/8 [00:00<00:00, 18.58it/s]
+[2025-09-02 13:59:30] Template Shape=[ 7561,  360]
+[2025-09-02 13:59:30] Done.
+[2025-09-02 13:59:30] Mass outside of the histograms:              2.7885e-07
+[2025-09-02 13:59:30] Mass normalisation is:                       1.0049
+[2025-09-02 13:59:30] Done.
+[2025-09-02 13:59:30] Reading histograms...
+[2025-09-02 13:59:30] Done.
+[2025-09-02 13:59:30] ZarrManager initialized: /home/poci/work/CubeFit/NGC4365_03 (2854 spat, 684 lspec, 7561 tspec, 201 vel, 3 comp, 360 pop)
+[2025-09-02 13:59:31] [CubeFit] Initialised PipelineRunner with FFT templates ((360, 7776)) and rebin matrix ((684, 7561))
+[2025-09-02 13:59:31] Zarr store type: <class 'zarr.storage._local.LocalStore'>
+[2025-09-02 13:59:31] Zarr path: no path attribute
+[2025-09-02 13:59:31] [CubeFit] ModelCube exists in Zarr—loading.
+[2025-09-02 13:59:31] CUBE shape:
+[2025-09-02 13:59:31] Generating spectrum plots...
+[2025-09-02 13:59:31] Spec plots:   0%|                                        | 0/20 [00:00<?, ?it/s]
+[2025-09-02 13:59:31] False
+[2025-09-02 13:59:31] 684
+[2025-09-02 13:59:31] 684
+[2025-09-02 13:59:31] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_worst_C0003_ap2745.png
+[2025-09-02 13:59:31] Spec plots:   5%|#6                              | 1/20 [00:00<00:03,  6.28it/s]
+[2025-09-02 13:59:31] False
+[2025-09-02 13:59:31] 684
+[2025-09-02 13:59:31] 684
+[2025-09-02 13:59:31] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_worst_C0003_ap2825.png
+[2025-09-02 13:59:31] Spec plots:  10%|###2                            | 2/20 [00:00<00:02,  6.85it/s]
+[2025-09-02 13:59:31] False
+[2025-09-02 13:59:31] 684
+[2025-09-02 13:59:31] 684
+[2025-09-02 13:59:31] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_worst_C0003_ap0802.png
+[2025-09-02 13:59:31] Spec plots:  15%|####8                           | 3/20 [00:00<00:03,  4.94it/s]
+[2025-09-02 13:59:31] False
+[2025-09-02 13:59:31] 684
+[2025-09-02 13:59:31] 684
+[2025-09-02 13:59:32] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_worst_C0003_ap2852.png
+[2025-09-02 13:59:32] Spec plots:  20%|######4                         | 4/20 [00:00<00:02,  5.53it/s]
+[2025-09-02 13:59:32] False
+[2025-09-02 13:59:32] 684
+[2025-09-02 13:59:32] 684
+[2025-09-02 13:59:32] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_worst_C0003_ap0757.png
+[2025-09-02 13:59:32] Spec plots:  25%|########                        | 5/20 [00:00<00:02,  5.94it/s]
+[2025-09-02 13:59:32] False
+[2025-09-02 13:59:32] 684
+[2025-09-02 13:59:32] 684
+[2025-09-02 13:59:32] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_worst_C0003_ap2853.png
+[2025-09-02 13:59:32] Spec plots:  30%|#########6                      | 6/20 [00:01<00:02,  6.29it/s]
+[2025-09-02 13:59:32] False
+[2025-09-02 13:59:32] 684
+[2025-09-02 13:59:32] 684
+[2025-09-02 13:59:32] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_worst_C0003_ap0759.png
+[2025-09-02 13:59:32] Spec plots:  35%|###########2                    | 7/20 [00:01<00:01,  6.52it/s]
+[2025-09-02 13:59:32] False
+[2025-09-02 13:59:32] 684
+[2025-09-02 13:59:32] 684
+[2025-09-02 13:59:32] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_worst_C0003_ap2850.png
+[2025-09-02 13:59:32] Spec plots:  40%|############8                   | 8/20 [00:01<00:01,  6.18it/s]
+[2025-09-02 13:59:32] False
+[2025-09-02 13:59:32] 684
+[2025-09-02 13:59:32] 684
+[2025-09-02 13:59:32] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_worst_C0003_ap2848.png
+[2025-09-02 13:59:32] Spec plots:  45%|##############4                 | 9/20 [00:01<00:01,  6.42it/s]
+[2025-09-02 13:59:32] False
+[2025-09-02 13:59:32] 684
+[2025-09-02 13:59:32] 684
+[2025-09-02 13:59:32] /home/poci/work/CubeFit/plotting.py:89: RuntimeWarning: More than 10 figures have been opened. Figures created through the pyplot interface (`matplotlib.pyplot.figure`) are retained until explicitly closed and may consume too much memory. (To control this warning, see the rcParam `figure.max_open_warning`). Consider using `matplotlib.pyplot.close()`.
+  fig, (ax0, ax1) = plt.subplots(
+[2025-09-02 13:59:33] /home/poci/work/CubeFit/kz_fitSpec.py:697: RuntimeWarning: More than 10 figures have been opened. Figures created through the pyplot interface (`matplotlib.pyplot.figure`) are retained until explicitly closed and may consume too much memory. (To control this warning, see the rcParam `figure.max_open_warning`). Consider using `matplotlib.pyplot.close()`.
+  plt.figure()
+[2025-09-02 13:59:33] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_worst_C0003_ap0806.png
+[2025-09-02 13:59:33] Spec plots:  50%|###############5               | 10/20 [00:01<00:01,  6.70it/s]
+[2025-09-02 13:59:33] False
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_best_C0003_ap0488.png
+[2025-09-02 13:59:33] Spec plots:  55%|#################              | 11/20 [00:01<00:01,  6.66it/s]
+[2025-09-02 13:59:33] False
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_best_C0003_ap0289.png
+[2025-09-02 13:59:33] Spec plots:  60%|##################5            | 12/20 [00:01<00:01,  6.70it/s]
+[2025-09-02 13:59:33] False
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_best_C0003_ap0139.png
+[2025-09-02 13:59:33] Spec plots:  65%|####################1          | 13/20 [00:02<00:01,  6.72it/s]
+[2025-09-02 13:59:33] False
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_best_C0003_ap0152.png
+[2025-09-02 13:59:33] Spec plots:  70%|#####################7         | 14/20 [00:02<00:00,  6.74it/s]
+[2025-09-02 13:59:33] False
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_best_C0003_ap0310.png
+[2025-09-02 13:59:33] Spec plots:  75%|#######################2       | 15/20 [00:02<00:00,  6.75it/s]
+[2025-09-02 13:59:33] False
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_best_C0003_ap0295.png
+[2025-09-02 13:59:33] Spec plots:  80%|########################8      | 16/20 [00:02<00:00,  6.66it/s]
+[2025-09-02 13:59:33] False
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:33] 684
+[2025-09-02 13:59:34] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_best_C0003_ap0490.png
+[2025-09-02 13:59:34] Spec plots:  85%|##########################3    | 17/20 [00:02<00:00,  5.21it/s]
+[2025-09-02 13:59:34] False
+[2025-09-02 13:59:34] 684
+[2025-09-02 13:59:34] 684
+[2025-09-02 13:59:34] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_best_C0003_ap0259.png
+[2025-09-02 13:59:34] Spec plots:  90%|###########################9   | 18/20 [00:02<00:00,  5.58it/s]
+[2025-09-02 13:59:34] False
+[2025-09-02 13:59:34] 684
+[2025-09-02 13:59:34] 684
+[2025-09-02 13:59:34] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_best_C0003_ap0232.png
+[2025-09-02 13:59:34] Spec plots:  95%|#############################4 | 19/20 [00:03<00:00,  5.88it/s]
+[2025-09-02 13:59:34] False
+[2025-09-02 13:59:34] 684
+[2025-09-02 13:59:34] 684
+[2025-09-02 13:59:34] [Plot] Saved: /home/poci/work/CubeFit/NGC4365_03/plots/spectrum_fit_best_C0003_ap0126.png
+[2025-09-02 13:59:34] Spec plots: 100%|###############################| 20/20 [00:03<00:00,  6.15it/s]
+[2025-09-02 13:59:34] Spec plots: 100%|###############################| 20/20 [00:03<00:00,  6.19it/s]

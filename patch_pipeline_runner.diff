@@ -1,0 +1,96 @@
+--- pipeline_runner.py
++++ pipeline_runner.py
+@@ -1,3 +1,41 @@
++
++
++# --- Warm-start helper --------------------------------------------------------
++def compute_streaming_x0(reader, *, S_sub: int = 256, K_sub: int = 256, seed: int | None = None,
++                         orbit_targets=None, renormalize_per_component: bool = True) -> np.ndarray:
++    """Compute a Jacobi-style warm start x0 by streaming a tiny subset of rows.
++    Returns x0 as float64 of length N=C*P.
++    """
++    rng = np.random.default_rng(seed)
++    N = int(reader.nComp) * int(reader.nPop)
++    C, P = int(reader.nComp), int(reader.nPop)
++    g = np.zeros(N, dtype=np.float64)
++    d = np.zeros(N, dtype=np.float64)
++    # choose S_sub spaxels evenly across S
++    S = int(reader.nSpat)
++    s_idx = np.linspace(0, S-1, num=min(S_sub, S), dtype=int)
++    for s in s_idx:
++        A_f32, y = reader.read_spaxel_plane(s)  # (N, L_eff), (L_eff,)
++        L_eff = A_f32.shape[1]
++        k = min(K_sub, L_eff)
++        cols = rng.choice(L_eff, size=k, replace=False)
++        for l in cols:
++            a = A_f32[:, l].astype(np.float64, copy=False)
++            g += a * float(y[l])
++            d += a * a
++    x0 = np.maximum(0.0, g / (d + 1e-12))
++    if orbit_targets is not None and renormalize_per_component:
++        ow = np.asarray(orbit_targets, dtype=np.float64).ravel()
++        if ow.size == C*P:
++            ow = ow.reshape(C, P).sum(axis=1)
++        if ow.size == C:
++            X = x0.reshape(C, P)
++            for c in range(C):
++                s = X[c].sum()
++                if s > 0:
++                    X[c] *= (ow[c] / s)
++            x0 = X.ravel()
++    return x0
+ # -*- coding: utf-8 -*-
+ r"""
+     pipeline_runner.py
+@@ -140,11 +178,17 @@
+                 lr: float = 0.25,
+                 project_nonneg: bool = True,
+                 row_order: str = "random",
+-                reader_s_tile: int = 1, # small tile; prevents slabs
++                reader_s_tile: int = 1,
+                 reader_c_tile: int | None = None,
+                 reader_p_tile: int | None = None,
+-                blas_threads: int | None = None, # threads for BLAS in solver
++                blas_threads: int | None = None,
+                 orbit_weights=None,
++                enforce_orbit_mass: str = "penalty",
++                penalty_lambda: float = 1.0,
++                penalty_rate: float = 0.02,
++                warm_start: bool = True,
++                warm_subset_spaxels: int = 256,
++                warm_subset_pixels: int = 256,
+                 verbose: bool = True,
+                 seed: int | None = None):
+         # open reader (rank-4 models; mask-aware)
+@@ -155,6 +199,16 @@
+                         apply_mask=True)
+         reader = HyperCubeReader(self.h5_path, cfg=rcfg)
+ 
++        # Warm start (optional)
++        x_init = None
++        if warm_start:
++            x_init = compute_streaming_x0(reader,
++                                         S_sub=warm_subset_spaxels,
++                                         K_sub=warm_subset_pixels,
++                                         seed=seed,
++                                         orbit_targets=orbit_weights,
++                                         renormalize_per_component=True)
++
+         cfg = SolverCfg(epochs=epochs,
+                         pixels_per_aperture=pixels_per_aperture,
+                         lr=lr,
+@@ -164,7 +218,13 @@
+                         verbose=verbose,
+                         seed=seed)
+         try:
+-            x, stats = solve_global_kaczmarz(reader, cfg=cfg, orbit_weights=orbit_weights)
++            x, stats = solve_global_kaczmarz(reader, cfg=cfg,
++                                   orbit_weights=None,
++                                   x0=x_init,
++                                   orbit_targets=orbit_weights,
++                                   enforce_orbit_mass=enforce_orbit_mass,
++                                   penalty_lambda=penalty_lambda,
++                                   penalty_rate=penalty_rate)
+         finally:
+             reader.close()
+         return x, stats

@@ -1,0 +1,7 @@
+site_name: CubeFit
+theme:
+  name: material
+nav:
+  - Home: index.md
+  - CubeFit: CubeFit.md
+docs_dir: docs
