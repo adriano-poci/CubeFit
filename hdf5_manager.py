@@ -302,40 +302,46 @@ def _h5clear(path: str | Path) -> bool:
         return False
 
 @contextmanager
-def open_h5(path: str | Path, role: str = "reader", retries: int = 3, backoff: float = 0.4):
+def open_h5(path: str | Path,
+            role: str = "reader",
+            retries: int = 3,
+            backoff: float = 0.4):
     """
-    Robust HDF5 open with lock handling and no double-open shenanigans.
-    role='reader' -> read-only.
-    role='writer' -> append/update (single writer).
+    Robust HDF5 open with lock handling and *modest* raw-chunk cache.
+
+    role='reader' -> read-only
+    role='writer' -> append/update (single writer)
+
+    Default caches are conservative (64 MiB) to prevent per-open GiB spikes.
+    You can override via:
+      CUBEFIT_RDCC_NBYTES, CUBEFIT_RDCC_NSLOTS, CUBEFIT_RDCC_W0
     """
     p = Path(path)
     if role not in ("reader", "writer"):
         raise ValueError("role must be 'reader' or 'writer'")
 
-    # Prefer disabling kernel file locking to avoid EEXIST/EAGAIN races on shared FS.
-    env_lock = os.environ.get("HDF5_USE_FILE_LOCKING")
-    if env_lock is None:
-        os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"  # mitigate shared FS quirks
+    # Avoid file-lock quirks on shared FS unless user overrides explicitly
+    if os.environ.get("HDF5_USE_FILE_LOCKING") is None:
+        os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
     mode = "r" if role == "reader" else "a"
     last_exc = None
     for attempt in range(retries + 1):
         try:
-            # Use a large raw-data chunk cache so one /HyperCube/models chunk (≈133MB)
-            # actually fits in the cache. Defaults can be overridden via env.
+            # Smaller, safer defaults (override with env if you want more)
             rdcc_nbytes = int(os.environ.get("CUBEFIT_RDCC_NBYTES",
-                str(1024 * 1024**2))) # 1024 MiB
+                                             str(512 * 1024 * 1024)))   # 64 MiB
             rdcc_nslots = int(os.environ.get("CUBEFIT_RDCC_NSLOTS",
-                "1000003")) # prime
-            rdcc_w0 = float(os.environ.get("CUBEFIT_RDCC_W0", "1.0"))
+                                             "200003"))               # prime
+            rdcc_w0     = float(os.environ.get("CUBEFIT_RDCC_W0", "0.75"))
+
             f = h5py.File(p, mode, libver="latest",
-                rdcc_nbytes=rdcc_nbytes, rdcc_nslots=rdcc_nslots,
-                rdcc_w0=rdcc_w0
-            )
+                          rdcc_nbytes=rdcc_nbytes,
+                          rdcc_nslots=rdcc_nslots,
+                          rdcc_w0=rdcc_w0)
             try:
                 yield f
             finally:
-                # Be explicit: flush and close in deterministic order.
                 try:
                     f.flush()
                 except Exception:
@@ -344,14 +350,13 @@ def open_h5(path: str | Path, role: str = "reader", retries: int = 3, backoff: f
             return
         except OSError as e:
             last_exc = e
+            # Retry only on lock-looking errors
             if not _looks_like_lock_error(e) or attempt == retries:
-                # Not a lock error or we've exhausted retries: give up.
                 raise
-            # Try to clear flags, then backoff and retry.
-            logger.log(f"[HDF5] open({mode}) failed with lock: {e} (attempt {attempt+1}/{retries})")
+            logger.log(f"[HDF5] open({mode}) failed with lock: {e} "
+                       f"(attempt {attempt+1}/{retries})")
             _h5clear(p)
             time.sleep(backoff * (attempt + 1))
-    # If we get here, raise the last error.
     raise last_exc
 
 # Convenience adapters that your class can call:

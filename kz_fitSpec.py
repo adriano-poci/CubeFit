@@ -461,7 +461,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         project_nonneg=True,
         orbit_weights=cWeights,
         verbose=True,
-        warm_start='jacobi'
+        warm_start='jacobi',
     )
     logger.log("[CubeFit] Global fit completed.")
     # --- Save the global solution vector
@@ -701,20 +701,56 @@ def parallel_model_cube_global_batched(
 
 # ------------------------------------------------------------------------------
 
-def reconstruct_model_cube_single(h5_path, x_global, array_name="ModelCube",
-                                  blas_threads=8, S_tile=None,
-                                  max_bytes_per_slab=6_000_000_000):  # ~6 GiB
-    # Respect Slurm if present; set before any heavy imports ideally
+def reconstruct_model_cube_single(h5_path: str,
+                                  x_global,
+                                  array_name: str = "ModelCube",
+                                  blas_threads: int = 8,
+                                  S_tile: int | None = None,
+                                  L_band: int = 128) -> None:
+    """
+    Chunk-aligned, streaming reconstruction of Y = (HyperCube) · x.
+
+    Reads the model cube in the same order it is chunked:
+      S in blocks of S_chunk, C in blocks of 1 (C_chunk=1), and P in
+      blocks of P_chunk. For each (S_chunk, C=1) slab it contracts over
+      P against x[c, :] using BLAS on small 2-D views, accumulating into
+      a (S_chunk, L) float64 tile. Optionally processes L in bands to
+      keep the GEMV working set small. Never materializes a (ΔS,C,P,L)
+      float64 slab.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the base HDF5 file.
+    x_global : array-like
+        Global weights, shape (C*P,) or (C,P). Internally used in f32
+        for speed; accumulation into output stays f64.
+    array_name : str
+        Name of output dataset to create (S,L) float64.
+    blas_threads : int
+        Number of BLAS threads to use inside this process.
+    S_tile : Optional[int]
+        If given, caps the S block size. Otherwise uses S_chunk.
+    L_band : int
+        Optional λ-banding for GEMV working set (does not change how
+        HDF5 reads; it just limits the temporary 2-D views).
+    """
+    try:
+        from threadpoolctl import threadpool_limits
+    except Exception:
+        threadpool_limits = None
+
+    # Respect Slurm if present; keep BLAS threads moderate.
     t = int(os.environ.get("SLURM_CPUS_PER_TASK", blas_threads))
     os.environ["OMP_NUM_THREADS"] = os.environ["MKL_NUM_THREADS"] = \
         os.environ["OPENBLAS_NUM_THREADS"] = str(t)
-    try:
-        from threadpoolctl import threadpool_limits
-        threadpool_limits(t)
-    except Exception:
-        pass
+    if threadpool_limits:
+        try:
+            threadpool_limits(t)
+        except Exception:
+            pass
 
-    # helper to return free heap to OS (glibc)
+    # Small helper to return free heap to the OS (keeps RSS flat).
     try:
         libc = ctypes.CDLL("libc.so.6")
         def trim_heap(): libc.malloc_trim(0)
@@ -722,83 +758,89 @@ def reconstruct_model_cube_single(h5_path, x_global, array_name="ModelCube",
         def trim_heap(): pass
 
     with open_h5(h5_path, role="writer") as f:
-        M = f["/HyperCube/models"]                     # (S,C,P,L) f32
+        M = f["/HyperCube/models"]              # (S,C,P,L) float32
         S, C, P, L = map(int, M.shape)
-        S_chunk = (M.chunks[0] if getattr(M, "chunks", None) else 128)
-        P_chunk = (M.chunks[2] if getattr(M, "chunks", None) else P)
-        L_chunk = (M.chunks[3] if getattr(M, "chunks", None) else L)  # usually == L
+        chunks = M.chunks or (S, 1, P, L)
+        S_chunk, C_chunk, P_chunk, L_chunk = map(int, chunks)
 
-        # ---------- choose (S_tile, P_block) to satisfy memory budget ----------
-        want_S = S_chunk if S_tile is None else max(1, int(S_tile))
-        S_eff  = min(want_S, S)
-        P_block = P_chunk
+        # Choose S block aligned to storage chunk (or user cap).
+        S_blk = S_chunk if S_tile is None else max(1, int(S_tile))
+        S_blk = min(S_blk, S_chunk)             # never exceed chunk
+        S_blk = min(S_blk, S)                   # clamp to S
 
-        # Conservative budget based on a hypothetical f64 slab (keeps settings
-        # similar to your previous runs; actual memory is lower since we keep
-        # the slab in f32 and only promote via out=)
-        def a64_bytes(S_eff, P_block): return S_eff * C * P_block * L * 8
-        while a64_bytes(S_eff, P_block) > max_bytes_per_slab:
-            if S_eff > 1:
-                S_eff = max(1, S_eff // 2)
-            elif P_block > 1:
-                P_block = max(1, P_block // 2)
-            else:
-                break
-
-        # Output (tile-aligned; uncompressed for speed)
+        # Prepare output (tile-aligned; uncompressed is fastest).
         if array_name in f:
             del f[array_name]
         out = f.create_dataset(array_name, shape=(S, L), dtype="f8",
-                               chunks=(min(S_eff, S), L))
+                               chunks=(S_blk, L))
 
-        # Weights (C,P) f64
-        x_cp = np.asarray(x_global, dtype=np.float64)
+        # Weights as (C,P) — math in f32 for speed; sum in f64.
+        x_cp = np.asarray(x_global)
         if x_cp.ndim == 1:
             x_cp = x_cp.reshape(C, P)
-        assert x_cp.shape == (C, P)
+        if x_cp.shape != (C, P):
+            raise ValueError(f"x shape {x_cp.shape} != (C,P)=({C},{P})")
+        x32 = np.asarray(x_cp, dtype=np.float32, order="C")
 
-        # --- Preallocate persistent buffers (REUSED every tile) ---
-        slab32 = np.empty((S_eff, C, P_block, L), dtype=np.float32, order="C")
-        tmp    = np.empty((S_eff, L), dtype=np.float64, order="C")  # einsum out
-        # ----------------------------------------------------------------------
-
-        print(f"[Recon] S_eff={S_eff}  P_block={P_block}  "
-              f"A64≈{a64_bytes(S_eff,P_block)/1024**3:.2f} GiB")
-
-        n_tiles = math.ceil(S / S_eff)
+        # Progress
+        n_tiles = math.ceil(S / S_blk)
+        print(f"[Recon] S_chunk={S_chunk} C_chunk={C_chunk} "
+              f"P_chunk={P_chunk} L_chunk={L_chunk} S_blk={S_blk} "
+              f"L_band={L_band}")
         pbar = tqdm(total=n_tiles, desc="[Reconstruct] tiles",
                     unit="tile", dynamic_ncols=True)
 
-        for s0 in range(0, S, S_eff):
-            s1 = min(S, s0 + S_eff)
+        # --- main loop: S in storage-aligned tiles -------------------
+        for s0 in range(0, S, S_blk):
+            s1 = min(S, s0 + S_blk)
             dS = s1 - s0
 
-            # Active view for this tile
+            # Tile accumulator in f64
             Y_tile = np.zeros((dS, L), dtype=np.float64, order="C")
 
-            for p0 in range(0, P, P_block):
-                p1 = min(P, p0 + P_block)
-                Pb = p1 - p0
+            # Iterate components in storage order (C_chunk == 1)
+            for c0 in range(0, C, max(1, C_chunk)):
+                c1 = min(C, c0 + max(1, C_chunk))
+                c = c0  # C_chunk is 1 in our files
 
-                # views limited to actual dS, Pb for last edges
-                v32 = slab32[:dS, :, :Pb, :]
-                # read directly into slab32 buffer (no new arrays)
-                M.read_direct(v32, np.s_[s0:s1, :, p0:p1, :], np.s_[:, :, :, :])
+                # Optional λ-banding for small GEMV views
+                for l0 in range(0, L, max(1, L_band)):
+                    l1  = min(L, l0 + max(1, L_band))
+                    Lb  = l1 - l0
 
-                # einsum directly from f32 slab into f64 tmp view
-                # (dS,C,Pb,L) x (C,Pb) -> (dS,L)
-                Tv = tmp[:dS, :]
-                np.einsum('dcpl,cp->dl',
-                          v32,
-                          x_cp[:, p0:p1],
-                          out=Tv,
-                          optimize='greedy')
+                    # Accumulator for this (c, L band)
+                    band_acc = np.zeros((dS, Lb), dtype=np.float64,
+                                        order="C")
 
-                # accumulate into the active region only
-                np.add(Y_tile, Tv, out=Y_tile)
+                    # Contract over P in P_chunk steps (exactly aligned)
+                    for p0 in range(0, P, max(1, P_chunk)):
+                        p1  = min(P, p0 + max(1, P_chunk))
+                        Pb  = p1 - p0
 
+                        # Read one storage-aligned slab:
+                        # (dS, 1, Pb, Lb) float32
+                        A32 = M[s0:s1, c:c1, p0:p1, l0:l1][...]
+                        A32 = np.asarray(A32, dtype=np.float32, order="C")
+
+                        # Make a (dS*Lb, Pb) 2-D view for BLAS gemv
+                        # by swapping axes (dS, Pb, Lb) → (dS, Lb, Pb)
+                        A2D = A32[:, 0, :, :].swapaxes(1, 2) \
+                                           .reshape(dS * Lb, Pb)
+
+                        # Multiply by weights for this (c, p-block) in f32
+                        w32 = x32[c, p0:p1]           # (Pb,)
+                        tmp = A2D @ w32               # (dS*Lb,) f32
+
+                        # Accumulate into f64 band
+                        band_acc += tmp.reshape(dS, Lb).astype(np.float64,
+                                                               copy=False)
+
+                    # Add this component's band into the tile
+                    Y_tile[:, l0:l1] += band_acc
+
+            # Write the finished S-tile
             out[s0:s1, :] = Y_tile
-            trim_heap()   # return free heap to OS to keep RSS flat
+            trim_heap()
             pbar.update(1)
 
         pbar.close()

@@ -39,11 +39,6 @@ import numpy as np
 import time
 from tqdm import tqdm
 
-try:
-    from threadpoolctl import threadpool_limits
-except Exception:
-    threadpool_limits = None
-
 @dataclass
 class SolverCfg:
     epochs: int = 1
@@ -54,21 +49,30 @@ class SolverCfg:
     blas_threads: Optional[int] = None
     verbose: bool = True
     seed: Optional[int] = None
+    # ratio-penalty (scale-invariant guidance from component priors)
+    ratio_use: Optional[bool] = None   # None -> auto (True if orbit_weights provided)
+    ratio_prob: float = 0.02           # chance to apply after a spaxel
+    ratio_eta: Optional[float] = None  # defaults to 0.1 * lr
+    ratio_anchor: str | int = "auto"   # "auto" (argmax weight) or integer index
+    ratio_min_weight: float = 1e-5     # ignore tiny prior weights
+    ratio_batch: int = 2               # how many constraints per trigger
 
-    # --- NEW (ratio-penalty) ---
-    ratio_use: Optional[bool] = None   # None -> auto (True if orbit_weights given)
-    ratio_prob: float = 0.02           # probability to apply ratio penalty after a spaxel
-    ratio_eta: Optional[float] = None  # default: 0.1 * lr
-    ratio_anchor: str | int = "auto"   # "auto" (argmax w) or explicit component index
-    ratio_min_weight: float = 1e-5     # ignore tiny-weight components
-    ratio_batch: int = 2               # how many ratio rows per trigger
+# Optional control of BLAS/OpenMP threads (safe no-op if unavailable)
+try:
+    from threadpoolctl import threadpool_limits as _threadpool_limits
+except Exception:
+    _threadpool_limits = None  # gracefully degrade if not installed
 
 def _blas_ctx(nthreads: Optional[int]):
-    if threadpool_limits and nthreads and nthreads > 0:
-        return threadpool_limits(limits=int(nthreads))
+    """
+    Context manager that limits BLAS/OpenMP threads to `nthreads`.
+    If threadpoolctl is unavailable or nthreads is falsy, it's a no-op.
+    """
+    if _threadpool_limits and nthreads and int(nthreads) > 0:
+        return _threadpool_limits(limits=int(nthreads))
     class _Nop:
         def __enter__(self): return None
-        def __exit__(self, *a): return False
+        def __exit__(self, *exc): return False
     return _Nop()
 
 def solve_global_kaczmarz(
@@ -98,24 +102,20 @@ def solve_global_kaczmarz(
     with a small step size and low frequency. This preserves mixture ratios
     while allowing the overall normalization to be set by the data.
 
-    Core data updates:
-      • For each selected pixel l, promote column A[:, l] (float32) to a
-        float64 buffer and perform a standard Kaczmarz step on x (float64).
-      • No per-column scaling by priors is applied.
+    Data updates:
+      For L_eff pixels in a spaxel, pick K rows, promote a single column
+      A[:, l] from f32 → f64 (into a pre-allocated buffer) and do a Kaczmarz
+      step on the global x (f64).
 
-    Optional scale-invariant ratio penalty:
-      • Let s_c = sum_p x_{c,p}. For an anchor component i (usually the
-        largest prior weight), stochastically enforce
-            s_c - (w_c / w_i) * s_i ≈ 0
-        with small step-size and low frequency. This nudges mixture ratios
-        without fixing absolute normalization.
+    Ratio penalty (scale-invariant):
+      Let s_c = sum_p x_{c,p}. Pick an anchor i (largest prior by default).
+      Stochastically apply s_c - (w_c/w_i)*s_i ≈ 0 with small step (eta) and
+      low freq. This preserves mixture ratios but not absolute scale.
 
     Callbacks:
-      • on_epoch_end(x, epoch, stats): called once per epoch (x is live).
-      • on_progress(x, epoch, stats): called every ~progress_interval_sec
-        within an epoch (x is live). Set interval to None to disable.
-      • on_batch_rmse(rmse): called once per spaxel with RMSE over that
-        spaxel’s selected rows; useful for a tracker EWMA.
+      - on_progress(x, epoch, stats)     ~ every progress_interval_sec
+      - on_batch_rmse(rmse)              once per spaxel (K-row RMSE)
+      - on_epoch_end(x, epoch, stats)    end of epoch
 
     Parameters
     ----------
@@ -174,253 +174,161 @@ def solve_global_kaczmarz(
     P = int(reader.nPop)
     N = C * P
 
-    # None-aware config reader
-    def _cfg_val(obj, name, default):
-        v = getattr(obj, name, None)
-        return default if v is None else v
-
-    # Base learning rate used in several defaults
-    lr = float(_cfg_val(cfg, "lr", 0.25))
-
-    # ---- Priors: per-component targets (length C) for ratios ----
+    # ----- priors → component fractions -----
     w_c = None
     if orbit_weights is not None:
-        w_c = np.asarray(orbit_weights, dtype=np.float64).ravel()
-        if w_c.size != C:
-            raise ValueError(
-                f"orbit_weights must have length C={C}; got {w_c.size}"
-            )
-        # Do not normalize: ratios w_c[c]/w_c[i] are scale-invariant.
+        ow = np.asarray(orbit_weights, np.float64).ravel()
+        if ow.size == C:
+            w_c = ow.copy()
+        elif ow.size == N:
+            w_c = ow.reshape(C, P).sum(axis=1)
+        else:
+            raise ValueError(f"orbit_weights size {ow.size} not in {{C,N}}")
+        tot = float(w_c.sum())
+        if tot > 0:
+            w_c = w_c / tot
+        else:
+            w_c = None
 
-        # ---- Ratio configuration (mass + shape preserving) ----
-        use_ratio = (_cfg_val(cfg, "ratio_use", None)
-                    if hasattr(cfg, "ratio_use") else None)
-        use_ratio = (w_c is not None) if (use_ratio is None) else bool(use_ratio)
+    use_ratio = bool(cfg.ratio_use) if cfg.ratio_use is not None else (w_c is not None)
+    eta_pen = float(cfg.ratio_eta if cfg.ratio_eta is not None else 0.1 * float(getattr(cfg, "lr", 0.25)))
+    p_ratio = float(getattr(cfg, "ratio_prob", 0.02))
+    ratio_batch = int(getattr(cfg, "ratio_batch", 2))
+    min_w = float(getattr(cfg, "ratio_min_weight", 1e-5))
 
-        # Gentle defaults so data rows dominate scale
-        ratio_prob   = float(_cfg_val(cfg, "ratio_prob", 0.005))
-        ratio_batch  = int(_cfg_val(cfg, "ratio_batch", 1))
-        eta_pen      = float(_cfg_val(cfg, "ratio_eta", 0.05 * lr))
-        min_w_frac   = float(_cfg_val(cfg, "ratio_min_weight", 1e-3))
-
-    if use_ratio and (w_c is not None):
-        wmax = float(np.max(w_c)) if w_c.size else 0.0
-        thr = max(min_w_frac * max(wmax, 1.0), 0.0)
-
-        anch = getattr(cfg, "ratio_anchor", "auto")
-        if anch == "auto":
-            good = (w_c >= thr)
-            if not np.any(good):
-                good = np.ones_like(w_c, dtype=bool)
+    if use_ratio and w_c is not None:
+        if cfg.ratio_anchor == "auto":
+            good = (w_c >= min_w)
+            if not np.any(good): good = np.ones_like(w_c, bool)
             i_anchor = int(np.argmax(w_c * good))
         else:
-            i_anchor = int(anch)
+            i_anchor = int(cfg.ratio_anchor)
             if not (0 <= i_anchor < C):
                 raise ValueError("ratio_anchor out of range")
-
-        cand = np.where(
-            (np.arange(C) != i_anchor) & (w_c >= thr)
-        )[0].astype(int)
-        # Precompute ratios r_ci = w_c / w_anchor (avoid div-by-zero).
-        denom = max(w_c[i_anchor], np.finfo(float).tiny)
-        r_ci = (w_c[cand] / denom).astype(np.float64, copy=False)
+        cand = np.arange(C, dtype=int)
+        cand = cand[(cand != i_anchor) & (w_c > min_w)]
+        r_ci = np.empty(cand.size, dtype=np.float64)
+        r_ci[:] = w_c[cand] / max(w_c[i_anchor], 1e-18)
     else:
-        i_anchor = None
-        cand = np.array([], dtype=int)
-        r_ci = np.array([], dtype=np.float64)
+        i_anchor, cand, r_ci = None, np.array([], int), np.array([], float)
 
-    # ---- Solution vector and buffers ----
-    if x0 is None:
-        x = np.zeros(N, dtype=np.float64)
-    else:
-        x = np.asarray(x0, dtype=np.float64, order="C").copy()
-    a64 = np.empty(N, dtype=np.float64)  # one-column buffer
+    # ----- solution and buffers -----
+    x = np.zeros(N, np.float64) if x0 is None else np.asarray(x0, np.float64, order="C").copy()
+    a64 = np.empty(N, np.float64)
 
-    # ---- Core Kaczmarz config ----
-    epochs   = int(_cfg_val(cfg, "epochs", 1))
-    K_req    = int(_cfg_val(cfg, "pixels_per_aperture", 256))
-    # lr already computed above
-    order    = str(_cfg_val(cfg, "row_order", "random"))
-    proj_nn  = bool(_cfg_val(cfg, "project_nonneg", True))
-    blas_threads = _cfg_val(cfg, "blas_threads", None)
-    verbose  = bool(_cfg_val(cfg, "verbose", True))
+    # ----- cfg -----
+    epochs = int(getattr(cfg, "epochs", 1))
+    K_req  = int(getattr(cfg, "pixels_per_aperture", 256))
+    lr     = float(getattr(cfg, "lr", 0.25))
+    order  = str(getattr(cfg, "row_order", "random"))
+    proj_nn = bool(getattr(cfg, "project_nonneg", True))
+    blas_threads = getattr(cfg, "blas_threads", None)
+    verbose = bool(getattr(cfg, "verbose", True))
 
-    # ---- Mass- and shape-preserving ratio update ----
-    def ratio_update(
-        x_vec: np.ndarray,
-        s_vec: np.ndarray,
-        c: int,
-        i: int,
-        r: float,
-        eps: float = 1e-18,
-    ) -> None:
-        """
-        Enforce s_c ≈ r * s_i by rescaling blocks c and i only.
-        - Preserves population *shape* within each block.
-        - Preserves total mass: Δs_c + Δs_i = 0.
-        - Effective step is eta_pen/(1+r) to keep dynamics stable.
-        """
-        sc = float(s_vec[c])
-        si = float(s_vec[i])
-        g = sc - r * si
-        if abs(g) < 1e-30:
-            return
-
-        # Mass-conserving pair step (effective step includes 1/(1+r)).
-        eff = eta_pen / (1.0 + r)
-        ds_c = -eff * g
-        ds_i = +eff * g
-
-        c0, i0 = c * P, i * P
-        xc = x_vec[c0:c0 + P]
-        xi = x_vec[i0:i0 + P]
-
-        # Directions follow current shapes (fallbacks if empty).
-        if sc > eps:
-            dir_c = xc / (sc + eps)
-        elif si > eps:
-            dir_c = xi / (si + eps)              # borrow anchor shape
-        else:
-            dir_c = np.full(P, 1.0 / P, x_vec.dtype)
-
-        if si > eps:
-            dir_i = xi / (si + eps)
-        elif sc > eps:
-            dir_i = xc / (sc + eps)
-        else:
-            dir_i = np.full(P, 1.0 / P, x_vec.dtype)
-
-        xc_new = xc + ds_c * dir_c
-        xi_new = xi + ds_i * dir_i
-
+    def _ratio_update(x_vec: np.ndarray, sums: np.ndarray, c: int, i: int, r: float):
+        e = sums[c] - r * sums[i]
+        den = P * (1.0 + r*r)
+        if den <= 0.0: return
+        dc = - eta_pen * e / den
+        di = + r       * eta_pen * e / den
+        c0 = c * P; i0 = i * P
+        x_vec[c0:c0+P] += dc
+        x_vec[i0:i0+P] += di
         if proj_nn:
-            sc_old, si_old = float(xc.sum()), float(xi.sum())
-            np.maximum(xc_new, 0.0, out=xc_new)
-            np.maximum(xi_new, 0.0, out=xi_new)
-            s_vec[c] += float(xc_new.sum() - sc_old)
-            s_vec[i] += float(xi_new.sum() - si_old)
+            xb = x_vec[c0:c0+P]; xi = x_vec[i0:i0+P]
+            bc = xb.sum(); bi = xi.sum()
+            np.maximum(xb, 0.0, out=xb)
+            np.maximum(xi, 0.0, out=xi)
+            sums[c] += float(xb.sum() - bc)
+            sums[i] += float(xi.sum() - bi)
         else:
-            s_vec[c] += ds_c
-            s_vec[i] += ds_i
+            sums[c] += P * dc
+            sums[i] += P * di
 
-        x_vec[c0:c0 + P] = xc_new
-        x_vec[i0:i0 + P] = xi_new
-
-    # ---- Main loop ----
     t0 = time.perf_counter()
+    next_progress = t0 + (float(progress_interval_sec) if progress_interval_sec else float("inf"))
+
     with _blas_ctx(blas_threads):
         for ep in range(epochs):
             if verbose:
-                print(f"[Kaczmarz] epoch {ep + 1}/{epochs}")
-            t_ep0 = time.perf_counter()
-            pbar = tqdm(
-                total=reader.nSpat,
-                desc=f"[Kaczmarz] epoch {ep + 1}/{epochs}",
-                unit="spax",
-                dynamic_ncols=True,
-                leave=(ep == epochs - 1),
-                disable=not verbose,
-                mininterval=1.0,
-            )
-            s_comp = None
-            last_tick = time.time()
+                print(f"[Kaczmarz] epoch {ep+1}/{epochs}")
+            pbar = tqdm(total=reader.nSpat,
+                        desc=f"[Kaczmarz] epoch {ep+1}/{epochs}",
+                        unit="spax",
+                        dynamic_ncols=True,
+                        leave=(ep == epochs - 1),
+                        disable=not verbose,
+                        mininterval=1.0)
+
+            s_comp = None  # lazily refreshed component sums
 
             for s0, s1 in reader.spaxel_tiles():
                 for s in range(s0, s1):
-                    A_f32, y = reader.read_spaxel_plane(s)
-                    L_eff = int(A_f32.shape[1])
-                    if L_eff != y.size:
-                        raise RuntimeError(
-                            f"L mismatch for spaxel {s}: "
-                            f"A has {L_eff}, y has {y.size}"
-                        )
-
-                    # Choose K pixel rows
+                    A32, y = reader.read_spaxel_plane(s)   # (N,L_eff) f32, (L_eff,) f64
+                    L_eff = int(A32.shape[1])
+                    if L_eff == 0:
+                        pbar.update(1); continue
                     K = min(K_req, L_eff)
                     if order == "sequential":
                         idx = np.arange(K, dtype=np.int64)
                     else:
                         idx = rng.choice(L_eff, size=K, replace=False)
 
-                    # Optional RMSE accumulator (per spaxel)
-                    if on_batch_rmse is not None:
-                        se_sum = 0.0
-
-                    # Data Kaczmarz updates
+                    rsq_sum = 0.0
                     for l in idx:
-                        a64[:] = A_f32[:, l]
-                        rres = y[l] - np.dot(a64, x)
-                        denom = np.dot(a64, a64) + 1e-18
-                        x += lr * (rres / denom) * a64
-                        if on_batch_rmse is not None:
-                            se_sum += float(rres * rres)
+                        a64[:] = A32[:, l]          # promote single column
+                        r = y[l] - np.dot(a64, x)
+                        den = np.dot(a64, a64) + 1e-18
+                        step = lr * (r / den)
+                        x += step * a64
+                        rsq_sum += float(r*r)
 
                     if on_batch_rmse is not None:
-                        rmse = float((se_sum / max(K, 1)) ** 0.5)
-                        on_batch_rmse(rmse)
+                        on_batch_rmse((rsq_sum / K) ** 0.5)
 
-                    # Occasional ratio adjustment (cheap, O(P))
-                    if use_ratio and cand.size and (rng.random() < ratio_prob):
+                    if use_ratio and cand.size and (rng.random() < p_ratio):
                         if s_comp is None:
                             s_comp = x.reshape(C, P).sum(axis=1)
                         for _ in range(ratio_batch):
                             j = int(rng.integers(cand.size))
-                            c_idx = int(cand[j])
-                            ratio_update(
-                                x, s_comp, c_idx, int(i_anchor), float(r_ci[j])
-                            )
-                        # Occasionally refresh sums to limit drift after proj
+                            _ratio_update(x, s_comp, int(cand[j]), int(i_anchor), float(r_ci[j]))
                         if rng.random() < 0.1:
                             s_comp = x.reshape(C, P).sum(axis=1)
 
-                    # Heartbeat for dashboards
-                    if (on_progress is not None) and (progress_interval_sec):
-                        now = time.time()
-                        if (now - last_tick) >= float(progress_interval_sec):
-                            on_progress(
-                                x,
-                                ep + 1,
-                                {
-                                    "epoch": ep + 1,
-                                    "elapsed_sec": now - t_ep0,
-                                    "pixels_per_aperture": K_req,
-                                    "blas_threads": blas_threads,
-                                    "N": N,
-                                },
-                            )
-                            last_tick = now
+                    # time-gated progress callback
+                    if on_progress is not None and time.perf_counter() >= next_progress:
+                        stats_ep = {"epoch": ep + 1, "N": N}
+                        try:
+                            on_progress(x, ep + 1, stats_ep)
+                        except Exception:
+                            pass
+                        next_progress = time.perf_counter() + (float(progress_interval_sec) if progress_interval_sec else float("inf"))
 
                     pbar.update(1)
 
             if proj_nn:
-                np.maximum(x, 0, out=x)
+                np.maximum(x, 0.0, out=x)
 
             pbar.close()
-
             if on_epoch_end is not None:
-                stats_epoch = {
-                    "epoch": ep + 1,
-                    "elapsed_sec": time.perf_counter() - t_ep0,
-                    "pixels_per_aperture": K_req,
-                    "blas_threads": blas_threads,
-                    "N": N,
-                }
-                on_epoch_end(x, ep + 1, stats_epoch)
+                stats_epoch = {"epoch": ep + 1,
+                               "elapsed_sec": time.perf_counter() - t0,
+                               "pixels_per_aperture": K_req,
+                               "blas_threads": blas_threads,
+                               "N": N}
+                try:
+                    on_epoch_end(x, ep + 1, stats_epoch)
+                except Exception:
+                    pass
 
-    elapsed = time.perf_counter() - t0
-    stats = {
-        "elapsed_sec": elapsed,
-        "epochs": epochs,
-        "pixels_per_aperture": K_req,
-        "blas_threads": blas_threads,
-        "N": N,
-        "ratio_used": bool(use_ratio),
-        "ratio_anchor": (None if not use_ratio else int(i_anchor)),
-        "ratio_prob": (ratio_prob if use_ratio else 0.0),
-        "ratio_eta_base": (eta_pen if use_ratio else 0.0),
-        "ratio_batch": (ratio_batch if use_ratio else 0),
-        "ratio_min_weight_frac": (min_w_frac if use_ratio else 0.0),
-        "ratio_mass_preserving": bool(use_ratio),
-        "ratio_shape_preserving": bool(use_ratio),
-    }
+    stats = {"elapsed_sec": time.perf_counter() - t0,
+             "epochs": epochs,
+             "N": N,
+             "ratio_used": bool(use_ratio),
+             "ratio_anchor": (None if not use_ratio else int(i_anchor)),
+             "ratio_prob": (p_ratio if use_ratio else 0.0),
+             "ratio_eta": (eta_pen if use_ratio else 0.0),
+             "ratio_batch": (ratio_batch if use_ratio else 0),
+             "ratio_min_weight": (min_w if use_ratio else 0.0),
+             "pixels_per_aperture": K_req}
     return x, stats

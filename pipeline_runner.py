@@ -67,62 +67,89 @@ def _load_resume_vector(h5_path: str) -> np.ndarray | None:
         print(f"[Pipeline] Resume probe failed: {e}")
     return None
 
-
 def _build_streaming_jacobi_seed(h5_path: str,
                                  Ns: int = 16,
                                  K: int = 256,
-                                 rng_seed: int = 12345) -> tuple[np.ndarray, dict]:
+                                 rng_seed: int = 12345,
+                                 max_bytes: int = 2_000_000_000
+                                 ) -> tuple[np.ndarray, dict]:
     """
-    Very fast diagonal/Jacobi initializer on a small sample:
-      Accumulate d = diag(A^T A), b = A^T y over Ns spaxels × K pixels.
-      x0 = clip(b / (d + eps), 0).
+    Chunk-friendly Jacobi initializer.
+
+    Reads a contiguous spaxel tile that lies within one S-chunk of the
+    /HyperCube/models dataset, loads full-L once per tile (L_chunk == L),
+    then samples K pixel columns *in RAM* per spaxel to accumulate:
+
+        d = diag(A^T A)   in float64 (no full f64 copy of A)
+        b = A^T y         with y in float64
+
+    Returns:
+        x0  : (C*P,) float64  non-negative seed clip(b / (d + eps), 0)
+        stats: dict with {'Ns_used', 'K_used', 's0', 's1', 'S_chunk'}
     """
     rng = np.random.default_rng(rng_seed)
     with open_h5(h5_path, role="reader") as f:
-        M = f["/HyperCube/models"]     # (S,C,P,L)
-        Data = f["/DataCube"]          # (S,L)
+        M = f["/HyperCube/models"]   # (S,C,P,L) float32
+        Y = f["/DataCube"]           # (S,L)     float64
         Mask = f["/Mask"] if "/Mask" in f else None
 
         S, C, P, L = map(int, M.shape)
         CP = C * P
-        d = np.zeros(CP, dtype=np.float64)
-        b = np.zeros(CP, dtype=np.float64)
+        chunks = M.chunks or (S, 1, P, L)
+        S_chunk = int(chunks[0])     # tile along S to reuse cached chunks
 
-        # stratified spaxel sample
-        if Ns >= S:
-            spaxels = np.arange(S, dtype=int)
-        else:
-            base = np.linspace(0, S - 1, Ns, dtype=int)
-            jitter = rng.integers(0, max(1, S // max(4, Ns)), size=Ns)
-            spaxels = np.unique(np.clip(base + jitter, 0, S - 1))
+        # memory budget: one slab (S_eff,C,P,L) float32
+        bytes_per_spax = C * P * L * 4
+        S_cap = max(1, int(max_bytes // max(1, bytes_per_spax)))
 
-        # choose pixel pool once (mask-aware)
+        # choose a tile fully inside one S_chunk
+        s0 = int(rng.integers(0, max(1, S // S_chunk)) * S_chunk)
+        s1 = min(S, s0 + S_chunk)
+        S_eff = min(Ns, S_chunk, S_cap, s1 - s0)
+        s1 = s0 + S_eff
+
+        # read once per tile
+        slab32 = M[s0:s1, :, :, :][...]          # (S_eff,C,P,L) f32
+        Y_tile = np.asarray(Y[s0:s1, :], np.float64)  # (S_eff,L)   f64
+
+        # pixel pool (mask-aware)
         if Mask is not None:
-            mask = np.asarray(Mask[...], bool).ravel()
-            pool = np.flatnonzero(mask)
+            pool = np.flatnonzero(np.asarray(Mask[...], bool).ravel())
             if pool.size == 0:
                 pool = np.arange(L, dtype=int)
         else:
             pool = np.arange(L, dtype=int)
 
-        for s in spaxels:
-            if K < pool.size:
-                ell = rng.choice(pool, size=K, replace=False)
-            else:
-                ell = pool
-            y = np.asarray(Data[s, ell], np.float64)                  # (K,)
-            # batch read K columns -> (C,P,K)
-            A = np.empty((C, P, ell.size), dtype=np.float32)
-            for j, k in enumerate(ell):
-                A[:, :, j] = M[s, :, :, int(k)]
-            A = np.asarray(A, dtype=np.float64)                       # promote once
-            Ak = A.reshape(CP, ell.size)                              # (CP, K)
-            d += np.einsum("ik,ik->i", Ak, Ak, optimize=True)         # diag(AtA)
-            b += Ak @ y                                               # At y
+        d = np.zeros(CP, dtype=np.float64)
+        b = np.zeros(CP, dtype=np.float64)
+
+        for i in range(S_eff):
+            mK = int(min(K, pool.size))
+            # h5py fancy indexing requires sorted indices; we also use them
+            # consistently for both A and y.
+            ell = rng.choice(pool, size=mK, replace=False)
+            ell_sorted = np.sort(ell)
+
+            # select columns in RAM; keep A in float32 for products,
+            # promote only the *result* to float64 via dtype=...
+            Aik = slab32[i, :, :, ell_sorted]         # (C,P,mK) f32
+            Ak = Aik.reshape(CP, mK)                  # (CP,mK) f32
+            yk = Y_tile[i, ell_sorted]                # (mK,)  f64
+
+            # diag(AtA): float64 accumulation without upcasting Ak itself
+            d += np.einsum("ik,ik->i", Ak, Ak, dtype=np.float64, optimize=True)
+            # At y: float32@float64 -> float64 result
+            b += Ak @ yk
 
         eps = 1e-12
         x0 = np.maximum(0.0, b / (d + eps))
-        stats = {"Ns": int(spaxels.size), "K": int(min(K, pool.size))}
+        stats = {
+            "Ns_used": int(S_eff),
+            "K_used": int(min(K, pool.size)),
+            "s0": int(s0),
+            "s1": int(s1),
+            "S_chunk": int(S_chunk),
+        }
         return x0, stats
 
 class PipelineRunner:
@@ -219,25 +246,25 @@ class PipelineRunner:
                 seed_cfg: dict | None = None,
                 tracker_mode: str = "async"):  # 'async'|'off'
 
-        # 1) Tracker: use your FitTracker as-is
-        
-        use_tracker = (tracker_mode != "off")
+        # ---------------- tracker (optional) ----------------
+        use_tracker = (str(tracker_mode).lower() != "off")
         tracker = NullTracker()
         if use_tracker:
             try:
+                logger.log('[Pipeline] Starting tracker...', flush=True)
                 tracker_cfg = TrackerConfig()
-                # or your existing cfg construction
                 tracker = FitTracker(self.h5_path, cfg=tracker_cfg)
-            # uses and writes /Fit/*  :contentReference[oaicite:2]{index=2}
+                logger.log('[Pipeline] Tracker started.', flush=True)
             except Exception as e:
-                print(f"[Pipeline] Tracker disabled (start failed: {e})")
+                print(f"[Pipeline] Tracker disabled (start failed: {e})",
+                    flush=True)
                 tracker = NullTracker()
-        
-        # 2) Build the reader as you currently do
+
+        # ---------------- reader ----------------
         rcfg = ReaderCfg(s_tile=reader_s_tile, c_tile=reader_c_tile, p_tile=reader_p_tile)
         reader = HyperCubeReader(self.h5_path, cfg=rcfg)
 
-        # 3) Solver config
+        # ---------------- solver cfg ----------------
         cfg = SolverCfg(epochs=epochs,
                         pixels_per_aperture=pixels_per_aperture,
                         lr=lr,
@@ -247,132 +274,95 @@ class PipelineRunner:
                         verbose=verbose,
                         seed=seed)
 
-        if orbit_weights is not None:
+        # ---------------- warm-start ----------------
+        x_best = x_last = None
+        if warm_start in ("auto", "resume"):
             try:
-                print('[Pipeline] tracker.set_orbit_weights...')
-                tracker.set_orbit_weights(orbit_weights)
+                with open_h5(self.h5_path, role="reader") as f:
+                    if "/Fit/x_best" in f:
+                        tmp = f["/Fit/x_best"][...]
+                        if tmp.size: x_best = np.asarray(tmp, np.float64, order="C")
+                    if "/X_global" in f:
+                        tmp = f["/X_global"][...]
+                        if tmp.size: x_last = np.asarray(tmp, np.float64, order="C")
             except Exception as e:
-                if verbose:
-                    print(f"[Pipeline] tracker.set_orbit_weights warning: {e}")
+                if verbose: print(f"[Pipeline] Resume probe failed: {e}")
 
-        # 4) Warm-start: user x0 overrides; else resume; else smart seed
-        def _build_jacobi_seed(N, *, Ns=16, K=256, seed=12345):
-            # Minimal streaming Jacobi using the reader (masked, f64-safe)
-            rng = np.random.default_rng(seed)
-            C, P = int(self.nComp), int(self.nPop)
-            N = C * P
-            d = np.zeros(N, dtype=np.float64)  # diag A^T A approx
-            b = np.zeros(N, dtype=np.float64)  # A^T y approx
-            ns = min(Ns, self.nSpat)
-            # stratified spaxel sample
-            spax = np.linspace(0, self.nSpat - 1, ns, dtype=int)
-            jitter = rng.integers(0, max(1, self.nSpat // max(4, ns)), size=ns)
-            spax = np.unique(np.clip(spax + jitter, 0, self.nSpat - 1))
-            for s in spax:
-                A_f32, y = reader.read_spaxel_plane(s)
-                L_eff = int(A_f32.shape[1])
-                if L_eff == 0: continue
-                kk = min(K, L_eff)
-                cols = rng.choice(L_eff, size=kk, replace=False)
-                for l in cols:
-                    a = np.asarray(A_f32[:, l], dtype=np.float64)
-                    d += a * a
-                    b += a * float(y[l])
-            x_seed = np.divide(b, d + 1e-18, out=np.zeros_like(b), where=(d > 0))
-            np.maximum(x_seed, 0.0, out=x_seed)
-            return x_seed
-
-        # Gather resume candidates
-        x_best = None; x_last = None
-        with open_h5(self.h5_path, role="reader") as f_ro:
-            if "/Fit/x_best" in f_ro:
-                x_best = np.asarray(f_ro["/Fit/x_best"][...], dtype=np.float64)
-            if "/X_global" in f_ro:
-                x_last = np.asarray(f_ro["/X_global"][...], dtype=np.float64)
-
-        N = int(self.nComp) * int(self.nPop)
-        if x0 is not None:
-            x0 = np.asarray(x0, dtype=np.float64).ravel()
-            if x0.size != N:
-                raise ValueError(f"x0.size {x0.size} != N {N}")
-
-        # Decide
-        wmode = (warm_start or "auto").lower()
-        if wmode == "jacobi":
-            x0_effective = _build_jacobi_seed(N, **(seed_cfg or {}))
-        elif wmode == "zeros":
-            x0_effective = np.zeros(N, dtype=np.float64)
-        elif wmode == "x0":
-            if x0 is None:
-                raise ValueError("warm_start='x0' but no x0 provided")
-            x0_effective = x0
-        elif wmode == "resume":
-            x0_effective = x_best if x_best is not None else (x_last if x_last is not None else np.zeros(N))
-        else:  # 'auto'
-            x0_effective = (
-                x0 if x0 is not None else
-                (x_best if x_best is not None else
-                (x_last if x_last is not None else _build_jacobi_seed(N, **(seed_cfg or {}))))
-            )
+        wmode = warm_start
+        x0_effective = None
+        if warm_start == "x0" and x0 is not None:
+            x0_effective = np.asarray(x0, np.float64, order="C")
+        elif warm_start == "resume" and (x_best is not None or x_last is not None):
+            x0_effective = x_best if x_best is not None else x_last
+        elif warm_start == "jacobi":
+            x0_effective, _ = _build_streaming_jacobi_seed(self.h5_path,
+                                                        **(seed_cfg or {}))
+        elif warm_start == "zeros":
+            x0_effective = np.zeros(reader.nComp * reader.nPop, dtype=np.float64)
+        else:  # auto
+            if x_best is not None or x_last is not None:
+                wmode = "resume"
+                x0_effective = x_best if x_best is not None else x_last
+            else:
+                wmode = "jacobi"
+                x0_effective, _ = _build_streaming_jacobi_seed(self.h5_path,
+                                                            **(seed_cfg or {}))
 
         if verbose:
             msg = ("fresh Jacobi" if wmode=="jacobi" else
                 "zeros" if wmode=="zeros" else
                 "explicit x0" if wmode=="x0" else
-                "resume" if wmode=="resume" else
-                "auto")
-            print(f"[Pipeline] Warm-start mode: {msg} "
-                f"(seed used: {'yes' if (wmode in ('jacobi','auto') and x0_effective is not x0 and x0_effective is not x_best and x0_effective is not x_last) else 'no'})")
-            # Let dashboard see the initial seed immediately
+                "resume" if wmode=="resume" else "auto")
+            logger.log(f"[Pipeline] Warm-start mode: {msg}", flush=True)
             try:
-                print('[Pipeline] tracker initial maybe_save...')
                 tracker.maybe_save(x0_effective, epoch=0, now=time.time())
-            except Exception as e:
-                if verbose:
-                    print(f"[Pipeline] tracker initial maybe_save warning: {e}")
+            except Exception:
+                pass
 
-        # 5) Wire callbacks for the solver
+        # ---------------- callbacks ----------------
         def _on_progress(x_vec: np.ndarray, epoch_no: int, stats_epoch: dict):
-            # Single call that lets tracker decide when/what to write; it's time-gated internally
             try:
                 tracker.maybe_save(x_vec, epoch=epoch_no, now=time.time())
-            except Exception as e:
-                if verbose:
-                    print(f"[Pipeline] tracker.maybe_save warning: {e}")
+            except Exception:
+                pass
+
         def _on_batch_rmse(rmse: float):
-            # EWMA of training RMSE; cheap scalar update
             try:
                 tracker.on_batch(float(rmse))
             except Exception:
                 pass
 
-        # Choose progress cadence ~ tracker metrics interval so we don't over-call
-        progress_interval = float(getattr(tracker_cfg, "metrics_interval_sec", 300))
+        progress_interval = 300.0
 
-
-        # 6) Run the solver with hooks
+        # ---------------- run solver ----------------
         try:
-            x, stats = solve_global_kaczmarz(reader, cfg=cfg,
-                orbit_weights=orbit_weights, x0=x0_effective,
+            logger.log('[Pipeline] Starting Kaczmarz solver.', flush=True)
+            x, stats = solve_global_kaczmarz(
+                reader, cfg=cfg,
+                orbit_weights=orbit_weights,
+                x0=x0_effective,
                 on_progress=_on_progress,
                 progress_interval_sec=progress_interval,
                 on_batch_rmse=_on_batch_rmse)
         finally:
             reader.close()
-        
-        # 7) Write final vector to canonical place for downstream code
+
+        # ---------------- persist final vector ----------------
         try:
             with open_h5(self.h5_path, role="writer") as f:
                 if "/X_global" in f: del f["/X_global"]
-                dset = f.create_dataset("/X_global", data=np.asarray(x, np.float64), dtype="f8",
-                                        chunks=(min(x.size, 1<<14),))
+                dset = f.create_dataset("/X_global",
+                    data=np.asarray(x, np.float64),
+                    dtype="f8", chunks=(min(x.size, 1<<14),))
                 dset.attrs["n"] = int(x.size)
-                # optional: tag provenance
-                dset.attrs["init"] = np.string_("resume" if x0_effective is not None else "jacobi_seed")
-                if seed_cfg:
-                    dset.attrs["seed_cfg"] = np.string_(str(seed_cfg))
+                dset.attrs["init"] = np.bytes_(wmode)
         except Exception as e:
             if verbose:
                 print(f"[Pipeline] Warning: could not write /X_global: {e}")
+
+        try:
+            tracker.close()
+        except Exception:
+            pass
 
         return x, stats
