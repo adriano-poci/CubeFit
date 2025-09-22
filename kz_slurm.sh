@@ -17,7 +17,7 @@
 #SBATCH --job-name="CubeFit"
 #SBATCH --time=0-12:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=48
 #SBATCH --mem=200G
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=adriano.poci@physics.ox.ac.uk
@@ -41,5 +41,5 @@ export OMP_PLACES=cores
 ulimit -n 8192
 
 cd /data/phys-gal-dynamics/phys2603/CubeFit
-# ipython kz_run.py
+ipython kz_run.py
 ipython kz_rio.py

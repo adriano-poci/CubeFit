@@ -88,6 +88,15 @@ os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 # ------------------------------------------------------------------------------
 
+def invalidate_done(h5_path: str):
+    with open_h5(h5_path, role="writer") as f:
+        g = f.require_group("/HyperCube")
+        g.attrs["complete"] = False
+        if "_done" in g:
+            del g["_done"]
+
+# ------------------------------------------------------------------------------
+
 def print_hypercube_done_status(h5_path: str) -> None:
     """
     Print a compact resume of /HyperCube/_done and basic dataset geometry.
