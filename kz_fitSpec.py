@@ -50,7 +50,7 @@ from typing import Tuple, Sequence
 from plotbin.display_pixels import display_pixels as dbi
 
 from CubeFit.hdf5_manager import H5Manager, H5Dims, open_h5,\
-    live_prefit_snapshot_from_models
+    live_prefit_snapshot_from_models, invalidate_done
 from CubeFit.hypercube_builder import build_hypercube
 from CubeFit.pipeline_runner   import PipelineRunner
 from muse import tri_fitSpec as tf
@@ -126,7 +126,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     full=False, slope=1.30, IMF='KB', iso='pad', weighting='luminosity',
     nProcs=1, lOrder=4, rescale=False, specRange=None, lsf=False,
     band='r', smask=None, method='fsf', varIMF=False,
-    source='ppxf', **kwargs):
+    source='ppxf', redraw=False, **kwargs):
     """
     _summary_
 
@@ -398,6 +398,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     logger.log('Done.')
     apHists = np.ma.masked_invalid(apHists)
     nApHists = (apHists*(massNorm/norma)[:, np.newaxis, np.newaxis])
+    nApHists /= biI['pCountsBin'][:, np.newaxis, np.newaxis]
     hbi = wbin*2 + 1
     vbins = (np.arange(hbi)-wbin)*histBinSize
     # (nSpat, nVel, nComp)
@@ -423,7 +424,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     mgr = H5Manager(hdf5Path)
     # mgr.set_velocity_grid(copy(vbins))
     arDims = mgr.populate_from_arrays(
-        losvd=apHists,
+        losvd=nApHists,
         datacube=laGrid,
         templates=lnGrid,
         mask=spmask,
@@ -435,6 +436,10 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     mgr.ensure_rebin_and_resample()
 
     # --- 2. Precompute HyperCube ---
+    if redraw:
+        logger.log('[CubeFit] Calling `invalidate_done` to regenerate '\
+            '/HyperCube.')
+        invalidate_done(hdf5Path)
     with logger.capture_all_output():
         nS, nC, nP = 128, 1, 360
         build_hypercube(

@@ -153,24 +153,51 @@ def _precompute_kernel_map(tem_loglam: np.ndarray, vel_pix: np.ndarray) -> Kerne
         center_idx=center_idx,
     )
 
-def _build_kernel_from_losvd(H_native: np.ndarray, km: KernelMap) -> np.ndarray:
+def _build_kernel_from_losvd(H_native: np.ndarray,
+                              km: KernelMap,
+                              *,
+                              vel_pix: np.ndarray | None = None,
+                              amp_mode: str = "sum") -> tuple[np.ndarray, float]:
     """
-    Given one LOSVD histogram H_native (length V on VelPix grid),
-    produce the kernel Hk on integer pixel shifts (length m), normalized and >=0.
-    Uses the precomputed linear interpolation weights.
+    From one LOSVD histogram H_native (length V on /VelPix), produce:
+      - Hk_unit : kernel on integer pixel shifts (length m), non-negative,
+                  *unit area* (sum == 1) for a stable convolution shape.
+      - amp_sc  : scalar amplitude to be applied to the convolved spectrum
+                  so the final basis row carries the LOSVD's mass/flux.
+
+    amp_mode:
+      "sum"   -> amp = sum(H_native)
+      "trapz" -> amp = ∫ H_native dV via np.trapz(H_native, vel_pix)
+
+    Returns
+    -------
+    (Hk_unit, amp_sc)
     """
     H = np.asarray(H_native, dtype=np.float64, order="C")
-    # Linear interpolation: Hk = (1-t)*H[il] + t*H[ir]
-    Hk = (1.0 - km.t) * H[km.il] + km.t * H[km.ir]
-    # zero outside the VelPix range
-    Hk[km.out_mask] = 0.0
-    # Non-negative & unit-area
-    np.maximum(Hk, 0.0, out=Hk)
-    s = Hk.sum()
-    if s > 0:
-        Hk /= s
-    return Hk  # (m,)
 
+    # amplitude carried by this (s,c)
+    if amp_mode == "trapz":
+        if vel_pix is None:
+            raise ValueError("amp_mode='trapz' requires vel_pix.")
+        amp_sc = float(np.trapz(H, np.asarray(vel_pix, dtype=np.float64)))
+    else:
+        amp_sc = float(H.sum())
+
+    # linear interpolation to integer-pixel offsets on the log-λ grid
+    Hk = (1.0 - km.t) * H[km.il] + km.t * H[km.ir]
+    Hk[km.out_mask] = 0.0
+    np.maximum(Hk, 0.0, out=Hk)
+
+    s = Hk.sum()
+    if s > 0.0:
+        Hk_unit = (Hk / s).astype(np.float64, copy=False)
+    else:
+        # degenerate LOSVD -> return a harmless delta-like kernel and zero amp
+        Hk_unit = np.zeros_like(Hk, dtype=np.float64)
+        Hk_unit[km.center_idx] = 1.0
+        amp_sc = 0.0
+
+    return Hk_unit, amp_sc
 
 # ------------------------- main builder ---------------------------------------
 
@@ -292,34 +319,39 @@ def build_hypercube(
             # For each (s,c) in this tile:
             for s_idx in range(s0, s1):
                 for c_idx in range(c0, c1):
-                    # 1) Build centered kernel FFT for this (s,c)
-                    H_native = np.asarray(losvd_ds[s_idx, :, c_idx], dtype=np.float64, order="C")  # (V,)
-                    Hk = _build_kernel_from_losvd(H_native, km)  # (m,)
-                    h0 = np.roll(Hk, -km.center_idx)             # center zero-lag at index 0
+                    # 1) LOSVD -> (unit) kernel + amplitude
+                    H_native = np.asarray(losvd_ds[s_idx, :, c_idx],
+                                        dtype=np.float64, order="C")        # (V,)
+                    Hk_unit, amp_sc = _build_kernel_from_losvd(
+                        H_native, km, vel_pix=vel_pix, amp_mode="sum"
+                    )
+
+                    # 2) Center zero-lag for FFT and rfft
+                    h0 = np.roll(Hk_unit, -km.center_idx)
                     H_fft = np.fft.rfft(h0, n=n_fft).astype(np.complex64, copy=False)
 
-                    # 2) Multiply in frequency domain for all ΔP templates
-                    Y_fft = T_fft_slice * H_fft[None, :]  # (ΔP, rfft)
+                    # 3) Multiply in frequency domain for this P-slice
+                    Y_fft = T_fft_slice * H_fft[None, :]                      # (ΔP, rfft)
 
-                    # 3) Linear convolution via irfft at padded length
-                    conv_full = np.fft.irfft(Y_fft, n=n_fft, axis=1)  # (ΔP, n_fft)
-
-                    # 4) Centered 'same' crop on template grid
-                    start = int(km.center_idx)
-                    stop  = start + T
+                    # 4) Linear convolution (padded) and 'same' crop on template grid
+                    conv_full = np.fft.irfft(Y_fft, n=n_fft, axis=1)          # (ΔP, n_fft)
+                    start = int(km.center_idx); stop = start + T
                     conv_td = conv_full[:, start:stop]
-                    if conv_td.shape[1] != T:  # rare edge guard
+                    if conv_td.shape[1] != T:                                 # edge guard
                         tmp = np.zeros((conv_td.shape[0], T), dtype=conv_td.dtype)
-                        w = min(T, max(0, conv_td.shape[1]))
-                        tmp[:, :w] = conv_td[:, :w]
+                        w = min(T, max(0, conv_td.shape[1])); tmp[:, :w] = conv_td[:, :w]
                         conv_td = tmp
-                    conv_td = conv_td.astype(np.float32, copy=False)  # (ΔP, T)
+                    conv_td = conv_td.astype(np.float32, copy=False)          # (ΔP, T)
 
-                    # 5) Rebin to observed grid AFTER convolution; clamp tiny round-off
-                    Ycp = conv_td @ R_T  # (ΔP, L)
+                    # 5) Rebin AFTER convolution
+                    Ycp = conv_td @ R_T                                       # (ΔP, L)
                     np.maximum(Ycp, 0.0, out=Ycp)
 
-                    # 6) Write
+                    # 6) Apply LOSVD amplitude so the basis carries surface brightness
+                    if amp_sc != 0.0:
+                        Ycp *= np.float32(amp_sc)
+
+                    # 7) Write
                     models[s_idx, c_idx, p0:p1, 0:L] = Ycp
 
             _done_set(done, idx3)
@@ -344,3 +376,5 @@ def build_hypercube(
         g.attrs["complete"] = True
         g.attrs["shape"] = (S, C, P, L)
         g.attrs["chunks"] = models.chunks
+        g.attrs["losvd_amplitude_mode"] = "sum"        # or "trapz"
+        g.attrs["kernel_unit_area"] = True             # document shape kernel
