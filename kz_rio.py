@@ -44,7 +44,7 @@ v1.0:	12 November 2021
 #   mpiexec -usize <nProcs+1> -n 1 ipython slurmSpecFCC170.py
 
 import os
-t = os.environ.get("SLURM_CPUS_PER_TASK", "8")
+t = os.environ.get("SLURM_CPUS_PER_TASK", "12")
 os.environ["OMP_NUM_THREADS"]      = t
 os.environ["MKL_NUM_THREADS"]      = t
 os.environ["OPENBLAS_NUM_THREADS"] = t
@@ -54,33 +54,46 @@ os.environ["MKL_DYNAMIC"]          = "FALSE"
 import numpy as np
 import re
 import pathlib as plp
+import argparse
 
 # Custom modules
 from CubeFit.kz_fitSpec import loadCubeFit
-from muse.fs_initNGC4365 import props
+from CubeFit.kz_initNGC4365 import props
 
-# First: Check if SLURM_CPU_PER_TASK environment variable is defined
-slurm_cpu = os.environ.get('SLURM_CPUS_PER_TASK')
-if slurm_cpu is not None:
-    nCPU = int(slurm_cpu)
-else:
-    # Fallback to reading from kz_addqueue.sh as before
-    curdir = plp.Path(__file__).parent
-    with open(curdir/'kz_addqueue.sh') as f:
-        content = f.read()
-    match = re.search(r'^\s*nCPU\s*=\s*(\d+)', content, re.MULTILINE)
-    if match:
-        nCPU = int(match.group(1))
+def main():
+    ap = argparse.ArgumentParser(description="Thin wrapper around genCubeFit")
+    # boolean redraw with explicit on/off flags
+    group = ap.add_mutually_exclusive_group()
+    group.add_argument("--redraw", dest="redraw", action="store_true",
+                       help="Enable redraw mode")
+    group.add_argument("--no-redraw", dest="redraw", action="store_false",
+                       help="Disable redraw mode")
+    ap.set_defaults(redraw=False)
+
+    args = ap.parse_args()
+
+    # Detect CPUs
+    slurm_cpu = os.environ.get('SLURM_CPUS_PER_TASK')
+    if slurm_cpu is not None:
+        nCPU = int(slurm_cpu)
     else:
-        print("nCPU not found")
-        nCPU = 20
+        curdir = plp.Path(__file__).parent
+        try:
+            with open(curdir/'kz_addqueue.sh') as f:
+                content = f.read()
+            m = re.search(r'^\s*nCPU\s*=\s*(\d+)', content, re.MULTILINE)
+            nCPU = int(m.group(1)) if m else 20
+        except FileNotFoundError:
+            nCPU = 20
 
-print(f"Setting nCPU to {nCPU} from SLURM_CPUS_PER_TASK or kz_addqueue.sh")
-props['nProcs'] = nCPU
+    print(f"Setting nCPU to {nCPU} from SLURM_CPUS_PER_TASK or kz_addqueue.sh")
+    props['nProcs'] = nCPU
 
-# props['zarrDir'] = plp.Path.home()/'Cube'/\
-#     f"{props['galaxy']}_{props['lOrder']:02d}"
-# props['nCuts'] = 3
+    # Pass-through args
+    props['redraw'] = bool(args.redraw)
+    print(f"redraw = {props['redraw']}")
 
-loadCubeFit(**props, redraw=True)
+    loadCubeFit(**props)
 
+if __name__ == "__main__":
+    main()

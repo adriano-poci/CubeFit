@@ -1,68 +1,62 @@
 """
-#!/apps/skylake/software/core/anaconda3/5.1.0/bin/python3
-#SBATCH -A oz059
-#SBATCH --job-name="slurmSpecNGC4365"
-#SBATCH --time=2-00:00
-#SBATCH -D "/fred/oz059/poci/muse"
-#SBATCH --output="/fred/oz059/poci/muse/slurmSpecNGC4365.log"
-#SBATCH --error="/fred/oz059/poci/muse/slurmSpecNGC4365.log"
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=200GB
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=adriano.poci@students.mq.edu.au
 
-    slurmSpecNGC4365.py
-    Adriano Poci
-    Durham University
-    2021
-
-    Platforms
-    ---------
-    Unix, Windows
-
-    Synopsis
-    --------
-    This module executes some function in the `SLURM` queueing environment
-
-    Authors
-    -------
-    Adriano Poci <adriano.poci@durham.ac.uk>
-
-History
--------
-v1.0:	12 November 2021
 """
 
 import numpy as np
 import os, re
 import pathlib as plp
+import argparse
 
 # Custom modules
 from CubeFit.kz_fitSpec import genCubeFit
-from muse.fs_initNGC4365 import props
+from CubeFit.kz_initNGC4365 import props
 
-# First: Check if SLURM_CPU_PER_TASK environment variable is defined
-slurm_cpu = os.environ.get('SLURM_CPUS_PER_TASK')
-if slurm_cpu is not None:
-    nCPU = int(slurm_cpu)
-else:
-    # Fallback to reading from kz_addqueue.sh as before
-    curdir = plp.Path(__file__).parent
-    with open(curdir/'kz_addqueue.sh') as f:
-        content = f.read()
-    match = re.search(r'^\s*nCPU\s*=\s*(\d+)', content, re.MULTILINE)
-    if match:
-        nCPU = int(match.group(1))
+
+def main():
+    ap = argparse.ArgumentParser(description="Thin wrapper around genCubeFit")
+    ap.add_argument(
+        "--run-switch",
+        type=str,
+        default=None,
+        help="Single string passed directly as runSwitch to genCubeFit"
+    )
+    # boolean redraw with explicit on/off flags
+    group = ap.add_mutually_exclusive_group()
+    group.add_argument("--redraw", dest="redraw", action="store_true",
+                       help="Enable redraw mode")
+    group.add_argument("--no-redraw", dest="redraw", action="store_false",
+                       help="Disable redraw mode")
+    ap.set_defaults(redraw=False)
+
+    args = ap.parse_args()
+
+    # Detect CPUs
+    slurm_cpu = os.environ.get('SLURM_CPUS_PER_TASK')
+    if slurm_cpu is not None:
+        nCPU = int(slurm_cpu)
     else:
-        print("nCPU not found")
-        nCPU = 20
+        curdir = plp.Path(__file__).parent
+        try:
+            with open(curdir/'kz_addqueue.sh') as f:
+                content = f.read()
+            m = re.search(r'^\s*nCPU\s*=\s*(\d+)', content, re.MULTILINE)
+            nCPU = int(m.group(1)) if m else 20
+        except FileNotFoundError:
+            nCPU = 20
 
-print(f"Setting nCPU to {nCPU} from SLURM_CPUS_PER_TASK or kz_addqueue.sh")
-props['nProcs'] = nCPU
+    print(f"Setting nCPU to {nCPU} from SLURM_CPUS_PER_TASK or kz_addqueue.sh")
+    props['nProcs'] = nCPU
 
-# props['zarrDir'] = plp.Path.home()/'Cube'/\
-#     f"{props['galaxy']}_{props['lOrder']:02d}"
-# props['nCuts'] = 3
+    # Pass-through args
+    if args.run_switch is not None:
+        props['runSwitch'] = args.run_switch
+        print(f"runSwitch = {props['runSwitch']}")
+    props['redraw'] = bool(args.redraw)
+    print(f"redraw = {props['redraw']}")
 
-genCubeFit(**props)
+    print(props)
+
+    genCubeFit(**props)
+
+if __name__ == "__main__":
+    main()

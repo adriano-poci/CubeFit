@@ -32,7 +32,7 @@ logger = get_logger(lfn, mode='w')
 logger.log(f"[CubeFit] CubeFit logger initialised to {logger.logfile}",
     flush=True)
 
-import os, pdb, math, ctypes
+import os, pdb, math, ctypes, sys
 import numpy as np
 import hashlib
 from tqdm.auto import tqdm
@@ -51,8 +51,10 @@ from plotbin.display_pixels import display_pixels as dbi
 
 from CubeFit.hdf5_manager import H5Manager, H5Dims, open_h5,\
     live_prefit_snapshot_from_models, invalidate_done
-from CubeFit.hypercube_builder import build_hypercube
+from CubeFit.hypercube_builder import build_hypercube, assert_preflight_ok,\
+    estimate_global_velocity_bias_prebuild
 from CubeFit.pipeline_runner   import PipelineRunner
+from CubeFit import cube_utils as cu
 from muse import tri_fitSpec as tf
 from muse import tri_utils as uu
 from dynamics.IFU.Constants import Constants, Units, UnitStr
@@ -72,6 +74,8 @@ moncmap = 'inferno'
 moncmapr = 'inferno_r'
 
 os.environ["FITTRACKER_START"] = "fork"
+
+# ------------------------------------------------------------------------------
 
 def _worker_reconstruct_readonly(h5_path: str, s0: int, s1: int, x_cp_2d, *, band_L: int = 128):
     """
@@ -124,9 +128,9 @@ def _worker_compute_tile(h5_path, s0, s1, x_cp64):
 
 def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     full=False, slope=1.30, IMF='KB', iso='pad', weighting='luminosity',
-    nProcs=1, lOrder=4, rescale=False, specRange=None, lsf=False,
-    band='r', smask=None, method='fsf', varIMF=False,
-    source='ppxf', redraw=False, **kwargs):
+    lOrder=4, rescale=False, specRange=None, lsf=False, band='r', smask=None,
+    method='fsf', varIMF=False, source='ppxf', redraw=False, runSwitch='gen',
+    **kwargs):
     """
     _summary_
 
@@ -212,8 +216,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     infn = bDir/'infil.xz'
     gfn = curdir/'obsData'/f"{galaxy}.xz"
 
-    cont = kwargs.pop('cont', False)
-
     INF = uu.Load.lzma(infn)
     PA = INF['angle'][0]
 
@@ -246,6 +248,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         VB = uu.Load.lzma(vbSpec)
         binNum = VB['binNum']
         binCounts = VB['binCounts']
+        binFlux = VB['binFlux']
         del VB
     else:
         raise RuntimeError(f"No binned spectra.\n{'': <4s}{vbSpec}")
@@ -326,9 +329,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     NOrbs, inds, energs, I2s, I3s, regs, types, weights, lcuts =\
         uu.Read.orbits(nnOrb)
-    cWeights = np.zeros(nComp)
-    for jk, comp in enumerate(nzComp):
-        cWeights[jk] = np.ma.sum(weights[oDict['wheres'][f"{comp:{pred}d}"]])
+    cWeights = np.array([
+        np.ma.sum(oDict['weights'][f"{comp:{pred}d}"]) for comp in nzComp])
 
     kiBin = INF['kin']['nbins'][0]
     assert nbins == kiBin, 'Output does not agree with input bins\nInput:'+\
@@ -398,7 +400,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     logger.log('Done.')
     apHists = np.ma.masked_invalid(apHists)
     nApHists = (apHists*(massNorm/norma)[:, np.newaxis, np.newaxis])
-    nApHists /= biI['pCountsBin'][:, np.newaxis, np.newaxis]
+    # nApHists /= binFlux[:, np.newaxis, np.newaxis]
     hbi = wbin*2 + 1
     vbins = (np.arange(hbi)-wbin)*histBinSize
     # (nSpat, nVel, nComp)
@@ -436,16 +438,47 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     mgr.ensure_rebin_and_resample()
 
     # --- 2. Precompute HyperCube ---
-    if redraw:
+    if redraw and ('gen' in runSwitch):
         logger.log('[CubeFit] Calling `invalidate_done` to regenerate '\
             '/HyperCube.')
         invalidate_done(hdf5Path)
+
+    nS, nC, nP = 128, 1, 360
+    # --- Optional hard gate before any heavy work
+    # Use small prefix slices if nothing is specified.
     with logger.capture_all_output():
-        nS, nC, nP = 128, 1, 360
+        _ = assert_preflight_ok(
+            hdf5Path,
+            s_list=list(range(int(np.minimum(3, nS)))),
+            c_list=list(range(int(np.minimum(2, nC)))),
+            p_list=list(range(int(np.minimum(6, nP)))),
+            # keep tolerances in sync with preflight defaults
+            tol_rel=2e-3,
+            tol_shift_px=0.5,
+            tol_flat_valid=3e-8,
+            require_rt_flat=True,
+            rt_flat_tol=3e-8,
+            verbose=True,
+        )
+    
+    with logger.capture_all_output():
+        est = estimate_global_velocity_bias_prebuild(hdf5Path,
+            n_spax=96, n_features=24, window_len=31, lag_px=12)
+    logger.log(f"[CubeFit] Estimated global velocity bias (km/s): "\
+        f"{est['vel_bias_kms']:.3f}")
+    logger.log(f"[CubeFit] Building /HyperCube in {hdf5Path}...")
+    with logger.capture_all_output():
         build_hypercube(
             hdf5Path,
+            norm_mode="data", # choose "model" or "data"
+            # "model" preserves relative contribution to both spaxel and components
+            amp_mode="sum", # "sum" or "trapz"
             S_chunk=nS, C_chunk=nC, P_chunk=nP,
+            vel_bias_kms=est["vel_bias_kms"]
         )
+    # even if runSwitch is fit only, we want to ensure the HyperCube
+    # is built, so we don't return early here.
+    # Should be zero-cost if already built
 
     prefit_png = spDir / f"prefit_overlay_from_models_C{nComp:03d}.png"
     live_prefit_snapshot_from_models(
@@ -455,35 +488,102 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         out_png=str(prefit_png),
     )
     logger.log(f"[Prefit] wrote {prefit_png}")
+    if 'gen' in runSwitch:
+        return
 
+    if 'fit' not in runSwitch:
+        logger.log(f"[CubeFit] runSwitch={runSwitch} is not understood; "
+            "exiting.")
+        raise RuntimeError("Invalid runSwitch")
     # --- 4) Run the global Kaczmarz fit (tiled; RAM-bounded) ---
     runner = PipelineRunner(hdf5Path)
 
-    x_global, stats = runner.solve_all(
-        epochs=1,
-        pixels_per_aperture=256,
-        lr=0.25,
-        project_nonneg=True,
-        orbit_weights=cWeights,
-        verbose=True,
-        warm_start='jacobi',
+    ncpuset, mask = cu.cpuset_count()
+    print(f"[guard] cpuset mask: {mask}  cores: {ncpuset}")
+    logger.log(f"cpuset cores: {len(os.sched_getaffinity(0))}")
+    from threadpoolctl import threadpool_info
+    logger.log(f"BLAS pools: {threadpool_info()}")
+    # look for openblas 
+    try:
+        with open("/proc/self/cgroup") as f:
+            print("[guard] cgroups:")
+            for line in f:
+                if "cpuset" in line or "cpu" in line:
+                    print(" ", line.strip())
+    except Exception:
+        pass
+
+    print("[env] SLURM_JOB_ID=", os.environ.get("SLURM_JOB_ID"),
+        " SLURM_STEP_ID=", os.environ.get("SLURM_STEP_ID"))
+
+    ########################
+    # Non-batched Kaczmarz #
+    ########################
+    # x_global, stats = runner.solve_all(
+    #     epochs=1,
+    #     pixels_per_aperture=4096,
+    #     lr=0.25,
+    #     project_nonneg=True,
+    #     # orbit_weights=cWeights,
+    #     orbit_weights=None,
+    #     ratio_use=False,
+    #     reader_s_tile=nS, reader_c_tile=nC, reader_p_tile=nP,
+    #     verbose=True,
+    #     warm_start='jacobi',  # 'zeros', 'random', 'jacobi'
+    #     row_order='sequential',
+    #     block_rows=2048,
+    #     blas_threads=48,
+    #     progress_interval_sec=900,
+    #     tracker_mode='off',
+    # # Optional ratio controls
+    # # ratio_use=True, ratio_anchor="auto", ratio_eta=0.05, ratio_prob=0.02,
+    # # ratio_batch=2, ratio_min_weight=1e-4,
+    # # progress_interval_sec=60,  # if you want periodic on_progress ticks
+    # )
+
+    #####################################
+    # Multi-processing Batched Kaczmarz #
+    #####################################
+    RC = cu.RatioCfg(
+        anchor="x0",
+        eta=0.4,
+        gamma=1.3,
+        prob=1.0,
+        batch=0,
     )
+    x_global, stats = runner.solve_all_mp_batched(
+        epochs=1,
+        lr=0.01,
+        project_nonneg=True,
+        # orbit_weights=None,     # or None for “free” fit
+        orbit_weights=cWeights,
+        processes=4,                # 4 workers
+        blas_threads=12,            # 12 BLAS threads each → 48 total
+        reader_s_tile=128,          # match /HyperCube/models chunking on S
+        verbose=True,
+        warm_start='resume',  # 'zeros', 'resume', 'jacobi',
+        seed_cfg=dict(Ns=24, L_sub=1200, K_cols=768, per_comp_cap=24),
+        ratio_cfg=RC,
+    )
+
     logger.log("[CubeFit] Global fit completed.")
-    # --- Save the global solution vector
-    logger.log("[CubeFit] Saving fit results...")
-    with open_h5(hdf5Path, role="writer") as f:
-        ds = f.get("/X_global", None)
-        if ds is not None and ds.shape == (x_global.size,):
-            ds[...] = np.asarray(x_global, np.float64)
-        else:
-            if "/X_global" in f:
-                del f["/X_global"]
-            f.create_dataset(
-                "/X_global",
-                data=np.asarray(x_global, np.float64),
-                chunks=(min(8192, x_global.size),),
-                compression="gzip", compression_opts=4, shuffle=True,
-            )
+    # # --- Save the global solution vector
+    # logger.log("[CubeFit] Saving fit results...")
+    # with open_h5(hdf5Path, role="writer") as f:
+    #     ds = f.get("/X_global", None)
+    #     if ds is not None and ds.shape == (x_global.size,):
+    #         ds[...] = np.asarray(x_global, np.float64)
+    #         logger.log("[CubeFit] Dataset already exists; overwritten.")
+    #     else:
+    #         if "/X_global" in f:
+    #             del f["/X_global"]
+    #         f.create_dataset(
+    #             "/X_global",
+    #             data=np.asarray(x_global, np.float64),
+    #             chunks=(min(8192, x_global.size),),
+    #             compression="gzip", compression_opts=4, shuffle=True,
+    #         )
+    #         logger.log("[CubeFit] Results stored.")
 
 # ------------------------------------------------------------------------------
 # HDF5 helpers (added)
@@ -740,12 +840,13 @@ def reconstruct_model_cube_single(h5_path: str,
         Optional λ-banding for GEMV working set (does not change how
         HDF5 reads; it just limits the temporary 2-D views).
     """
+
+    # Try to limit BLAS threads for predictability on clusters
     try:
         from threadpoolctl import threadpool_limits
     except Exception:
         threadpool_limits = None
 
-    # Respect Slurm if present; keep BLAS threads moderate.
     t = int(os.environ.get("SLURM_CPUS_PER_TASK", blas_threads))
     os.environ["OMP_NUM_THREADS"] = os.environ["MKL_NUM_THREADS"] = \
         os.environ["OPENBLAS_NUM_THREADS"] = str(t)
@@ -762,16 +863,32 @@ def reconstruct_model_cube_single(h5_path: str,
     except Exception:
         def trim_heap(): pass
 
+    # Optional dataset chunk-cache tuning (local to this dataset)
+    rdcc_slots = int(os.environ.get("CUBEFIT_RDCC_SLOTS", "1000003"))
+    rdcc_bytes = int(os.environ.get("CUBEFIT_RDCC_BYTES", str(256 * 1024**2)))
+    rdcc_w0    = float(os.environ.get("CUBEFIT_RDCC_W0", "0.90"))
+
+    # Force unbuffered writes so tqdm appears immediately on HPC logs
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # py3.7+
+    except Exception:
+        pass
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
     with open_h5(h5_path, role="writer") as f:
         M = f["/HyperCube/models"]              # (S,C,P,L) float32
         S, C, P, L = map(int, M.shape)
+        try:
+            M.id.set_chunk_cache(rdcc_slots, rdcc_bytes, rdcc_w0)
+        except Exception:
+            pass
+
         chunks = M.chunks or (S, 1, P, L)
         S_chunk, C_chunk, P_chunk, L_chunk = map(int, chunks)
 
         # Choose S block aligned to storage chunk (or user cap).
         S_blk = S_chunk if S_tile is None else max(1, int(S_tile))
-        S_blk = min(S_blk, S_chunk)             # never exceed chunk
-        S_blk = min(S_blk, S)                   # clamp to S
+        S_blk = min(S_blk, S_chunk, S)
 
         # Prepare output (tile-aligned; uncompressed is fastest).
         if array_name in f:
@@ -787,13 +904,23 @@ def reconstruct_model_cube_single(h5_path: str,
             raise ValueError(f"x shape {x_cp.shape} != (C,P)=({C},{P})")
         x32 = np.asarray(x_cp, dtype=np.float32, order="C")
 
-        # Progress
+        # Progress — write to stdout & flush so it shows immediately
         n_tiles = math.ceil(S / S_blk)
-        print(f"[Recon] S_chunk={S_chunk} C_chunk={C_chunk} "
-              f"P_chunk={P_chunk} L_chunk={L_chunk} S_blk={S_blk} "
-              f"L_band={L_band}")
-        pbar = tqdm(total=n_tiles, desc="[Reconstruct] tiles",
-                    unit="tile", dynamic_ncols=True)
+        header = (f"[Recon] S_chunk={S_chunk} C_chunk={C_chunk} "
+                  f"P_chunk={P_chunk} L_chunk={L_chunk} S_blk={S_blk} "
+                  f"L_band={L_band}")
+        print(header, flush=True)
+
+        pbar = tqdm(total=n_tiles,
+                    desc="[Reconstruct] tiles",
+                    unit="tile",
+                    dynamic_ncols=True,
+                    mininterval=2.0,
+                    miniters=1,
+                    smoothing=0.0,
+                    file=sys.stdout,
+                    leave=True)
+        pbar.refresh(); sys.stdout.flush()
 
         # --- main loop: S in storage-aligned tiles -------------------
         for s0 in range(0, S, S_blk):
@@ -814,39 +941,46 @@ def reconstruct_model_cube_single(h5_path: str,
                     Lb  = l1 - l0
 
                     # Accumulator for this (c, L band)
-                    band_acc = np.zeros((dS, Lb), dtype=np.float64,
-                                        order="C")
+                    band_acc = np.zeros((dS, Lb), dtype=np.float64, order="C")
 
-                    # Contract over P in P_chunk steps (exactly aligned)
+                    # Contract over P in P_chunk steps
                     for p0 in range(0, P, max(1, P_chunk)):
                         p1  = min(P, p0 + max(1, P_chunk))
                         Pb  = p1 - p0
 
-                        # Read one storage-aligned slab:
-                        # (dS, 1, Pb, Lb) float32
+                        # Read one storage-aligned slab: (dS, 1, Pb, Lb) f32
                         A32 = M[s0:s1, c:c1, p0:p1, l0:l1][...]
                         A32 = np.asarray(A32, dtype=np.float32, order="C")
 
-                        # Make a (dS*Lb, Pb) 2-D view for BLAS gemv
-                        # by swapping axes (dS, Pb, Lb) → (dS, Lb, Pb)
-                        A2D = A32[:, 0, :, :].swapaxes(1, 2) \
-                                           .reshape(dS * Lb, Pb)
+                        # Make a (dS*Lb, Pb) 2-D view for GEMV
+                        A2D = A32[:, 0, :, :].swapaxes(1, 2).reshape(dS * Lb, Pb)
 
                         # Multiply by weights for this (c, p-block) in f32
-                        w32 = x32[c, p0:p1]           # (Pb,)
-                        tmp = A2D @ w32               # (dS*Lb,) f32
+                        w32 = x32[c, p0:p1]          # (Pb,)
+                        tmp = A2D @ w32              # (dS*Lb,) f32
 
                         # Accumulate into f64 band
-                        band_acc += tmp.reshape(dS, Lb).astype(np.float64,
-                                                               copy=False)
+                        band_acc += tmp.reshape(dS, Lb).astype(np.float64, copy=False)
 
                     # Add this component's band into the tile
                     Y_tile[:, l0:l1] += band_acc
 
             # Write the finished S-tile
             out[s0:s1, :] = Y_tile
-            trim_heap()
+
+            # Make progress visible right now
             pbar.update(1)
+            pbar.refresh()
+            try:
+                out.id.flush()    # SWMR-friendly: expose new tile
+            except Exception:
+                pass
+            try:
+                f.flush()
+            except Exception:
+                pass
+            sys.stdout.flush()
+            trim_heap()
 
         pbar.close()
 
@@ -921,74 +1055,151 @@ def parallel_spectrum_plots(
 ):
     """
     Memory-safe plotting:
-      - Reads only the needed rows from /DataCube and /ModelCube.
+      - Reads only needed rows from /DataCube and /ModelCube.
       - Never touches /HyperCube/models.
       - Closes every figure immediately.
-      - Keeps thread pool tiny (I/O bound).
+      - Small thread pool (I/O bound).
+
+    Style:
+      - Data in black, model in red (lw=0.8).
+      - Residuals (data - model) as green diamonds at every pixel,
+        vertically offset (same offset policy as before) so they don’t
+        overlap the spectra.
+      - A solid green line at the residual zero (i.e., the offset
+        baseline), and thin dashed green lines at ±1σ (σ computed on
+        masked residuals).
+      - If /Mask exists (or 'mask' provided), masked regions are shaded
+        with semi-transparent grey bands.
     """
+    import os
+    import pathlib as plp
+    from concurrent.futures import ThreadPoolExecutor
+
     plp.Path(plot_dir).mkdir(parents=True, exist_ok=True)
 
-    n = int(max(1, n))
+    n = int(np.maximum(1, n))
     chi2 = np.asarray(chi2, dtype=np.float64)
-    S = chi2.shape[0]
+    S = int(chi2.shape[0])
 
-    # Pick indices
-    idx_worst = np.argsort(-chi2)[:n]
-    idx_best  = np.argsort( chi2)[:n]
-    picks     = np.unique(np.concatenate([idx_worst, idx_best])).astype(int)
+    # Pick indices (worst/best by chi^2)
+    order_desc = np.argsort(-chi2)
+    order_asc  = np.argsort( chi2)
+    idx_worst  = order_desc[:n]
+    idx_best   = order_asc[:n]
+    picks      = np.unique(np.concatenate([idx_worst, idx_best])).astype(int)
 
-
-    # Read only those spaxels (rows) from /DataCube and /ModelCube
+    # Read only the selected rows + metadata
     with open_h5(str(h5_or_path), role="reader") as f:
-        # a modest raw chunk cache keeps mem small but avoids metadata churn
         if "/ModelCube" not in f:
             raise RuntimeError("Expected /ModelCube (S,L) for plotting. Reconstruct first.")
-        data_ds  = f["/DataCube"]    # (S,L) float64 (or f32)
-        model_ds = f["/ModelCube"]   # (S,L) float64
-        obs      = f["/ObsPix"][...] if "/ObsPix" in f else np.arange(model_ds.shape[1])
-        L = int(model_ds.shape[1])
+        data_ds  = f["/DataCube"]    # (S,L)
+        model_ds = f["/ModelCube"]   # (S,L)
 
-        print(f"[Plots] picks={picks.size} L={L} mem≈{picks.size*L*8*2/1e6:.1f} MB for data+model rows")
+        L = int(model_ds.shape[1])
+        obs = f["/ObsPix"][...] if "/ObsPix" in f else np.arange(L, dtype=np.float64)
+
+        # Prefer provided mask; else load /Mask; else keep-all
+        if mask is None and "/Mask" in f:
+            m = np.asarray(f["/Mask"][...], dtype=bool).ravel()
+            mask = m if int(m.size) == L else None
         if mask is None:
             mask = np.ones(L, dtype=bool)
         else:
             mask = np.asarray(mask, dtype=bool)
-            if mask.shape[0] != L:
-                raise ValueError(f"Mask length {mask.shape[0]} != L={L}")
+            if int(mask.size) != L:
+                raise ValueError(f"Mask length {mask.size} != L={L}")
 
-        # Pull just the rows we need into compact arrays
-        data_sel  = np.empty((picks.size, L), dtype=np.float64)
-        model_sel = np.empty((picks.size, L), dtype=np.float64)
+        print(
+            "[Plots] picks={} L={} mem≈{:.1f} MB for data+model rows"
+            .format(int(picks.size), L, float(picks.size * L * 16.0 / 1e6))
+        )
+
+        data_sel  = np.empty((int(picks.size), L), dtype=np.float64)
+        model_sel = np.empty((int(picks.size), L), dtype=np.float64)
         for j, s in enumerate(picks):
-            # These slices are small; using [...] is fine here
-            data_sel[j, :]  = data_ds[s, :]
-            model_sel[j, :] = model_ds[s, :]
+            data_sel[j, :]  = data_ds[int(s), :]
+            model_sel[j, :] = model_ds[int(s), :]
 
-    # Small plotting worker: takes *row views*, not whole cubes
+    # Precompute masked bands as contiguous intervals where mask == False
+    masked = ~mask
+    if np.any(masked):
+        pad = np.concatenate((
+            np.array([0], dtype=np.int8),
+            masked.view(np.int8),
+            np.array([0], dtype=np.int8)
+        ))
+        edges = np.diff(pad)
+        starts = np.nonzero(edges == 1)[0]
+        ends   = np.nonzero(edges == -1)[0]
+        mask_spans = list(zip(starts, ends))  # intervals [start, end)
+    else:
+        mask_spans = []
+
+    # Small plotting worker: operates on compact row views
     def _plot_one(s_idx: int, rank_tag: str):
-        j   = int(np.where(picks == s_idx)[0][0])
+        j = int(np.where(picks == s_idx)[0][0])
         dat = data_sel[j, :]
         mod = model_sel[j, :]
+        res = dat - mod
+
+        # Keep the SAME residual offset policy as before
+        y_lo = float(np.nanmin(np.concatenate((dat[mask], mod[mask]))))
+        y_hi = float(np.nanmax(np.concatenate((dat[mask], mod[mask]))))
+        y_rng = float(np.maximum(y_hi - y_lo, 1.0))
+        y_off = y_lo - 0.25 * y_rng
+
+        # σ from masked residuals
+        sigma = float(np.nanstd(res[mask])) if np.any(mask) else 0.0
 
         fig = plt.figure(figsize=(8, 3.5))
         ax  = fig.add_subplot(111)
-        ax.plot(obs[mask], dat[mask], lw=1.0, label="data")
-        ax.plot(obs[mask], mod[mask], lw=1.0, alpha=0.85, label="model")
-        ax.set_title(f"spaxel {s_idx}  χ={chi2[s_idx]:.3f}")
-        ax.set_xlabel("λ (log space)")
-        ax.set_ylabel("flux")
-        ax.legend(loc="best", fontsize=8)
-        fig.tight_layout()
-        fig.savefig(os.path.join(plot_dir, f"{rank_tag}_{tag}_spax{int(s_idx):05d}.png"), dpi=120)
-        plt.close(fig)  # critical: free figure memory immediately
 
-    # Launch a tiny pool; 2–4 is plenty
-    pool_n = max(1, min(n_workers, 4))
-    jobs = [(int(s), "worst") for s in idx_worst] + [(int(s), "best") for s in idx_best]
+        # Data/model lines (thin)
+        ax.plot(obs[mask], dat[mask], lw=0.8, color="k", label="data")
+        ax.plot(obs[mask], mod[mask], lw=0.8, color="r", label="model")
+
+        # Residuals as green diamonds at every pixel (offset)
+        ax.scatter(
+            obs[mask], (res[mask] + y_off),
+            s=8, marker="D", edgecolors="none", color="g", alpha=0.9,
+            label="residual (offset)"
+        )
+
+        # Residual baseline (solid) and ±1σ (dashed)
+        ax.axhline(y_off,             ls="-",  lw=0.7, color="g")          # zero residual
+        if sigma > 0.0 and np.isfinite(sigma):
+            ax.axhline(y_off + sigma, ls="--", lw=0.6, color="g")
+            ax.axhline(y_off - sigma, ls="--", lw=0.6, color="g")
+
+        # Shade masked regions as semi-transparent grey bands
+        if mask_spans:
+            y0, y1 = ax.get_ylim()
+            for a, b in mask_spans:
+                x0 = float(obs[int(a)])
+                x1 = float(obs[int(np.maximum(a, b - 1))])
+                if int(b) < L:
+                    x1 = float(obs[int(b)])
+                ax.axvspan(x0, x1, color="0.2", alpha=0.12, zorder=0)
+            ax.set_ylim(y0, y1)
+
+        # ax.set_title(f"spaxel {int(s_idx)}  χ={chi2[int(s_idx)]:.3f}")
+        ax.set_xlabel(rf"$\log(\lambda\ [\AA])$")
+        ax.set_ylabel("$F_\lambda$ (arb. units)")
+        # ax.legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(os.path.join(
+            plot_dir, f"{rank_tag}_{tag}_spax{int(s_idx):05d}.png"
+        ), dpi=120)
+        plt.close(fig)
+
+    # Tiny pool; ≤4 for I/O friendliness (NumPy math, not builtins)
+    pool_n = int(np.minimum(np.maximum(1, int(n_workers)), 4))
+    jobs = [(int(s), "worst") for s in idx_worst] + \
+           [(int(s), "best")  for s in idx_best]
+
     with ThreadPoolExecutor(max_workers=pool_n) as pool:
         list(pool.map(lambda args: _plot_one(*args), jobs))
 
-    # Help GC release the small arrays (paranoid but cheap)
     del data_sel, model_sel
 
 # ------------------------------------------------------------------------------
@@ -1036,7 +1247,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     full=False, slope=1.30, IMF='KB', iso='pad', weighting='luminosity',
     nProcs=1, lOrder=4, rescale=False, specRange=None, lsf=False,
     band='r', smask=None, method='fsf', varIMF=False,
-    source='ppxf', pplots=['spec', 'mw'], redraw=False, **kwargs):
+    source='ppxf', pplots=['sfh', 'spec', 'mw'], redraw=False, **kwargs):
     """
     Load the CubeFit data for a given galaxy and model path.
     """
@@ -1101,8 +1312,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     ypix = np.compress(goods, ypix)
     xbix = np.compress(goods, xbix)
     ybix = np.compress(goods, ybix)
-
-    cont = kwargs.get('cont', False)
 
     with logger.capture_all_output():
         decDir, cDirs, cKeys, nComp, teLL, lnGrid, histBinSize, dataVelScale,\
@@ -1422,7 +1631,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     satube = (otypes == 0) # group short-axis tubes
     latube = (otypes == 1)
     boxess = (otypes == 2)
-    arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas)
+    arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
     coSFH = arSOL[satube, :, :, :].sum(axis=0)
     laSFH = arSOL[latube, :, :, :].sum(axis=0)
     boSFH = arSOL[boxess, :, :, :].sum(axis=0)
@@ -1500,3 +1709,293 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     print(f"Worst fit: aperture {worst} (χ² = {rchi2[worst]:.2f})")
     print(f"Best fit:  aperture {best} (χ² = {rchi2[best]:.2f})")
     print(f"[CubeFit] All plots and maps saved in {str(spDir)}")
+
+# ------------------------------------------------------------------------------
+
+def plot_sparse_spectra_from_x(
+    h5_or_path: str,
+    x_global: np.ndarray | None = None,
+    *,
+    picks: np.ndarray | list[int] | None = None,
+    chi2: np.ndarray | None = None,
+    n: int = 6,
+    plot_dir: str = ".",
+    tag: str = "",
+    mask: np.ndarray | None = None,
+):
+    """
+    Plot a few diagnostic spectra without building /ModelCube.
+    Computes y_hat for selected spaxels directly from /HyperCube/models and x_global.
+
+    Args
+    ----
+    h5_or_path : str
+        Path to HDF5 with /HyperCube/models and /DataCube.
+    x_global : array-like
+        Global weights (C*P,) or (C,P). Internally cast to float32.
+    picks : array-like of int, optional
+        Explicit spaxel indices to plot. If None, use `chi2` & `n`.
+    chi2 : array-like, optional
+        Per-spaxel RMSE/chi2 to pick best/worst examples from.
+    n : int
+        If using `chi2`, number of best and worst to show (unique combined).
+    plot_dir : str
+        Where to save PNGs.
+    tag : str
+        Small tag to include in filenames.
+    mask : 1-D bool array, optional
+        Wavelength mask to apply to both data & model for plotting.
+    """
+    os.makedirs(plot_dir, exist_ok=True)
+
+    with open_h5(h5_or_path, role="reader") as f:
+        M = f["/HyperCube/models"]      # (S, C, P, L) float32
+        DC = f["/DataCube"]             # (S, L)
+        S, C, P, L = map(int, M.shape)
+        obs = f["/ObsPix"][...] if "/ObsPix" in f else np.arange(L, dtype=int)
+
+        # Load x_global if not provided
+        if x_global is None:
+            if "/X_global" not in f:
+                raise RuntimeError("x_global not provided and /X_global not found in file.")
+            x_global = np.asarray(f["/X_global"][...], dtype=np.float64)
+
+        # Choose picks if not explicitly provided
+        if picks is None:
+            if chi2 is None:
+                raise ValueError("Provide `picks` or (`chi2` and `n`).")
+            chi2 = np.asarray(chi2, dtype=np.float64)
+            if chi2.shape[0] != S:
+                raise ValueError(f"chi2 length {chi2.shape[0]} != S={S}.")
+            worst = np.argsort(-chi2)[:int(max(1, n))]
+            best  = np.argsort( chi2)[:int(max(1, n))]
+            picks = np.unique(np.concatenate([worst, best])).astype(int)
+        else:
+            picks = np.asarray(picks, dtype=int)
+
+        # Mask sanity
+        if mask is None:
+            mask = np.ones(L, dtype=bool)
+        else:
+            mask = np.asarray(mask, dtype=bool)
+            if mask.shape[0] != L:
+                raise ValueError(f"Mask length {mask.shape[0]} != L={L}.")
+
+        # Weights as (C,P) float32 for speed; accumulation stays float64
+        x_cp = np.asarray(x_global)
+        if x_cp.ndim == 1:
+            if x_cp.size != C * P:
+                raise ValueError(f"x_global length {x_cp.size} != C*P={C*P}.")
+            x_cp = x_cp.reshape(C, P)
+        elif x_cp.shape != (C, P):
+            raise ValueError(f"x_global shape {x_cp.shape} != (C,P)=({C},{P}).")
+        x32 = np.asarray(x_cp, dtype=np.float32, order="C")
+
+        # Respect storage layout to keep I/O small
+        chunks = M.chunks or (min(S, 32), 1, min(P, 256), L)
+        S_chunk, C_chunk, P_chunk, L_chunk = map(int, chunks)
+
+        print(f"[DiagSparse] S={S} C={C} P={P} L={L} | chunks={chunks}")
+        print(f"[DiagSparse] picks={picks.size} → reads per pick ≈ C·ceil(P/P_chunk)={C*math.ceil(P/max(1,P_chunk))}")
+
+        def _predict_row(s_idx: int) -> np.ndarray:
+            y = np.zeros(L, dtype=np.float64, order="C")
+            for c0 in range(0, C, max(1, C_chunk)):
+                c1 = min(C, c0 + max(1, C_chunk))
+                c = c0  # C_chunk==1 in our files
+                for p0 in range(0, P, max(1, P_chunk)):
+                    p1  = min(P, p0 + max(1, P_chunk))
+                    A32 = M[s_idx:s_idx+1, c:c1, p0:p1, :][...].astype(np.float32, copy=False)
+                    A2D = A32[0, 0, :, :]          # (Pb, L)
+                    w32 = x32[c, p0:p1]            # (Pb,)
+                    y  += (A2D.T @ w32).astype(np.float64, copy=False)
+            return y
+
+        for s in tqdm(picks, desc="[DiagSparse] spaxels", dynamic_ncols=True, mininterval=1.5):
+            s = int(s)
+            data  = np.asarray(DC[s, :], dtype=np.float64, order="C")
+            model = _predict_row(s)
+
+            fig = plt.figure(figsize=(8, 3.5))
+            ax  = fig.add_subplot(111)
+            ax.plot(obs[mask], data[mask],  lw=1.0, label="data")
+            ax.plot(obs[mask], model[mask], lw=1.0, alpha=0.9, label="model (sparse)")
+            ax.set_title(f"spaxel {s}")
+            ax.set_xlabel("λ (log space)")
+            ax.set_ylabel("flux")
+            ax.legend(loc="best", fontsize=8)
+            fig.tight_layout()
+            fn = os.path.join(plot_dir, f"diag_sparse_{tag}_spax{int(s):05d}.png")
+            fig.savefig(fn, dpi=120)
+            plt.close(fig)
+
+        print(f"[DiagSparse] wrote {picks.size} plots to {plot_dir}")
+
+# ------------------------------------------------------------------------------
+
+def compare_orbit_vs_solution(
+    h5_path: str,
+    *,
+    orbit_weights: np.ndarray | None = None,   # shape (C,), raw or normalized
+    x_global: np.ndarray | None = None,        # shape (C*P,) or (C,P)
+    title: str | None = None,
+    save: str | None = None,
+    show: bool = True,
+):
+    """
+    Visualize how the learned per-component mass (sum over P) compares to the
+    input orbit_weights used by the ratio penalty.
+    """
+    # --- read C,P and x_global if needed
+    with open_h5(h5_path, role="reader") as f:
+        M = f["/HyperCube/models"]
+        S, C, P, L = map(int, M.shape)
+        if x_global is None:
+            if "/X_global" not in f:
+                raise RuntimeError("No /X_global in HDF5 and x_global not provided.")
+            x_global = np.asarray(f["/X_global"][...], dtype=np.float64)
+
+    x = np.asarray(x_global, dtype=np.float64)
+    if x.ndim == 1:
+        if x.size != C*P:
+            raise ValueError(f"x_global has length {x.size}, expected C*P={C*P}.")
+        x = x.reshape(C, P)  # (C,P)
+    elif x.ndim == 2:
+        if x.shape != (C, P):
+            raise ValueError(f"x_global shape {x.shape}, expected (C,P)=({C},{P}).")
+    else:
+        raise ValueError("x_global must be 1-D or 2-D")
+
+    # --- per-component totals and normalization
+    eps = 1e-18
+    sol_tot = np.maximum(0.0, x).sum(axis=1)       # (C,)
+    sol_sum = float(sol_tot.sum()) or 1.0
+    sol_pdf = (sol_tot / sol_sum)
+
+    # ------------------- ratio penalty setup (simple) -------------------
+    have_ratio = False
+    w_full = None  # per-component step scaling
+
+    # If not passed explicitly, read from HDF5 only (no other fallbacks)
+    if orbit_weights is None:
+        ow_dset = os.environ.get("CUBEFIT_ORBIT_WEIGHTS_DSET",
+                                 "/HyperCube/norm/orbit_weights")
+        with open_h5(h5_path, role="reader") as f:
+            if ow_dset not in f:
+                raise RuntimeError(f"orbit_weights requested but dataset "
+                                   f"'{ow_dset}' not found in {h5_path}")
+            w_in = np.asarray(f[ow_dset][...], dtype=np.float64).ravel(order="C")
+    else:
+        w_in = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
+
+    if w_in.size != C:
+        raise ValueError(f"orbit_weights length {w_in.size} != C={C}")
+    if not np.all(np.isfinite(w_in)):
+        raise ValueError("orbit_weights contains non-finite values")
+    w_sum = float(np.sum(w_in))
+    if w_sum <= 0.0:
+        raise ValueError("orbit_weights sum must be > 0")
+
+    # Normalized component prior (probabilities)
+    w_c = (w_in / w_sum).astype(np.float64, copy=False)
+
+    # Enable penalty and keep your existing knobs
+    have_ratio   = True
+    _ratio_eta   = 0.02
+    _ratio_prob  = 0.02
+    _ratio_batch = 2
+    _ratio_minw  = 1e-4
+    rng = np.random.default_rng()
+
+    # Per-component step scaling (mean -> 1.0), same semantics you had
+    m = float(np.mean(w_c)) or 1.0
+    w_full = (w_c / m).astype(np.float64, copy=False)
+
+    def _ratio_update_in_place(x_mat: np.ndarray) -> None:
+        s = x_mat.sum(axis=1)
+        eps = 1e-12
+        active = (w_c >= _ratio_minw) | (s > 0)
+        if not np.any(active):
+            return
+        a = int(np.argmax(w_c * active))
+        sa = float(np.max((s[a], eps)))
+        wa = float(np.max((w_c[a], eps)))
+        pool = np.flatnonzero(active & (np.arange(C) != a))
+        if pool.size == 0:
+            return
+        sel = pool[rng.choice(pool.size, size=np.min((_ratio_batch, pool.size)), replace=False)]
+        if sel.size > 1 and _ratio_prob < 1.0:
+            keep_mask = rng.random(sel.size) < _ratio_prob
+            sel = sel[keep_mask]
+            if sel.size == 0:
+                return
+        for c in sel:
+            sc = float(np.max((s[c], eps)))
+            rc = float(np.max((w_c[c], eps)))
+            e = math.log((sc/sa) / (rc/wa))
+            if e == 0.0:
+                continue
+            delta_sc = -_ratio_eta * e * sc
+            delta_sa = +_ratio_eta * e * sa
+            pc = x_mat[c, :] / sc
+            pa = x_mat[a, :] / sa
+            if not np.all(np.isfinite(pc)):
+                pc = np.full(P, 1.0 / P, dtype=np.float64)
+            if not np.all(np.isfinite(pa)):
+                pa = np.full(P, 1.0 / P, dtype=np.float64)
+            x_mat[c, :] += delta_sc * pc
+            x_mat[a, :] += delta_sa * pa
+        if cfg.project_nonneg:
+            np.maximum(x_mat, 0.0, out=x_mat)
+
+
+    # --- diagnostics
+    l1 = float(np.sum(np.abs(w_in - sol_pdf)))
+    cos = float(np.dot(w_in, sol_pdf) / (np.linalg.norm(w_in) * np.linalg.norm(sol_pdf) + eps))
+    # KLs with epsilon-smoothing
+    p = np.clip(w_in, eps, 1.0); p /= p.sum()
+    q = np.clip(sol_pdf, eps, 1.0); q /= q.sum()
+    kl_pq = float(np.sum(p * (np.log(p) - np.log(q))))
+    kl_qp = float(np.sum(q * (np.log(q) - np.log(p))))
+    print(f"[ratio vs solution] C={C}, P={P}")
+    print(f"  L1 distance        : {l1:.4f}")
+    print(f"  Cosine similarity  : {cos:.6f}")
+    print(f"  KL(p||q), KL(q||p) : {kl_pq:.6f}, {kl_qp:.6f}")
+
+    # --- plotting
+    idx = np.arange(C)
+    width = 0.45
+
+    fig = plt.figure(figsize=(10, 4.2))
+    ax1 = fig.add_subplot(1,2,1)
+    ax1.bar(idx - width/2, w_in,  width, label="input prior (orbit_weights)")
+    ax1.bar(idx + width/2, sol_pdf, width, label="solution ∑_P x[c,p]")
+    ax1.set_xlabel("component c")
+    ax1.set_ylabel("normalized mass / probability")
+    ttl = title or "Component weights: prior vs solution"
+    ax1.set_title(ttl)
+    ax1.legend(frameon=False, fontsize=9)
+
+    ax2 = fig.add_subplot(1,2,2)
+    ax2.scatter(w_in, sol_pdf, s=14)
+    lim = (0.0, max(1.0/C*5, float(max(w_in.max(), sol_pdf.max()))*1.05))
+    ax2.plot(lim, lim, lw=1.0)
+    ax2.set_xlim(lim); ax2.set_ylim(lim)
+    ax2.set_xlabel("input prior w_in[c]")
+    ax2.set_ylabel("solution mass fraction")
+    ax2.set_title(f"scatter vs y=x  (cos={cos:.3f}, L1={l1:.3f})")
+    fig.tight_layout()
+
+    if save:
+        fig.savefig(save, dpi=140)
+        print(f"[saved] {save}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    # return raw arrays if you want to post-process
+    return dict(
+        prior=w_in, solution=sol_pdf, sol_tot=sol_tot,
+        L1=l1, cosine=cos, KL_pq=kl_pq, KL_qp=kl_qp
+    )

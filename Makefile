@@ -9,5 +9,5 @@ html:
 
 pdf:
 	pandoc -s -f gfm $(DOC) -o $(PDF) --pdf-engine=xelatex \
-	  -V geometry:margin=1in -V mainfont="Latin Modern Roman" \
-	  -V monofont="Latin Modern Mono" --toc
+	  -V geometry:margin=1in -V mainfont="Open Sans" \
+	  -V monofont="IntoneMono Nerd Font Mono" --toc

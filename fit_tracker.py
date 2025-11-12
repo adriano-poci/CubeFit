@@ -1,11 +1,29 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-from __future__ import annotations
+"""
+fit_tracker.py
 
-import os, time, math, subprocess, multiprocessing as mp
+Sidecar-based, non-blocking fit tracker for live Kaczmarz runs.
+
+- Writes ONLY to <main>.fit.<pid>.<ts>.h5 (a sidecar), never the main HDF5.
+- Uses a bounded mp.Queue so the solver never blocks on I/O.
+- No SWMR; no file locking on the main file.
+"""
+
+from __future__ import annotations
+import queue as _queue
+import os, time, math, json, multiprocessing as mp
+from multiprocessing.queues import Queue as MPQueue  # put near other imports
 from dataclasses import dataclass
 from typing import Optional
-import numpy as np, h5py
+import numpy as np
+import h5py
+
+# for lock-clear + detection
+from CubeFit.hdf5_manager import _h5clear, _looks_like_lock_error
+import CubeFit.cube_utils as cu
+from CubeFit.logger import get_logger
+
+logger = get_logger()
 
 # ---------------------------- configuration ----------------------------------
 
@@ -13,125 +31,209 @@ import numpy as np, h5py
 class TrackerConfig:
     ring_size: int = 96
     metrics_interval_sec: float = 300.0
-    # (we keep only what's needed right now)
     diag_seed: int = 12345
 
-# ------------------------------- utilities -----------------------------------
+# ------------------------------ writer proc -----------------------------------
 
-def _try_h5clear(path: str) -> None:
-    try:
-        subprocess.run(["h5clear", "-s", path],
-                       check=False,
-                       stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+def _writer_main(h5_path: str, cfg: TrackerConfig, rx: MPQueue) -> None:
+    # Resolve/construct a sidecar path...
+    sidecar = cu._find_latest_sidecar(h5_path)
+    if not sidecar:
+        sidecar = cu._default_sidecar_path(h5_path)
+    if not sidecar:
+        base = str(h5_path) if h5_path else "cube"
+        sidecar = f"{base}.fit.{os.getpid()}.{int(time.time())}.h5"
 
-def _open_sidecar(path: str):
-    """
-    Open <path>.fit.h5 with a *small* raw chunk cache and locking disabled.
-    Never touches the main file; avoids SWMR/locking entirely.
-    """
-    side = path + ".fit.h5"
-    # tiny cache to keep RSS flat
-    try:
-        return h5py.File(side, "a", libver="latest", locking=False,
-                         rdcc_nbytes=8 * 1024 * 1024,   # 8 MiB
-                         rdcc_nslots=1 << 15,           # ~32k
-                         rdcc_w0=0.75)
-    except TypeError:
-        # Older h5py without 'locking' kwarg
-        return h5py.File(side, "a", libver="latest")
+    if os.environ.get("HDF5_USE_FILE_LOCKING") is None:
+        os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
-# ------------------------------- writer proc ---------------------------------
+    # lock-aware open
+    retries, backoff, last_exc = 3, 0.4, None
+    f = None
+    for attempt in range(retries + 1):
+        try:
+            f = h5py.File(sidecar, "a", libver="latest")
+            break
+        except OSError as e:
+            last_exc = e
+            try:
+                looks_lock = _looks_like_lock_error(e)
+            except Exception:
+                looks_lock = ("Unable to synchronously open file" in str(e)
+                              or "open for write" in str(e)
+                              or "open for read-only" in str(e))
+            if (attempt == retries) or (not looks_lock):
+                raise
+            try:
+                _h5clear(sidecar)
+            except Exception:
+                pass
+            time.sleep(backoff * (attempt + 1))
 
-def _writer_main(h5_path: str, cfg: TrackerConfig, q: mp.Queue) -> None:
-    """
-    Child process: owns the only append handle (to the *sidecar*).
-    Messages:
-      {"op": "save", "x": np.ndarray1d, "epoch": int, "time_sec": float, "train_rmse_ewma": float}
-      {"op": "set_orbit", "ow": np.ndarray1d}
-      {"op": "stop"}
-    """
-    # Completely disable file locking in this process.
-    os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+    with f:
+        gfit = f.require_group("/Fit")
+        gfit.attrs["source_main_h5"] = str(h5_path)
 
-    f = _open_sidecar(h5_path)
-    fitg = f.require_group("/Fit")
+        try:
+            f.flush()
+            f.swmr_mode = True
+            logger.log(
+                f"[FitTracker] SWMR writer enabled on sidecar: {sidecar}")
+        except Exception as e:
+            logger.log("[FitTracker] SWMR enable failed:")
+            logger.log_exc(e)
 
-    def _ensure_schema(CP: int):
-        if "x_latest" not in fitg:
-            fitg.create_dataset("x_latest", shape=(CP,), dtype="f8")
-        if "x_best" not in fitg:
-            fitg.create_dataset("x_best", shape=(CP,), dtype="f8")
-        if "x_ring" not in fitg:
-            xr = fitg.create_dataset("x_ring", shape=(cfg.ring_size, CP),
-                                     dtype="f8", chunks=(1, CP))
-            xr.attrs["head"] = np.int64(0)
-        if "metrics" not in fitg:
-            m = fitg.create_group("metrics")
-            m.create_dataset("epoch", (0,), maxshape=(None,), dtype="i8", chunks=True)
-            m.create_dataset("time_sec", (0,), maxshape=(None,), dtype="f8", chunks=True)
-            m.create_dataset("train_rmse_ewma", (0,), maxshape=(None,), dtype="f8", chunks=True)
+        # history datasets (small)
+        if "rmse_hist" not in gfit:
+            gfit.create_dataset("rmse_hist", shape=(0,), maxshape=(None,), chunks=(8192,), dtype="f4")
+        if "rmse_ewma" not in gfit:
+            gfit.create_dataset("rmse_ewma", shape=(0,), maxshape=(None,), chunks=(8192,), dtype="f4")
+        if "progress" not in gfit:
+            gfit.create_dataset("progress", shape=(0, 4), maxshape=(None, 4), chunks=(2048, 4), dtype="f4")
 
-    def _append_metric(epoch: int, tsec: float, rmse: float):
-        m = fitg["metrics"]
-        for nm, val in (("epoch", epoch), ("time_sec", tsec), ("train_rmse_ewma", rmse)):
-            ds = m[nm]
-            n = ds.shape[0]
-            ds.resize((n + 1,))
-            ds[n] = val
 
-    try:
+        # lazy x datasets are created only on first save_x
+        def _save_x(vec: np.ndarray, epoch: float, rmse: float) -> None:
+            x = np.asarray(vec, dtype=np.float64).ravel(order="C")
+            if "x_last" not in gfit:
+                gfit.create_dataset("x_last", data=x, dtype="f8", maxshape=(x.size,), chunks=(x.size,))
+            else:
+                ds = gfit["x_last"]
+                if ds.shape != (x.size,):
+                    del gfit["x_last"]
+                    gfit.create_dataset("x_last", data=x, dtype="f8", maxshape=(x.size,), chunks=(x.size,))
+                else:
+                    ds[...] = x
+            gfit["x_last"].attrs["epoch"] = float(epoch)
+            gfit["x_last"].attrs["rmse"]  = float(rmse)
+
+            # optional x_best (keep best-by-RMSE)
+            try:
+                keep = False
+                if "x_best" not in gfit:
+                    keep = True
+                else:
+                    cur = float(gfit["x_best"].attrs.get("rmse", np.inf))
+                    keep = (rmse < cur)
+                if keep:
+                    if "x_best" not in gfit:
+                        gfit.create_dataset("x_best", data=x, dtype="f8", maxshape=(x.size,), chunks=(x.size,))
+                    else:
+                        dsb = gfit["x_best"]
+                        if dsb.shape != (x.size,):
+                            del gfit["x_best"]
+                            gfit.create_dataset("x_best", data=x, dtype="f8", maxshape=(x.size,), chunks=(x.size,))
+                        else:
+                            dsb[...] = x
+                    gfit["x_best"].attrs["epoch"] = float(epoch)
+                    gfit["x_best"].attrs["rmse"]  = float(rmse)
+            except Exception as e:
+                logger.log("[FitTracker] x_best update failed:")
+                logger.log_exc(e)
+        # ---------- helpers for x snapshots ----------
+        def _ensure_x_ds(N: int) -> None:
+            """Create ring + last datasets if absent, sized by N."""
+            if N <= 0:
+                return
+            if "x_last" not in gfit:
+                gfit.create_dataset("x_last", shape=(N,), dtype="f4", chunks=(N,))
+            if "x_ring" not in gfit:
+                ring = gfit.create_dataset(
+                    "x_ring",
+                    shape=(cfg.ring_size, N),
+                    maxshape=(cfg.ring_size, N),
+                    chunks=(1, N),
+                    dtype="f4",
+                )
+                gfit.create_dataset("x_epoch", shape=(cfg.ring_size,), dtype="i4")
+                gfit.create_dataset("x_ts",    shape=(cfg.ring_size,), dtype="f8")
+                gfit.create_dataset("x_rmse",  shape=(cfg.ring_size,), dtype="f4")
+                gfit.attrs["x_head"] = np.int64(0)
+
+        def _append_x(x32: np.ndarray, epoch: int, rmse: float | None) -> None:
+            """Append into the ring and update x_last."""
+            N = int(x32.size)
+            _ensure_x_ds(N)
+            head = int(gfit.attrs.get("x_head", 0))
+            idx  = head % int(cfg.ring_size)
+            gfit["x_ring"][idx, :] = x32
+            gfit["x_epoch"][idx]   = int(epoch) if epoch is not None else -1
+            gfit["x_ts"][idx]      = float(time.time())
+            gfit["x_rmse"][idx]    = float(rmse) if (rmse is not None and np.isfinite(rmse)) else np.nan
+            gfit["x_last"][:]      = x32
+            gfit.attrs["x_head"]   = np.int64(head + 1)
+
+        # batching knobs
+        FLUSH_EVERY = int(os.environ.get("CUBEFIT_TRACKER_FLUSH_EVERY", "128"))
+        FLUSH_INTERVAL = float(os.environ.get("CUBEFIT_TRACKER_FLUSH_SEC", "5.0"))
+        pending = 0
+        t_last = time.monotonic()
+
+        # main loop with timeout, so we can flush even with no messages
         while True:
-            msg = q.get()
-            if not isinstance(msg, dict):
-                continue
-            op = msg.get("op", "")
-
-            if op == "stop":
-                try:
-                    f.flush()
-                except Exception:
-                    pass
-                break
-
-            elif op == "set_orbit":
-                ow = np.asarray(msg.get("ow", []), np.float64).ravel()
-                if ow.size:
-                    if "orbit_weights" in fitg:
-                        del fitg["orbit_weights"]
-                    fitg.create_dataset("orbit_weights", data=ow, dtype="f8")
+            try:
+                msg = rx.get(timeout=1.0)
+            except _queue.Empty:
+                # idle tick: flush if needed
+                now = time.monotonic()
+                if (pending > 0) and (now - t_last >= FLUSH_INTERVAL):
                     try:
                         f.flush()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.log("[FitTracker] periodic flush failed:")
+                        logger.log_exc(e)
+                    pending = 0
+                    t_last = now
+                continue
 
-            elif op == "save":
-                x = msg.get("x", None)
-                epoch = int(msg.get("epoch", -1))
-                tsec  = float(msg.get("time_sec", time.time()))
-                rmse  = float(msg.get("train_rmse_ewma", math.nan))
-                if isinstance(x, np.ndarray) and x.ndim == 1 and x.size:
-                    CP = int(x.size)
-                    _ensure_schema(CP)
-                    x64 = np.asarray(x, np.float64)
-                    fitg["x_latest"][...] = x64
-                    xr = fitg["x_ring"]
-                    head = int(xr.attrs.get("head", 0))
-                    xr[head % xr.shape[0], :] = x64
-                    xr.attrs.modify("head", (head + 1) % xr.shape[0])
-                try:
-                    _append_metric(epoch, tsec, rmse)
-                except Exception:
-                    pass
-                try:
-                    f.flush()
-                except Exception:
-                    pass
-    finally:
+            if msg is None or msg.get("op") == "stop":
+                break
+
+            try:
+                op = msg.get("op")
+                if op == "rmse_batch":
+                    r = float(msg["value"]); e = float(msg.get("ewma", r))
+                    d1 = gfit["rmse_hist"]; n1 = d1.shape[0]; d1.resize((n1+1,)); d1[n1] = r
+                    d2 = gfit["rmse_ewma"]; n2 = d2.shape[0]; d2.resize((n2+1,)); d2[n2] = e
+                    pending += 1
+
+                elif op == "progress":
+                    epoch = float(msg.get("epoch", 0))
+                    done  = float(msg.get("done", 0))
+                    total = float(msg.get("total", 0))
+                    ewma  = float(msg.get("ewma") or np.nan)
+                    dp = gfit["progress"]; n = dp.shape[0]
+                    dp.resize((n+1, 4)); dp[n, :] = (epoch, done, total, ewma)
+                    pending += 1
+
+                elif op == "epoch_end":
+                    epoch = float(msg.get("epoch", 0))
+                    dp = gfit["progress"]; n = dp.shape[0]
+                    dp.resize((n+1, 4)); dp[n, :] = (epoch, np.nan, np.nan, np.nan)
+                    pending += 1
+
+                elif op in ("save_x", "x_snapshot"):
+                    _save_x(np.asarray(msg["x"], np.float64), float(msg.get("epoch", -1)), float(msg.get("rmse", np.nan)))
+                    pending += 1
+
+                # batch/interval flush
+                now = time.monotonic()
+                if pending >= FLUSH_EVERY or (now - t_last) >= FLUSH_INTERVAL:
+                    try:
+                        f.flush()
+                        pending = 0
+                        t_last = now
+                    except Exception as e:
+                        logger.log("[FitTracker] flush failed:")
+                        logger.log_exc(e)
+
+            except Exception as e:
+                logger.log("[FitTracker] message handling error:")
+                logger.log_exc(e)
+
+        # final flush
         try:
-            f.close()
+            f.flush()
         except Exception:
             pass
 
@@ -139,8 +241,7 @@ def _writer_main(h5_path: str, cfg: TrackerConfig, q: mp.Queue) -> None:
 
 class FitTracker:
     """
-    Non-blocking tracker. Uses a bounded queue; drops updates if full.
-    Writes ONLY to '<file>.fit.h5'.
+    Non-blocking tracker façade. Sends tiny messages to a sidecar writer proc.
     """
     def __init__(self, h5_path: str, cfg: Optional[TrackerConfig] = None):
         self.h5_path = str(h5_path)
@@ -148,21 +249,28 @@ class FitTracker:
         self._ewma = None
         self._alpha = 0.02
 
-        prefer = os.environ.get("FITTRACKER_START", "").lower()
-        methods = mp.get_all_start_methods()
-        order = ([prefer] if prefer else []) + \
-                [m for m in ("fork", "forkserver", "spawn")
-                 if m and m in methods and m != prefer]
+        # Sampling & queue knobs (env-overridable)
+        self._rmse_stride = int(os.environ.get("CUBEFIT_RMSE_STRIDE", "16"))
+        self._rmse_ctr = 0
+
+        prefer = (os.environ.get("FITTRACKER_START", "spawn")).lower()
+        avail = mp.get_all_start_methods()
+        order = [m for m in (prefer, "spawn", "forkserver", "fork") if m in avail]
 
         last_err = None
         self._q = None
         self._proc = None
+        self._start_method = None
+
+        self._snap_last_t = 0.0
+        self._snap_min_sec = float(os.environ.get("CUBEFIT_X_SNAPSHOT_SEC", "3600"))  # seconds between snapshots
+
+
         for m in order:
             try:
                 ctx = mp.get_context(m)
-                self._q = ctx.Queue(maxsize=8)  # bounded → never blocks producer
-                self._proc = ctx.Process(target=_writer_main,
-                                         args=(self.h5_path, self.cfg, self._q))
+                self._q = ctx.Queue(maxsize=int(os.environ.get("CUBEFIT_TRACKER_QSIZE", "8192")))
+                self._proc = ctx.Process(target=_writer_main, args=(self.h5_path, self.cfg, self._q))
                 self._proc.daemon = False
                 self._proc.start()
                 self._start_method = m
@@ -172,62 +280,119 @@ class FitTracker:
                 self._q = None
                 self._proc = None
                 continue
+
         if self._proc is None or self._q is None:
             raise RuntimeError("FitTracker: could not start writer") from last_err
 
-    def set_orbit_weights(self, ow: np.ndarray) -> None:
-        if self._q is None: return
-        try:
-            self._q.put_nowait({"op": "set_orbit",
-                                "ow": np.asarray(ow, np.float64)})
-        except Exception:
-            pass
+    # ------------ public methods used by PipelineRunner / solver ---------------
 
-    def on_batch(self, rmse: float) -> None:
-        if not np.isfinite(rmse): return
-        self._ewma = float(rmse) if self._ewma is None \
-            else (1.0 - self._alpha) * self._ewma + self._alpha * float(rmse)
+    def set_meta(self, N: int) -> None:
+        self._try_put({"op": "set_meta", "N": int(N)})
 
-    def maybe_save(self, x: np.ndarray, epoch: int, now: float | None = None) -> None:
-        if self._q is None: return
-        msg = {
-            "op": "save",
-            "x": np.asarray(x, np.float64).ravel(),
-            "epoch": int(epoch),
-            "time_sec": float(now if now is not None else time.time()),
-            "train_rmse_ewma": float(self._ewma) if self._ewma is not None else math.nan,
-        }
+    def set_orbit_weights(self, w: np.ndarray) -> None:
+        self._try_put({"op": "set_orbit_weights",
+                       "w": np.asarray(w, np.float64).ravel()})
+
+    def on_batch_rmse(self, rmse: float, *, block: bool = False) -> None:
+        """
+        Non-blocking RMSE push with optional subsampling.
+        - Updates local EWMA always.
+        - Enqueues at most every `self._rmse_stride` batches.
+        - Queue put is non-blocking by default; drops if full.
+        """
+        if not np.isfinite(rmse):
+            return
+
+        r = float(rmse)
+        self._ewma = r if self._ewma is None else (1.0 - self._alpha) * self._ewma + self._alpha * r
+
+        self._rmse_ctr += 1
+        if (self._rmse_ctr % max(1, self._rmse_stride)) != 0:
+            return
+
+        self._try_put({"op": "rmse_batch", "value": r, "ewma": float(self._ewma)}, block=block)
+
+    def on_progress(self, epoch: int, spax_done: int, spax_total: int, *, rmse_ewma: Optional[float] = None) -> None:
+        self._try_put({"op": "progress", "epoch": int(epoch),
+                    "done": int(spax_done), "total": int(spax_total),
+                    "ewma": float(rmse_ewma) if rmse_ewma is not None else None}, block=False)
+
+    def on_epoch_end(self, epoch: int, stats: dict) -> None:
+        self._try_put({"op": "epoch_end", "epoch": int(epoch), "stats": dict(stats)}, block=False)
+
+    def maybe_save(self, x_final: np.ndarray, stats: dict) -> None:
+        self._try_put({"op": "save_x",
+                    "x": np.asarray(x_final, np.float32).ravel(order="C"),
+                    "epoch": int(stats.get("epochs", -1)),
+                    "rmse": float(stats.get("rmse_epoch_last",
+                                            stats.get("rmse_final", math.nan)))}, block=False)
+
+    def maybe_snapshot_x(self, x: np.ndarray, *, epoch: int | None = None,
+                        rmse: float | None = None, force: bool = False) -> bool:
+        """
+        Non-blocking, time-gated snapshot of the current global solution vector.
+        - Downcasts to float32 before enqueue to cut payload in half.
+        - Throttled to at most one snapshot every _snap_min_sec unless force=True.
+        Returns True if enqueued, False if skipped/dropped.
+        """
+        now = time.monotonic()
+        if (not force) and ((now - self._snap_last_t) < max(1.0, self._snap_min_sec)):
+            return False
+        self._snap_last_t = now
+
         try:
-            self._q.put_nowait(msg)
+            x32 = np.asarray(x, np.float32).ravel(order="C")
         except Exception:
-            pass
+            return False
+
+        return self._try_put({"op": "x_snapshot",
+                            "x": x32,
+                            "epoch": int(epoch) if epoch is not None else None,
+                            "rmse": float(rmse) if (rmse is not None and np.isfinite(rmse)) else None},
+                            block=False)
+
 
     def close(self, timeout: float = 2.0) -> None:
-        if self._q is not None:
-            try: self._q.put_nowait({"op": "stop"})
-            except Exception: pass
+        # send a real sentinel the writer understands
+        q = getattr(self, "_q", None)
+        if q is not None:
+            try:
+                q.put_nowait(None)  # sentinel
+            except Exception:
+                pass
+
         if self._proc is not None:
             self._proc.join(timeout=timeout)
             if self._proc.is_alive():
-                try: self._proc.terminate()
-                except Exception: pass
+                try:
+                    self._proc.terminate()
+                except Exception:
+                    pass
+
+    # ----------------------------- helpers ------------------------------------
+
+    def _try_put(self, msg, block: bool = False) -> bool:
+        """
+        Put `msg` into the tracker queue; non-blocking by default.
+        Returns True if enqueued, False if dropped or no queue.
+        """
+        q = getattr(self, "_q", None)
+        if q is None:
+            return False
+        try:
+            if block:
+                q.put(msg)
+            else:
+                q.put_nowait(msg)
+            return True
+        except _queue.Full:
+            return False
 
 class NullTracker:
-    def __init__(self, *a, **k): pass
+    def set_meta(self, *a, **k): pass
     def set_orbit_weights(self, *a, **k): pass
-    def on_batch(self, *a, **k): pass
+    def on_progress(self, *a, **k): pass
+    def on_batch_rmse(self, *a, **k): pass
+    def on_epoch_end(self, *a, **k): pass
     def maybe_save(self, *a, **k): pass
     def close(self, *a, **k): pass
-
-def copy_fit_sidecar_back(main_path: str):
-    """Optional: copy /Fit/x_best from sidecar → main file after the run."""
-    side = main_path + ".fit.h5"
-    if not os.path.exists(side): return
-    with h5py.File(main_path, "a", libver="latest", locking=False) as F, \
-         h5py.File(side, "r", libver="latest") as G:
-        if "/Fit/x_best" in G:
-            F.require_group("/Fit")
-            if "/Fit/x_best" in F: del F["/Fit/x_best"]
-            F.create_dataset("/Fit/x_best",
-                             data=np.asarray(G["/Fit/x_best"][...], np.float64),
-                             dtype="f8")
