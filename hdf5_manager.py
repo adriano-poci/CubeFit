@@ -40,6 +40,7 @@ needs optional overrides in memory.
 """
 
 from __future__ import annotations
+import numpy as np
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,9 +49,7 @@ from typing import Optional, Tuple, Sequence
 import os, time, errno, subprocess, tempfile, shutil, fcntl
 from contextlib import contextmanager
 import matplotlib.pyplot as plt
-
-import numpy as np
-import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D  # for BL legend proxies
 import h5py
 
 from dynamics.IFU.Constants import Constants
@@ -216,15 +215,6 @@ def _run(cmd: list[str]) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
-def _h5clear_status(path: Path) -> bool:
-    ok, out = _run(["h5clear", "-s", str(path)])
-    if ok:
-        try:
-            logger.log(f"[HDF5] h5clear -s succeeded on {path}")
-        except Exception:
-            pass
-    return ok
-
 def _h5repack_inplace(path: Path) -> bool:
     tmp = path.with_suffix(path.suffix + ".tmp-repack")
     ok, out = _run(["h5repack", str(path), str(tmp)])
@@ -314,69 +304,60 @@ def _h5clear(path: str | Path) -> bool:
 def open_h5(path: str | Path,
             role: str = "reader",
             retries: int = 3,
-            backoff: float = 0.4):
+            backoff: float = 0.4,
+            *,
+            swmr: bool | None = None,
+            locking: bool | None = None):
     """
-    Robust HDF5 open with lock handling and *modest* raw-chunk cache.
-
-    role='reader' -> read-only
-    role='writer' -> append/update (single writer)
-
-    Default caches are conservative (64 MiB) to prevent per-open GiB spikes.
-    You can override via:
-      CUBEFIT_RDCC_NBYTES, CUBEFIT_RDCC_NSLOTS, CUBEFIT_RDCC_W0
+    Robust HDF5 open with lock handling and modest raw-chunk cache.
+    role='reader' -> read-only; role='writer' -> append/update.
+    If swmr is True and role='reader', open in SWMR-read mode.
     """
     p = Path(path)
     if role not in ("reader", "writer"):
         raise ValueError("role must be 'reader' or 'writer'")
 
-    # Avoid file-lock quirks on shared FS unless user overrides explicitly
-    if os.environ.get("HDF5_USE_FILE_LOCKING") is None:
+    # Allow caller to force HDF5 file locking on/off for this process
+    if locking is not None:
+        os.environ["HDF5_USE_FILE_LOCKING"] = "TRUE" if locking else "FALSE"
+    elif os.environ.get("HDF5_USE_FILE_LOCKING") is None:
         os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
     mode = "r" if role == "reader" else "a"
     last_exc = None
     for attempt in range(retries + 1):
         try:
-            # Smaller, safer defaults (override with env if you want more)
-            rdcc_nbytes = int(os.environ.get("CUBEFIT_RDCC_NBYTES",
-                                             str(512 * 1024 * 1024)))   # 64 MiB
-            rdcc_nslots = int(os.environ.get("CUBEFIT_RDCC_NSLOTS",
-                                             "200003"))               # prime
-            rdcc_w0     = float(os.environ.get("CUBEFIT_RDCC_W0", "0.75"))
+            rdcc_nbytes = int(os.environ.get("CUBEFIT_RDCC_NBYTES", str(4 * 1024**3)))
+            rdcc_nslots = int(os.environ.get("CUBEFIT_RDCC_NSLOTS", "400_003"))
+            rdcc_w0     = float(os.environ.get("CUBEFIT_RDCC_W0", "0.9"))
 
-            f = h5py.File(p, mode, libver="latest",
+            kwargs = dict(libver="latest",
                           rdcc_nbytes=rdcc_nbytes,
                           rdcc_nslots=rdcc_nslots,
                           rdcc_w0=rdcc_w0)
+
+            # h5py allows swmr=... only for read-only opens
+            if role == "reader" and (swmr is True):
+                kwargs["swmr"] = True
+
+            f = h5py.File(p, mode, **kwargs)
             try:
                 yield f
             finally:
-                try:
-                    f.flush()
-                except Exception:
-                    pass
+                try: f.flush()
+                except Exception: pass
                 f.close()
             return
         except OSError as e:
             last_exc = e
-            # Retry only on lock-looking errors
+            # Only retry on likely lock/consistency errors
             if not _looks_like_lock_error(e) or attempt == retries:
                 raise
-            logger.log(f"[HDF5] open({mode}) failed with lock: {e} "
-                       f"(attempt {attempt+1}/{retries})")
-            _h5clear(p)
+            logger.log(f"[HDF5] open({mode}) failed with lock: {e} (attempt {attempt+1}/{retries})")
+            try: _h5clear(p)
+            except Exception: pass
             time.sleep(backoff * (attempt + 1))
     raise last_exc
-
-# Convenience adapters that your class can call:
-def _open_ro(path: str | Path):
-    return open_h5(path, role="reader")
-
-def _open_rw_append(path: str | Path):
-    return open_h5(path, role="writer")
-
-def _open_rw_update(path: str | Path):
-    return open_h5(path, role="writer")
 
 # ---------------------------------------------------------------------------
 
@@ -870,23 +851,26 @@ class H5Manager:
         Expected input shapes (strict):
         datacube : (L_obs, S)   # wavelength-major
         losvd    : (S, V, C)
-        templates: (T_tem, nMetals, nAges, nAlphas)  # spectral axis is FIRST
+        templates: (T_tem, nMetals, nAges, nAlphas) # spectral axis is first
         mask     : (L_obs,) optional
 
         Stores:
         /DataCube   -> (S, L_obs) float64
         /LOSVD      -> (S, V, C)  float64
-        /Templates  -> (P, T_c)   float64   (flattened populations, cropped spectral)
+        /Templates  -> (P, T_c)   float64 (flattened populations, cropped spectral)
         /TemPix     -> (T_c,)     float64
         /ObsPix     -> (L_obs,)   float64
         /VelPix     -> (V,)       float64
         /R_T        -> (T_c, L_obs) float32
         attrs on /Templates to reconstruct N-D population axes and crop indices.
-
-        NEW (optional per-pixel metadata):
         /XPix       -> (nPix,) float64
         /YPix       -> (nPix,) float64
         /BinNum     -> (nPix,) int32   (pixel → spatial-bin index in [0..S-1])
+        /HyperCube/data_flux -> (S,) float64
+            Per-spaxel mean of observed flux over *unmasked* wavelengths (λ),
+            computed only over unmasked wavelengths. Masked wavelengths
+            are written as 0.0. This vector is the solver/builder’s
+            canonical "L_vec".
         """
 
         # ---------- normalize arrays ----------
@@ -895,40 +879,63 @@ class H5Manager:
         templates_in = np.asarray(templates)
 
         # ---------- source grids from file if not passed ----------
-        with self._open_ro() as f_ro:
-            if tem_pix is None:
-                if "/TemPix" not in f_ro:
-                    raise RuntimeError("Missing /TemPix; pass tem_pix or call set_spectral_grids(...).")
-                tem_pix = np.asarray(f_ro["/TemPix"][...], dtype=np.float64)
-            else:
-                tem_pix = np.asarray(tem_pix, dtype=np.float64)
+        base_exists = Path(self.base_path).exists()
 
-            if obs_pix is None:
-                if "/ObsPix" not in f_ro:
-                    raise RuntimeError("Missing /ObsPix; pass obs_pix or call set_spectral_grids(...).")
-                obs_pix = np.asarray(f_ro["/ObsPix"][...], dtype=np.float64)
-            else:
-                obs_pix = np.asarray(obs_pix, dtype=np.float64)
+        if base_exists:
+            # Only read if the file already exists
+            with self._open_ro() as f_ro:
+                if tem_pix is None:
+                    if "/TemPix" not in f_ro:
+                        raise RuntimeError("Missing /TemPix; pass tem_pix or call "
+                                        "set_spectral_grids(...).")
+                    tem_pix = np.asarray(f_ro["/TemPix"][...], dtype=np.float64)
+                else:
+                    tem_pix = np.asarray(tem_pix, dtype=np.float64)
 
-            if vel_pix is None:
-                if "/VelPix" not in f_ro:
-                    raise RuntimeError("Missing /VelPix; call set_velocity_grid(...).")
-                vel_pix = np.asarray(f_ro["/VelPix"][...], dtype=np.float64)
-            else:
+                if obs_pix is None:
+                    if "/ObsPix" not in f_ro:
+                        raise RuntimeError("Missing /ObsPix; pass obs_pix or call "
+                                        "set_spectral_grids(...).")
+                    obs_pix = np.asarray(f_ro["/ObsPix"][...], dtype=np.float64)
+                else:
+                    obs_pix = np.asarray(obs_pix, dtype=np.float64)
+
+                if vel_pix is not None:
+                    vel_pix = np.asarray(vel_pix, dtype=np.float64)
+        else:
+            # Fresh run: no base file yet. If you supplied the grids, persist them.
+            if tem_pix is None or obs_pix is None:
+                raise RuntimeError(
+                    "Base HDF5 does not exist yet and spectral grids were not "
+                    "provided. Pass tem_pix and obs_pix (and optionally vel_pix) "
+                    "on the first run."
+                )
+            tem_pix = np.asarray(tem_pix, dtype=np.float64)
+            obs_pix = np.asarray(obs_pix, dtype=np.float64)
+            if vel_pix is not None:
                 vel_pix = np.asarray(vel_pix, dtype=np.float64)
+
+            # Create the file and write the grids + rebin artifacts so downstream
+            # code can read them
+            self.set_spectral_grids(tem_pix, obs_pix)
+            # (No read here; we just wrote them.)
 
         # ---------- strict shape checks & normalization ----------
         # datacube comes as (L, S) → store as (S, L)
         if datacube_in.ndim != 2:
-            raise ValueError(f"datacube must be 2-D (L,S). Got {datacube_in.ndim}D with shape {datacube_in.shape}.")
+            raise ValueError(f"datacube must be 2-D (L,S). Got "
+                            f"{datacube_in.ndim}D with shape "
+                            f"{datacube_in.shape}.")
         L_obs = int(obs_pix.size)
         if datacube_in.shape[0] != L_obs:
-            raise ValueError(f"datacube first dim must equal len(ObsPix)={L_obs}, got {datacube_in.shape}.")
+            raise ValueError(f"datacube first dim must equal len(ObsPix)={L_obs}, "
+                            f"got {datacube_in.shape}.")
         datacube_SL = datacube_in.T  # (S, L)
 
         # losvd is (S, V, C)
         if losvd_in.ndim != 3:
-            raise ValueError(f"losvd must be 3-D (S,V,C). Got {losvd_in.ndim}D with shape {losvd_in.shape}.")
+            raise ValueError(f"losvd must be 3-D (S,V,C). Got "
+                            f"{losvd_in.ndim}D with shape {losvd_in.shape}.")
         S, L = map(int, datacube_SL.shape)
         S2, V, C = map(int, losvd_in.shape)
         if S2 != S:
@@ -942,8 +949,8 @@ class H5Manager:
             raise ValueError("templates must be at least 1-D.")
         if templates_in.shape[0] != T_len:
             raise ValueError(
-                f"templates spectral axis (axis 0) length {templates_in.shape[0]} "
-                f"!= len(tem_pix) {T_len}."
+                f"templates spectral axis (axis 0) length "
+                f"{templates_in.shape[0]} != len(tem_pix) {T_len}."
             )
 
         templates_in_shape = tuple(templates_in.shape)          # (T, *pop_axes)
@@ -956,7 +963,9 @@ class H5Manager:
         P, T = map(int, templates_PT.shape)
 
         # ---------- compute guard (template pixels) & crop spectral axis ----------
-        Kguard   = self._compute_template_guard_pixels(tem_pix, vel_pix, safety_pad_px=safety_pad_px)
+        Kguard = self._compute_template_guard_pixels(
+            tem_pix, vel_pix, safety_pad_px=safety_pad_px
+        )
         dlog_tem = float(np.median(np.diff(tem_pix)))
         lam_lo   = float(obs_pix.min()) - Kguard * dlog_tem
         lam_hi   = float(obs_pix.max()) + Kguard * dlog_tem
@@ -969,17 +978,21 @@ class H5Manager:
             raise ValueError(
                 "Templates do not span the required guard. "
                 f"Need [{lam_lo:.6f}, {lam_hi:.6f}] in log-λ, but tem_pix runs "
-                f"{tem_pix[0]:.6f}..{tem_pix[-1]:.6f}. Provide a wider template grid."
+                f"{tem_pix[0]:.6f}..{tem_pix[-1]:.6f}. Provide a wider template "
+                "grid."
             )
 
         clipped_left  = (i_lo == 0) and (tem_pix[0] > lam_lo)
         clipped_right = (i_hi == T) and (tem_pix[-1] < lam_hi)
         if clipped_left or clipped_right:
-            eff_lo_px = int(round(max(0.0, (obs_pix.min() - tem_pix[0]) / dlog_tem)))
-            eff_hi_px = int(round(max(0.0, (tem_pix[-1] - obs_pix.max()) / dlog_tem)))
+            eff_lo_px = int(round(max(0.0,
+                            (obs_pix.min() - tem_pix[0]) / dlog_tem)))
+            eff_hi_px = int(round(max(0.0,
+                            (tem_pix[-1] - obs_pix.max()) / dlog_tem)))
             raise ValueError(
                 "Template guard insufficient after cropping: "
-                f"effective guard (px) left={eff_lo_px}, right={eff_hi_px}, required={Kguard}."
+                f"effective guard (px) left={eff_lo_px}, right={eff_hi_px}, "
+                f"required={Kguard}."
             )
 
         tem_pix_c   = tem_pix[i_lo:i_hi].copy()
@@ -991,7 +1004,7 @@ class H5Manager:
         # ---------- build rebin operator for cropped grid ----------
         R_T = self._build_R_T_dense(tem_pix_c, obs_pix)  # (T_c, L), float32
 
-        # ---------- NEW: per-pixel metadata validation ----------
+        # ---------- per-pixel metadata validation ----------
         nPix = None
         if xpix is not None:
             xpix = np.asarray(xpix).ravel()
@@ -1002,25 +1015,30 @@ class H5Manager:
             if nPix is None:
                 nPix = nPix_y
             elif nPix_y != nPix:
-                raise RuntimeError(f"/XPix length ({nPix}) and /YPix length ({nPix_y}) mismatch.")
+                raise RuntimeError(f"/XPix length ({nPix}) and /YPix length "
+                                f"({nPix_y}) mismatch.")
         if binnum is not None:
             bn = np.asarray(binnum).ravel()
             nPix_b = int(bn.size)
             if nPix is None:
                 nPix = nPix_b
             elif nPix_b != nPix:
-                raise RuntimeError(f"/BinNum length ({nPix_b}) and /XPix length ({nPix}) mismatch.")
+                raise RuntimeError(f"/BinNum length ({nPix_b}) and /XPix length "
+                                f"({nPix}) mismatch.")
             if not np.issubdtype(bn.dtype, np.integer):
-                raise ValueError("binnum must be integer indices mapping pixels to spatial bins [0..S-1].")
+                raise ValueError("binnum must be integer indices mapping pixels "
+                                "to spatial bins [0..S-1].")
             if bn.size == 0:
                 raise ValueError("binnum must be non-empty if provided.")
             if (bn.min() < 0) or (bn.max() >= S):
-                raise ValueError(f"binnum contains out-of-range indices; expected in [0, {S-1}].")
+                raise ValueError("binnum contains out-of-range indices; expected "
+                                f"in [0, {S-1}].")
 
         # ---------- write everything ----------
         with self._open_rw() as f:
             def _write(name, data, **create_kw):
-                if name in f: del f[name]
+                if name in f:
+                    del f[name]
                 return f.create_dataset(name, data=data, **create_kw)
 
             # grids
@@ -1029,15 +1047,24 @@ class H5Manager:
             _write("/VelPix", vel_pix,   dtype=np.float64)
 
             # core arrays
-            _write("/DataCube", datacube_SL.astype(np.float64, copy=False), dtype=np.float64)  # (S,L)
-            _write("/LOSVD",    losvd_in.astype(np.float64,    copy=False), dtype=np.float64)  # (S,V,C)
+            _write("/DataCube",
+                datacube_SL.astype(np.float64, copy=False),
+                dtype=np.float64)  # (S,L)
+            _write("/LOSVD",
+                losvd_in.astype(np.float64, copy=False),
+                dtype=np.float64)  # (S,V,C)
 
-            Tds = _write("/Templates", templates_c.astype(np.float64, copy=False), dtype=np.float64)  # (P, T_c)
+            Tds = _write("/Templates",
+                        templates_c.astype(np.float64, copy=False),
+                        dtype=np.float64)  # (P, T_c)
 
             if mask is not None:
                 mask = np.asarray(mask, dtype=bool).ravel()
                 if mask.size != L_obs:
                     raise ValueError(f"mask length {mask.size} != L {L_obs}.")
+                frac_true = float(np.mean(mask))
+                logger.log(
+                    f"[Mask] True==keep; fraction kept = {frac_true:.3f}")
                 _write("/Mask", mask, dtype=np.bool_)
             if x_init is not None:
                 x_init = np.asarray(x_init, dtype=np.float64).ravel()
@@ -1049,14 +1076,16 @@ class H5Manager:
             _write("/R_T", R_T, dtype=np.float32)
 
             # dims (post-crop)
-            dims = dict(nSpat=S, nLSpec=L_obs, nTSpec=T_c, nVel=V, nComp=C, nPop=P)
+            dims = dict(nSpat=S, nLSpec=L_obs, nTSpec=T_c, nVel=V, nComp=C,
+                        nPop=P)
             self._write_dims_attrs(f, dims)
 
             # template metadata (reconstruction + crop)
-            Tds.attrs["orig_shape"]  = np.asarray(templates_in_shape, dtype=np.int64)  # (T, nM, nA, nα)
-            Tds.attrs["orig_t_axis"] = np.int64(orig_t_axis)                            # 0
-            Tds.attrs["pop_shape"]   = np.asarray(pop_shape, dtype=np.int64)           # (nM, nA, nα)
-            Tds.attrs["crop_i_lo"]   = np.int64(i_lo)                                   # indices in original spectral axis
+            Tds.attrs["orig_shape"]  = np.asarray(templates_in_shape,
+                                                dtype=np.int64)
+            Tds.attrs["orig_t_axis"] = np.int64(orig_t_axis)
+            Tds.attrs["pop_shape"]   = np.asarray(pop_shape, dtype=np.int64)
+            Tds.attrs["crop_i_lo"]   = np.int64(i_lo)
             Tds.attrs["crop_i_hi"]   = np.int64(i_hi)
             Tds.attrs["T_len_in"]    = np.int64(T)
             Tds.attrs["T_len_out"]   = np.int64(T_c)
@@ -1092,6 +1121,33 @@ class H5Manager:
                     units="index",
                     semantic="pixel→spatial-bin mapping [0..S-1]",
                 )
+
+            # ---------- compute & store /HyperCube/data_flux (S,) -----------
+            # Per-spaxel mean over unmasked wavelengths (λ). Masked λ are ignored.
+            if "/HyperCube" not in f:
+                f.create_group("/HyperCube")
+
+            if mask is None:
+                with np.errstate(invalid="ignore"):
+                    L_vec = np.nanmean(datacube_SL, axis=1).astype(np.float64)  # (S,)
+            else:
+                use = np.asarray(mask, dtype=bool).ravel()
+                if use.size != L_obs:
+                    raise ValueError(f"mask length {use.size} != L {L_obs}.")
+                if np.any(use):
+                    with np.errstate(invalid="ignore"):
+                        L_vec = np.nanmean(datacube_SL[:, use], axis=1).astype(np.float64)
+                else:
+                    L_vec = np.zeros(S, dtype=np.float64)
+
+            L_vec[~np.isfinite(L_vec)] = 0.0
+
+            if "/HyperCube/data_flux" in f:
+                del f["/HyperCube/data_flux"]
+            ds = f.create_dataset("/HyperCube/data_flux", data=L_vec, dtype=np.float64)
+            ds.attrs["semantic"] = "per-spaxel mean flux over unmasked λ"
+            ds.attrs["source"] = "/DataCube + /Mask"
+            ds.attrs["stat"] = "mean"
 
         return dict(nSpat=S, nLSpec=L_obs, nTSpec=T_c, nVel=V, nComp=C, nPop=P)
 
@@ -1653,6 +1709,52 @@ def plot_prefit_panel(
 
 # ------------------------------------------------------------------------------
 
+def _component_scale(f, s: int, c: int, eps: float = 1e-30) -> tuple[float, str, float]:
+    """
+    Compute the scale applied to (s,c) columns in /HyperCube/models.
+
+    Parameters
+    ----------
+    f : h5py.File
+        Open HDF5 handle.
+    s : int
+        Spaxel index.
+    c : int
+        Component index.
+    eps : float, optional
+        Numerical floor to avoid divide-by-zero.
+
+    Returns
+    -------
+    scale_sc : float
+        The multiplicative factor actually applied to every (p,λ) for this
+        (s,c) in the models array.
+    mode : str
+        'data' or 'model' (the normalization mode).
+    frac : float
+        For data-mode only: A[s,c] / sum_c A[s,c]. For model-mode this is
+        0.0 (unused).
+
+    Examples
+    --------
+    >>> with open_h5(h5, 'reader') as f:
+    ...     scale, mode, frac = _component_scale(f, 1033, 124)
+    ...     print(scale, mode, frac)
+    """
+    mode = str(f["/HyperCube"].attrs.get("norm.mode", "model")).lower()
+    A_sc = float(f["/HyperCube/norm/losvd_amp"][s, c])  # A[s,c]
+    if mode == "data":
+        a_sum = float(f["/HyperCube/norm/losvd_amp_sum"][s])  # Σ_c A[s,c]
+        Ls = float(f["/HyperCube/data_flux"][s])              # masked mean data
+        if a_sum <= 0.0 or Ls <= 0.0:
+            return 0.0, mode, 0.0
+        frac = A_sc / max(a_sum, eps)
+        return Ls * frac, mode, frac
+    else:
+        return A_sc, mode, 0.0
+
+# ------------------------------------------------------------------------------
+
 def live_prefit_snapshot_from_models(
     h5_path: str,
     *,
@@ -1698,10 +1800,8 @@ def live_prefit_snapshot_from_models(
         lam = np.asarray(lam_obs, dtype=float).ravel()
         if lam.size < 2:
             return
-        # infer semantics: if majority True => keep; otherwise True means masked
-        frac_true = float(np.sum(mask_raw)) / float(mask_raw.size)
-        keep_mask = mask_raw if frac_true >= 0.5 else ~mask_raw
-        bad_mask  = ~keep_mask  # shaded
+        keep_mask = np.asarray(mask_raw, dtype=bool).ravel()   # True == keep
+        bad_mask  = ~keep_mask                                  # shaded regions
         dlam = float(np.median(np.diff(lam)))
         half = abs(dlam) * 0.5
         x_min, x_max = float(lam[0]), float(lam[-1])
@@ -1720,9 +1820,7 @@ def live_prefit_snapshot_from_models(
                 if z.size:
                     vals.append(z[np.isfinite(z)])
         else:
-            frac_true = float(np.sum(mask_raw)) / float(mask_raw.size)
-            keep_mask = mask_raw if frac_true >= 0.5 else ~mask_raw
-            keep = np.asarray(keep_mask, dtype=bool).ravel()
+            keep = np.asarray(mask_raw, dtype=bool).ravel()     # True == keep
             for y in ys:
                 z = np.asarray(y, dtype=float).ravel()
                 if z.size:
@@ -1735,8 +1833,7 @@ def live_prefit_snapshot_from_models(
         cat = np.concatenate([v for v in vals if v.size], dtype=float)
         if cat.size == 0:
             return
-        y0 = float(np.quantile(cat, qlo))
-        y1 = float(np.quantile(cat, qhi))
+        y0 = float(np.quantile(cat, qlo)); y1 = float(np.quantile(cat, qhi))
         if not np.isfinite(y0) or not np.isfinite(y1) or y1 <= y0:
             y0 = float(np.nanmin(cat)); y1 = float(np.nanmax(cat))
             if not np.isfinite(y0) or not np.isfinite(y1):
@@ -1831,6 +1928,11 @@ def live_prefit_snapshot_from_models(
         rng.shuffle(co_pool)
         co_sel = np.array(sorted(co_pool[:min(max_components, C)]), dtype=int)
 
+        LOS = f["/LOSVD"]  # (S,V,C)
+        def _has_signal(s_idx: int, c_idx: int) -> bool:
+            row = np.asarray(LOS[s_idx, :, c_idx], dtype=float)
+            return np.isfinite(row).any() and float(row.sum()) > 0.0
+
         # --- BR: build diverse (s,c) PAIRS from distinct tiles with any P done
         # boolean grid of finished (si,ci) pairs
         done_si_ci = done_arr.any(axis=2)            # (sgrid, cgrid)
@@ -1849,6 +1951,8 @@ def live_prefit_snapshot_from_models(
                     continue
                 s_idx = int(rng.integers(s0, s1))
                 c_idx = int(min(C - 1, int(ci) * c_chunk + rng.integers(0, max(1, c_chunk))))
+                if not _has_signal(s_idx, c_idx):
+                    continue
                 sc_pairs.append((s_idx, c_idx, int(si), int(ci)))
                 used_si.add(int(si)); used_ci.add(int(ci))
                 if len(sc_pairs) >= max_sc_pairs:
@@ -1862,9 +1966,25 @@ def live_prefit_snapshot_from_models(
                     continue
                 s_idx = int(rng.integers(s0, s1))
                 c_idx = int(min(C - 1, int(ci) * c_chunk + rng.integers(0, max(1, c_chunk))))
+                if not _has_signal(s_idx, c_idx):
+                    continue
                 sc_pairs.append((s_idx, c_idx, int(si), int(ci)))
                 if len(sc_pairs) >= max_sc_pairs:
                     break
+
+        if len(sc_pairs) == 0:
+            # Fallback: scan for any non-zero (s,c)
+            for s_idx in range(S):
+                for c_idx in range(C):
+                    if _has_signal(s_idx, c_idx):
+                        sc_pairs.append(
+                            (s_idx, c_idx, int(s_idx // s_chunk), int(c_idx // c_chunk))
+                        )
+                        break
+                if sc_pairs:
+                    break
+            if len(sc_pairs) == 0:
+                raise RuntimeError("All candidate (s,c) have zero LOSVD mass.")
 
         # For each (si,ci), pick templates from its finished P-tiles
         pj_done = done_arr  # alias
@@ -1880,6 +2000,7 @@ def live_prefit_snapshot_from_models(
             rng.shuffle(p_cands)
             p_sel_pair = list(sorted(p_cands[:min(templates_per_pair, len(p_cands))]))
             per_pair_curves.append((s_idx, c_idx, p_sel_pair))
+        bl_pairs = [(s_idx, c_idx) for (s_idx, c_idx, _) in per_pair_curves]
 
         # ---------------- figure ----------------
         fig, axs = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
@@ -1905,7 +2026,7 @@ def live_prefit_snapshot_from_models(
         _shade_mask(axs[0, 1], lam_obs, mask)
         axs[0, 1].legend(fontsize=9)
 
-        # BL: LOSVD (native) + resampled kernel
+        # BL: LOSVD (native) + resampled kernel (+ amplitude-scaled kernel on twin y)
         def _kernel_from_losvd(los_row, V):
             dlog = float(np.median(np.diff(tem_log)))
             k_min = int(np.floor(np.log1p(V.min() / C_KMS) / dlog))
@@ -1923,22 +2044,66 @@ def live_prefit_snapshot_from_models(
             Hk[oob] = 0.0
             s = Hk.sum()
             if s > 0:
-                Hk /= s
+                Hk /= s  # unit-area kernel for shape-only view
             return v_for_k, Hk
 
+        los_handles = []
         LOS = f["/LOSVD"]  # (S,V,C)
-        for s in sp_sel[:min(len(sp_sel), 4)]:
-            for c in co_sel:
-                los = np.asarray(LOS[s, :, c], dtype=float)
-                tot = los.sum()
-                if tot > 0:
-                    los = los / tot
-                v_for_k, Hk = _kernel_from_losvd(los, vel_pix)
-                axs[1, 0].plot(vel_pix, los, lw=0.9, alpha=0.55)
-                axs[1, 0].plot(v_for_k, Hk, lw=1.0)
-        axs[1, 0].set_title("LOSVD (native) and resampled kernel")
-        axs[1, 0].set_xlabel("velocity (km/s)")
-        axs[1, 0].grid(alpha=0.25)
+
+        # twin y-axis for amplitude-scaled kernels (flux units)
+        ax_los = axs[1, 0]
+        ax_kflux = ax_los.twinx()
+        ax_kflux.set_ylabel("kernel × scale(s,c)  (flux units)")
+
+        # global norm mode (same for all components)
+        norm_mode = str(f["/HyperCube"].attrs.get("norm.mode", "model")).lower()
+
+        for (s_idx, c_idx) in bl_pairs:
+            los = np.asarray(LOS[s_idx, :, c_idx], dtype=float)
+            tot = los.sum()
+            if tot > 0:
+                los = los / tot  # unit-sum for native LOSVD display
+
+            v_for_k, Hk = _kernel_from_losvd(los, vel_pix)
+            # actual per-(s,c) scale used in /HyperCube/models
+            scale_sc, mode_used, frac = _component_scale(f, int(s_idx), int(c_idx))
+
+            # native LOSVD (solid)
+            if norm_mode == "data":
+                lbl = f"(s={int(s_idx)}, c={int(c_idx)})  frac={frac:.3e}"
+            else:
+                lbl = f"(s={int(s_idx)}, c={int(c_idx)})"
+            line_los, = ax_los.plot(vel_pix, los, lw=1.5, label=lbl)
+            los_handles.append(line_los)
+
+            # unit-area resampled kernel (dashed) — same color as LOSVD
+            ax_los.plot(v_for_k, Hk, lw=1.0, ls="--", color=line_los.get_color())
+
+            # amplitude-scaled kernel on twin axis (dotted) — same color
+            if scale_sc > 0.0:
+                ax_kflux.plot(v_for_k, scale_sc * Hk, lw=1.0, ls=":",
+                            alpha=0.9, color=line_los.get_color())
+
+        ax_los.set_title(f"LOSVD (native) and resampled kernel  [mode={norm_mode}]")
+        ax_los.set_xlabel("velocity (km/s)")
+        ax_los.grid(alpha=0.25)
+
+        # Style legend (explains line styles)
+        lg_styles = ax_los.legend(
+            handles=[
+                Line2D([], [], lw=1.5, label="LOSVD (native)"),
+                Line2D([], [], lw=1.0, ls="--", label="kernel (unit-area)"),
+                Line2D([], [], lw=1.0, ls=":", label="kernel × scale(s,c)"),
+            ],
+            loc="lower right", fontsize=8, frameon=False
+        )
+        ax_los.add_artist(lg_styles)
+
+        # Per-curve legend showing which (spaxel, component) each LOSVD is
+        ax_los.legend(
+            handles=los_handles, loc="upper left",
+            fontsize=7, frameon=False, ncol=2, title="(s, c)"
+        )
 
         # BR: ACTUAL /HyperCube/models for diverse (s,c) pairs
         br_all_rows = []

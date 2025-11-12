@@ -47,30 +47,31 @@ class CubeFitLogger:
         self.logfile = Path(logfile) if logfile is not None else None
         self.mode = mode
 
-    def log(self, msg, flush=True, ts=True):
-        now = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
-        outmsg = (now + " " + msg) if ts else msg
+    def log(self, msg="", flush=True, ts=True):
+        # accept any object (including Exceptions) and stringify safely
+        try:
+            text = str(msg)
+        except Exception:
+            text = repr(msg)
+        now = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]") if ts else ""
+        outmsg = (now + " " + text) if ts else text
         with threading.Lock():
-            print(outmsg, file=sys.__stdout__)
+            print(outmsg, file=sys.__stdout__, flush=flush)
             if self.logfile is not None:
                 with self.logfile.open("a") as f:
                     f.write(outmsg + "\n")
             if flush:
                 sys.__stdout__.flush()
 
+    def log_exc(self, exc: BaseException, prefix="[EXC]"):
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        self.log(f"{prefix} {tb}", flush=True)
+
     def flush(self):
         sys.__stdout__.flush()
         if self.logfile is not None:
             with self.logfile.open("a"):
                 pass
-
-    def log_solver_output(self, text):
-        with threading.Lock():
-            print(text, end="", file=sys.__stdout__)
-            if self.logfile is not None:
-                with self.logfile.open("a") as f:
-                    f.write(text)
-            sys.__stdout__.flush()
 
     @contextmanager
     def capture_all_output(self):

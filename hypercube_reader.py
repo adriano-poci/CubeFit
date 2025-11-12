@@ -42,7 +42,6 @@ import numpy as np
 
 from CubeFit.hdf5_manager import open_h5
 
-
 @dataclass
 class ReaderCfg:
     s_tile: Optional[int] = None
@@ -50,7 +49,6 @@ class ReaderCfg:
     p_tile: Optional[int] = None
     dtype_models: str = "float32"   # how to read models; math stays float64
     apply_mask: bool = True
-
 
 class HyperCubeReader:
     """
@@ -98,6 +96,47 @@ class HyperCubeReader:
         self._mask = None
         if self._Mask is not None and self._apply_mask:
             self._mask = np.asarray(self._Mask[...], dtype=bool)
+
+    # --------------------------------------------------------------------------
+
+    @property
+    def has_mask(self) -> bool:
+        """True if /Mask exists in the file."""
+        return self._Mask is not None
+
+    @property
+    def has_models(self) -> bool:
+        """True if /HyperCube/models exists (reader requires it at init)."""
+        try:
+            return "/HyperCube/models" in self._f
+        except Exception:
+            return False
+
+    @property
+    def models_complete(self) -> bool:
+        """True if /HyperCube.attrs['complete'] is set."""
+        try:
+            return bool(self._f["/HyperCube"].attrs.get("complete", False))
+        except Exception:
+            return False
+
+    @property
+    def models_path(self) -> str:
+        """Path of the HDF5 file that contains the models (for logging)."""
+        return str(getattr(self._f, "filename", ""))
+
+    # Make the reader usable as a context manager and clean up on GC.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # ----------------------------- lifecycle ---------------------------------
 
