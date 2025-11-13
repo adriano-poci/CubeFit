@@ -6,6 +6,7 @@ import numpy as np
 import os, glob, time, re
 import pathlib as plp
 from dataclasses import dataclass
+import matplotlib.pyplot as plt
 
 from dynamics.IFU.Constants import Constants
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
@@ -909,3 +910,211 @@ class RatioCfg:
     anchor: str = "auto"       # {'target','x0','auto'}
     tile_every: int = 1
     epoch_renorm: bool = True
+
+# ------------------------------------------------------------------------------
+
+def compare_usage_to_orbit_weights(h5_path: str,
+                                   sidecar: str | None = None,
+                                   x_dset: str | None = None,
+                                   normalize: str = "unit_sum",
+                                   out_png: str | None = None) -> dict:
+    """
+    Compare the final component usage (sum over populations) against the
+    input orbital weights, both read from the HDF5 store.
+
+    The function prefers solution vectors in a sidecar if present, then
+    falls back to the main file. It also prefers orbital weights stored
+    in the sidecar, then falls back to the main file.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the main HDF5 file.
+    sidecar : str or None
+        Optional explicit path to a sidecar. If None, the function will
+        try to auto-detect one matching '<main>.fit.*.h5' and use the
+        newest by mtime.
+    x_dset : str or None
+        Optional explicit dataset path for X in either the sidecar or
+        main file (e.g., '/Fit/x_best'). If None, the search order is:
+        sidecar: '/Fit/x_best', '/Fit/x_last', '/Fit/x_epoch_last',
+                 last row of '/Fit/x_snapshots', last row of '/Fit/x_hist';
+        main:    '/X_global', '/Fit/x_latest'.
+    normalize : {'unit_sum', 'match_sum'}
+        Normalization applied before comparison. With 'unit_sum', both
+        vectors are scaled to sum to 1. With 'match_sum', the usage is
+        scaled so its sum matches the orbital weights sum. Use
+        'unit_sum' for shape-only comparison.
+    out_png : str or None
+        If provided, write a small bar+marker figure overlaying usage
+        and target weights.
+
+    Returns
+    -------
+    out : dict
+        Dictionary with:
+          - 'usage_raw'     : (C,) float64, sum over populations
+          - 'weights_raw'   : (C,) float64, as read
+          - 'usage'         : (C,) float64, normalized
+          - 'weights'       : (C,) float64, normalized
+          - 'l1'            : float, L1 error (|u-w|).sum()
+          - 'linf'          : float, L∞ error |u-w|.max()
+          - 'cosine'        : float, cosine similarity
+          - 'pearson_r'     : float, Pearson correlation (NaN if C<2)
+          - 'argmax_err'    : int, component index of max |u-w|
+          - 'plot_path'     : str or None
+
+    Notes
+    -----
+    * Uses float64 everywhere. No Python builtins like min/max are used.
+    * Very low-cost: reads only small vectors and HDF5 attrs/shapes.
+    """
+    # ------------------ helpers ------------------
+    def _find_latest_sidecar(main_path: str) -> str | None:
+        pat = f"{os.fspath(main_path)}.fit.*.h5"
+        cand = glob.glob(pat)
+        if not cand:
+            return None
+        cand.sort(key=lambda p: os.path.getmtime(p))
+        return cand[-1]
+
+    def _read_C_P(f) -> tuple[int, int]:
+        M = f["/HyperCube/models"]
+        _, C, P, _ = map(int, M.shape)
+        return C, P
+
+    def _row_or_vec(ds) -> np.ndarray:
+        arr = np.asarray(ds[...], dtype=np.float64)
+        if arr.ndim == 2 and arr.shape[0] > 0:
+            return arr[-1, :].astype(np.float64, copy=False)
+        return arr.ravel().astype(np.float64, copy=False)
+
+    def _read_X(f_side, f_main, C, P) -> np.ndarray:
+        # explicit override
+        if x_dset is not None:
+            src = f_side if (f_side is not None and x_dset in f_side) else f_main
+            if src is None or x_dset not in src:
+                raise RuntimeError(f"Requested x_dset '{x_dset}' not found.")
+            x = _row_or_vec(src[x_dset])
+            return x
+        # sidecar-first
+        if f_side is not None:
+            for name in ("/Fit/x_best", "/Fit/x_last", "/Fit/x_epoch_last"):
+                if name in f_side:
+                    return _row_or_vec(f_side[name])
+            for name in ("/Fit/x_snapshots", "/Fit/x_hist"):
+                if name in f_side and f_side[name].shape[0] > 0:
+                    return _row_or_vec(f_side[name])
+        # main fallbacks
+        for name in ("/X_global", "/Fit/x_latest"):
+            if name in f_main:
+                return _row_or_vec(f_main[name])
+        raise RuntimeError("No solution vector found in sidecar or main file.")
+
+    def _read_weights(f_side, f_main) -> np.ndarray:
+        if f_side is not None and "/CompWeights" in f_side:
+            return np.asarray(f_side["/CompWeights"][...], dtype=np.float64)
+        if "/Fit/orbit_weights" in f_main:
+            return np.asarray(f_main["/Fit/orbit_weights"][...], dtype=np.float64)
+        if "/CompWeights" in f_main:
+            return np.asarray(f_main["/CompWeights"][...], dtype=np.float64)
+        raise RuntimeError("No orbital weights found in sidecar or main file.")
+
+    def _safe_norm(v: np.ndarray, mode: str, ref_sum: float | None = None
+                   ) -> np.ndarray:
+        v = np.asarray(v, dtype=np.float64)
+        s = float(np.sum(v))
+        eps = 1.0e-30
+        if mode == "unit_sum":
+            if s <= eps:
+                return np.zeros_like(v)
+            return v / s
+        # match_sum
+        tgt = float(ref_sum) if ref_sum is not None else s
+        if s <= eps:
+            return np.zeros_like(v)
+        return v * (tgt / s)
+
+    # ------------------ open files ------------------
+    if sidecar is None:
+        sidecar = _find_latest_sidecar(h5_path)
+
+    with open_h5(h5_path, role="reader", swmr=True) as F:
+        C, P = _read_C_P(F)
+        if sidecar is not None and os.path.exists(sidecar):
+            with open_h5(sidecar, role="reader", swmr=True) as G:
+                x = _read_X(G, F, C, P)
+                w = _read_weights(G, F)
+        else:
+            x = _read_X(None, F, C, P)
+            w = _read_weights(None, F)
+
+    # ------------------ assemble & compare ------------------
+    x = np.asarray(x, dtype=np.float64).ravel(order="C")
+    if x.size != C * P:
+        raise ValueError(f"x length {x.size} != C*P={C*P}.")
+    X_cp = x.reshape(C, P, order="C")
+    usage_raw = np.sum(X_cp, axis=1)          # (C,)
+    weights_raw = np.asarray(w, dtype=np.float64).ravel()
+    if weights_raw.size != C:
+        raise ValueError(f"weights length {weights_raw.size} != C={C}.")
+
+    if normalize not in ("unit_sum", "match_sum"):
+        raise ValueError("normalize must be 'unit_sum' or 'match_sum'.")
+
+    if normalize == "unit_sum":
+        usage = _safe_norm(usage_raw, "unit_sum")
+        weights = _safe_norm(weights_raw, "unit_sum")
+    else:
+        usage = _safe_norm(usage_raw, "match_sum", ref_sum=float(np.sum(weights_raw)))
+        weights = weights_raw.copy()
+
+    diff = usage - weights
+    l1 = float(np.sum(np.abs(diff)))
+    linf = float(np.max(np.abs(diff))) if diff.size else np.nan
+    denom = np.linalg.norm(usage) * np.linalg.norm(weights)
+    cosine = float((usage @ weights) / np.maximum(denom, 1.0e-30)) if denom > 0.0 else np.nan
+    if usage.size >= 2:
+        rr = np.corrcoef(usage, weights)
+        pearson_r = float(rr[0, 1])
+    else:
+        pearson_r = np.nan
+    argmax_err = int(np.argmax(np.abs(diff))) if diff.size else -1
+
+    plot_path = None
+    if out_png is not None:
+        fig = plt.figure(figsize=(9, 3.2))
+        ax = fig.add_subplot(111)
+        idx = np.arange(C, dtype=int)
+        ax.bar(idx, usage, width=0.8, alpha=0.85, label="usage (sum over P)")
+        ax.plot(idx, weights, marker="o", linestyle="--", label="target w_c")
+        mx = np.max(np.stack([usage, weights], axis=0)) if C > 0 else 1.0
+        ax.set_ylim(0.0, float(1.05 * mx))
+        ax.set_xlabel("component c")
+        ax.set_ylabel("normalized weight")
+        ax.set_title(f"component usage vs target  L1={l1:.3g}  L∞={linf:.3g}  "
+                     f"cos={cosine:.3f}  r={pearson_r:.3f}")
+        ax.legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=140)
+        plt.close(fig)
+        plot_path = out_png
+
+    out = dict(
+        usage_raw=usage_raw,
+        weights_raw=weights_raw,
+        usage=usage,
+        weights=weights,
+        l1=l1,
+        linf=linf,
+        cosine=cosine,
+        pearson_r=pearson_r,
+        argmax_err=argmax_err,
+        plot_path=plot_path,
+    )
+    # quick console line for at-a-glance check
+    print("[usage_vs_weights] L1={:.4g}  L∞={:.4g}  cos={:.4f}  r={:.4f}  "
+          "argmax_err={}".format(l1, linf, cosine, pearson_r, argmax_err))
+    return out
+
+# ------------------------------------------------------------------------------

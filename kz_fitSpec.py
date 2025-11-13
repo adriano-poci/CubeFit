@@ -433,7 +433,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         tem_pix=copy(teLL), obs_pix=copy(spLL),
         vel_pix=copy(vbins),
         xpix=xpix, ypix=ypix,
-        binnum=binNum
+        binnum=binNum,
+        orbit_weights=cWeights,
     )
     mgr.ensure_rebin_and_resample()
 
@@ -545,11 +546,12 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     RC = cu.RatioCfg(
-        anchor="x0",
-        eta=0.4,
-        gamma=1.3,
-        prob=1.0,
-        batch=0,
+        anchor="target",  # pull toward /CompWeights
+        eta=1.0,          # strength
+        gamma=1.2,        # slightly superlinear
+        prob=1.0,         # apply every tile
+        batch=0,          # all pairs
+        minw=1e-4         # ignore components with ~zero target weight
     )
     x_global, stats = runner.solve_all_mp_batched(
         epochs=1,
