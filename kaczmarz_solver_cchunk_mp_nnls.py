@@ -481,6 +481,25 @@ def solve_global_kaczmarz_cchunk_mp(
                 Yt = Yt[:, keep_idx]
             norms.append(float(np.linalg.norm(Yt)))
             Y_glob_norm2 += float(np.sum(Yt * Yt))
+        
+    # --- Persist orbit_weights and push into tracker (MP path) ---
+    if orbit_weights is not None:
+        w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
+        if w.size not in (C, C * P):
+            raise ValueError(
+                f"orbit_weights length must be C ({C}) or C*P ({C*P}); got {w.size}."
+            )
+        if w.size == C * P:
+            w = w.reshape(C, P, order="C").sum(axis=1)  # reduce to component level
+
+        # unit-sum normalize (shape comparison friendly)
+        s = float(np.sum(w))
+        w = (w / np.maximum(s, 1.0e-30)) if s > 0.0 else np.zeros_like(w)
+
+        # hand to tracker so UIs can show the target distribution
+        if tracker is not None:
+            tracker.set_orbit_weights(w)
+
     s_ranges = [sr for _, sr in sorted(
         zip(norms, s_ranges), key=lambda t: -t[0]
     )]

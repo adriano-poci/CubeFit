@@ -846,6 +846,7 @@ class H5Manager:
         xpix: np.ndarray | None = None,     # length nPix, float
         ypix: np.ndarray | None = None,     # length nPix, float
         binnum: np.ndarray | None = None,   # length nPix, int in [0, S)
+        orbit_weights: np.ndarray | None = None, 
     ) -> dict:
         """
         Expected input shapes (strict):
@@ -1148,6 +1149,26 @@ class H5Manager:
             ds.attrs["semantic"] = "per-spaxel mean flux over unmasked λ"
             ds.attrs["source"] = "/DataCube + /Mask"
             ds.attrs["stat"] = "mean"
+
+            # ---------- write /CompWeights if provided ----------
+            if orbit_weights is not None:
+                w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
+                if w.size not in (C, C * P):
+                    raise ValueError(
+                        f"orbit_weights length must be C ({C}) or C*P ({C*P}); got {w.size}."
+                    )
+                if w.size == C * P:
+                    w = w.reshape(C, P, order="C").sum(axis=1)  # reduce to component level
+
+                # unit-sum normalize for canonical storage
+                s = float(np.sum(w))
+                w = (w / np.maximum(s, 1.0e-30)) if s > 0.0 else np.zeros_like(w)
+
+                if "/CompWeights" in f:
+                    del f["/CompWeights"]
+                ds_w = f.create_dataset("/CompWeights", data=w, dtype=np.float64)
+                ds_w.attrs["semantic"] = "prior component weights w_c (unit-sum)"
+                ds_w.attrs["normalized"] = bool(np.isclose(np.sum(w), 1.0))
 
         return dict(nSpat=S, nLSpec=L_obs, nTSpec=T_c, nVel=V, nComp=C, nPop=P)
 
