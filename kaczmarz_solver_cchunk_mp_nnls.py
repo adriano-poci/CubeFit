@@ -22,7 +22,8 @@ from tqdm import tqdm
 from CubeFit.hdf5_manager import open_h5
 from CubeFit.hypercube_builder import read_global_column_energy
 from CubeFit.cube_utils import (
-    read_lambda_weights, ensure_lambda_weights, _get_mask, RatioCfg
+    read_lambda_weights, ensure_lambda_weights, _get_mask, RatioCfg,
+    apply_component_softbox
 )
 
 # ----------------------------- Config ---------------------------------
@@ -388,7 +389,7 @@ def _worker_tile_job_with_R(args):
 
         return R_delta, dx_list, nnls_candidates
 
-# ---------------------------- Coordinator ------------------------------
+# ------------------------------------------------------------------------------
 
 def solve_global_kaczmarz_cchunk_mp(
     h5_path: str,
@@ -1041,6 +1042,17 @@ def solve_global_kaczmarz_cchunk_mp(
                                     )
 
                 # ---------- end NNLS polish ----------
+
+                # ---------- optional soft box on component usage ----------
+                if orbit_weights is not None:
+                    # use the same priors you passed in; if you normalized them earlier, reuse that
+                    apply_component_softbox(
+                        x_CP,
+                        (w_full if w_full is not None else np.asarray(orbit_weights, np.float64)),
+                        band=0.30, # start loose; you can tighten across epochs
+                        step=0.25, # gentle pull
+                        min_target=1e-10
+                    )
 
                 if tracker is not None:
                     tracker.on_progress(
