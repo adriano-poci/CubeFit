@@ -1046,12 +1046,14 @@ def solve_global_kaczmarz_cchunk_mp(
                 # ---------- optional soft box on component usage ----------
                 if orbit_weights is not None:
                     # use the same priors you passed in; if you normalized them earlier, reuse that
+                    w_prior = (w_full if w_full is not None
+                            else np.asarray(orbit_weights, dtype=np.float64))
+
+                    if w_prior.size not in (x_CP.shape[0], x_CP.size):
+                        raise ValueError(f"orbit_weights length {w_prior.size} is neither C={x_CP.shape[0]} nor C*P={x_CP.size}.")
+
                     apply_component_softbox(
-                        x_CP,
-                        (w_full if w_full is not None else np.asarray(orbit_weights, np.float64)),
-                        band=0.30, # start loose; you can tighten across epochs
-                        step=0.25, # gentle pull
-                        min_target=1e-10
+                        x_CP, w_prior, band=0.30, step=0.25, min_target=1e-10
                     )
 
                 if tracker is not None:

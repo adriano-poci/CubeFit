@@ -1119,48 +1119,82 @@ def compare_usage_to_orbit_weights(h5_path: str,
 
 # ------------------------------------------------------------------------------
 
-# CubeFit/cube_utils.py
-import numpy as np
+def apply_component_softbox(
+    x_cp: np.ndarray,
+    w_c: np.ndarray,
+    *,
+    band: float = 0.30,
+    step: float = 0.25,
+    min_target: float = 1e-10,
+) -> None:
+    """
+    Softly pull per-component usage s_c = sum_p x[c,p] toward a target
+    proportional to the prior weights w_c, within a (1±band) tube.
+    In-place, O(C·P). Accepts w_c of length C or C*P.
 
-def apply_component_softbox(x_cp: np.ndarray,
-                            w_c: np.ndarray,
-                            band: float = 0.30,
-                            step: float = 0.25,
-                            min_target: float = 1e-10) -> None:
+    Parameters
+    ----------
+    x_cp : (C,P) float
+        Current component×population weights (modified in place).
+    w_c : (C,) or (C*P,) float
+        Component priors. If length C*P, they are summed over P → (C,).
+    band : float
+        Allowed relative deviation around target (e.g. 0.30 → ±30%).
+    step : float
+        Relaxation fraction toward the band edge per call (0..1).
+    min_target : float
+        Floor for targets to avoid division-by-zero.
     """
-    Enforce a soft band on row sums s_c = sum_p x[c,p] around targets
-    t_c = (w_c / sum w_c) * sum(x_cp). In-place, pure NumPy.
-    """
-    x = np.asarray(x_cp, np.float64, order="C")
-    w = np.asarray(w_c,  np.float64).ravel()
+    x = np.asarray(x_cp, dtype=np.float64, order="C")
+    if x.ndim != 2:
+        raise ValueError(f"x_cp must be 2-D (C,P); got shape {x.shape}.")
     C, P = x.shape
 
-    w_sum = np.sum(w)
-    if w_sum <= 0.0:
+    w = np.asarray(w_c, dtype=np.float64).ravel(order="C")
+    if w.size == C:
+        wC = w
+    elif w.size == C * P:
+        wC = w.reshape(C, P).sum(axis=1)
+    else:
+        raise ValueError(f"w_c length {w.size} incompatible with C={C}, P={P}.")
+
+    w_sum = np.sum(wC)
+    if not np.isfinite(w_sum) or w_sum <= 0.0:
+        return  # nothing to do
+
+    # Targets proportional to priors, matched to total mass in x
+    total = np.sum(x)
+    if not np.isfinite(total) or total <= 0.0:
         return
-    w_norm = w / w_sum
-    total  = np.sum(x)
-    t = np.maximum(min_target, w_norm * total)     # (C,)
 
-    s = np.sum(x, axis=1)                          # (C,)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        # exact factor to map s->t (used only at the band edges)
-        f_exact = np.where(s > 0.0, t / s, 1.0)
+    w_norm = wC / np.maximum(w_sum, 1.0e-300)         # (C,)
+    t = np.maximum(min_target, w_norm * total)        # (C,)
+    s = np.sum(x, axis=1)                             # (C,)
 
+    # Tube bounds and which rows violate
     lo = (1.0 - band)
     hi = (1.0 + band)
+    too_high = s > (hi * t)
+    too_low  = s < (lo * t)
+    need = (too_high | too_low)
+    if not np.any(need):
+        return
 
-    too_high = (s > hi * t)
-    too_low  = (s < lo * t)
+    # Scale factors (smooth pull toward tube edges)
+    f = np.ones(C, dtype=np.float64)
+    s_safe = np.maximum(s, min_target)
 
-    # fractionally move toward the band boundary
-    f = np.ones(C, np.float64)
-    if np.any(too_high):
-        f[too_high] = (1.0 - step) + step * (hi * t[too_high] / np.maximum(s[too_high], min_target))
-    if np.any(too_low):
-        f[too_low]  = (1.0 - step) + step * (lo * t[too_low] / np.maximum(s[too_low],  min_target))
+    # map s -> hi*t for high violators; s -> lo*t for low violators
+    # blend with (1-step) to avoid shocks
+    f_hi = (hi * t) / s_safe
+    f_lo = (lo * t) / s_safe
 
-    x *= f[:, None]
-    np.maximum(x, 0.0, out=x)
+    f[too_high] = (1.0 - step) + step * f_hi[too_high]
+    f[too_low]  = (1.0 - step) + step * f_lo[too_low]
+
+    # Apply only to rows that need adjustment
+    idx = np.flatnonzero(need)
+    x[idx, :] *= f[idx, None]
+    np.maximum(x[idx, :], 0.0, out=x[idx, :])  # keep nonnegativity
 
 # ------------------------------------------------------------------------------
