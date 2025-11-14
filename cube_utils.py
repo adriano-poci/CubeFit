@@ -1118,3 +1118,49 @@ def compare_usage_to_orbit_weights(h5_path: str,
     return out
 
 # ------------------------------------------------------------------------------
+
+# CubeFit/cube_utils.py
+import numpy as np
+
+def apply_component_softbox(x_cp: np.ndarray,
+                            w_c: np.ndarray,
+                            band: float = 0.30,
+                            step: float = 0.25,
+                            min_target: float = 1e-10) -> None:
+    """
+    Enforce a soft band on row sums s_c = sum_p x[c,p] around targets
+    t_c = (w_c / sum w_c) * sum(x_cp). In-place, pure NumPy.
+    """
+    x = np.asarray(x_cp, np.float64, order="C")
+    w = np.asarray(w_c,  np.float64).ravel()
+    C, P = x.shape
+
+    w_sum = np.sum(w)
+    if w_sum <= 0.0:
+        return
+    w_norm = w / w_sum
+    total  = np.sum(x)
+    t = np.maximum(min_target, w_norm * total)     # (C,)
+
+    s = np.sum(x, axis=1)                          # (C,)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # exact factor to map s->t (used only at the band edges)
+        f_exact = np.where(s > 0.0, t / s, 1.0)
+
+    lo = (1.0 - band)
+    hi = (1.0 + band)
+
+    too_high = (s > hi * t)
+    too_low  = (s < lo * t)
+
+    # fractionally move toward the band boundary
+    f = np.ones(C, np.float64)
+    if np.any(too_high):
+        f[too_high] = (1.0 - step) + step * (hi * t[too_high] / np.maximum(s[too_high], min_target))
+    if np.any(too_low):
+        f[too_low]  = (1.0 - step) + step * (lo * t[too_low] / np.maximum(s[too_low],  min_target))
+
+    x *= f[:, None]
+    np.maximum(x, 0.0, out=x)
+
+# ------------------------------------------------------------------------------

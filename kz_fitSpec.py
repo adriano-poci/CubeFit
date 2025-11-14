@@ -547,10 +547,10 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     #####################################
     RC = cu.RatioCfg(
         anchor="target",  # pull toward /CompWeights
-        eta=1.0,          # strength
-        gamma=1.2,        # slightly superlinear
+        eta=0.6,          # strength
+        gamma=2.0,        # slightly superlinear
         prob=1.0,         # apply every tile
-        batch=0,          # all pairs
+        batch=2,          
         minw=1e-4         # ignore components with ~zero target weight
     )
     x_global, stats = runner.solve_all_mp_batched(
