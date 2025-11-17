@@ -547,15 +547,15 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     #####################################
     RC = cu.RatioCfg(
         anchor="target",  # pull toward /CompWeights
-        eta=0.6,          # strength
+        eta=0.8,          # strength
         gamma=2.0,        # slightly superlinear
         prob=1.0,         # apply every tile
-        batch=2,          
+        batch=0,          
         minw=1e-4         # ignore components with ~zero target weight
     )
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=1,
-        lr=0.01,
+        epochs=4,
+        lr=0.0075,
         project_nonneg=True,
         # orbit_weights=None,     # or None for “free” fit
         orbit_weights=cWeights,
@@ -981,6 +981,191 @@ def reconstruct_model_cube_single(h5_path: str,
                 f.flush()
             except Exception:
                 pass
+            sys.stdout.flush()
+            trim_heap()
+
+        pbar.close()
+
+# ------------------------------------------------------------------------------
+
+def reconstruct_modelcube_fast(
+    h5_path: str,
+    x_cp: np.ndarray,
+    out_dset: str = "/ModelCube",
+    s_chunk: int | None = None,
+    l_band: int | None = None,
+    use_sparse: bool = True,
+    out_dtype: str = "float64",
+    rdcc_slots: int = 1_000_003,
+    rdcc_bytes: int = 512 * 1024**2,
+    rdcc_w0: float = 0.90,
+) -> None:
+    """
+    Reconstruct /ModelCube = sum_{c,p} X[c,p] * models[s,c,p,λ] efficiently,
+    using a single writer handle (read + write) to avoid HDF5 lock thrashing.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the CubeFit HDF5 file.
+    x_cp : ndarray
+        Solution weights as shape (C, P) or flat (C*P,).
+    out_dset : str, optional
+        Destination dataset name. Default is "/ModelCube".
+    s_chunk : int or None, optional
+        Spatial tile size. If None, uses models' S chunk on disk.
+    l_band : int or None, optional
+        Wavelength band size. If None, uses models' λ chunk on disk.
+    use_sparse : bool, optional
+        If True, skip zero populations per component. Default True.
+    out_dtype : {"float64","float32"}, optional
+        Output dtype (math is accumulated in float64). Default "float64".
+    rdcc_slots, rdcc_bytes, rdcc_w0 : int, int, float
+        HDF5 raw chunk cache knobs for faster streaming.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    RuntimeError
+        If required datasets are missing or incompatible.
+    ValueError
+        If `x_cp` cannot be reshaped to (C, P).
+
+    Examples
+    --------
+    >>> reconstruct_modelcube_fast(h5_path, x_global)
+    """
+    # Keep tqdm visible on HPC logs
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # py3.7+
+    except Exception:
+        pass
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+    # Helper: return free heap to OS (keeps RSS flat during long loops)
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        def trim_heap(): libc.malloc_trim(0)
+    except Exception:
+        def trim_heap(): pass
+
+    want_dtype = np.float64 if str(out_dtype) == "float64" else np.float32
+
+    # Single writer handle: read models + write ModelCube with the same file
+    with open_h5(h5_path, role="writer") as f:
+        if "/HyperCube/models" not in f:
+            raise RuntimeError("No /HyperCube/models; build the HyperCube first.")
+
+        M = f["/HyperCube/models"]           # (S, C, P, L) f32 on disk
+        try:
+            M.id.set_chunk_cache(int(rdcc_slots), int(rdcc_bytes), float(rdcc_w0))
+        except Exception:
+            pass
+
+        if M.ndim != 4:
+            raise RuntimeError(f"Unexpected /HyperCube/models rank {M.ndim}")
+        S, C, P, L = map(int, M.shape)
+
+        # Choose tile sizes aligned to on-disk chunking unless overridden
+        m_chunks = M.chunks or (S, 1, P, L)
+        S_chunk_file, _, _, L_chunk_file = map(int, m_chunks)
+        S_blk  = S_chunk_file if s_chunk is None else int(s_chunk)
+        L_band = L_chunk_file if l_band is None else int(l_band)
+        S_blk  = max(1, min(S_blk,  S))   # clamp
+        L_band = max(1, min(L_band, L))   # clamp
+
+        # Prepare /ModelCube with compatibility check (shape/dtype/chunks)
+        ds = f.get(out_dset, None)
+        if ds is not None:
+            ok = (tuple(ds.shape) == (S, L) and str(ds.dtype) == str(want_dtype))
+            ch = getattr(ds, "chunks", None)
+            if ch is None or tuple(ch) != (S_blk, L_band):
+                ok = False
+            if not ok:
+                del f[out_dset]
+                ds = None
+        if ds is None:
+            ds = f.create_dataset(
+                out_dset,
+                shape=(S, L),
+                dtype=want_dtype,
+                chunks=(S_blk, L_band),
+                compression=None,
+                shuffle=False,
+            )
+        out = ds  # alias
+
+        # Accept (C,P) or flat (C*P,)
+        x_in = np.asarray(x_cp, np.float64).ravel(order="C")
+        if x_in.size != C * P:
+            raise ValueError(f"x_cp length {x_in.size} != C*P={C*P}")
+        x_cp = np.ascontiguousarray(x_in.reshape(C, P), dtype=np.float64)
+
+        # Optional sparse speedup: precompute nonzeros per component
+        nz_per_c = None
+        if use_sparse:
+            nz_per_c = [np.flatnonzero(x_cp[c, :] != 0.0) for c in range(C)]
+
+        # Progress
+        n_tiles = math.ceil(S / S_blk) * math.ceil(L / L_band)
+        pbar = tqdm(total=n_tiles, desc="[Reconstruct]", mininterval=2.0)
+        pbar.refresh(); sys.stdout.flush()
+
+        # Main loops: S tiles × λ bands; accumulate per component in f64
+        for s0 in range(0, S, S_blk):
+            s1 = min(S, s0 + S_blk)
+            dS = s1 - s0
+
+            # Reset accumulator for this S-tile (full λ span)
+            Y_tile = np.zeros((dS, L), dtype=np.float64, order="C")
+
+            for l0 in range(0, L, L_band):
+                l1 = min(L, l0 + L_band)
+
+                # Accumulate this λ band
+                band = np.zeros((dS, l1 - l0), dtype=np.float64, order="C")
+
+                for c in range(C):
+                    if use_sparse:
+                        nz = nz_per_c[c]
+                        if nz.size == 0:
+                            continue
+                        w = x_cp[c, nz]  # (P_sub,)
+                        A_c = np.asarray(
+                            M[s0:s1, c, nz, l0:l1], dtype=np.float32, order="C"
+                        )
+                    else:
+                        w = x_cp[c, :]    # (P,)
+                        A_c = np.asarray(
+                            M[s0:s1, c, :, l0:l1], dtype=np.float32, order="C"
+                        )
+
+                    # y += sum_p w[p] * A[:, p, :]
+                    band += np.tensordot(
+                        w.astype(np.float64, copy=False),
+                        A_c.astype(np.float64, copy=False),
+                        axes=(0, 1),
+                    )
+
+                # Drop the band into the tile buffer
+                Y_tile[:, l0:l1] += band
+
+                # Progress per band
+                pbar.update(1)
+                pbar.refresh()
+                sys.stdout.flush()
+
+            # Commit the finished S-tile
+            out[s0:s1, :] = Y_tile.astype(want_dtype, copy=False)
+
+            # SWMR-friendly: expose new data; keep UI responsive
+            try: out.id.flush()
+            except Exception: pass
+            try: f.flush()
+            except Exception: pass
             sys.stdout.flush()
             trim_heap()
 
@@ -1495,11 +1680,12 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         logger.log("[ModelCube] Skipping reconstruction.")
     else:
         logger.log("[ModelCube] Reconstructing…")
-        reconstruct_model_cube_single(  # or your parallel version
+        # reconstruct_model_cube_single(  # or your parallel version
+        reconstruct_modelcube_fast(
             h5_path=str(hdf5Path),
-            x_global=x_global,
-            array_name="ModelCube",
-            blas_threads=nProcs,
+            x_cp=x_global,
+            # array_name="ModelCube",
+            # blas_threads=nProcs,
         )
         # Stamp digest so future runs can skip confidently
         try:
@@ -1509,7 +1695,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 ds.attrs["x_digest"] = xdig
                 ds.attrs["x_shape"]  = np.asarray(x_global).shape
                 ds.attrs["dtype_math"] = "float64"
-                ds.attrs["generator"] = "reconstruct_model_cube_single"
+                ds.attrs["generator"] = "reconstruct_modelcube_fast"
         except Exception as e:
             logger.log(f"[ModelCube] Warning: could not stamp digest ({e})")
 

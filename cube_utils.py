@@ -1088,14 +1088,13 @@ def compare_usage_to_orbit_weights(h5_path: str,
         idx = np.arange(C, dtype=int)
         ax.bar(idx, usage, width=0.8, alpha=0.85, label="usage (sum over P)")
         ax.plot(idx, weights, marker="o", linestyle="--", label="target w_c")
-        mx = np.max(np.stack([usage, weights], axis=0)) if C > 0 else 1.0
+        mx = np.max(weights) if C > 0 else 1.0
         ax.set_ylim(0.0, float(1.05 * mx))
         ax.set_xlabel("component c")
         ax.set_ylabel("normalized weight")
         ax.set_title(f"component usage vs target  L1={l1:.3g}  L∞={linf:.3g}  "
                      f"cos={cosine:.3f}  r={pearson_r:.3f}")
         ax.legend(loc="best", fontsize=8)
-        fig.tight_layout()
         fig.savefig(out_png, dpi=140)
         plt.close(fig)
         plot_path = out_png
@@ -1196,5 +1195,58 @@ def apply_component_softbox(
     idx = np.flatnonzero(need)
     x[idx, :] *= f[idx, None]
     np.maximum(x[idx, :], 0.0, out=x[idx, :])  # keep nonnegativity
+
+# ------------------------------------------------------------------------------
+
+def apply_component_softbox_energy(
+    x_cp: np.ndarray,
+    E_cp: np.ndarray,          # read_global_column_energy(h5_path) → (C,P) f64
+    w_c: np.ndarray,           # /CompWeights: len C or C*P
+    *,
+    band: float = 0.30,        # allowed deviation band ±30%
+    step: float = 0.20,        # fraction of the way to the band boundary
+    min_target: float = 1e-10,
+) -> None:
+    x = np.asarray(x_cp, np.float64, order="C")
+    E = np.asarray(E_cp, np.float64, order="C")
+    C, P = x.shape
+    if E.shape != (C, P):
+        raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C,P)}")
+
+    w = np.asarray(w_c, np.float64).ravel(order="C")
+    if w.size == C:
+        t = w
+    elif w.size == C * P:
+        t = w.reshape(C, P).sum(axis=1)
+    else:
+        raise ValueError(f"w_c length {w.size} incompatible with C={C}, P={P}.")
+
+    # energy-weighted usage per component (proportional to flux)
+    s = np.sum(x * E, axis=1)                       # (C,)
+
+    # normalize target & usage
+    t = np.maximum(t, min_target)
+    t = t / np.sum(t)
+    s_sum = np.sum(s)
+    if not np.isfinite(s_sum) or s_sum <= 0.0:
+        return
+    s = s / s_sum
+
+    lo = (1.0 - float(band))
+    hi = (1.0 + float(band))
+
+    # Pull back toward the nearest band edge with a convex blend
+    over = s > (hi * t)
+    under = s < (lo * t)
+    if np.any(over):
+        f_over = (hi * t[over]) / s[over]                     # exact factor to land on upper edge
+        alpha_over = (1.0 - step) + step * f_over             # partial move
+        x[over, :] *= alpha_over[:, None]
+    if np.any(under):
+        f_under = (lo * t[under]) / s[under]                  # exact factor to land on lower edge
+        alpha_under = (1.0 - step) + step * f_under
+        x[under, :] *= alpha_under[:, None]
+
+    np.maximum(x, 0.0, out=x)  # keep nonnegativity
 
 # ------------------------------------------------------------------------------

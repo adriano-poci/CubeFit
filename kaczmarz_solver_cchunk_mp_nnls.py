@@ -23,7 +23,7 @@ from CubeFit.hdf5_manager import open_h5
 from CubeFit.hypercube_builder import read_global_column_energy
 from CubeFit.cube_utils import (
     read_lambda_weights, ensure_lambda_weights, _get_mask, RatioCfg,
-    apply_component_softbox
+    apply_component_softbox_energy
 )
 
 # ----------------------------- Config ---------------------------------
@@ -391,6 +391,66 @@ def _worker_tile_job_with_R(args):
 
 # ------------------------------------------------------------------------------
 
+def _canon_orbit_weights(h5_path: str,
+                         orbit_weights,
+                         C: int,
+                         P: int) -> np.ndarray | None:
+    """
+    Return a (C,) float64 prior vector for components, or None if unavailable.
+    Accepts:
+      - orbit_weights == None: try reading '/CompWeights' from HDF5.
+      - orbit_weights shape == (C,): use as-is.
+      - orbit_weights shape == (C*P,): sum over populations -> (C,).
+    Raises if a provided vector has incompatible size.
+    """
+    w = None
+    if orbit_weights is not None:
+        w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
+    else:
+        with open_h5(h5_path, role="reader") as f:
+            if "/CompWeights" in f:
+                w = np.asarray(f["/CompWeights"][...], dtype=np.float64).ravel(order="C")
+            else:
+                return None  # no prior available
+
+    if w.size == C:
+        pass
+    elif w.size == C * P:
+        w = w.reshape(C, P).sum(axis=1)
+    else:
+        raise ValueError(f"orbit_weights length {w.size} incompatible with C={C}, P={P}. "
+                         f"Expected C or C*P.")
+    # normalize to a comparable scale (optional, keeps magnitudes sane)
+    s = np.sum(w)
+    if np.isfinite(s) and s > 0.0:
+        w = w / s
+    return w
+
+# ------------------------------------------------------------------------------
+
+def softbox_params_smooth(eq: int, E: int) -> tuple[float, float]:
+    """
+    Cosine ramp starting at epoch 2 (1-based):
+      eq = 1 → (band, step) = (0.30, 0.20)
+      eq = E → (band, step) = (0.15, 0.30)
+      2..E ramps smoothly between the two.
+    """
+    eq = int(eq)
+    E  = int(max(2, E))
+
+    if eq <= 1:
+        return 0.30, 0.20
+
+    # t=0 at eq=2, t=1 at eq=E
+    t = np.clip((eq - 2) / max(1, (E - 2)), 0.0, 1.0)
+    s = 0.5 - 0.5 * np.cos(np.pi * t)
+
+    band = (1.0 - s) * 0.30 + s * 0.15   # 0.30 → 0.15
+    step = (1.0 - s) * 0.20 + s * 0.30   # 0.20 → 0.30
+    return float(band), float(step)
+
+# ------------------------------------------------------------------------------
+
 def solve_global_kaczmarz_cchunk_mp(
     h5_path: str,
     cfg: MPConfig,
@@ -483,23 +543,10 @@ def solve_global_kaczmarz_cchunk_mp(
             norms.append(float(np.linalg.norm(Yt)))
             Y_glob_norm2 += float(np.sum(Yt * Yt))
         
-    # --- Persist orbit_weights and push into tracker (MP path) ---
-    if orbit_weights is not None:
-        w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
-        if w.size not in (C, C * P):
-            raise ValueError(
-                f"orbit_weights length must be C ({C}) or C*P ({C*P}); got {w.size}."
-            )
-        if w.size == C * P:
-            w = w.reshape(C, P, order="C").sum(axis=1)  # reduce to component level
-
-        # unit-sum normalize (shape comparison friendly)
-        s = float(np.sum(w))
-        w = (w / np.maximum(s, 1.0e-30)) if s > 0.0 else np.zeros_like(w)
-
-        # hand to tracker so UIs can show the target distribution
-        if tracker is not None:
-            tracker.set_orbit_weights(w)
+    # --- Persist orbit_weights and push into tracker ---
+    w_prior = _canon_orbit_weights(h5_path, orbit_weights, C, P)
+    if (w_prior is not None) and (tracker is not None) and hasattr(tracker, "set_orbit_weights"):
+        tracker.set_orbit_weights(w_prior)  # this mirrors your SP path behavior
 
     s_ranges = [sr for _, sr in sorted(
         zip(norms, s_ranges), key=lambda t: -t[0]
@@ -509,7 +556,7 @@ def solve_global_kaczmarz_cchunk_mp(
     # ------------------- global column energy & knobs -----------------
     E_global = read_global_column_energy(h5_path)  # (C,P) float64
     tau_global = float(os.environ.get("CUBEFIT_GLOBAL_TAU", "0.5"))
-    beta_blend = float(os.environ.get("CUBEFIT_GLOBAL_ENERGY_BLEND", "1e-3"))
+    beta_blend = float(os.environ.get("CUBEFIT_GLOBAL_ENERGY_BLEND", "1e-2"))
 
     # ------------------- x init --------------------------------------
     if x0 is None:
@@ -855,7 +902,7 @@ def solve_global_kaczmarz_cchunk_mp(
                     os.environ.get("CUBEFIT_NNLS_MAX_ITER", "200")
                 )
                 nnls_min_improve = float(
-                    os.environ.get("CUBEFIT_NNLS_MIN_IMPROVE", "0.999")
+                    os.environ.get("CUBEFIT_NNLS_MIN_IMPROVE", "0.9995")
                 )
                 nnls_l2 = float(os.environ.get("CUBEFIT_NNLS_L2", "0.0"))
 
@@ -1043,19 +1090,6 @@ def solve_global_kaczmarz_cchunk_mp(
 
                 # ---------- end NNLS polish ----------
 
-                # ---------- optional soft box on component usage ----------
-                if orbit_weights is not None:
-                    # use the same priors you passed in; if you normalized them earlier, reuse that
-                    w_prior = (w_full if w_full is not None
-                            else np.asarray(orbit_weights, dtype=np.float64))
-
-                    if w_prior.size not in (x_CP.shape[0], x_CP.size):
-                        raise ValueError(f"orbit_weights length {w_prior.size} is neither C={x_CP.shape[0]} nor C*P={x_CP.size}.")
-
-                    apply_component_softbox(
-                        x_CP, w_prior, band=0.30, step=0.25, min_target=1e-10
-                    )
-
                 if tracker is not None:
                     tracker.on_progress(
                         epoch=ep + 1,
@@ -1070,6 +1104,26 @@ def solve_global_kaczmarz_cchunk_mp(
                 pbar.refresh()
 
             pbar.close()
+
+            if w_prior is not None:
+                t0_sb = time.perf_counter()
+
+                orbBand, orbStep = softbox_params_smooth(eq=ep, E=cfg.epochs)
+                apply_component_softbox_energy(
+                    x_CP, E_global,
+                    (orbit_weights if orbit_weights is not None else np.ones(x_CP.shape[0])),
+                    band=float(orbBand), step=float(orbStep), min_target=1e-10
+                )
+                # apply_component_softbox(
+                #     x_CP,
+                #     w_prior, # (C,)
+                #     band=orbBand, step=orbStep,
+                #     # start loose; tighten across epochs
+                #     # band=0.30→0.10, step=0.20→0.30 over 3-4 epochs
+                #     min_target=1e-10
+                # )
+                dt_sb = time.perf_counter() - t0_sb
+                print(f"[softbox] epoch {ep+1}: took {dt_sb:.3f}s", flush=True)
 
             print(f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs} snapshotting...",
                   flush=True)
@@ -1117,7 +1171,7 @@ def probe_kaczmarz_tile(
     rel_zero   = float(os.environ.get("CUBEFIT_ZERO_COL_REL", "1e-12"))
     abs_zero   = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-24"))
     tau_global = float(os.environ.get("CUBEFIT_GLOBAL_TAU", "0.5"))
-    beta_blend = float(os.environ.get("CUBEFIT_GLOBAL_ENERGY_BLEND", "1e-3"))
+    beta_blend = float(os.environ.get("CUBEFIT_GLOBAL_ENERGY_BLEND", "1e-2"))
 
     with h5py.File(h5_path, "r") as f:
         M  = f["/HyperCube/models"]  # (S,C,P,L)

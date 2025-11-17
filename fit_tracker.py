@@ -212,8 +212,20 @@ def _writer_main(h5_path: str, cfg: TrackerConfig, rx: MPQueue) -> None:
                     dp.resize((n+1, 4)); dp[n, :] = (epoch, np.nan, np.nan, np.nan)
                     pending += 1
 
-                elif op in ("save_x", "x_snapshot"):
-                    _save_x(np.asarray(msg["x"], np.float64), float(msg.get("epoch", -1)), float(msg.get("rmse", np.nan)))
+                elif op == "save_x":
+                    _save_x(
+                        np.asarray(msg["x"], np.float64),
+                        float(msg.get("epoch", -1)),
+                        float(msg.get("rmse", np.nan)),
+                    )
+                    pending += 1
+
+                elif op == "x_snapshot":
+                    _append_x(
+                        np.asarray(msg["x"], np.float32),
+                        msg.get("epoch"),
+                        msg.get("rmse"),
+                    )
                     pending += 1
 
                 # batch/interval flush
