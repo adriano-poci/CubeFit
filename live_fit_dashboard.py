@@ -538,7 +538,6 @@ def render_aperture_fits(h5_path: str, out_png: str,
 
 # -----------------------------------------------------------------------------
 
-
 def main():
     ap = argparse.ArgumentParser(
         description="Render live Kaczmarz fit dashboard (new sidecar or legacy) "
@@ -583,3 +582,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ipython -- /data/phys-gal-dynamics/phys2603/CubeFit/live_fit_dashboard.py /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/NGC4365_00.h5 --out /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/fit_live.png --apertures 0,2000,1400,740 --apertures-separate-dir /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/apertures/
