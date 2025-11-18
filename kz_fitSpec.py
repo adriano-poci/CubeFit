@@ -563,7 +563,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         blas_threads=12,            # 12 BLAS threads each → 48 total
         reader_s_tile=128,          # match /HyperCube/models chunking on S
         verbose=True,
-        warm_start='resume',  # 'zeros', 'resume', 'jacobi',
+        warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=24, L_sub=1200, K_cols=768, per_comp_cap=24),
         ratio_cfg=RC,
     )
@@ -1709,6 +1709,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     resid = (data_cube - model_cube)[:, mask_arr]
     rchi2 = np.sqrt((resid * resid).mean(axis=1))
 
+    breakpoint()  # debugging hook
     plt.figure(figsize=(6, 4))
     plt.hist(rchi2, bins=40, alpha=0.7)
     plt.xlabel(r"${\rm Norm}/\sqrt{N_{\rm pix}}$")

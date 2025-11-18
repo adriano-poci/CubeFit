@@ -873,11 +873,32 @@ def solve_global_kaczmarz_cchunk_mp(
                         alpha *= float(cap / np.max((1e-12, global_step_norm)))
 
                 # ----------------- apply α ONCE to x and R -------------------
+                # ----------------- APPLY α (NaN-hardened) -----------------
+                # If backtracking produced nonsense, neutralize it.
+                if not np.isfinite(alpha):
+                    alpha = 0.0
+
+                # R update: sanitize the aggregated residual step if needed.
+                if not np.all(np.isfinite(R_delta_agg)):
+                    R_delta_agg = np.nan_to_num(
+                        R_delta_agg, nan=0.0, posinf=0.0, neginf=0.0
+                    )
+
                 R += alpha * R_delta_agg
+
+                # x updates: sanitize each band’s dx before applying.
                 for (c, dx_c) in band_updates:
+                    if not np.all(np.isfinite(dx_c)):
+                        # Zero-out any NaN/Inf in the step; keep shape, no copy.
+                        dx_c = np.nan_to_num(dx_c, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
                     x_CP[c, :] += alpha * dx_c
                     if cfg.project_nonneg:
                         np.maximum(x_CP[c, :], 0.0, out=x_CP[c, :])
+
+                # Safety net: if any NaNs still leaked into x_CP, zero them.
+                if not np.all(np.isfinite(x_CP)):
+                    bad = ~np.isfinite(x_CP)
+                    x_CP[bad] = 0.0
 
                 # ---------- optional ratio penalty --------------------------
                 if have_ratio and (t_norm is not None) and ((tile_idx % rc.tile_every) == 0):
@@ -1142,6 +1163,8 @@ def solve_global_kaczmarz_cchunk_mp(
                   f"done.", flush=True)
 
         elapsed = time.perf_counter() - t0
+
+        np.nan_to_num(x_CP, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
         return x_CP.ravel(order="C"), dict(epochs=cfg.epochs,
                                            elapsed_sec=elapsed)
     finally:

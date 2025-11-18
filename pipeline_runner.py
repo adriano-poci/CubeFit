@@ -50,6 +50,8 @@ from CubeFit.kaczmarz_solver_cchunk_mp_nnls import (
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
 )
+from CubeFit.nnls_patch import run_patch as _nnls_patch_run,\
+    apply_orbit_prior_to_seed
 from CubeFit.fit_tracker import FitTracker, NullTracker, TrackerConfig
 import CubeFit.cube_utils as cu
 from CubeFit.cube_utils import RatioCfg
@@ -551,14 +553,6 @@ class PipelineRunner:
         elif warm_start == "nnls":
             if verbose:
                 logger.log("[Pipeline] Warm-start mode: nnls_patch seed (exact semantics)")
-            try:
-                # Import the exact implementation
-                from CubeFit.nnls_patch import run_patch as _nnls_patch_run
-            except Exception as e:
-                raise RuntimeError(
-                    "Could not import CubeFit.nnls_patch. Make sure nnls_patch.py "
-                    "is inside the CubeFit package (importable) or adjust PYTHONPATH."
-                ) from e
 
             # Mirror nnls_patch defaults: mask+lambda on, nnls solver, normalized columns, zero ridge
             res = _nnls_patch_run(
@@ -577,6 +571,11 @@ class PipelineRunner:
                 normalize_columns=True,
             )
             Xcp = np.asarray(res["x_CP"], np.float64, order="C")
+            # If you have a prior, enforce it on the seed:
+            if orbit_weights is not None:
+                Xcp = apply_orbit_prior_to_seed(Xcp, orbit_weights,
+                                                preserve_total=True, min_w_frac=1e-4)
+
             x0_effective = Xcp.ravel(order="C")
             if verbose:
                 meta = res.get("meta", {})
@@ -795,14 +794,6 @@ class PipelineRunner:
         elif warm_start == "nnls":
             if verbose:
                 logger.log("[Pipeline] Warm-start mode: nnls_patch seed (exact semantics)")
-            try:
-                # Import the exact implementation
-                from CubeFit.nnls_patch import run_patch as _nnls_patch_run
-            except Exception as e:
-                raise RuntimeError(
-                    "Could not import CubeFit.nnls_patch. Make sure nnls_patch.py "
-                    "is inside the CubeFit package (importable) or adjust PYTHONPATH."
-                ) from e
 
             # Mirror nnls_patch defaults: mask+lambda on, nnls solver, normalized columns, zero ridge
             res = _nnls_patch_run(
@@ -816,11 +807,16 @@ class PipelineRunner:
                 use_lambda=True,
                 lam_dset="/HyperCube/lambda_weights",
                 out_dir=plp.Path(self.h5_path).parent,
-                write_seed=False,
+                write_seed=bool((seed_cfg or {}).get("write_seed", True)),
                 seed_path="/Seeds/x0_nnls_patch",
                 normalize_columns=True,
             )
             Xcp = np.asarray(res["x_CP"], np.float64, order="C")
+            # If you have a prior, enforce it on the seed:
+            if orbit_weights is not None:
+                Xcp = apply_orbit_prior_to_seed(Xcp, orbit_weights,
+                                                preserve_total=True, min_w_frac=1e-4)
+
             x0_effective = Xcp.ravel(order="C")
             if verbose:
                 meta = res.get("meta", {})
