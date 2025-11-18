@@ -8,7 +8,8 @@ import argparse
 
 from CubeFit.hdf5_manager import open_h5
 from CubeFit.hypercube_builder import read_global_column_energy
-from CubeFit.cube_utils import read_lambda_weights, ensure_lambda_weights
+from CubeFit.cube_utils import read_lambda_weights, ensure_lambda_weights,\
+    compare_usage_to_orbit_weights
 
 # ----------------------------- helpers ---------------------------------
 
@@ -202,6 +203,92 @@ def _global_nnls_workingset(Bw, yw, col_map,
     res_w = float(np.linalg.norm(Bw @ x - yw))
     print(f"[ws-NNLS] rounds={r+1} support={keep.size}/{K}  ||Bw x - yw||={res_w:.3g}")
     return x, keep
+
+# ------------------------------------------------------------------------------
+
+def apply_orbit_prior_to_seed(Xcp: np.ndarray,
+                              orbit_weights,
+                              *,
+                              preserve_total: bool = True,
+                              min_w_frac: float = 1e-4) -> np.ndarray:
+    """
+    Rescale rows of Xcp (C,P) so row sums follow orbit_weights fractions.
+
+    Parameters
+    ----------
+    Xcp : ndarray, shape (C, P)
+        Patch seed from nnls_patch (non-negative).
+    orbit_weights : array_like, shape (C,) or (C*P,)
+        Component weights (C) or per-pixel weights (C*P). Converted to
+        per-component fractions internally.
+    preserve_total : bool, optional
+        If True, keep sum(Xcp) unchanged after rescaling.
+    min_w_frac : float, optional
+        Components with prior fraction < min_w_frac are treated as 0 for
+        the anchor/active logic (but still allowed to keep their current
+        mass if present).
+
+    Returns
+    -------
+    Xcp_adj : ndarray, shape (C, P)
+        Rescaled seed with per-component proportions ≈ prior fractions.
+
+    Notes
+    -----
+    - If a component has zero mass but positive prior, a tiny uniform
+      mass is injected before scaling to avoid division by zero.
+    - Non-finite entries are treated as zeros.
+    """
+    X = np.nan_to_num(np.asarray(Xcp, np.float64),
+                      nan=0.0, posinf=0.0, neginf=0.0, copy=True)
+    if X.ndim != 2:
+        raise ValueError("Xcp must be 2-D (C,P).")
+    C, P = X.shape
+
+    w = np.asarray(orbit_weights, dtype=np.float64).ravel()
+    if w.size not in (C, C * P):
+        raise ValueError(f"orbit_weights has size {w.size}, expected {C} or {C*P}")
+    if w.size == C * P:
+        w = w.reshape(C, P).sum(axis=1)
+
+    w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+    tot = float(w.sum())
+    if tot <= 0.0:
+        return X  # no prior to enforce
+
+    # Target fractions in [0,1]
+    w_c = w / tot
+
+    s = X.sum(axis=1)  # current row sums
+    S = float(s.sum())
+
+    # Tiny mass for empty-yet-wanted components
+    want = (w_c >= min_w_frac * w_c.max())
+    need = (s <= 0.0) & (w_c > 0.0)
+    if np.any(need):
+        eps = 1e-12 * (S if S > 0 else 1.0)
+        X[need, :] = (eps / P)  # uniform sprinkle
+        s = X.sum(axis=1)
+        S = float(s.sum())
+
+    # Row scale factors so that s' ∝ w_c
+    eps_den = 1e-30
+    t = w_c / np.maximum(s, eps_den)
+
+    X *= t[:, None]
+
+    if preserve_total:
+        # Normalize to keep overall mass the same as before
+        Sp = float(X.sum())
+        if Sp > 0 and S > 0:
+            X *= (S / Sp)
+
+    # Project non-negativity and clean again
+    np.maximum(X, 0.0, out=X)
+    np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    return X
+
+# ------------------------------------------------------------------------------
 
 def _solve_nnls(Bw: np.ndarray, yw: np.ndarray, solver="nnls", max_iter=200, ridge=0.0,
                 normalize_columns: bool = True) -> np.ndarray:
@@ -590,6 +677,63 @@ def run_patch(h5_path: str,
             ds.attrs["solver"]     = str(solver)
             ds.attrs["ridge"]      = float(ridge)
             ds.attrs["norm.mode_at_fit"] = norm_mode
+    
+    usage_png = os.path.join(out_dir, "nnlsPatchUsage.png") if out_dir else None
+
+    metrics = None
+    if write_seed:
+        # If you're already saving the seed into the main HDF5, just point the comparator at it.
+        # nnls_patch writes to seed_path (default '/Seeds/x0_nnls_patch'). :contentReference[oaicite:2]{index=2}
+        try:
+            metrics = compare_usage_to_orbit_weights(
+                h5_path,
+                sidecar=None,
+                x_dset=seed_path, # e.g. "/Seeds/x0_nnls_patch"
+                normalize="unit_sum",
+                out_png=usage_png,
+            )
+        except Exception as e:
+            print(f"[nnls_patch] usage-vs-prior (seed) failed: {e}")
+
+    else:
+        import tempfile
+        # Not writing the seed? Make a tiny *temporary sidecar* with just x,
+        # so the comparator can read it. We store it under '/Fit/x_best'. :contentReference[oaicite:3]{index=3}
+        tmp_sidecar = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(prefix=os.path.basename(h5_path)+".fit.",
+                                            suffix=".h5", delete=False)
+            tmp_sidecar = tmp.name
+            tmp.close()
+
+            import h5py
+            with h5py.File(tmp_sidecar, "w") as G:
+                G.create_dataset("/Fit/x_best", data=x_CP.astype("f8"),
+                                dtype="f8", compression="gzip")
+
+            metrics = compare_usage_to_orbit_weights(
+                h5_path,
+                sidecar=tmp_sidecar,
+                x_dset="/Fit/x_best",
+                normalize="unit_sum",
+                out_png=usage_png,
+            )
+        except Exception as e:
+            print(f"[nnls_patch] usage-vs-prior (temp sidecar) failed: {e}")
+        finally:
+            if tmp_sidecar and os.path.exists(tmp_sidecar):
+                try: os.remove(tmp_sidecar)
+                except OSError: pass
+
+    if metrics is not None:
+        print(
+            "[nnls_patch] usage-vs-prior:"
+            f" L1={metrics.get('l1', float('nan')):.3e}"
+            f"  L∞={metrics.get('linf', float('nan')):.3e}"
+            f"  cos={metrics.get('cosine', float('nan')):.4f}"
+            f"  r={metrics.get('pearson_r', float('nan')):.4f}"
+            f"  plot={metrics.get('plot_path')}"
+        )
 
     return dict(
         x_CP=x_CP, picks=picks, s_idx=s_idx, rmse=rmse, chi2=chi2,

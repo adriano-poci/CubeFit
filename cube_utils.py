@@ -1086,8 +1086,10 @@ def compare_usage_to_orbit_weights(h5_path: str,
         fig = plt.figure(figsize=(9, 3.2))
         ax = fig.add_subplot(111)
         idx = np.arange(C, dtype=int)
-        ax.bar(idx, usage, width=0.8, alpha=0.85, label="usage (sum over P)")
-        ax.plot(idx, weights, marker="o", linestyle="--", label="target w_c")
+        ax.bar(idx, usage, width=0.8, alpha=0.85, label="usage (sum over P)",
+            color='r')
+        ax.plot(idx, weights, marker="o", linestyle="--", label="target w_c",
+            color='k')
         mx = np.max(weights) if C > 0 else 1.0
         ax.set_ylim(0.0, float(1.05 * mx))
         ax.set_xlabel("component c")
