@@ -658,6 +658,44 @@ def solve_global_kaczmarz_cchunk_mp(
             if cfg.project_nonneg:
                 np.maximum(x_mat, 0.0, out=x_mat)
 
+        def _ratio_project_epoch(x_mat: np.ndarray,
+                                t_vec: np.ndarray,
+                                *,
+                                eta: float = 1.0,
+                                gamma: float = 10.0,
+                                beta: float = 1.0,
+                                minw: float = 1e-6) -> None:
+            """
+            One global, mass-preserving multiplicative pass toward t_vec (Σ=1).
+            If beta<1, blends the projected state with the current one.
+            """
+            C, P = map(int, x_mat.shape)
+            s = np.sum(x_mat, axis=1)          # (C,)
+            S = float(np.sum(s))
+            if not np.isfinite(S) or S <= 0.0:
+                return
+            sh = s / max(S, 1.0)
+
+            # log-space factors, clipped
+            e = np.log(np.maximum(sh, minw)) - np.log(np.maximum(t_vec, minw))
+            F = np.exp(-eta * e)
+            F = np.clip(F, 1.0 / gamma, gamma)
+
+            denom = float(np.sum(sh * F))
+            if not np.isfinite(denom) or denom <= 0.0:
+                return
+            F /= max(denom, 1e-30)
+
+            Xp = x_mat * F[:, None]
+            if beta < 1.0:
+                x_mat *= (1.0 - beta)
+                x_mat += beta * Xp
+            else:
+                x_mat[:] = Xp
+
+            # keep ≥0
+            np.maximum(x_mat, 0.0, out=x_mat)
+
     # ------------------- bands & pool -------------------
     nprocs = np.max((1, int(cfg.processes)))
     band_size = math.ceil(C / nprocs)
@@ -922,10 +960,11 @@ def solve_global_kaczmarz_cchunk_mp(
                 nnls_max_iter = int(
                     os.environ.get("CUBEFIT_NNLS_MAX_ITER", "200")
                 )
-                nnls_min_improve = float(
-                    os.environ.get("CUBEFIT_NNLS_MIN_IMPROVE", "0.9995")
-                )
-                nnls_l2 = float(os.environ.get("CUBEFIT_NNLS_L2", "0.0"))
+                nnls_min_improve = float(os.environ.get("CUBEFIT_NNLS_MIN_IMPROVE", "0.9995"))
+                nnls_l2         = float(os.environ.get("CUBEFIT_NNLS_L2", "0.0"))
+                # allow a small worsening of ratio misfit when polishing (>=1 means allow)
+                # e.g. 1.02 allows up to +2% worse local ratio misfit; 1.00 = never worsen.
+                nnls_ratio_worsen = float(os.environ.get("CUBEFIT_NNLS_RATIO_WORSEN", "1.02"))
 
                 do_nnls = (
                     nnls_enable and ((tile_idx % nnls_every) == 0)
@@ -1083,31 +1122,53 @@ def solve_global_kaczmarz_cchunk_mp(
                             except Exception:
                                 xW_new = None
 
-                        # Commit only if it helped enough (weighted RMSE)
+                        # Commit only if we actually solved something and it helped enough
                         if xW_new is not None:
                             dxW = xW_new - xW
                             if np.any(dxW != 0.0):
+
+                                # --- Weighted RMSE accept criterion (unchanged) ---
                                 def _wrmse(vec_1d: np.ndarray) -> float:
                                     w2 = sqrt_w_rows * sqrt_w_rows
                                     num = float(np.dot(w2, vec_1d * vec_1d))
                                     den = float(np.sum(w2)) or 1.0
                                     return math.sqrt(num / den)
 
-                                r_after = r_sub - (B @ dxW)
+                                r_after = r_sub - (B @ dxW)   # NOTE: unweighted residual update
                                 rmse_before = _wrmse(r_sub)
-                                rmse_after2 = _wrmse(r_after)
+                                rmse_after  = _wrmse(r_after)
+                                ok_rmse = (rmse_after / max(1e-12, rmse_before)) < nnls_min_improve
 
-                                if (rmse_after2 / np.max((1e-12, rmse_before)))\
-                                        < nnls_min_improve:
+                                # --- ratio-drift guard vs global prior w_prior ---
+                                ok_ratio = True
+                                if have_ratio:
+                                    # totals before
+                                    s_before = x_CP.sum(axis=1)             # (C,)
+                                    S_b = float(np.sum(s_before))
+                                    if S_b > 0.0:
+                                        mix_b = s_before / S_b
+
+                                        # apply dxW only to the touched (c,p) indices
+                                        comp_of_j = (W_idx // P).astype(np.int64)
+                                        dS = np.zeros(C, dtype=np.float64)
+                                        np.add.at(dS, comp_of_j, dxW)
+
+                                        s_after = s_before + dS
+                                        S_a = float(np.sum(s_after))
+                                        if S_a > 0.0:
+                                            mix_a = s_after / S_a
+                                            # L1 deviation from target mixture w_prior
+                                            dev_b = float(np.sum(np.abs(mix_b - w_prior)))
+                                            dev_a = float(np.sum(np.abs(mix_a - w_prior)))
+                                            ok_ratio = (dev_a <= dev_b * nnls_ratio_worsen + 1e-18)
+
+                                if ok_rmse and ok_ratio:
+                                    # Commit to x_CP and to the *unweighted* residual R
                                     for j, g in enumerate(W_idx):
                                         cc = int(g // P); pp = int(g % P)
-                                        x_CP[cc, pp] = float(np.max((
-                                            0.0, x_CP[cc, pp] + dxW[j]
-                                        )))
-                                    # Update residual in the unweighted space
-                                    R[:, lam_sel] = r_after.reshape(
-                                        Sblk, lam_sel.size, order="C"
-                                    )
+                                        x_CP[cc, pp] = float(max(0.0, x_CP[cc, pp] + dxW[j]))
+                                    R[:, lam_sel] = r_after.reshape(Sblk, lam_sel.size, order="C")
+                                # else: reject this NNLS polish
 
                 # ---------- end NNLS polish ----------
 
@@ -1128,21 +1189,28 @@ def solve_global_kaczmarz_cchunk_mp(
 
             if w_prior is not None:
                 t0_sb = time.perf_counter()
-
                 orbBand, orbStep = softbox_params_smooth(eq=ep, E=cfg.epochs)
                 apply_component_softbox_energy(
                     x_CP, E_global,
                     (orbit_weights if orbit_weights is not None else np.ones(x_CP.shape[0])),
                     band=float(orbBand), step=float(orbStep), min_target=1e-10
                 )
-                # apply_component_softbox(
-                #     x_CP,
-                #     w_prior, # (C,)
-                #     band=orbBand, step=orbStep,
-                #     # start loose; tighten across epochs
-                #     # band=0.30→0.10, step=0.20→0.30 over 3-4 epochs
-                #     min_target=1e-10
-                # )
+
+            # global, mass-preserving projection of row sums toward the prior
+            if have_ratio and rc.epoch_project:
+                # choose the target mixture used elsewhere in the solver
+                t_vec = (t_x0 if (rc.anchor == "x0" and t_x0 is not None) else w_target)
+                if rc.epoch_renorm:
+                    # keep Σ t_vec = 1 to match the multiplicative update math
+                    t_vec = t_vec / max(1.0, float(np.sum(t_vec)))
+
+                _ratio_project_epoch(
+                    x_CP, t_vec,
+                    eta=float(rc.epoch_eta),
+                    gamma=float(rc.epoch_gamma),
+                    beta=float(rc.epoch_beta),
+                    minw=float(rc.minw),
+                )
                 dt_sb = time.perf_counter() - t0_sb
                 print(f"[softbox] epoch {ep+1}: took {dt_sb:.3f}s", flush=True)
 
@@ -1156,7 +1224,7 @@ def solve_global_kaczmarz_cchunk_mp(
             try:
                 if tracker is not None:
                     tracker.maybe_snapshot_x(x_CP, epoch=ep+1,
-                                             rmse=rmse_after, force=True)
+                        rmse=rmse_after, force=True)
             except Exception:
                 pass
             print(f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs} housekeeping "

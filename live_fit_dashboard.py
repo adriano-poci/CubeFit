@@ -465,13 +465,15 @@ def render_dashboard(h5_path: str, out_png: str,
         # Use reader's C,P to reshape safely
         X_cp = np.asarray(x, float).ravel().reshape(C, P)
         usage = X_cp.sum(axis=1)
-        ax.bar(np.arange(C), usage, label="usage")
+        ax.bar(np.arange(C), usage, label="usage", color='r')
         if ow is not None and ow.size == usage.size:
-            ax.plot(np.arange(C), ow, marker="o", linestyle="--", label="target w_c")
+            ax.plot(np.arange(C), ow, marker="o", linestyle="--", label="target w_c", color='k')
             maxerr = float(np.max(np.abs(usage - ow))) if usage.size else np.nan
             ax.set_title(f"Component usage vs target (max|e|={maxerr:.3g})")
+            ax.set_ylim(0.0, float(1.05 * np.max(ow)) if ow.size else 1.0)
         else:
             ax.set_title("Component usage (sum over P)")
+            ax.set_ylim(0.0, float(1.05 * np.max(usage)) if usage.size else 1.0)
         ax.set_xlabel("component c")
         ax.legend(loc="best")
 
