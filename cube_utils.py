@@ -255,8 +255,6 @@ def _get_mask(f):
 
 # ------------------------------------------------------------------------------
 
-
-
 def _bin_edges_from_loglam(loglam: np.ndarray) -> np.ndarray:
     loglam = np.asarray(loglam, float)
     mid = 0.5 * (loglam[1:] + loglam[:-1])
@@ -911,6 +909,12 @@ class RatioCfg:
     tile_every: int = 1
     epoch_renorm: bool = True
 
+    # strong epoch-end projector
+    epoch_project: bool = True  # do a global pass at epoch end
+    epoch_eta: float = 1.0      # stronger than tile eta
+    epoch_gamma: float = 10.0   # allow larger rebalancing
+    epoch_beta: float = 1.0     # mixing: 1.0=full replace, <1 = blend
+
 # ------------------------------------------------------------------------------
 
 def compare_usage_to_orbit_weights(h5_path: str,
@@ -983,11 +987,34 @@ def compare_usage_to_orbit_weights(h5_path: str,
         _, C, P, _ = map(int, M.shape)
         return C, P
 
-    def _row_or_vec(ds) -> np.ndarray:
+    def _row_or_vec(ds, C: int, P: int) -> np.ndarray:
+        """Return a 1-D vector for X, disambiguating shapes robustly.
+
+        Accepts:
+        - (C, P)  : returns raveled C-major (len = C*P)
+        - (P, C)  : returns raveled after transpose
+        - (T, C*P): returns last row (time-series snapshots)
+        - (1, C*P) or (C*P, 1): flattens
+        - (C*P,)  : returns as-is
+        """
         arr = np.asarray(ds[...], dtype=np.float64)
-        if arr.ndim == 2 and arr.shape[0] > 0:
-            return arr[-1, :].astype(np.float64, copy=False)
-        return arr.ravel().astype(np.float64, copy=False)
+        if arr.ndim == 2:
+            # Exact factorization layout
+            if arr.shape == (C, P):
+                return arr.reshape(C * P).astype(np.float64, copy=False)
+            if arr.shape == (P, C):
+                return arr.T.reshape(C * P).astype(np.float64, copy=False)
+            # Time-series snapshots (T, C*P)
+            if arr.shape[1] == C * P:
+                return arr[-1, :].astype(np.float64, copy=False)
+            # Single-row/col CP vectors
+            if arr.shape == (1, C * P):
+                return arr[0, :].astype(np.float64, copy=False)
+            if arr.shape == (C * P, 1):
+                return arr[:, 0].astype(np.float64, copy=False)
+        # Fallback: flat vector
+        v = arr.ravel().astype(np.float64, copy=False)
+        return v
 
     def _read_X(f_side, f_main, C, P) -> np.ndarray:
         # explicit override
@@ -995,20 +1022,22 @@ def compare_usage_to_orbit_weights(h5_path: str,
             src = f_side if (f_side is not None and x_dset in f_side) else f_main
             if src is None or x_dset not in src:
                 raise RuntimeError(f"Requested x_dset '{x_dset}' not found.")
-            x = _row_or_vec(src[x_dset])
-            return x
+            return _row_or_vec(src[x_dset], C, P)
+
         # sidecar-first
         if f_side is not None:
             for name in ("/Fit/x_best", "/Fit/x_last", "/Fit/x_epoch_last"):
                 if name in f_side:
-                    return _row_or_vec(f_side[name])
+                    return _row_or_vec(f_side[name], C, P)
             for name in ("/Fit/x_snapshots", "/Fit/x_hist"):
                 if name in f_side and f_side[name].shape[0] > 0:
-                    return _row_or_vec(f_side[name])
+                    return _row_or_vec(f_side[name], C, P)
+
         # main fallbacks
         for name in ("/X_global", "/Fit/x_latest"):
             if name in f_main:
-                return _row_or_vec(f_main[name])
+                return _row_or_vec(f_main[name], C, P)
+
         raise RuntimeError("No solution vector found in sidecar or main file.")
 
     def _read_weights(f_side, f_main) -> np.ndarray:
@@ -1049,15 +1078,35 @@ def compare_usage_to_orbit_weights(h5_path: str,
             x = _read_X(None, F, C, P)
             w = _read_weights(None, F)
 
-    # ------------------ assemble & compare ------------------
+    # ------------------ assemble & compare (robust to x∈{C, C*P}) ----------
     x = np.asarray(x, dtype=np.float64).ravel(order="C")
-    if x.size != C * P:
-        raise ValueError(f"x length {x.size} != C*P={C*P}.")
-    X_cp = x.reshape(C, P, order="C")
-    usage_raw = np.sum(X_cp, axis=1)          # (C,)
-    weights_raw = np.asarray(w, dtype=np.float64).ravel()
-    if weights_raw.size != C:
-        raise ValueError(f"weights length {weights_raw.size} != C={C}.")
+    # be robust to NaNs/Infs in solution vectors
+    x = np.nan_to_num(x, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if x.size == C * P:
+        usage_raw = x.reshape(C, P, order="C").sum(axis=1)
+    elif x.size == C:
+        usage_raw = x.copy()
+    else:
+        raise ValueError(
+            f"x length {x.size} is incompatible; expected C={C} or C*P={C*P}."
+        )
+
+    # Accept orbit_weights as (C,) or (C*P,) as well
+    w_vec = np.asarray(w, dtype=np.float64).ravel()
+    if w_vec.size == C:
+        weights_raw = w_vec
+    elif w_vec.size == C * P:
+        weights_raw = w_vec.reshape(C, P, order="C").sum(axis=1)
+    else:
+        raise ValueError(
+            f"weights length {w_vec.size} is incompatible; expected C={C} "
+            f"or C*P={C*P}."
+        )
+
+    # sanitize
+    usage_raw = np.maximum(np.nan_to_num(usage_raw, nan=0.0), 0.0)
+    weights_raw = np.maximum(np.nan_to_num(weights_raw, nan=0.0), 0.0)
 
     if normalize not in ("unit_sum", "match_sum"):
         raise ValueError("normalize must be 'unit_sum' or 'match_sum'.")
@@ -1066,19 +1115,19 @@ def compare_usage_to_orbit_weights(h5_path: str,
         usage = _safe_norm(usage_raw, "unit_sum")
         weights = _safe_norm(weights_raw, "unit_sum")
     else:
-        usage = _safe_norm(usage_raw, "match_sum", ref_sum=float(np.sum(weights_raw)))
+        usage = _safe_norm(
+            usage_raw, "match_sum", ref_sum=float(np.sum(weights_raw))
+        )
         weights = weights_raw.copy()
 
     diff = usage - weights
     l1 = float(np.sum(np.abs(diff)))
     linf = float(np.max(np.abs(diff))) if diff.size else np.nan
     denom = np.linalg.norm(usage) * np.linalg.norm(weights)
-    cosine = float((usage @ weights) / np.maximum(denom, 1.0e-30)) if denom > 0.0 else np.nan
-    if usage.size >= 2:
-        rr = np.corrcoef(usage, weights)
-        pearson_r = float(rr[0, 1])
-    else:
-        pearson_r = np.nan
+    cosine = float((usage @ weights) / np.maximum(denom, 1.0e-30)) \
+        if denom > 0.0 else np.nan
+    pearson_r = float(np.corrcoef(usage, weights)[0, 1]) \
+        if usage.size >= 2 else np.nan
     argmax_err = int(np.argmax(np.abs(diff))) if diff.size else -1
 
     plot_path = None
@@ -1113,7 +1162,6 @@ def compare_usage_to_orbit_weights(h5_path: str,
         argmax_err=argmax_err,
         plot_path=plot_path,
     )
-    # quick console line for at-a-glance check
     print("[usage_vs_weights] L1={:.4g}  L∞={:.4g}  cos={:.4f}  r={:.4f}  "
           "argmax_err={}".format(l1, linf, cosine, pearson_r, argmax_err))
     return out

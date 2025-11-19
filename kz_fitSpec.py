@@ -1709,7 +1709,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     resid = (data_cube - model_cube)[:, mask_arr]
     rchi2 = np.sqrt((resid * resid).mean(axis=1))
 
-    breakpoint()  # debugging hook
     plt.figure(figsize=(6, 4))
     plt.hist(rchi2, bins=40, alpha=0.7)
     plt.xlabel(r"${\rm Norm}/\sqrt{N_{\rm pix}}$")

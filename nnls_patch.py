@@ -558,14 +558,14 @@ def run_patch(h5_path: str,
                 col_map.append((c, int(p_idx)))
                 j += 1
 
-    # NEW: final sanitation guard (paranoia)
+    # final sanitation guard (paranoia)
     if not np.isfinite(B).all():
         bad_cols = np.any(~np.isfinite(B), axis=0).nonzero()[0]
         print(f"[patch] WARNING: non-finite values in {bad_cols.size} columns; "
               f"sanitizing to 0.")
         B[:, bad_cols] = np.nan_to_num(B[:, bad_cols], copy=False)
 
-    # NEW: quick column-norm diagnostics on the weighted system
+    # quick column-norm diagnostics on the weighted system
     colnorm_w = np.linalg.norm(B * sqrt_w_rows[:, None], axis=0)
     print("[patch] column norms (weighted) min/median/max: "
           f"{colnorm_w.min():.3g}/{np.median(colnorm_w):.3g}/{colnorm_w.max():.3g}")

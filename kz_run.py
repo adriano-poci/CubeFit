@@ -54,6 +54,14 @@ def main():
     props['redraw'] = bool(args.redraw)
     print(f"redraw = {props['redraw']}")
 
+    os.environ['CUBEFIT_NNLS_ENABLE']=str(0)
+    os.environ['CUBEFIT_NNLS_EVERY']=str(5)
+    os.environ['CUBEFIT_NNLS_MIN_IMPROVE']=str(0.9995)
+    os.environ['CUBEFIT_NNLS_MAX_COLS']=str(64)
+    os.environ['CUBEFIT_NNLS_SUB_L']=str(512)
+    os.environ['CUBEFIT_NNLS_SOLVER']='fista'
+    os.environ['CUBEFIT_NNLS_L2']=str(1e-6)
+
     print(props)
 
     genCubeFit(**props)
