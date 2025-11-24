@@ -1694,7 +1694,7 @@ def plot_prefit_panel(
     If include_mix=True and x_global is provided, overlays reconstructed model A_s^T x.
     """
     galaxy = Path(base_h5).stem.split("_")[0]
-    pDir = Path(base_h5).parent/galaxy
+    pDir = Path(base_h5).parent/galaxy/'figures'
     pDir.mkdir(parents=True, exist_ok=True)
 
     lam_obs, y = read_observed_spectrum(base_h5, s, apply_mask=True)
