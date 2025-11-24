@@ -187,8 +187,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Directories
     bDir = mDir/'tri_models'/mPath
     pDir = curdir.parent/'pxf'
-    spDir = bDir/'SPDec'
-    MKDIRS = [bDir, pDir, spDir]
+    figDir = curdir/galaxy/'figures'
+    MKDIRS = [bDir, pDir, figDir]
     [plp.Path(DIR).mkdir(parents=True, exist_ok=True) for DIR in MKDIRS]
     if isinstance(decDir, type(None)):
         with open(bDir/'decomp.dir', 'r+') as dd:
@@ -266,13 +266,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     nSSP = int(np.prod((nMetals, nAges, nAlphas), dtype=int))
     pred = f"0{len(repr(nComp)):d}"
     nComp = int(nComp)
-    afDir = spDir/'apers'/f"C{nComp:04d}"
-    sfDir = spDir/'SSPFit'/f"C{nComp:04d}"
-    MKDIRS = [afDir, sfDir]
-    [DIR.mkdir(parents=True, exist_ok=True) for DIR in MKDIRS]
-    lAPF = "{}_{}_c.npy"
-    globAper = afDir.rglob(lAPF.format('*', f"{lOrder:02}"))
-    runAper = np.arange(nSpat)
 
     oDict = uu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
     if 'binFN' not in oDict.keys():
@@ -481,7 +474,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # is built, so we don't return early here.
     # Should be zero-cost if already built
 
-    prefit_png = spDir / f"prefit_overlay_from_models_C{nComp:03d}.png"
+    prefit_png = figDir / f"prefit_overlay_from_models_C{nComp:03d}.png"
     live_prefit_snapshot_from_models(
         h5_path=str(hdf5Path),
         max_components=4,
@@ -546,12 +539,20 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     RC = cu.RatioCfg(
-        anchor="target",  # pull toward /CompWeights
-        eta=0.8,          # strength
-        gamma=2.0,        # slightly superlinear
-        prob=1.0,         # apply every tile
-        batch=0,          
-        minw=1e-4         # ignore components with ~zero target weight
+        anchor="target",   # pull toward /CompWeights
+        eta=0.8,           # per-tile multiplicative strength
+        gamma=2.0,         # clamp for multiplicative factors
+        prob=1.0,          # apply every tile
+        batch=0,           # consider all active components
+        minw=1e-4,         # ignore ~zero-weight targets
+        # epoch-level projection (gentle, blended)
+        epoch_project=True,
+        epoch_eta=0.6,     # how hard the epoch projection pushes
+        epoch_gamma=3.0,   # clamp at epoch projection
+        epoch_beta=0.35,   # 0..1 blend toward the projected state
+        epoch_renorm=True, # keep target sum=1
+        tile_every=1,      # apply per tile
+        use=True           # <-- IMPORTANT: actually enable the ratio term
     )
     x_global, stats = runner.solve_all_mp_batched(
         epochs=4,
@@ -1069,6 +1070,15 @@ def reconstruct_modelcube_fast(
             raise RuntimeError(f"Unexpected /HyperCube/models rank {M.ndim}")
         S, C, P, L = map(int, M.shape)
 
+        # Use the same keep_idx as the solver would (from /Mask), so the ref is consistent.
+        keep_idx = None
+        if "/Mask" in f:
+            m = np.asarray(f["/Mask"][...], dtype=bool).ravel()
+            if int(m.size) == int(M.shape[-1]):
+                keep_idx = np.flatnonzero(m)
+        cp_flux_ref = cu._ensure_cp_flux_ref(h5_path, keep_idx)
+        inv_cp_flux_ref = (1.0 / cp_flux_ref).astype(np.float64, copy=False)
+
         # Choose tile sizes aligned to on-disk chunking unless overridden
         m_chunks = M.chunks or (S, 1, P, L)
         S_chunk_file, _, _, L_chunk_file = map(int, m_chunks)
@@ -1137,11 +1147,13 @@ def reconstruct_modelcube_fast(
                         A_c = np.asarray(
                             M[s0:s1, c, nz, l0:l1], dtype=np.float32, order="C"
                         )
+                        A_c = A_c * inv_cp_flux_ref[c, nz][None, :, None]
                     else:
                         w = x_cp[c, :]    # (P,)
                         A_c = np.asarray(
                             M[s0:s1, c, :, l0:l1], dtype=np.float32, order="C"
                         )
+                        A_c = A_c * inv_cp_flux_ref[c, :][None, :, None]
 
                     # y += sum_p w[p] * A[:, p, :]
                     band += np.tensordot(
@@ -1161,6 +1173,7 @@ def reconstruct_modelcube_fast(
             # Commit the finished S-tile
             out[s0:s1, :] = Y_tile.astype(want_dtype, copy=False)
 
+
             # SWMR-friendly: expose new data; keep UI responsive
             try: out.id.flush()
             except Exception: pass
@@ -1168,6 +1181,11 @@ def reconstruct_modelcube_fast(
             except Exception: pass
             sys.stdout.flush()
             trim_heap()
+        try:
+            out.attrs["basis.normalization"] = "cp_flux_ref"
+            out.attrs["basis.norm_ref_dset"] = "/HyperCube/norm/cp_flux_ref"
+        except Exception:
+            pass
 
         pbar.close()
 
@@ -1370,7 +1388,7 @@ def parallel_spectrum_plots(
             ax.set_ylim(y0, y1)
 
         # ax.set_title(f"spaxel {int(s_idx)}  χ={chi2[int(s_idx)]:.3f}")
-        ax.set_xlabel(rf"$\log(\lambda\ [\AA])$")
+        ax.set_xlabel("log(\u03bb [\u212B])")
         ax.set_ylabel("$F_\lambda$ (arb. units)")
         # ax.legend(loc="best", fontsize=8)
         fig.tight_layout()
@@ -1441,8 +1459,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Directories
     bDir = mDir/'tri_models'/mPath
     pDir = curdir.parent/'pxf'
-    spDir = bDir/'SPDec'
-    MKDIRS = [bDir, pDir, spDir]
+    figDir = curdir/galaxy/'figures'
+    MKDIRS = [bDir, pDir, figDir]
     [plp.Path(DIR).mkdir(parents=True, exist_ok=True) for DIR in MKDIRS]
     if isinstance(decDir, type(None)):
         with open(bDir/'decomp.dir', 'r+') as dd:
@@ -1715,7 +1733,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     plt.ylabel("Number of apertures")
     plt.title("Distribution of fit quality")
     plt.tight_layout()
-    plt.savefig(spDir/"chi2_hist.png")
+    plt.savefig(figDir/"chi2_hist.png")
     plt.close()
 
     if 'spec' in pplots:
@@ -1725,20 +1743,20 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 h5_or_path=str(hdf5Path),
                 chi2=rchi2,
                 n=10,
-                plot_dir=str(spDir),
+                plot_dir=str(figDir),
                 n_workers=min(12, max(1, nProcs)),
                 tag=f"C{nComp:04d}",
                 mask=mask_arr,
             )
 
     if 'mw' in pplots:
-        laGrid = np.ma.masked_less_equal(laGrid, 0.0)
+        data_cube = np.ma.masked_less_equal(data_cube, 0.0)
         model_cube = np.ma.masked_less_equal(model_cube, 0.0)
         flux = np.ma.masked_invalid(
             # (np.ma.sum(laGrid, axis=0)/binCounts)[binNum], 0.))
-            (np.ma.sum(laGrid, axis=0)/binCounts))
+            (np.ma.sum(data_cube[:, mask_arr], axis=0)/binCounts))
         modSB = np.ma.masked_array( # re-scale to original data levels
-            (np.ma.sum(model_cube, axis=1)/binCounts),
+            (np.ma.sum(model_cube[:, mask_arr], axis=1)/binCounts),
             # (np.ma.sum(model_cube, axis=0)*laScales/binCounts)[binNum],
             mask=np.ma.getmaskarray(flux))
         fmin, fmax = np.log10(np.ma.min(flux)), np.log10(np.ma.max(flux))
@@ -1799,7 +1817,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         BIG.set_xlabel(r'$x\ [{\rm arcsec}]$', labelpad=25)
         BIG.set_ylabel(r'$y\ [{\rm arcsec}]$', labelpad=25)
 
-        plt.savefig(spDir/\
+        plt.savefig(figDir/\
             f"modelCube_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
 
     if 'otype' not in oDict['cutOn']:
@@ -1887,7 +1905,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         BIG.set_yticks([])
         BIG.set_xlabel(r'$t\ [{\rm Gyr}]$', labelpad=20)
         BIG.set_ylabel(r'$[Z/H]$', labelpad=35)
-        plt.savefig(spDir/\
+        plt.savefig(figDir/\
             f"orbitSFH_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
 
     # 7. Print summary
@@ -1896,7 +1914,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     best = np.argmin(rchi2)
     print(f"Worst fit: aperture {worst} (χ² = {rchi2[worst]:.2f})")
     print(f"Best fit:  aperture {best} (χ² = {rchi2[best]:.2f})")
-    print(f"[CubeFit] All plots and maps saved in {str(spDir)}")
+    print(f"[CubeFit] All plots and maps saved in {str(figDir)}")
 
 # ------------------------------------------------------------------------------
 

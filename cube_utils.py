@@ -1250,18 +1250,45 @@ def apply_component_softbox(
 
 def apply_component_softbox_energy(
     x_cp: np.ndarray,
-    E_cp: np.ndarray,          # read_global_column_energy(h5_path) → (C,P) f64
+    E_cp: np.ndarray,          # read_global_column_energy(h5_path) → (C,P)
     w_c: np.ndarray,           # /CompWeights: len C or C*P
     *,
     band: float = 0.30,        # allowed deviation band ±30%
     step: float = 0.20,        # fraction of the way to the band boundary
     min_target: float = 1e-10,
+    row_chunk: int = 8192,
 ) -> None:
+    """
+    Soft "box" constraint in energy-weighted usage space. Scales rows of
+    x_cp toward the nearest band edge around the target usage, without
+    forming large temporaries or using advanced indexing.
+
+    Parameters
+    ----------
+    x_cp : ndarray, shape (C, P)
+        Coefficient matrix to adjust in-place.
+    E_cp : ndarray, shape (C, P)
+        Global column energy per (c, p).
+    w_c : ndarray, shape (C,) or (C*P,)
+        Component prior weights; if length C*P, reduced to component level.
+    band : float, optional
+        Half-width of allowed band, i.e., s ∈ [(1-band)t, (1+band)t].
+    step : float, optional
+        Fractional move toward the boundary (0→no-op, 1→land exactly).
+    min_target : float, optional
+        Floor on target weights before normalization.
+    row_chunk : int, optional
+        Row-chunk size for streamed scaling.
+
+    Returns
+    -------
+    None
+    """
     x = np.asarray(x_cp, np.float64, order="C")
     E = np.asarray(E_cp, np.float64, order="C")
     C, P = x.shape
     if E.shape != (C, P):
-        raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C,P)}")
+        raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C, P)}")
 
     w = np.asarray(w_c, np.float64).ravel(order="C")
     if w.size == C:
@@ -1272,31 +1299,158 @@ def apply_component_softbox_energy(
         raise ValueError(f"w_c length {w.size} incompatible with C={C}, P={P}.")
 
     # energy-weighted usage per component (proportional to flux)
-    s = np.sum(x * E, axis=1)                       # (C,)
+    # avoids materializing x*E as a (C,P) temp
+    s = np.einsum("cp,cp->c", x, E, dtype=np.float64)      # (C,)
 
     # normalize target & usage
-    t = np.maximum(t, min_target)
-    t = t / np.sum(t)
-    s_sum = np.sum(s)
+    t = np.maximum(t, float(min_target))
+    t /= np.sum(t)
+    s_sum = float(np.sum(s))
     if not np.isfinite(s_sum) or s_sum <= 0.0:
         return
-    s = s / s_sum
+    s /= s_sum
 
     lo = (1.0 - float(band))
     hi = (1.0 + float(band))
 
-    # Pull back toward the nearest band edge with a convex blend
     over = s > (hi * t)
     under = s < (lo * t)
+
+    # Build a single per-row scaling vector G (defaults to 1.0)
+    G = np.ones(C, dtype=np.float64)
+
     if np.any(over):
-        f_over = (hi * t[over]) / s[over]                     # exact factor to land on upper edge
-        alpha_over = (1.0 - step) + step * f_over             # partial move
-        x[over, :] *= alpha_over[:, None]
+        # exact factor to land on upper edge, then partial move
+        f_over = (hi * t[over]) / s[over]
+        G[over] = (1.0 - float(step)) + float(step) * f_over
+
     if np.any(under):
-        f_under = (lo * t[under]) / s[under]                  # exact factor to land on lower edge
-        alpha_under = (1.0 - step) + step * f_under
-        x[under, :] *= alpha_under[:, None]
+        # exact factor to land on lower edge, then partial move
+        f_under = (lo * t[under]) / s[under]
+        G[under] = (1.0 - float(step)) + float(step) * f_under
+
+    # Streamed in-place row scaling: x[i,:] *= G[i]
+    for i0 in range(0, C, int(row_chunk)):
+        i1 = min(C, i0 + int(row_chunk))
+        x[i0:i1, :] *= G[i0:i1, None]
 
     np.maximum(x, 0.0, out=x)  # keep nonnegativity
+
+# ------------------------------------------------------------------------------
+
+def _ensure_cp_flux_ref(h5_path: str,
+                        keep_idx: np.ndarray | None,
+                        dset: str = "/HyperCube/norm/cp_flux_ref",
+                        *,
+                        max_samples: int = 256,
+                        floor: float = 1e-12) -> np.ndarray:
+    """
+    Ensure /HyperCube/norm/cp_flux_ref (C,P) exists. If missing, compute
+    a robust per-(c,p) flux reference as the **median over spaxels** of
+    the λ-sum of the (c,p) slice, using the current spectral mask.
+
+    We sample up to `max_samples` spaxels (evenly spaced) for speed.
+    """
+    # Fast path: already present
+    with open_h5(h5_path, role="reader") as f:
+        if dset in f:
+            ref = np.asarray(f[dset][...], dtype=np.float64, order="C")
+            return ref
+
+    # Build (approximate) median over spaxels of sum_λ A[s,c,p,λ]
+    with open_h5(h5_path, role="reader") as f:
+        M = f["/HyperCube/models"]  # (S,C,P,L)
+        if M.ndim != 4:
+            raise RuntimeError(f"Unexpected /HyperCube/models rank {M.ndim}")
+        S, C, P, L = map(int, M.shape)
+
+        if keep_idx is None:
+            Lk = L
+        else:
+            keep_idx = np.asarray(keep_idx, dtype=np.int64)
+            Lk = int(keep_idx.size)
+
+        # choose evenly spaced spaxels
+        Ns = int(min(S, max_samples))
+        if Ns <= 0:
+            raise RuntimeError("No spaxels available for cp_flux_ref.")
+        picks = np.unique(np.linspace(0, S - 1, Ns).astype(int))
+
+        # accumulate per-sample λ-sums → (Ns, C, P)
+        ref_samp = np.empty((picks.size, C, P), dtype=np.float64)
+        for j, s in enumerate(picks):
+            A = np.asarray(M[s, :, :, :], dtype=np.float32, order="C")  # (C,P,L)
+            if keep_idx is not None:
+                A = A[:, :, keep_idx]                                    # (C,P,Lk)
+            # sum over λ (keep_idx) in float64
+            ref_samp[j, :, :] = np.sum(A.astype(np.float64, copy=False), axis=2)
+
+        ref = np.median(ref_samp, axis=0)  # (C,P)
+        ref = np.where(np.isfinite(ref), ref, 0.0)
+        ref = np.maximum(ref, float(floor))
+
+    # persist
+    with open_h5(h5_path, role="writer") as f:
+        g = f.require_group("/HyperCube/norm")
+        if dset in f:
+            del f[dset]
+        d = f.create_dataset(dset, data=ref.astype(np.float64), chunks=(1, ref.shape[1]))
+        g.attrs["basis.mode"] = "cp_flux_ref"  # mark what we applied
+
+    return ref
+
+# ------------------------------------------------------------------------------
+
+def kacz_weighted_tile_whitelight(h5_path, x_flat, s0=0, Sblk=128, use_mask=True):
+    """
+    Rebuild y_hat for Sblk spaxels using the *weighted* operator (A_w, b_w)
+    exactly like the solver, then collapse to white-light with the *same*
+    weights/mask. Returns (data_sum, model_sum) arrays of length dS.
+    """
+    with open_h5(h5_path, role="reader") as f:
+        M = f["/HyperCube/models"]       # (S, C, P, L), float32
+        D = f["/DataCube"]               # (S, L), data
+        wlam = f["/HyperCube/lambda_weights"][...] if "/HyperCube/lambda_weights" in f else None
+        mask = f["/Masks/fit_mask"][...] if (use_mask and "/Masks/fit_mask" in f) else None
+
+        S, C, P, L = map(int, M.shape)
+        dS = int(min(Sblk, S - s0))
+        x = np.asarray(x_flat, np.float64).ravel(order="C")
+        assert x.size == C * P, f"x size {x.size} != C*P={C*P}"
+        X = x.reshape(C, P)
+
+        # λ selection consistent with the fit
+        lam_sel = np.ones(L, dtype=bool)
+        if mask is not None:
+            lam_sel &= (mask != 0)
+        lam_sel = np.where(lam_sel)[0]
+        if lam_sel.size == 0:
+            raise RuntimeError("Empty lambda selection.")
+
+        # weights used by the solver (sqrt-w per row)
+        w = np.ones(lam_sel.size, dtype=np.float64)
+        if wlam is not None:
+            w = np.sqrt(np.asarray(wlam, np.float64)[lam_sel])
+
+        # build weighted rhs and model on the *same* λ grid
+        D_sub = np.asarray(D[s0:s0+dS, lam_sel], np.float64, order="C")
+        D_w   = D_sub * w[None, :]
+
+        Y_w = np.zeros_like(D_w)  # (dS, L_sel), weighted model
+        for c in range(C):
+            A_sc = np.asarray(M[s0:s0+dS, c, :, lam_sel], np.float32, order="C")  # (dS, P, L_sel)
+            # tensordot over P, then apply sqrt-w
+            Y_w += np.tensordot(X[c, :].astype(np.float64, copy=False),
+                                A_sc.astype(np.float64, copy=False),
+                                axes=(0, 1)) * w[None, :]
+
+        # white-light collapse with the *same* weights & λ selection
+        data_sum  = D_w.sum(axis=1)
+        model_sum = Y_w.sum(axis=1)
+        return data_sum, model_sum
+
+# Example usage (pick a central tile)
+# data_sum, model_sum = kacz_weighted_tile_whitelight(h5_path, x_global, s0=0, Sblk=256)
+# print("median(model/data) =", np.median(model_sum / np.maximum(1e-30, data_sum)))
 
 # ------------------------------------------------------------------------------

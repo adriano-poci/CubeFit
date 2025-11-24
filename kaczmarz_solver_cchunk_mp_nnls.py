@@ -23,7 +23,7 @@ from CubeFit.hdf5_manager import open_h5
 from CubeFit.hypercube_builder import read_global_column_energy
 from CubeFit.cube_utils import (
     read_lambda_weights, ensure_lambda_weights, _get_mask, RatioCfg,
-    apply_component_softbox_energy
+    apply_component_softbox_energy, _ensure_cp_flux_ref
 )
 
 # ----------------------------- Config ---------------------------------
@@ -190,7 +190,9 @@ def _worker_tile_job_with_R(args):
      c_start, c_stop, x_band, lr, project_nonneg, R, w_band,
      dset_slots, dset_bytes, dset_w0,
      E_global_band, beta_blend,
-     w_lam_sqrt) = args
+     w_lam_sqrt,
+     inv_ref_band) = args   # (band_size, P)
+
 
     bt_steps   = int(os.environ.get("CUBEFIT_BT_STEPS", "3"))
     bt_factor  = float(os.environ.get("CUBEFIT_BT_FACTOR", "0.5"))
@@ -247,6 +249,9 @@ def _worker_tile_job_with_R(args):
             A = np.asarray(M[s0:s1, c, :, :], np.float32, order="C")
             if keep_idx is not None:
                 A = A[:, :, keep_idx]  # (Sblk,P,Lk)
+            inv_ref = np.asarray(inv_ref_band[bi, :], dtype=np.float64)
+            # Broadcast over (Sblk, P, Lk)
+            A = A * inv_ref[None, :, None]
             _finite_inplace(A, f"A_nonfinite_c{c}", stats)
 
             # λ-weighted view for gradient/denominator
@@ -488,6 +493,7 @@ def solve_global_kaczmarz_cchunk_mp(
         mask = _get_mask(f) if cfg.apply_mask else None
         keep_idx = np.flatnonzero(mask) if mask is not None else None
         Lk = int(keep_idx.size) if keep_idx is not None else L
+        cp_flux_ref = _ensure_cp_flux_ref(h5_path, keep_idx)   # (C,P) float64
 
         # ------------------- λ-weights (feature emphasis) -------------
         lamw_enable = os.environ.get(
@@ -543,6 +549,9 @@ def solve_global_kaczmarz_cchunk_mp(
             norms.append(float(np.linalg.norm(Yt)))
             Y_glob_norm2 += float(np.sum(Yt * Yt))
         
+    cp_flux_ref = np.asarray(cp_flux_ref, dtype=np.float64, order="C")
+    inv_cp_flux_ref = 1.0 / cp_flux_ref  # broadcasted column scaling
+
     # --- Persist orbit_weights and push into tracker ---
     w_prior = _canon_orbit_weights(h5_path, orbit_weights, C, P)
     if (w_prior is not None) and (tracker is not None) and hasattr(tracker, "set_orbit_weights"):
@@ -664,36 +673,67 @@ def solve_global_kaczmarz_cchunk_mp(
                                 eta: float = 1.0,
                                 gamma: float = 10.0,
                                 beta: float = 1.0,
-                                minw: float = 1e-6) -> None:
+                                minw: float = 1e-6,
+                                row_chunk: int = 8192) -> None:
             """
             One global, mass-preserving multiplicative pass toward t_vec (Σ=1).
-            If beta<1, blends the projected state with the current one.
+            If beta < 1, blend by scaling rows with G = (1-beta) + beta*F, which
+            is equivalent to (1-beta)*x + beta*(F*x) but avoids an extra copy.
+
+            Parameters
+            ----------
+            x_mat : ndarray, shape (C, P)
+                Nonnegative matrix to be modified in-place.
+            t_vec : ndarray, shape (C,)
+                Target mixture over components, nonnegative, will be floored.
+            eta : float, optional
+                Step size in log-space.
+            gamma : float, optional
+                Symmetric clipping bound on multiplicative factor F.
+            beta : float, optional
+                Blending factor; 1.0 applies full projection, <1.0 blends.
+            minw : float, optional
+                Floor for robust logs.
+            row_chunk : int, optional
+                Row-chunk size for streamed scaling to limit temporaries.
+
+            Returns
+            -------
+            None
             """
             C, P = map(int, x_mat.shape)
-            s = np.sum(x_mat, axis=1)          # (C,)
+
+            # component sums and mixture
+            s = np.sum(x_mat, axis=1, dtype=np.float64)           # (C,)
             S = float(np.sum(s))
             if not np.isfinite(S) or S <= 0.0:
                 return
-            sh = s / max(S, 1.0)
+            sh = s / S
 
             # log-space factors, clipped
-            e = np.log(np.maximum(sh, minw)) - np.log(np.maximum(t_vec, minw))
-            F = np.exp(-eta * e)
-            F = np.clip(F, 1.0 / gamma, gamma)
+            sh_c = np.maximum(sh, float(minw))
+            tv_c = np.maximum(np.asarray(t_vec, np.float64), float(minw))
+            e = np.log(sh_c) - np.log(tv_c)
+            F = np.exp(-float(eta) * e)
+            F = np.clip(F, 1.0 / float(gamma), float(gamma))
 
-            denom = float(np.sum(sh * F))
+            denom = float(np.dot(sh, F))
             if not np.isfinite(denom) or denom <= 0.0:
                 return
-            F /= max(denom, 1e-30)
+            F /= max(denom, 1.0e-30)
 
-            Xp = x_mat * F[:, None]
-            if beta < 1.0:
-                x_mat *= (1.0 - beta)
-                x_mat += beta * Xp
+            # Blend without extra matrix: G = (1-beta) + beta*F
+            if float(beta) < 1.0:
+                G = (1.0 - float(beta)) + float(beta) * F
             else:
-                x_mat[:] = Xp
+                G = F
 
-            # keep ≥0
+            # Streamed in-place row scaling: x[i,:] *= G[i]
+            for i0 in range(0, C, int(row_chunk)):
+                i1 = min(C, i0 + int(row_chunk))
+                x_mat[i0:i1, :] *= G[i0:i1, None]
+
+            # keep ≥ 0
             np.maximum(x_mat, 0.0, out=x_mat)
 
     # ------------------- bands & pool -------------------
@@ -786,8 +826,7 @@ def solve_global_kaczmarz_cchunk_mp(
                 with open_h5(h5_path, role="reader") as f:
                     DC = f["/DataCube"]; M  = f["/HyperCube/models"]
                     try: M.id.set_chunk_cache(cfg.dset_slots,
-                                              cfg.dset_bytes,
-                                              cfg.dset_w0)
+                        cfg.dset_bytes, cfg.dset_w0)
                     except Exception: pass
 
                     Y = np.asarray(DC[s0:s1, :], np.float64, order="C")
@@ -796,10 +835,11 @@ def solve_global_kaczmarz_cchunk_mp(
 
                     yhat = np.zeros((Sblk, Lk), np.float64)
                     for c in range(C):
-                        A = np.asarray(M[s0:s1, c, :, :], np.float32,
-                                       order="C")
+                        A = np.asarray(M[s0:s1, c, :, :], np.float32, order="C")
                         if keep_idx is not None:
                             A = A[:, :, keep_idx]
+                        # Mode A: same cp normalization here
+                        A = A * (inv_cp_flux_ref[c, :][None, :, None])
                         xc = x_CP[c, :].astype(np.float64, copy=False)
                         for s in range(Sblk):
                             yhat[s, :] += xc @ A[s, :, :]
@@ -838,7 +878,8 @@ def solve_global_kaczmarz_cchunk_mp(
                     x_band = x_CP[c_start:c_stop, :].copy()
                     w_band = None if w_full is None else \
                         w_full[c_start:c_stop].copy()
-                    E_band = E_global[c_start:c_stop, :]  # (band_size,P)
+                    E_band = E_global[c_start:c_stop, :]              # (band_size,P)
+                    inv_ref_band = inv_cp_flux_ref[c_start:c_stop, :] # (band_size,P)
                     jobs.append((
                         h5_path, s0, s1, keep_idx,
                         c_start, c_stop, x_band,
@@ -846,7 +887,8 @@ def solve_global_kaczmarz_cchunk_mp(
                         R.copy(), w_band,
                         cfg.dset_slots, cfg.dset_bytes, cfg.dset_w0,
                         E_band, float(beta_blend),
-                        w_lam_sqrt
+                        w_lam_sqrt,
+                        inv_ref_band
                     ))
 
                 results = pool.map(_worker_tile_job_with_R, jobs)
@@ -1039,9 +1081,11 @@ def solve_global_kaczmarz_cchunk_mp(
                                     col = A_c[:, int(pp), :].astype(
                                         np.float64, copy=False
                                     ).reshape(rows, order="C")
+                                    # Mode A: normalize this (c,p) column
+                                    col *= float(inv_cp_flux_ref[int(cc), int(pp)])
                                     B[:, int(j)] = col
-                                    xW[int(j)]   = float(x_CP[int(cc),
-                                                              int(pp)])
+                                    xW[int(j)]   = float(x_CP[int(cc), int(pp)])
+
 
                         r_sub = R[:, lam_sel].reshape(rows, order="C")
                         y_rhs = B @ xW + r_sub
@@ -1196,23 +1240,43 @@ def solve_global_kaczmarz_cchunk_mp(
                     band=float(orbBand), step=float(orbStep), min_target=1e-10
                 )
 
+                dt_sb = time.perf_counter() - t0_sb
+                print(f"[softbox] epoch {ep+1}: took {dt_sb:.3f}s", flush=True)
+
             # global, mass-preserving projection of row sums toward the prior
             if have_ratio and rc.epoch_project:
                 # choose the target mixture used elsewhere in the solver
                 t_vec = (t_x0 if (rc.anchor == "x0" and t_x0 is not None) else w_target)
+                # Reduce any (C*P,) prior to (C,) and sanitize
+                t = np.asarray(t_vec, np.float64).ravel(order="C")
+                if t.size == (C * P):
+                    t = t.reshape(C, P, order="C").sum(axis=1)
+                elif t.size != C:
+                    raise ValueError(f"[ratio] target len {t.size} not in {{C, C*P}}")
+
+                # floor and (optionally) renormalize to sum=1
+                t = np.maximum(t, float(rc.minw))
                 if rc.epoch_renorm:
-                    # keep Σ t_vec = 1 to match the multiplicative update math
-                    t_vec = t_vec / max(1.0, float(np.sum(t_vec)))
+                    t = t / max(float(np.sum(t)), 1.0)
+
+                t0_rp = time.perf_counter()
 
                 _ratio_project_epoch(
-                    x_CP, t_vec,
+                    x_CP, t,
                     eta=float(rc.epoch_eta),
                     gamma=float(rc.epoch_gamma),
                     beta=float(rc.epoch_beta),
                     minw=float(rc.minw),
                 )
-                dt_sb = time.perf_counter() - t0_sb
-                print(f"[softbox] epoch {ep+1}: took {dt_sb:.3f}s", flush=True)
+                # ensure any flat views used later see the updated state
+                x[:] = x_CP.ravel(order="C")
+
+                s = x_CP.sum(axis=1).astype(np.float64); S = float(s.sum() or 1.0)
+                l1 = float(np.sum(np.abs((s / S) - t)))
+                print(f"[ratio] epoch L1-to-target = {l1:.4f}")
+
+                dt_rp = time.perf_counter() - t0_rp
+                print(f"[ratio] epoch {ep+1}: took {dt_rp:.3f}s", flush=True)
 
             print(f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs} snapshotting...",
                   flush=True)
@@ -1321,6 +1385,8 @@ def probe_kaczmarz_tile(
         A = np.asarray(M[s0:s1, c, :, :], np.float32, order="C")
         if keep_idx is not None:
             A = A[:, :, keep_idx]  # (Sblk, P, Lk)
+        cp_flux_ref = _ensure_cp_flux_ref(h5_path, keep_idx=None if keep_idx is None else np.arange(L)[keep_idx])
+        A = A * (1.0 / cp_flux_ref[int(c), :])[None, :, None]
 
         # sanitize
         badR = ~np.isfinite(R); R[badR] = 0.0

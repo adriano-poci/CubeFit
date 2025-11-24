@@ -56,6 +56,91 @@ C_KMS = CTS.c
 
 # ------------------------- small utilities ------------------------------------
 
+class _P2Median:
+    """
+    Streaming P² median estimator (Jain & Chlamtac, 1985) with ~5 markers.
+
+    Stores only O(1) state per tracked series; good accuracy for large S.
+    """
+    __slots__ = ("_n", "_q", "_nq", "_dn")
+
+    def __init__(self) -> None:
+        self._n = 0
+        self._q = np.zeros(5, dtype=np.float64)
+        self._nq = np.array([0, 1, 2, 3, 4], dtype=np.float64)
+        self._dn = np.array([0.0, 0.5, 1.0, 1.5, 2.0], dtype=np.float64)
+
+    def update(self, x: np.ndarray) -> None:
+        """
+        Vectorized: accept a batch of scalars as a 1D array.
+        Initializes each series lazily on first five samples.
+        """
+        # For simplicity with many series, we call per-scalar here.
+        # The outer code will call update() with scalars in a tight loop.
+        for v in np.ravel(x):
+            n = self._n
+            if n < 5:
+                self._q[n] = float(v)
+                self._n += 1
+                if self._n == 5:
+                    self._q.sort()
+                continue
+            # Find cell k such that q[k] <= v < q[k+1]
+            if v < self._q[0]:
+                self._q[0] = v
+                k = 0
+            elif v >= self._q[4]:
+                self._q[4] = v
+                k = 3
+            else:
+                k = int(np.searchsorted(self._q, v)) - 1
+            self._nq[:5] += self._dn
+            self._nq[k+1:5] += 1.0
+            # Desired marker positions for median (p=0.5)
+            m = np.array([0, 0.5*(self._n), 1*self._n, 1.5*(self._n), 2*self._n],
+                         dtype=np.float64) / 2.0
+            self._n += 1
+            # Adjust interior markers (1..3)
+            for i in (1, 2, 3):
+                d = m[i] - self._nq[i]
+                if (d >= 1 and self._nq[i+1] - self._nq[i] > 1) or \
+                   (d <= -1 and self._nq[i-1] - self._nq[i] < -1):
+                    d = np.sign(d)
+                    qi = self._q[i]
+                    qip = self._q[i+1]
+                    qim = self._q[i-1]
+                    di = (self._q[i+1] - qi)/(self._nq[i+1] - self._nq[i]) if self._nq[i+1] != self._nq[i] else 0.0
+                    dm = (qi - self._q[i-1])/(self._nq[i] - self._nq[i-1]) if self._nq[i] != self._nq[i-1] else 0.0
+                    qnew = qi + d*((self._nq[i] - self._nq[i-1] + d)*dm +
+                                   (self._nq[i+1] - self._nq[i] - d)*di) / \
+                                   (self._nq[i+1] - self._nq[i-1])
+                    # If monotonicity breaks, fall back to linear.
+                    if not (qim <= qnew <= qip):
+                        qnew = qi + d * (self._q[i + int(d)] - qi) / \
+                               (self._nq[i + int(d)] - self._nq[i])
+                    self._q[i] = qnew
+                    self._nq[i] += d
+
+    def median(self) -> float:
+        n = self._n
+        if n == 0:
+            return 0.0
+        if n <= 5:
+            return float(np.median(self._q[:n]))
+        return float(self._q[2])
+
+
+def _ensure_mask_indices(f, L: int) -> Optional[np.ndarray]:
+    """
+    Return wavelength mask indices (int64) if /Mask exists and is same L.
+    Otherwise None (use full λ range).
+    """
+    if "/Mask" in f:
+        m = np.asarray(f["/Mask"][...], dtype=bool, order="C")
+        if m.ndim == 1 and m.size == L:
+            return np.nonzero(m)[0].astype(np.int64)
+    return None
+
 def _choose_nfft(T_len: int, k_support: int) -> int:
     """Linear conv length >= T + m - 1; pick power-of-two for speed."""
     L = T_len + k_support - 1
@@ -797,6 +882,8 @@ def build_hypercube(
     *,
     norm_mode: str = "data",        # "model" or "data"
     amp_mode: str = "sum",           # "sum" or "trapz" for LOSVD amplitude
+    cp_flux_ref_mode: str = "median",   # "median" | "mean" | "off"
+    floor: float = 1e-12,
     S_chunk: int = 128,
     C_chunk: int = 1,
     P_chunk: int = 360,
@@ -816,6 +903,9 @@ def build_hypercube(
 
     if norm_mode not in ("model", "data"):
         raise ValueError("norm_mode must be 'model' or 'data'.")
+    if cp_flux_ref_mode not in ("median", "mean", "off"):
+        raise ValueError("cp_flux_ref_mode must be 'median', 'mean', or 'off'.")
+
 
     # -------- Fast preflight: exit early if fully complete (reader-only)
     with open_h5(base_h5, "reader") as f_rd:
@@ -851,6 +941,19 @@ def build_hypercube(
             m = np.asarray(f_rd["/Mask"][...], dtype=bool).ravel()
             if m.size == L and np.any(m):
                 keep_idx = np.flatnonzero(m)
+
+
+        # Optional λ-weights for energy/statistics (apply same floor, use √w)
+        w_lam_sqrt = None
+        lamw_floor = 1e-6
+        if "/HyperCube/lambda_weights" in f_rd:
+            _w = np.asarray(f_rd["/HyperCube/lambda_weights"][...],
+                            dtype=np.float64).ravel()
+            if _w.size == L:
+                _w = np.clip(_w, lamw_floor, None)
+                if keep_idx is not None:
+                    _w = _w[keep_idx]
+                w_lam_sqrt = np.sqrt(_w).astype(np.float64, copy=False)  # (Lk,) or (L,)
 
     # Precompute velocity→pixel mapping (shared for all (s,c))
     km = _kernel_map_from_grids(tem_loglam, vel_pix)
@@ -930,9 +1033,32 @@ def build_hypercube(
             del f["/HyperCube/col_energy"]
         E_ds = g.create_dataset("col_energy", shape=(C, P), dtype="f8",
                                 chunks=(min(C,256), min(P,1024)), compression="gzip")
-        E_ds.attrs["masked"] = bool(masked_flag)  # set attrs before swmr_mode
+        # set attrs before swmr_mode
+        E_ds.attrs["masked"] = bool(masked_flag)
+        E_ds.attrs["lambda_weights"] = bool(w_lam_sqrt is not None)
+        E_ds.attrs["lambda_weights_floor"] = 1e-6
         E_ds.attrs["shape"] = (int(C), int(P))
         E_ds.attrs["provenance"] = "sum_{s,λ} models^2 (mask applied)" if masked_flag else "sum_{s,λ} models^2"
+        if masked_flag and (w_lam_sqrt is not None):
+            E_ds.attrs["provenance"] = "sum_{s,λ} (√w·models)^2 over masked λ"
+        elif masked_flag:
+            E_ds.attrs["provenance"] = "sum_{s,λ} models^2 over masked λ"
+        elif (w_lam_sqrt is not None):
+            E_ds.attrs["provenance"] = "sum_{s,λ} (√w·models)^2 over all λ"
+        else:
+            E_ds.attrs["provenance"] = "sum_{s,λ} models^2 over all λ"
+
+        # --- cp_flux_ref accumulators
+        do_ref = (cp_flux_ref_mode != "off")
+        if do_ref:
+            if cp_flux_ref_mode == "mean":
+                ref_sum = np.zeros((C, P), dtype=np.float64)
+                ref_cnt = np.zeros((C, P), dtype=np.int64)
+            else:  # "median"
+                ref_acc = np.empty((C, P), dtype=object)
+                for c_ in range(C):
+                    for p_ in range(P):
+                        ref_acc[c_, p_] = _P2Median()
 
         # --- SWMR writer mode
         try:
@@ -1002,20 +1128,42 @@ def build_hypercube(
                     else:
                         Ycp.fill(0.0)
 
-                    # 6b) accumulate global energy E[c,p] over λ (mask if present)
+                    # 6b) accumulate global energy E[c,p] with same λ-view:
+                    # mask if present, and apply √w if lambda_weights exist.
                     if masked_flag:
+                        Yv = Ycp[:, keep_idx]  # (ΔP, Lk)
+                    else:
+                        Yv = Ycp               # (ΔP, L)
+                    if w_lam_sqrt is not None:
                         E_acc[c_idx, p0:p1] += np.einsum(
-                            "pl,pl->p", Ycp[:, keep_idx], Ycp[:, keep_idx],
+                            "pl,pl->p",
+                            Yv * w_lam_sqrt[None, :],
+                            Yv * w_lam_sqrt[None, :],
                             dtype=np.float64, optimize=True
                         )
                     else:
                         E_acc[c_idx, p0:p1] += np.einsum(
-                            "pl,pl->p", Ycp, Ycp,
+                            "pl,pl->p", Yv, Yv,
                             dtype=np.float64, optimize=True
                         )
 
+                    # --- cp_flux_ref: per-(c,p) masked λ-sum, one sample per spaxel
+                    if do_ref:
+                        if masked_flag:
+                            s_lambda = np.sum(Ycp[:, keep_idx], axis=1, dtype=np.float64)  # (ΔP,)
+                        else:
+                            s_lambda = np.sum(Ycp, axis=1, dtype=np.float64)              # (ΔP,)
+                        if cp_flux_ref_mode == "mean":
+                            ref_sum[c_idx, p0:p1] += s_lambda
+                            ref_cnt[c_idx, p0:p1] += 1
+                        else:
+                            # median: update sketches per p
+                            for dp, val in enumerate(s_lambda):
+                                ref_acc[c_idx, p0 + dp].update(float(val))
+
                     # 7) write
                     models[s_idx, c_idx, p0:p1, 0:L] = Ycp
+
 
             _done_set(done, idx3)
 
@@ -1039,12 +1187,42 @@ def build_hypercube(
 
         E_ds[...] = E_acc
 
+        # --- finalize cp_flux_ref
+        if do_ref:
+            if "/HyperCube/norm/cp_flux_ref" in f:
+                del f["/HyperCube/norm/cp_flux_ref"]
+            if cp_flux_ref_mode == "mean":
+                ref = np.divide(ref_sum, np.maximum(ref_cnt, 1, dtype=np.int64),
+                                dtype=np.float64)
+            else:
+                ref = np.empty((C, P), dtype=np.float64)
+                for c_ in range(C):
+                    for p_ in range(P):
+                        ref[c_, p_] = ref_acc[c_, p_].median()
+            # sanitize + floor
+            ref = np.where(np.isfinite(ref), ref, 0.0)
+            ref = np.maximum(ref, float(floor))
+            g_norm = f.require_group("/HyperCube/norm")
+            g_norm.create_dataset(
+                "cp_flux_ref", data=ref.astype(np.float64),
+                chunks=(min(C,256), min(P,1024)), compression="gzip"
+            )
+            g_norm.attrs["cp_flux_ref.mode"] = cp_flux_ref_mode
+            g_norm.attrs["masked"] = bool(masked_flag)
+            g_norm.attrs["definition"] = (
+                "per-(c,p) statistic of sum_λ models[s,c,p,λ] over spaxels; "
+                "mask applied to λ if present"
+            )
+
+
         g.attrs["complete"] = True
         if vel_bias_kms is not None:
             g.attrs["vel_bias_kms"] = float(vel_bias_kms)
             g.attrs["vel_bias_note"] = "global LOSVD shift applied at build"
         g.attrs["shape"] = (S, C, P, L)
         g.attrs["chunks"] = models.chunks
+        g.attrs["cp_flux_ref_mode"] = cp_flux_ref_mode
+
 
         # help h5py close cleanly
         del models, losvd_ds, done, g, E_ds
