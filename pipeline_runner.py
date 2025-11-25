@@ -569,12 +569,9 @@ class PipelineRunner:
                 write_seed=False,
                 seed_path="/Seeds/x0_nnls_patch",
                 normalize_columns=True,
+                orbit_weights=orbit_weights,
             )
             Xcp = np.asarray(res["x_CP"], np.float64, order="C")
-            # If you have a prior, enforce it on the seed:
-            if orbit_weights is not None:
-                Xcp = apply_orbit_prior_to_seed(Xcp, orbit_weights,
-                                                preserve_total=True, min_w_frac=1e-4)
 
             x0_effective = Xcp.ravel(order="C")
             if verbose:
@@ -808,12 +805,9 @@ class PipelineRunner:
                 write_seed=bool((seed_cfg or {}).get("write_seed", True)),
                 seed_path="/Seeds/x0_nnls_patch",
                 normalize_columns=True,
+                orbit_weights=orbit_weights,
             )
             Xcp = np.asarray(res["x_CP"], np.float64, order="C")
-            # If you have a prior, enforce it on the seed:
-            if orbit_weights is not None:
-                Xcp = apply_orbit_prior_to_seed(Xcp, orbit_weights,
-                                                preserve_total=True, min_w_frac=1e-4)
 
             x0_effective = Xcp.ravel(order="C")
             if verbose:

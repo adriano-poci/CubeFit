@@ -420,7 +420,7 @@ def run_patch(h5_path: str,
     print(f"[triage] Lk (masked wavelengths) = {Lk}")
     if Lk == 0:
         raise SystemExit("[triage] /Mask removes all wavelengths for this run "
-                        "(Lk=0). Try --no-mask or fix /Mask.")
+            "(Lk=0). Try --no-mask or fix /Mask.")
 
     # finite counts per spaxel under the mask
     with open_h5(h5_path, role="reader") as f:
@@ -599,7 +599,6 @@ def run_patch(h5_path: str,
         x_CP[c, p] = x_patch[j]
     # --- Enforce orbit prior on the seed (energy metric) --- FAST and strict
     if orbit_weights is not None:
-        E = read_global_column_energy(h5_path)  # (C,P)
         x_CP = apply_orbit_prior_to_seed(x_CP, orbit_weights,
             E_cp=E, preserve_total=True, min_w_frac=1e-4)
 
@@ -613,14 +612,14 @@ def run_patch(h5_path: str,
         for i, s in enumerate(tqdm(s_idx, desc="[patch] plots", mininterval=0.5, dynamic_ncols=True)):
             y_fit = np.zeros(Lk, dtype=np.float64)
             # weighted least-squares sense: compare on masked/log grid unweighted
-            A_sp = np.asarray(M[s, :, :, :], dtype=np.float32)  # (C,P,L)
+            A_sp = np.asarray(M[s, :, :, :], dtype=np.float32) # (C,P,L)
             if keep_idx is not None:
-                A_sp = A_sp[:, :, keep_idx]                       # (C,P,Lk)
+                A_sp = A_sp[:, :, keep_idx] # (C,P,Lk)
             # only chosen pops contribute
             for c, plist in enumerate(picks):
                 if len(plist) == 0:
                     continue
-                coeff = x_CP[c, plist]                           # (|plist|,)
+                coeff = x_CP[c, plist] # (|plist|,)
                 if coeff.sum() != 0.0:
                     y_fit += coeff @ A_sp[c, plist, :]
             y_obs = y[pos:pos+Lk]
@@ -678,34 +677,35 @@ def run_patch(h5_path: str,
 
     metrics = None
     if write_seed:
-        # If you're already saving the seed into the main HDF5, just point the comparator at it.
-        # nnls_patch writes to seed_path (default '/Seeds/x0_nnls_patch'). :contentReference[oaicite:2]{index=2}
+        # Seed is in the main HDF5 at `seed_path`
         try:
             metrics = compare_usage_to_orbit_weights(
                 h5_path,
                 sidecar=None,
-                x_dset=seed_path, # e.g. "/Seeds/x0_nnls_patch"
+                x_dset=seed_path,           # e.g. "/Seeds/x0_nnls_patch"
                 normalize="unit_sum",
                 out_png=usage_png,
+                usage_metric="energy",      # use energy–weighted usage
+                E_cp=E,                     # (C,P) from read_global_column_energy
             )
         except Exception as e:
             print(f"[nnls_patch] usage-vs-prior (seed) failed: {e}")
 
     else:
         import tempfile
-        # Not writing the seed? Make a tiny *temporary sidecar* with just x,
-        # so the comparator can read it. We store it under '/Fit/x_best'. :contentReference[oaicite:3]{index=3}
         tmp_sidecar = None
         try:
-            tmp = tempfile.NamedTemporaryFile(prefix=os.path.basename(h5_path)+".fit.",
-                                            suffix=".h5", delete=False)
+            tmp = tempfile.NamedTemporaryFile(
+                prefix=os.path.basename(h5_path)+".fit.",
+                suffix=".h5", delete=False
+            )
             tmp_sidecar = tmp.name
             tmp.close()
 
             import h5py
             with h5py.File(tmp_sidecar, "w") as G:
                 G.create_dataset("/Fit/x_best", data=x_CP.astype("f8"),
-                                dtype="f8", compression="gzip")
+                                 dtype="f8", compression="gzip")
 
             metrics = compare_usage_to_orbit_weights(
                 h5_path,
@@ -713,13 +713,17 @@ def run_patch(h5_path: str,
                 x_dset="/Fit/x_best",
                 normalize="unit_sum",
                 out_png=usage_png,
+                usage_metric="energy",
+                E_cp=E,
             )
         except Exception as e:
             print(f"[nnls_patch] usage-vs-prior (temp sidecar) failed: {e}")
         finally:
             if tmp_sidecar and os.path.exists(tmp_sidecar):
-                try: os.remove(tmp_sidecar)
-                except OSError: pass
+                try:
+                    os.remove(tmp_sidecar)
+                except OSError:
+                    pass
 
     if metrics is not None:
         print(
