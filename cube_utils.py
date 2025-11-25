@@ -921,7 +921,10 @@ def compare_usage_to_orbit_weights(h5_path: str,
                                    sidecar: str | None = None,
                                    x_dset: str | None = None,
                                    normalize: str = "unit_sum",
-                                   out_png: str | None = None) -> dict:
+                                   out_png: str | None = None,
+                                   *,
+                                   usage_metric: str = "sum",
+                                   E_cp: np.ndarray | None = None) -> dict:
     """
     Compare the final component usage (sum over populations) against the
     input orbital weights, both read from the HDF5 store.
@@ -952,29 +955,33 @@ def compare_usage_to_orbit_weights(h5_path: str,
     out_png : str or None
         If provided, write a small bar+marker figure overlaying usage
         and target weights.
+    usage_metric : {'sum', 'energy'}, optional
+        How to aggregate usage over populations. With 'sum', usage is
+        sum_p X[c,p]. With 'energy', usage is sum_p X[c,p]*E[c,p], where
+        E is the global column energy from the HyperCube build.
+    E_cp : ndarray or None, optional
+        Optional (C,P) array of global column energies. If None and
+        usage_metric=='energy', this will be read from the main HDF5 via
+        `read_global_column_energy(h5_path)`.
 
     Returns
     -------
     out : dict
         Dictionary with:
-          - 'usage_raw'     : (C,) float64, sum over populations
-          - 'weights_raw'   : (C,) float64, as read
-          - 'usage'         : (C,) float64, normalized
-          - 'weights'       : (C,) float64, normalized
-          - 'l1'            : float, L1 error (|u-w|).sum()
-          - 'linf'          : float, L∞ error |u-w|.max()
-          - 'cosine'        : float, cosine similarity
-          - 'pearson_r'     : float, Pearson correlation (NaN if C<2)
-          - 'argmax_err'    : int, component index of max |u-w|
-          - 'plot_path'     : str or None
-
-    Notes
-    -----
-    * Uses float64 everywhere. No Python builtins like min/max are used.
-    * Very low-cost: reads only small vectors and HDF5 attrs/shapes.
+          - 'usage_raw'   : (C,) float64, aggregated usage (per metric)
+          - 'weights_raw' : (C,) float64, as read
+          - 'usage'       : (C,) float64, normalized
+          - 'weights'     : (C,) float64, normalized
+          - 'l1'          : float, L1 error (|u-w|).sum()
+          - 'linf'        : float, L∞ error |u-w|.max()
+          - 'cosine'      : float, cosine similarity
+          - 'pearson_r'   : float, Pearson correlation (NaN if C<2)
+          - 'argmax_err'  : int, index of max |u-w|
+          - 'plot_path'   : str or None
     """
     # ------------------ helpers ------------------
     def _find_latest_sidecar(main_path: str) -> str | None:
+        import glob  # ensure available even if caller didn't import at top
         pat = f"{os.fspath(main_path)}.fit.*.h5"
         cand = glob.glob(pat)
         if not cand:
@@ -984,37 +991,23 @@ def compare_usage_to_orbit_weights(h5_path: str,
 
     def _read_C_P(f) -> tuple[int, int]:
         M = f["/HyperCube/models"]
-        _, C, P, _ = map(int, M.shape)
-        return C, P
+        _, C_, P_, _ = map(int, M.shape)
+        return C_, P_
 
     def _row_or_vec(ds, C: int, P: int) -> np.ndarray:
-        """Return a 1-D vector for X, disambiguating shapes robustly.
-
-        Accepts:
-        - (C, P)  : returns raveled C-major (len = C*P)
-        - (P, C)  : returns raveled after transpose
-        - (T, C*P): returns last row (time-series snapshots)
-        - (1, C*P) or (C*P, 1): flattens
-        - (C*P,)  : returns as-is
-        """
         arr = np.asarray(ds[...], dtype=np.float64)
         if arr.ndim == 2:
-            # Exact factorization layout
             if arr.shape == (C, P):
                 return arr.reshape(C * P).astype(np.float64, copy=False)
             if arr.shape == (P, C):
                 return arr.T.reshape(C * P).astype(np.float64, copy=False)
-            # Time-series snapshots (T, C*P)
             if arr.shape[1] == C * P:
                 return arr[-1, :].astype(np.float64, copy=False)
-            # Single-row/col CP vectors
             if arr.shape == (1, C * P):
                 return arr[0, :].astype(np.float64, copy=False)
             if arr.shape == (C * P, 1):
                 return arr[:, 0].astype(np.float64, copy=False)
-        # Fallback: flat vector
-        v = arr.ravel().astype(np.float64, copy=False)
-        return v
+        return arr.ravel().astype(np.float64, copy=False)
 
     def _read_X(f_side, f_main, C, P) -> np.ndarray:
         # explicit override
@@ -1078,35 +1071,59 @@ def compare_usage_to_orbit_weights(h5_path: str,
             x = _read_X(None, F, C, P)
             w = _read_weights(None, F)
 
-    # ------------------ assemble & compare (robust to x∈{C, C*P}) ----------
+    # ------------------ assemble & compare ------------------
     x = np.asarray(x, dtype=np.float64).ravel(order="C")
-    # be robust to NaNs/Infs in solution vectors
     x = np.nan_to_num(x, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-    if x.size == C * P:
-        usage_raw = x.reshape(C, P, order="C").sum(axis=1)
-    elif x.size == C:
-        usage_raw = x.copy()
-    else:
+    if x.size not in (C, C * P):
         raise ValueError(
             f"x length {x.size} is incompatible; expected C={C} or C*P={C*P}."
         )
 
-    # Accept orbit_weights as (C,) or (C*P,) as well
-    w_vec = np.asarray(w, dtype=np.float64).ravel()
+    # Usage metric
+    usage_metric = str(usage_metric).lower()
+    if usage_metric not in ("sum", "energy"):
+        raise ValueError("usage_metric must be 'sum' or 'energy'.")
+
+    if x.size == C * P:
+        Xcp = x.reshape(C, P, order="C")
+    else:
+        # If only a C-vector is provided, treat it as already aggregated.
+        Xcp = None
+
+    if usage_metric == "energy":
+        # Prefer passed-in E_cp; otherwise read once from main file.
+        if E_cp is None:
+            from CubeFit.hypercube_builder import read_global_column_energy
+            E_cp = read_global_column_energy(h5_path)  # (C,P) float64
+        E = np.asarray(E_cp, np.float64, order="C")
+        if E.shape != (C, P):
+            raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C,P)}")
+        if Xcp is None:
+            # x is (C,), nothing to multiply; interpret as already-aggregated.
+            usage_raw = np.maximum(x.copy(), 0.0)
+        else:
+            usage_raw = np.maximum((Xcp * E).sum(axis=1), 0.0)
+    else:
+        # 'sum' metric
+        if Xcp is None:
+            usage_raw = np.maximum(x.copy(), 0.0)
+        else:
+            usage_raw = np.maximum(Xcp.sum(axis=1), 0.0)
+
+    # Accept orbit_weights as (C,) or (C*P,)
+    w_vec = np.asarray(w, dtype=np.float64).ravel(order="C")
     if w_vec.size == C:
-        weights_raw = w_vec
+        weights_raw = np.maximum(w_vec, 0.0)
     elif w_vec.size == C * P:
-        weights_raw = w_vec.reshape(C, P, order="C").sum(axis=1)
+        weights_raw = np.maximum(
+            w_vec.reshape(C, P, order="C").sum(axis=1), 0.0
+        )
     else:
         raise ValueError(
             f"weights length {w_vec.size} is incompatible; expected C={C} "
             f"or C*P={C*P}."
         )
-
-    # sanitize
-    usage_raw = np.maximum(np.nan_to_num(usage_raw, nan=0.0), 0.0)
-    weights_raw = np.maximum(np.nan_to_num(weights_raw, nan=0.0), 0.0)
 
     if normalize not in ("unit_sum", "match_sum"):
         raise ValueError("normalize must be 'unit_sum' or 'match_sum'.")
@@ -1136,15 +1153,16 @@ def compare_usage_to_orbit_weights(h5_path: str,
         ax = fig.add_subplot(111)
         idx = np.arange(C, dtype=int)
         ax.bar(idx, usage, width=0.8, alpha=0.85, label="usage (sum over P)",
-            color='r')
+               color='r')
         ax.plot(idx, weights, marker="o", linestyle="--", label="target w_c",
-            color='k')
+                color='k')
         mx = np.max(weights) if C > 0 else 1.0
         ax.set_ylim(0.0, float(1.05 * mx))
         ax.set_xlabel("component c")
         ax.set_ylabel("normalized weight")
-        ax.set_title(f"component usage vs target  L1={l1:.3g}  L∞={linf:.3g}  "
-                     f"cos={cosine:.3f}  r={pearson_r:.3f}")
+        ttl = (f"component usage vs target  L1={l1:.3g}  L∞={linf:.3g}  "
+               f"cos={cosine:.3f}  r={pearson_r:.3f}")
+        ax.set_title(ttl)
         ax.legend(loc="best", fontsize=8)
         fig.savefig(out_png, dpi=140)
         plt.close(fig)
