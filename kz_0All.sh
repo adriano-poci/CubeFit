@@ -1,6 +1,7 @@
 #!/bin/bash -l
 
 module purge
+module load foss/2023a
 module load Python/3.11.3-GCCcore-12.3.0
 # glibc / allocator hygiene
 export MALLOC_ARENA_MAX=2

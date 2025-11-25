@@ -209,81 +209,71 @@ def _global_nnls_workingset(Bw, yw, col_map,
 def apply_orbit_prior_to_seed(Xcp: np.ndarray,
                               orbit_weights,
                               *,
+                              E_cp: np.ndarray | None = None,
                               preserve_total: bool = True,
                               min_w_frac: float = 1e-4) -> np.ndarray:
     """
-    Rescale rows of Xcp (C,P) so row sums follow orbit_weights fractions.
+    Rescale rows of Xcp (C,P) so row usage matches orbit_weights fractions.
 
-    Parameters
-    ----------
-    Xcp : ndarray, shape (C, P)
-        Patch seed from nnls_patch (non-negative).
-    orbit_weights : array_like, shape (C,) or (C*P,)
-        Component weights (C) or per-pixel weights (C*P). Converted to
-        per-component fractions internally.
-    preserve_total : bool, optional
-        If True, keep sum(Xcp) unchanged after rescaling.
-    min_w_frac : float, optional
-        Components with prior fraction < min_w_frac are treated as 0 for
-        the anchor/active logic (but still allowed to keep their current
-        mass if present).
+    If E_cp is provided (C,P), usage is energy-weighted: s_c = sum_p X[c,p]*E[c,p].
+    Otherwise usage is plain row sums: s_c = sum_p X[c,p].
 
-    Returns
-    -------
-    Xcp_adj : ndarray, shape (C, P)
-        Rescaled seed with per-component proportions ≈ prior fractions.
-
-    Notes
-    -----
-    - If a component has zero mass but positive prior, a tiny uniform
-      mass is injected before scaling to avoid division by zero.
-    - Non-finite entries are treated as zeros.
+    This is a fast, closed-form, mass-preserving projection; O(C*P).
     """
-    X = np.nan_to_num(np.asarray(Xcp, np.float64),
-                      nan=0.0, posinf=0.0, neginf=0.0, copy=True)
+    X = np.nan_to_num(np.asarray(Xcp, np.float64), nan=0.0, posinf=0.0,
+                      neginf=0.0, copy=True)
     if X.ndim != 2:
         raise ValueError("Xcp must be 2-D (C,P).")
     C, P = X.shape
 
-    w = np.asarray(orbit_weights, dtype=np.float64).ravel()
+    w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
     if w.size not in (C, C * P):
         raise ValueError(f"orbit_weights has size {w.size}, expected {C} or {C*P}")
     if w.size == C * P:
-        w = w.reshape(C, P).sum(axis=1)
+        w = w.reshape(C, P, order="C").sum(axis=1)
 
     w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
-    tot = float(w.sum())
-    if tot <= 0.0:
+    Wsum = float(w.sum())
+    if Wsum <= 0.0:
         return X  # no prior to enforce
+    t = w / Wsum  # target fractions per component in [0,1]
 
-    # Target fractions in [0,1]
-    w_c = w / tot
-
-    s = X.sum(axis=1)  # current row sums
+    # Current usage per component
+    if E_cp is not None:
+        E = np.asarray(E_cp, np.float64, order="C")
+        if E.shape != (C, P):
+            raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C,P)}")
+        s = (X * E).sum(axis=1)  # energy-weighted usage
+    else:
+        s = X.sum(axis=1)        # plain usage
     S = float(s.sum())
 
-    # Tiny mass for empty-yet-wanted components
-    want = (w_c >= min_w_frac * w_c.max())
-    need = (s <= 0.0) & (w_c > 0.0)
+    # If a component has zero usage but positive target, sprinkle tiny mass
+    need = (s <= 0.0) & (t > 0.0)
     if np.any(need):
-        eps = 1e-12 * (S if S > 0 else 1.0)
-        X[need, :] = (eps / P)  # uniform sprinkle
-        s = X.sum(axis=1)
+        eps = 1e-12 * (S if S > 0.0 else 1.0)
+        X[need, :] = (eps / P)
+        # recompute s/S in the same metric
+        if E_cp is not None:
+            s = (X * E).sum(axis=1)
+        else:
+            s = X.sum(axis=1)
         S = float(s.sum())
 
-    # Row scale factors so that s' ∝ w_c
-    eps_den = 1e-30
-    t = w_c / np.maximum(s, eps_den)
-
-    X *= t[:, None]
+    # Row scale factors so that new usage ∝ target t
+    s_safe = np.maximum(s, 1e-30)
+    scale = t / s_safe
+    X *= scale[:, None]
 
     if preserve_total:
-        # Normalize to keep overall mass the same as before
-        Sp = float(X.sum())
-        if Sp > 0 and S > 0:
+        # Keep overall mass in the same metric as before
+        if E_cp is not None:
+            Sp = float((X * E).sum())
+        else:
+            Sp = float(X.sum())
+        if Sp > 0.0 and S > 0.0:
             X *= (S / Sp)
 
-    # Project non-negativity and clean again
     np.maximum(X, 0.0, out=X)
     np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     return X
@@ -388,7 +378,8 @@ def run_patch(h5_path: str,
               out_dir: Optional[str | os.PathLike] = None,
               write_seed: bool = False,
               seed_path: str = "/Seeds/x0_nnls_patch",
-              normalize_columns: bool = True) -> dict:
+              normalize_columns: bool = True,
+              orbit_weights: np.ndarray | None = None):
 
     out_dir = None if out_dir is None else str(out_dir)
     if out_dir:
@@ -606,6 +597,11 @@ def run_patch(h5_path: str,
     x_CP = np.zeros((C, P), dtype=np.float64)
     for j, (c, p) in enumerate(col_map):
         x_CP[c, p] = x_patch[j]
+    # --- Enforce orbit prior on the seed (energy metric) --- FAST and strict
+    if orbit_weights is not None:
+        E = read_global_column_energy(h5_path)  # (C,P)
+        x_CP = apply_orbit_prior_to_seed(x_CP, orbit_weights,
+            E_cp=E, preserve_total=True, min_w_frac=1e-4)
 
     # --- Reconstruct + diagnostics per spaxel
     rmse = np.zeros(s_idx.size, dtype=np.float64)

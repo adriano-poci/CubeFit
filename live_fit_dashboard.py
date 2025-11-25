@@ -558,9 +558,8 @@ def main():
     args = ap.parse_args()
 
     # 1) Always write the main dashboard
-    render_dashboard(args.h5_path, args.out,
-                     n_spaxels=args.n_spaxels, downsample=args.downsample,
-                     sidecar=args.sidecar)
+    render_dashboard(args.h5_path, args.out, n_spaxels=args.n_spaxels,
+        downsample=args.downsample, sidecar=args.sidecar)
 
     # 2) Optionally also write the per-aperture full-resolution fits (combined)
     if args.apertures.strip():

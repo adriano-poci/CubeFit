@@ -132,9 +132,9 @@ v1.0:	12 November 2021
 # props = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=393, lOrder=7,
 #     specRange=[5100, 5950], full=True, lsf=True, iso='BaSTI', nProcs=1,
 #     band='F814W', smask=[[5550, 5560]], genSwitch=None)
-props = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=207, lOrder=0,
+props = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=207, lOrder=3,
     specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI', nProcs=1,
-    band='F814W', genSwitch=None, kind='SMILES', cont=False,
+    band='F814W', genSwitch=None, kind='SMILES', cont=True,
     smask=[[5530, 5555], [6255, 6270], [6320, 6335], [7580, 7700], [8775, 9000]],
     lam=1e-12)
 </file>
@@ -1174,11 +1174,34 @@ def compare_usage_to_orbit_weights(h5_path: str,
         _, C, P, _ = map(int, M.shape)
         return C, P
 
-    def _row_or_vec(ds) -> np.ndarray:
+    def _row_or_vec(ds, C: int, P: int) -> np.ndarray:
+        """Return a 1-D vector for X, disambiguating shapes robustly.
+
+        Accepts:
+        - (C, P)  : returns raveled C-major (len = C*P)
+        - (P, C)  : returns raveled after transpose
+        - (T, C*P): returns last row (time-series snapshots)
+        - (1, C*P) or (C*P, 1): flattens
+        - (C*P,)  : returns as-is
+        """
         arr = np.asarray(ds[...], dtype=np.float64)
-        if arr.ndim == 2 and arr.shape[0] > 0:
-            return arr[-1, :].astype(np.float64, copy=False)
-        return arr.ravel().astype(np.float64, copy=False)
+        if arr.ndim == 2:
+            # Exact factorization layout
+            if arr.shape == (C, P):
+                return arr.reshape(C * P).astype(np.float64, copy=False)
+            if arr.shape == (P, C):
+                return arr.T.reshape(C * P).astype(np.float64, copy=False)
+            # Time-series snapshots (T, C*P)
+            if arr.shape[1] == C * P:
+                return arr[-1, :].astype(np.float64, copy=False)
+            # Single-row/col CP vectors
+            if arr.shape == (1, C * P):
+                return arr[0, :].astype(np.float64, copy=False)
+            if arr.shape == (C * P, 1):
+                return arr[:, 0].astype(np.float64, copy=False)
+        # Fallback: flat vector
+        v = arr.ravel().astype(np.float64, copy=False)
+        return v
 
     def _read_X(f_side, f_main, C, P) -> np.ndarray:
         # explicit override
@@ -1186,20 +1209,22 @@ def compare_usage_to_orbit_weights(h5_path: str,
             src = f_side if (f_side is not None and x_dset in f_side) else f_main
             if src is None or x_dset not in src:
                 raise RuntimeError(f"Requested x_dset '{x_dset}' not found.")
-            x = _row_or_vec(src[x_dset])
-            return x
+            return _row_or_vec(src[x_dset], C, P)
+
         # sidecar-first
         if f_side is not None:
             for name in ("/Fit/x_best", "/Fit/x_last", "/Fit/x_epoch_last"):
                 if name in f_side:
-                    return _row_or_vec(f_side[name])
+                    return _row_or_vec(f_side[name], C, P)
             for name in ("/Fit/x_snapshots", "/Fit/x_hist"):
                 if name in f_side and f_side[name].shape[0] > 0:
-                    return _row_or_vec(f_side[name])
+                    return _row_or_vec(f_side[name], C, P)
+
         # main fallbacks
         for name in ("/X_global", "/Fit/x_latest"):
             if name in f_main:
-                return _row_or_vec(f_main[name])
+                return _row_or_vec(f_main[name], C, P)
+
         raise RuntimeError("No solution vector found in sidecar or main file.")
 
     def _read_weights(f_side, f_main) -> np.ndarray:
@@ -1240,15 +1265,35 @@ def compare_usage_to_orbit_weights(h5_path: str,
             x = _read_X(None, F, C, P)
             w = _read_weights(None, F)
 
-    # ------------------ assemble & compare ------------------
+    # ------------------ assemble & compare (robust to x∈{C, C*P}) ----------
     x = np.asarray(x, dtype=np.float64).ravel(order="C")
-    if x.size != C * P:
-        raise ValueError(f"x length {x.size} != C*P={C*P}.")
-    X_cp = x.reshape(C, P, order="C")
-    usage_raw = np.sum(X_cp, axis=1)          # (C,)
-    weights_raw = np.asarray(w, dtype=np.float64).ravel()
-    if weights_raw.size != C:
-        raise ValueError(f"weights length {weights_raw.size} != C={C}.")
+    # be robust to NaNs/Infs in solution vectors
+    x = np.nan_to_num(x, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if x.size == C * P:
+        usage_raw = x.reshape(C, P, order="C").sum(axis=1)
+    elif x.size == C:
+        usage_raw = x.copy()
+    else:
+        raise ValueError(
+            f"x length {x.size} is incompatible; expected C={C} or C*P={C*P}."
+        )
+
+    # Accept orbit_weights as (C,) or (C*P,) as well
+    w_vec = np.asarray(w, dtype=np.float64).ravel()
+    if w_vec.size == C:
+        weights_raw = w_vec
+    elif w_vec.size == C * P:
+        weights_raw = w_vec.reshape(C, P, order="C").sum(axis=1)
+    else:
+        raise ValueError(
+            f"weights length {w_vec.size} is incompatible; expected C={C} "
+            f"or C*P={C*P}."
+        )
+
+    # sanitize
+    usage_raw = np.maximum(np.nan_to_num(usage_raw, nan=0.0), 0.0)
+    weights_raw = np.maximum(np.nan_to_num(weights_raw, nan=0.0), 0.0)
 
     if normalize not in ("unit_sum", "match_sum"):
         raise ValueError("normalize must be 'unit_sum' or 'match_sum'.")
@@ -1257,19 +1302,19 @@ def compare_usage_to_orbit_weights(h5_path: str,
         usage = _safe_norm(usage_raw, "unit_sum")
         weights = _safe_norm(weights_raw, "unit_sum")
     else:
-        usage = _safe_norm(usage_raw, "match_sum", ref_sum=float(np.sum(weights_raw)))
+        usage = _safe_norm(
+            usage_raw, "match_sum", ref_sum=float(np.sum(weights_raw))
+        )
         weights = weights_raw.copy()
 
     diff = usage - weights
     l1 = float(np.sum(np.abs(diff)))
     linf = float(np.max(np.abs(diff))) if diff.size else np.nan
     denom = np.linalg.norm(usage) * np.linalg.norm(weights)
-    cosine = float((usage @ weights) / np.maximum(denom, 1.0e-30)) if denom > 0.0 else np.nan
-    if usage.size >= 2:
-        rr = np.corrcoef(usage, weights)
-        pearson_r = float(rr[0, 1])
-    else:
-        pearson_r = np.nan
+    cosine = float((usage @ weights) / np.maximum(denom, 1.0e-30)) \
+        if denom > 0.0 else np.nan
+    pearson_r = float(np.corrcoef(usage, weights)[0, 1]) \
+        if usage.size >= 2 else np.nan
     argmax_err = int(np.argmax(np.abs(diff))) if diff.size else -1
 
     plot_path = None
@@ -1304,7 +1349,6 @@ def compare_usage_to_orbit_weights(h5_path: str,
         argmax_err=argmax_err,
         plot_path=plot_path,
     )
-    # quick console line for at-a-glance check
     print("[usage_vs_weights] L1={:.4g}  L∞={:.4g}  cos={:.4f}  r={:.4f}  "
           "argmax_err={}".format(l1, linf, cosine, pearson_r, argmax_err))
     return out
@@ -1393,18 +1437,45 @@ def apply_component_softbox(
 
 def apply_component_softbox_energy(
     x_cp: np.ndarray,
-    E_cp: np.ndarray,          # read_global_column_energy(h5_path) → (C,P) f64
+    E_cp: np.ndarray,          # read_global_column_energy(h5_path) → (C,P)
     w_c: np.ndarray,           # /CompWeights: len C or C*P
     *,
     band: float = 0.30,        # allowed deviation band ±30%
     step: float = 0.20,        # fraction of the way to the band boundary
     min_target: float = 1e-10,
+    row_chunk: int = 8192,
 ) -> None:
+    """
+    Soft "box" constraint in energy-weighted usage space. Scales rows of
+    x_cp toward the nearest band edge around the target usage, without
+    forming large temporaries or using advanced indexing.
+
+    Parameters
+    ----------
+    x_cp : ndarray, shape (C, P)
+        Coefficient matrix to adjust in-place.
+    E_cp : ndarray, shape (C, P)
+        Global column energy per (c, p).
+    w_c : ndarray, shape (C,) or (C*P,)
+        Component prior weights; if length C*P, reduced to component level.
+    band : float, optional
+        Half-width of allowed band, i.e., s ∈ [(1-band)t, (1+band)t].
+    step : float, optional
+        Fractional move toward the boundary (0→no-op, 1→land exactly).
+    min_target : float, optional
+        Floor on target weights before normalization.
+    row_chunk : int, optional
+        Row-chunk size for streamed scaling.
+
+    Returns
+    -------
+    None
+    """
     x = np.asarray(x_cp, np.float64, order="C")
     E = np.asarray(E_cp, np.float64, order="C")
     C, P = x.shape
     if E.shape != (C, P):
-        raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C,P)}")
+        raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C, P)}")
 
     w = np.asarray(w_c, np.float64).ravel(order="C")
     if w.size == C:
@@ -1415,32 +1486,159 @@ def apply_component_softbox_energy(
         raise ValueError(f"w_c length {w.size} incompatible with C={C}, P={P}.")
 
     # energy-weighted usage per component (proportional to flux)
-    s = np.sum(x * E, axis=1)                       # (C,)
+    # avoids materializing x*E as a (C,P) temp
+    s = np.einsum("cp,cp->c", x, E, dtype=np.float64)      # (C,)
 
     # normalize target & usage
-    t = np.maximum(t, min_target)
-    t = t / np.sum(t)
-    s_sum = np.sum(s)
+    t = np.maximum(t, float(min_target))
+    t /= np.sum(t)
+    s_sum = float(np.sum(s))
     if not np.isfinite(s_sum) or s_sum <= 0.0:
         return
-    s = s / s_sum
+    s /= s_sum
 
     lo = (1.0 - float(band))
     hi = (1.0 + float(band))
 
-    # Pull back toward the nearest band edge with a convex blend
     over = s > (hi * t)
     under = s < (lo * t)
+
+    # Build a single per-row scaling vector G (defaults to 1.0)
+    G = np.ones(C, dtype=np.float64)
+
     if np.any(over):
-        f_over = (hi * t[over]) / s[over]                     # exact factor to land on upper edge
-        alpha_over = (1.0 - step) + step * f_over             # partial move
-        x[over, :] *= alpha_over[:, None]
+        # exact factor to land on upper edge, then partial move
+        f_over = (hi * t[over]) / s[over]
+        G[over] = (1.0 - float(step)) + float(step) * f_over
+
     if np.any(under):
-        f_under = (lo * t[under]) / s[under]                  # exact factor to land on lower edge
-        alpha_under = (1.0 - step) + step * f_under
-        x[under, :] *= alpha_under[:, None]
+        # exact factor to land on lower edge, then partial move
+        f_under = (lo * t[under]) / s[under]
+        G[under] = (1.0 - float(step)) + float(step) * f_under
+
+    # Streamed in-place row scaling: x[i,:] *= G[i]
+    for i0 in range(0, C, int(row_chunk)):
+        i1 = min(C, i0 + int(row_chunk))
+        x[i0:i1, :] *= G[i0:i1, None]
 
     np.maximum(x, 0.0, out=x)  # keep nonnegativity
+
+# ------------------------------------------------------------------------------
+
+def _ensure_cp_flux_ref(h5_path: str,
+                        keep_idx: np.ndarray | None,
+                        dset: str = "/HyperCube/norm/cp_flux_ref",
+                        *,
+                        max_samples: int = 256,
+                        floor: float = 1e-12) -> np.ndarray:
+    """
+    Ensure /HyperCube/norm/cp_flux_ref (C,P) exists. If missing, compute
+    a robust per-(c,p) flux reference as the **median over spaxels** of
+    the λ-sum of the (c,p) slice, using the current spectral mask.
+
+    We sample up to `max_samples` spaxels (evenly spaced) for speed.
+    """
+    # Fast path: already present
+    with open_h5(h5_path, role="reader") as f:
+        if dset in f:
+            ref = np.asarray(f[dset][...], dtype=np.float64, order="C")
+            return ref
+
+    # Build (approximate) median over spaxels of sum_λ A[s,c,p,λ]
+    with open_h5(h5_path, role="reader") as f:
+        M = f["/HyperCube/models"]  # (S,C,P,L)
+        if M.ndim != 4:
+            raise RuntimeError(f"Unexpected /HyperCube/models rank {M.ndim}")
+        S, C, P, L = map(int, M.shape)
+
+        if keep_idx is None:
+            Lk = L
+        else:
+            keep_idx = np.asarray(keep_idx, dtype=np.int64)
+            Lk = int(keep_idx.size)
+
+        # choose evenly spaced spaxels
+        Ns = int(min(S, max_samples))
+        if Ns <= 0:
+            raise RuntimeError("No spaxels available for cp_flux_ref.")
+        picks = np.unique(np.linspace(0, S - 1, Ns).astype(int))
+
+        # accumulate per-sample λ-sums → (Ns, C, P)
+        ref_samp = np.empty((picks.size, C, P), dtype=np.float64)
+        for j, s in enumerate(picks):
+            A = np.asarray(M[s, :, :, :], dtype=np.float32, order="C")  # (C,P,L)
+            if keep_idx is not None:
+                A = A[:, :, keep_idx]                                    # (C,P,Lk)
+            # sum over λ (keep_idx) in float64
+            ref_samp[j, :, :] = np.sum(A.astype(np.float64, copy=False), axis=2)
+
+        ref = np.median(ref_samp, axis=0)  # (C,P)
+        ref = np.where(np.isfinite(ref), ref, 0.0)
+        ref = np.maximum(ref, float(floor))
+
+    # persist
+    with open_h5(h5_path, role="writer") as f:
+        g = f.require_group("/HyperCube/norm")
+        if dset in f:
+            del f[dset]
+        d = f.create_dataset(dset, data=ref.astype(np.float64), chunks=(1, ref.shape[1]))
+        g.attrs["basis.mode"] = "cp_flux_ref"  # mark what we applied
+
+    return ref
+
+# ------------------------------------------------------------------------------
+
+def kacz_weighted_tile_whitelight(h5_path, x_flat, s0=0, Sblk=128, use_mask=True):
+    """
+    Rebuild y_hat for Sblk spaxels using the *weighted* operator (A_w, b_w)
+    exactly like the solver, then collapse to white-light with the *same*
+    weights/mask. Returns (data_sum, model_sum) arrays of length dS.
+    """
+    with open_h5(h5_path, role="reader") as f:
+        M = f["/HyperCube/models"]       # (S, C, P, L), float32
+        D = f["/DataCube"]               # (S, L), data
+        wlam = f["/HyperCube/lambda_weights"][...] if "/HyperCube/lambda_weights" in f else None
+        mask = f["/Masks/fit_mask"][...] if (use_mask and "/Masks/fit_mask" in f) else None
+
+        S, C, P, L = map(int, M.shape)
+        dS = int(min(Sblk, S - s0))
+        x = np.asarray(x_flat, np.float64).ravel(order="C")
+        assert x.size == C * P, f"x size {x.size} != C*P={C*P}"
+        X = x.reshape(C, P)
+
+        # λ selection consistent with the fit
+        lam_sel = np.ones(L, dtype=bool)
+        if mask is not None:
+            lam_sel &= (mask != 0)
+        lam_sel = np.where(lam_sel)[0]
+        if lam_sel.size == 0:
+            raise RuntimeError("Empty lambda selection.")
+
+        # weights used by the solver (sqrt-w per row)
+        w = np.ones(lam_sel.size, dtype=np.float64)
+        if wlam is not None:
+            w = np.sqrt(np.asarray(wlam, np.float64)[lam_sel])
+
+        # build weighted rhs and model on the *same* λ grid
+        D_sub = np.asarray(D[s0:s0+dS, lam_sel], np.float64, order="C")
+        D_w   = D_sub * w[None, :]
+
+        Y_w = np.zeros_like(D_w)  # (dS, L_sel), weighted model
+        for c in range(C):
+            A_sc = np.asarray(M[s0:s0+dS, c, :, lam_sel], np.float32, order="C")  # (dS, P, L_sel)
+            # tensordot over P, then apply sqrt-w
+            Y_w += np.tensordot(X[c, :].astype(np.float64, copy=False),
+                                A_sc.astype(np.float64, copy=False),
+                                axes=(0, 1)) * w[None, :]
+
+        # white-light collapse with the *same* weights & λ selection
+        data_sum  = D_w.sum(axis=1)
+        model_sum = Y_w.sum(axis=1)
+        return data_sum, model_sum
+
+# Example usage (pick a central tile)
+# data_sum, model_sum = kacz_weighted_tile_whitelight(h5_path, x_global, s0=0, Sblk=256)
+# print("median(model/data) =", np.median(model_sum / np.maximum(1e-30, data_sum)))
 
 # ------------------------------------------------------------------------------
 </file>
@@ -2755,7 +2953,7 @@ from CubeFit.hdf5_manager import open_h5
 from CubeFit.hypercube_builder import read_global_column_energy
 from CubeFit.cube_utils import (
     read_lambda_weights, ensure_lambda_weights, _get_mask, RatioCfg,
-    apply_component_softbox_energy
+    apply_component_softbox_energy, _ensure_cp_flux_ref
 )
 
 # ----------------------------- Config ---------------------------------
@@ -2922,7 +3120,9 @@ def _worker_tile_job_with_R(args):
      c_start, c_stop, x_band, lr, project_nonneg, R, w_band,
      dset_slots, dset_bytes, dset_w0,
      E_global_band, beta_blend,
-     w_lam_sqrt) = args
+     w_lam_sqrt,
+     inv_ref_band) = args   # (band_size, P)
+
 
     bt_steps   = int(os.environ.get("CUBEFIT_BT_STEPS", "3"))
     bt_factor  = float(os.environ.get("CUBEFIT_BT_FACTOR", "0.5"))
@@ -2979,6 +3179,9 @@ def _worker_tile_job_with_R(args):
             A = np.asarray(M[s0:s1, c, :, :], np.float32, order="C")
             if keep_idx is not None:
                 A = A[:, :, keep_idx]  # (Sblk,P,Lk)
+            inv_ref = np.asarray(inv_ref_band[bi, :], dtype=np.float64)
+            # Broadcast over (Sblk, P, Lk)
+            A = A * inv_ref[None, :, None]
             _finite_inplace(A, f"A_nonfinite_c{c}", stats)
 
             # λ-weighted view for gradient/denominator
@@ -3220,6 +3423,7 @@ def solve_global_kaczmarz_cchunk_mp(
         mask = _get_mask(f) if cfg.apply_mask else None
         keep_idx = np.flatnonzero(mask) if mask is not None else None
         Lk = int(keep_idx.size) if keep_idx is not None else L
+        cp_flux_ref = _ensure_cp_flux_ref(h5_path, keep_idx)   # (C,P) float64
 
         # ------------------- λ-weights (feature emphasis) -------------
         lamw_enable = os.environ.get(
@@ -3275,6 +3479,9 @@ def solve_global_kaczmarz_cchunk_mp(
             norms.append(float(np.linalg.norm(Yt)))
             Y_glob_norm2 += float(np.sum(Yt * Yt))
         
+    cp_flux_ref = np.asarray(cp_flux_ref, dtype=np.float64, order="C")
+    inv_cp_flux_ref = 1.0 / cp_flux_ref  # broadcasted column scaling
+
     # --- Persist orbit_weights and push into tracker ---
     w_prior = _canon_orbit_weights(h5_path, orbit_weights, C, P)
     if (w_prior is not None) and (tracker is not None) and hasattr(tracker, "set_orbit_weights"):
@@ -3292,7 +3499,7 @@ def solve_global_kaczmarz_cchunk_mp(
 
     # ------------------- x init --------------------------------------
     if x0 is None:
-        x_CP = np.zeros((C, P), dtype=np.float64)
+        x_CP = np.zeros((C, P), dtype=np.float64, order="C")
     else:
         x0 = np.asarray(x0, np.float64).ravel(order="C")
         if x0.size != C * P:
@@ -3345,7 +3552,7 @@ def solve_global_kaczmarz_cchunk_mp(
         else:
             t_x0 = None
 
-        rng = np.random.default_rng(12345)  # deterministic unless you change it
+        rng = np.random.default_rng()
 
         def _ratio_update_in_place(x_mat: np.ndarray, t_vec: np.ndarray) -> None:
             """
@@ -3389,44 +3596,6 @@ def solve_global_kaczmarz_cchunk_mp(
             x_mat *= F[:, None]
             if cfg.project_nonneg:
                 np.maximum(x_mat, 0.0, out=x_mat)
-
-        def _ratio_project_epoch(x_mat: np.ndarray,
-                                t_vec: np.ndarray,
-                                *,
-                                eta: float = 1.0,
-                                gamma: float = 10.0,
-                                beta: float = 1.0,
-                                minw: float = 1e-6) -> None:
-            """
-            One global, mass-preserving multiplicative pass toward t_vec (Σ=1).
-            If beta<1, blends the projected state with the current one.
-            """
-            C, P = map(int, x_mat.shape)
-            s = np.sum(x_mat, axis=1)          # (C,)
-            S = float(np.sum(s))
-            if not np.isfinite(S) or S <= 0.0:
-                return
-            sh = s / max(S, 1.0)
-
-            # log-space factors, clipped
-            e = np.log(np.maximum(sh, minw)) - np.log(np.maximum(t_vec, minw))
-            F = np.exp(-eta * e)
-            F = np.clip(F, 1.0 / gamma, gamma)
-
-            denom = float(np.sum(sh * F))
-            if not np.isfinite(denom) or denom <= 0.0:
-                return
-            F /= max(denom, 1e-30)
-
-            Xp = x_mat * F[:, None]
-            if beta < 1.0:
-                x_mat *= (1.0 - beta)
-                x_mat += beta * Xp
-            else:
-                x_mat[:] = Xp
-
-            # keep ≥0
-            np.maximum(x_mat, 0.0, out=x_mat)
 
     # ------------------- bands & pool -------------------
     nprocs = np.max((1, int(cfg.processes)))
@@ -3476,6 +3645,8 @@ def solve_global_kaczmarz_cchunk_mp(
         "CUBEFIT_SHIFT_DIAG", "0"
     ).lower() not in ("0", "false", "no", "off")
 
+    x = x_CP.ravel(order="C")   # x is a view; keep and reuse everywhere
+
     try:
         for ep in range(cfg.epochs):
             if not _pool_ok(pool, timeout=ping_timeout) or renew_each_epoch:
@@ -3518,8 +3689,7 @@ def solve_global_kaczmarz_cchunk_mp(
                 with open_h5(h5_path, role="reader") as f:
                     DC = f["/DataCube"]; M  = f["/HyperCube/models"]
                     try: M.id.set_chunk_cache(cfg.dset_slots,
-                                              cfg.dset_bytes,
-                                              cfg.dset_w0)
+                        cfg.dset_bytes, cfg.dset_w0)
                     except Exception: pass
 
                     Y = np.asarray(DC[s0:s1, :], np.float64, order="C")
@@ -3528,10 +3698,11 @@ def solve_global_kaczmarz_cchunk_mp(
 
                     yhat = np.zeros((Sblk, Lk), np.float64)
                     for c in range(C):
-                        A = np.asarray(M[s0:s1, c, :, :], np.float32,
-                                       order="C")
+                        A = np.asarray(M[s0:s1, c, :, :], np.float32, order="C")
                         if keep_idx is not None:
                             A = A[:, :, keep_idx]
+                        # Mode A: same cp normalization here
+                        A = A * (inv_cp_flux_ref[c, :][None, :, None])
                         xc = x_CP[c, :].astype(np.float64, copy=False)
                         for s in range(Sblk):
                             yhat[s, :] += xc @ A[s, :, :]
@@ -3570,7 +3741,8 @@ def solve_global_kaczmarz_cchunk_mp(
                     x_band = x_CP[c_start:c_stop, :].copy()
                     w_band = None if w_full is None else \
                         w_full[c_start:c_stop].copy()
-                    E_band = E_global[c_start:c_stop, :]  # (band_size,P)
+                    E_band = E_global[c_start:c_stop, :]              # (band_size,P)
+                    inv_ref_band = inv_cp_flux_ref[c_start:c_stop, :] # (band_size,P)
                     jobs.append((
                         h5_path, s0, s1, keep_idx,
                         c_start, c_stop, x_band,
@@ -3578,7 +3750,8 @@ def solve_global_kaczmarz_cchunk_mp(
                         R.copy(), w_band,
                         cfg.dset_slots, cfg.dset_bytes, cfg.dset_w0,
                         E_band, float(beta_blend),
-                        w_lam_sqrt
+                        w_lam_sqrt,
+                        inv_ref_band
                     ))
 
                 results = pool.map(_worker_tile_job_with_R, jobs)
@@ -3692,10 +3865,11 @@ def solve_global_kaczmarz_cchunk_mp(
                 nnls_max_iter = int(
                     os.environ.get("CUBEFIT_NNLS_MAX_ITER", "200")
                 )
-                nnls_min_improve = float(
-                    os.environ.get("CUBEFIT_NNLS_MIN_IMPROVE", "0.9995")
-                )
-                nnls_l2 = float(os.environ.get("CUBEFIT_NNLS_L2", "0.0"))
+                nnls_min_improve = float(os.environ.get("CUBEFIT_NNLS_MIN_IMPROVE", "0.9995"))
+                nnls_l2         = float(os.environ.get("CUBEFIT_NNLS_L2", "0.0"))
+                # allow a small worsening of ratio misfit when polishing (>=1 means allow)
+                # e.g. 1.02 allows up to +2% worse local ratio misfit; 1.00 = never worsen.
+                nnls_ratio_worsen = float(os.environ.get("CUBEFIT_NNLS_RATIO_WORSEN", "1.02"))
 
                 do_nnls = (
                     nnls_enable and ((tile_idx % nnls_every) == 0)
@@ -3770,9 +3944,11 @@ def solve_global_kaczmarz_cchunk_mp(
                                     col = A_c[:, int(pp), :].astype(
                                         np.float64, copy=False
                                     ).reshape(rows, order="C")
+                                    # Mode A: normalize this (c,p) column
+                                    col *= float(inv_cp_flux_ref[int(cc), int(pp)])
                                     B[:, int(j)] = col
-                                    xW[int(j)]   = float(x_CP[int(cc),
-                                                              int(pp)])
+                                    xW[int(j)]   = float(x_CP[int(cc), int(pp)])
+
 
                         r_sub = R[:, lam_sel].reshape(rows, order="C")
                         y_rhs = B @ xW + r_sub
@@ -3853,31 +4029,53 @@ def solve_global_kaczmarz_cchunk_mp(
                             except Exception:
                                 xW_new = None
 
-                        # Commit only if it helped enough (weighted RMSE)
+                        # Commit only if we actually solved something and it helped enough
                         if xW_new is not None:
                             dxW = xW_new - xW
                             if np.any(dxW != 0.0):
+
+                                # --- Weighted RMSE accept criterion (unchanged) ---
                                 def _wrmse(vec_1d: np.ndarray) -> float:
                                     w2 = sqrt_w_rows * sqrt_w_rows
                                     num = float(np.dot(w2, vec_1d * vec_1d))
                                     den = float(np.sum(w2)) or 1.0
                                     return math.sqrt(num / den)
 
-                                r_after = r_sub - (B @ dxW)
+                                r_after = r_sub - (B @ dxW)   # NOTE: unweighted residual update
                                 rmse_before = _wrmse(r_sub)
-                                rmse_after2 = _wrmse(r_after)
+                                rmse_after  = _wrmse(r_after)
+                                ok_rmse = (rmse_after / max(1e-12, rmse_before)) < nnls_min_improve
 
-                                if (rmse_after2 / np.max((1e-12, rmse_before)))\
-                                        < nnls_min_improve:
+                                # --- ratio-drift guard vs global prior w_prior ---
+                                ok_ratio = True
+                                if have_ratio:
+                                    # totals before
+                                    s_before = x_CP.sum(axis=1)             # (C,)
+                                    S_b = float(np.sum(s_before))
+                                    if S_b > 0.0:
+                                        mix_b = s_before / S_b
+
+                                        # apply dxW only to the touched (c,p) indices
+                                        comp_of_j = (W_idx // P).astype(np.int64)
+                                        dS = np.zeros(C, dtype=np.float64)
+                                        np.add.at(dS, comp_of_j, dxW)
+
+                                        s_after = s_before + dS
+                                        S_a = float(np.sum(s_after))
+                                        if S_a > 0.0:
+                                            mix_a = s_after / S_a
+                                            # L1 deviation from target mixture w_prior
+                                            dev_b = float(np.sum(np.abs(mix_b - w_prior)))
+                                            dev_a = float(np.sum(np.abs(mix_a - w_prior)))
+                                            ok_ratio = (dev_a <= dev_b * nnls_ratio_worsen + 1e-18)
+
+                                if ok_rmse and ok_ratio:
+                                    # Commit to x_CP and to the *unweighted* residual R
                                     for j, g in enumerate(W_idx):
                                         cc = int(g // P); pp = int(g % P)
-                                        x_CP[cc, pp] = float(np.max((
-                                            0.0, x_CP[cc, pp] + dxW[j]
-                                        )))
-                                    # Update residual in the unweighted space
-                                    R[:, lam_sel] = r_after.reshape(
-                                        Sblk, lam_sel.size, order="C"
-                                    )
+                                        x_CP[cc, pp] = float(max(0.0, x_CP[cc, pp] + dxW[j]))
+                                    R[:, lam_sel] = r_after.reshape(Sblk, lam_sel.size, order="C")
+                                # else: reject this NNLS polish
 
                 # ---------- end NNLS polish ----------
 
@@ -3905,21 +4103,6 @@ def solve_global_kaczmarz_cchunk_mp(
                     band=float(orbBand), step=float(orbStep), min_target=1e-10
                 )
 
-            # global, mass-preserving projection of row sums toward the prior
-            if have_ratio and rc.epoch_project:
-                # choose the target mixture used elsewhere in the solver
-                t_vec = (t_x0 if (rc.anchor == "x0" and t_x0 is not None) else w_target)
-                if rc.epoch_renorm:
-                    # keep Σ t_vec = 1 to match the multiplicative update math
-                    t_vec = t_vec / max(1.0, float(np.sum(t_vec)))
-
-                _ratio_project_epoch(
-                    x_CP, t_vec,
-                    eta=float(rc.epoch_eta),
-                    gamma=float(rc.epoch_gamma),
-                    beta=float(rc.epoch_beta),
-                    minw=float(rc.minw),
-                )
                 dt_sb = time.perf_counter() - t0_sb
                 print(f"[softbox] epoch {ep+1}: took {dt_sb:.3f}s", flush=True)
 
@@ -4030,6 +4213,8 @@ def probe_kaczmarz_tile(
         A = np.asarray(M[s0:s1, c, :, :], np.float32, order="C")
         if keep_idx is not None:
             A = A[:, :, keep_idx]  # (Sblk, P, Lk)
+        cp_flux_ref = _ensure_cp_flux_ref(h5_path, keep_idx=None if keep_idx is None else np.arange(L)[keep_idx])
+        A = A * (1.0 / cp_flux_ref[int(c), :])[None, :, None]
 
         # sanitize
         badR = ~np.isfinite(R); R[badR] = 0.0
@@ -6224,14 +6409,14 @@ def run_patch(h5_path: str,
                 col_map.append((c, int(p_idx)))
                 j += 1
 
-    # NEW: final sanitation guard (paranoia)
+    # final sanitation guard (paranoia)
     if not np.isfinite(B).all():
         bad_cols = np.any(~np.isfinite(B), axis=0).nonzero()[0]
         print(f"[patch] WARNING: non-finite values in {bad_cols.size} columns; "
               f"sanitizing to 0.")
         B[:, bad_cols] = np.nan_to_num(B[:, bad_cols], copy=False)
 
-    # NEW: quick column-norm diagnostics on the weighted system
+    # quick column-norm diagnostics on the weighted system
     colnorm_w = np.linalg.norm(B * sqrt_w_rows[:, None], axis=0)
     print("[patch] column norms (weighted) min/median/max: "
           f"{colnorm_w.min():.3g}/{np.median(colnorm_w):.3g}/{colnorm_w.max():.3g}")
@@ -8544,6 +8729,91 @@ C_KMS = CTS.c
 
 # ------------------------- small utilities ------------------------------------
 
+class _P2Median:
+    """
+    Streaming P² median estimator (Jain & Chlamtac, 1985) with ~5 markers.
+
+    Stores only O(1) state per tracked series; good accuracy for large S.
+    """
+    __slots__ = ("_n", "_q", "_nq", "_dn")
+
+    def __init__(self) -> None:
+        self._n = 0
+        self._q = np.zeros(5, dtype=np.float64)
+        self._nq = np.array([0, 1, 2, 3, 4], dtype=np.float64)
+        self._dn = np.array([0.0, 0.5, 1.0, 1.5, 2.0], dtype=np.float64)
+
+    def update(self, x: np.ndarray) -> None:
+        """
+        Vectorized: accept a batch of scalars as a 1D array.
+        Initializes each series lazily on first five samples.
+        """
+        # For simplicity with many series, we call per-scalar here.
+        # The outer code will call update() with scalars in a tight loop.
+        for v in np.ravel(x):
+            n = self._n
+            if n < 5:
+                self._q[n] = float(v)
+                self._n += 1
+                if self._n == 5:
+                    self._q.sort()
+                continue
+            # Find cell k such that q[k] <= v < q[k+1]
+            if v < self._q[0]:
+                self._q[0] = v
+                k = 0
+            elif v >= self._q[4]:
+                self._q[4] = v
+                k = 3
+            else:
+                k = int(np.searchsorted(self._q, v)) - 1
+            self._nq[:5] += self._dn
+            self._nq[k+1:5] += 1.0
+            # Desired marker positions for median (p=0.5)
+            m = np.array([0, 0.5*(self._n), 1*self._n, 1.5*(self._n), 2*self._n],
+                         dtype=np.float64) / 2.0
+            self._n += 1
+            # Adjust interior markers (1..3)
+            for i in (1, 2, 3):
+                d = m[i] - self._nq[i]
+                if (d >= 1 and self._nq[i+1] - self._nq[i] > 1) or \
+                   (d <= -1 and self._nq[i-1] - self._nq[i] < -1):
+                    d = np.sign(d)
+                    qi = self._q[i]
+                    qip = self._q[i+1]
+                    qim = self._q[i-1]
+                    di = (self._q[i+1] - qi)/(self._nq[i+1] - self._nq[i]) if self._nq[i+1] != self._nq[i] else 0.0
+                    dm = (qi - self._q[i-1])/(self._nq[i] - self._nq[i-1]) if self._nq[i] != self._nq[i-1] else 0.0
+                    qnew = qi + d*((self._nq[i] - self._nq[i-1] + d)*dm +
+                                   (self._nq[i+1] - self._nq[i] - d)*di) / \
+                                   (self._nq[i+1] - self._nq[i-1])
+                    # If monotonicity breaks, fall back to linear.
+                    if not (qim <= qnew <= qip):
+                        qnew = qi + d * (self._q[i + int(d)] - qi) / \
+                               (self._nq[i + int(d)] - self._nq[i])
+                    self._q[i] = qnew
+                    self._nq[i] += d
+
+    def median(self) -> float:
+        n = self._n
+        if n == 0:
+            return 0.0
+        if n <= 5:
+            return float(np.median(self._q[:n]))
+        return float(self._q[2])
+
+
+def _ensure_mask_indices(f, L: int) -> Optional[np.ndarray]:
+    """
+    Return wavelength mask indices (int64) if /Mask exists and is same L.
+    Otherwise None (use full λ range).
+    """
+    if "/Mask" in f:
+        m = np.asarray(f["/Mask"][...], dtype=bool, order="C")
+        if m.ndim == 1 and m.size == L:
+            return np.nonzero(m)[0].astype(np.int64)
+    return None
+
 def _choose_nfft(T_len: int, k_support: int) -> int:
     """Linear conv length >= T + m - 1; pick power-of-two for speed."""
     L = T_len + k_support - 1
@@ -9285,6 +9555,8 @@ def build_hypercube(
     *,
     norm_mode: str = "data",        # "model" or "data"
     amp_mode: str = "sum",           # "sum" or "trapz" for LOSVD amplitude
+    cp_flux_ref_mode: str = "median",   # "median" | "mean" | "off"
+    floor: float = 1e-12,
     S_chunk: int = 128,
     C_chunk: int = 1,
     P_chunk: int = 360,
@@ -9304,6 +9576,9 @@ def build_hypercube(
 
     if norm_mode not in ("model", "data"):
         raise ValueError("norm_mode must be 'model' or 'data'.")
+    if cp_flux_ref_mode not in ("median", "mean", "off"):
+        raise ValueError("cp_flux_ref_mode must be 'median', 'mean', or 'off'.")
+
 
     # -------- Fast preflight: exit early if fully complete (reader-only)
     with open_h5(base_h5, "reader") as f_rd:
@@ -9339,6 +9614,19 @@ def build_hypercube(
             m = np.asarray(f_rd["/Mask"][...], dtype=bool).ravel()
             if m.size == L and np.any(m):
                 keep_idx = np.flatnonzero(m)
+
+
+        # Optional λ-weights for energy/statistics (apply same floor, use √w)
+        w_lam_sqrt = None
+        lamw_floor = 1e-6
+        if "/HyperCube/lambda_weights" in f_rd:
+            _w = np.asarray(f_rd["/HyperCube/lambda_weights"][...],
+                            dtype=np.float64).ravel()
+            if _w.size == L:
+                _w = np.clip(_w, lamw_floor, None)
+                if keep_idx is not None:
+                    _w = _w[keep_idx]
+                w_lam_sqrt = np.sqrt(_w).astype(np.float64, copy=False)  # (Lk,) or (L,)
 
     # Precompute velocity→pixel mapping (shared for all (s,c))
     km = _kernel_map_from_grids(tem_loglam, vel_pix)
@@ -9418,9 +9706,32 @@ def build_hypercube(
             del f["/HyperCube/col_energy"]
         E_ds = g.create_dataset("col_energy", shape=(C, P), dtype="f8",
                                 chunks=(min(C,256), min(P,1024)), compression="gzip")
-        E_ds.attrs["masked"] = bool(masked_flag)  # set attrs before swmr_mode
+        # set attrs before swmr_mode
+        E_ds.attrs["masked"] = bool(masked_flag)
+        E_ds.attrs["lambda_weights"] = bool(w_lam_sqrt is not None)
+        E_ds.attrs["lambda_weights_floor"] = 1e-6
         E_ds.attrs["shape"] = (int(C), int(P))
         E_ds.attrs["provenance"] = "sum_{s,λ} models^2 (mask applied)" if masked_flag else "sum_{s,λ} models^2"
+        if masked_flag and (w_lam_sqrt is not None):
+            E_ds.attrs["provenance"] = "sum_{s,λ} (√w·models)^2 over masked λ"
+        elif masked_flag:
+            E_ds.attrs["provenance"] = "sum_{s,λ} models^2 over masked λ"
+        elif (w_lam_sqrt is not None):
+            E_ds.attrs["provenance"] = "sum_{s,λ} (√w·models)^2 over all λ"
+        else:
+            E_ds.attrs["provenance"] = "sum_{s,λ} models^2 over all λ"
+
+        # --- cp_flux_ref accumulators
+        do_ref = (cp_flux_ref_mode != "off")
+        if do_ref:
+            if cp_flux_ref_mode == "mean":
+                ref_sum = np.zeros((C, P), dtype=np.float64)
+                ref_cnt = np.zeros((C, P), dtype=np.int64)
+            else:  # "median"
+                ref_acc = np.empty((C, P), dtype=object)
+                for c_ in range(C):
+                    for p_ in range(P):
+                        ref_acc[c_, p_] = _P2Median()
 
         # --- SWMR writer mode
         try:
@@ -9490,20 +9801,42 @@ def build_hypercube(
                     else:
                         Ycp.fill(0.0)
 
-                    # 6b) accumulate global energy E[c,p] over λ (mask if present)
+                    # 6b) accumulate global energy E[c,p] with same λ-view:
+                    # mask if present, and apply √w if lambda_weights exist.
                     if masked_flag:
+                        Yv = Ycp[:, keep_idx]  # (ΔP, Lk)
+                    else:
+                        Yv = Ycp               # (ΔP, L)
+                    if w_lam_sqrt is not None:
                         E_acc[c_idx, p0:p1] += np.einsum(
-                            "pl,pl->p", Ycp[:, keep_idx], Ycp[:, keep_idx],
+                            "pl,pl->p",
+                            Yv * w_lam_sqrt[None, :],
+                            Yv * w_lam_sqrt[None, :],
                             dtype=np.float64, optimize=True
                         )
                     else:
                         E_acc[c_idx, p0:p1] += np.einsum(
-                            "pl,pl->p", Ycp, Ycp,
+                            "pl,pl->p", Yv, Yv,
                             dtype=np.float64, optimize=True
                         )
 
+                    # --- cp_flux_ref: per-(c,p) masked λ-sum, one sample per spaxel
+                    if do_ref:
+                        if masked_flag:
+                            s_lambda = np.sum(Ycp[:, keep_idx], axis=1, dtype=np.float64)  # (ΔP,)
+                        else:
+                            s_lambda = np.sum(Ycp, axis=1, dtype=np.float64)              # (ΔP,)
+                        if cp_flux_ref_mode == "mean":
+                            ref_sum[c_idx, p0:p1] += s_lambda
+                            ref_cnt[c_idx, p0:p1] += 1
+                        else:
+                            # median: update sketches per p
+                            for dp, val in enumerate(s_lambda):
+                                ref_acc[c_idx, p0 + dp].update(float(val))
+
                     # 7) write
                     models[s_idx, c_idx, p0:p1, 0:L] = Ycp
+
 
             _done_set(done, idx3)
 
@@ -9527,12 +9860,42 @@ def build_hypercube(
 
         E_ds[...] = E_acc
 
+        # --- finalize cp_flux_ref
+        if do_ref:
+            if "/HyperCube/norm/cp_flux_ref" in f:
+                del f["/HyperCube/norm/cp_flux_ref"]
+            if cp_flux_ref_mode == "mean":
+                ref = np.divide(ref_sum, np.maximum(ref_cnt, 1, dtype=np.int64),
+                                dtype=np.float64)
+            else:
+                ref = np.empty((C, P), dtype=np.float64)
+                for c_ in range(C):
+                    for p_ in range(P):
+                        ref[c_, p_] = ref_acc[c_, p_].median()
+            # sanitize + floor
+            ref = np.where(np.isfinite(ref), ref, 0.0)
+            ref = np.maximum(ref, float(floor))
+            g_norm = f.require_group("/HyperCube/norm")
+            g_norm.create_dataset(
+                "cp_flux_ref", data=ref.astype(np.float64),
+                chunks=(min(C,256), min(P,1024)), compression="gzip"
+            )
+            g_norm.attrs["cp_flux_ref.mode"] = cp_flux_ref_mode
+            g_norm.attrs["masked"] = bool(masked_flag)
+            g_norm.attrs["definition"] = (
+                "per-(c,p) statistic of sum_λ models[s,c,p,λ] over spaxels; "
+                "mask applied to λ if present"
+            )
+
+
         g.attrs["complete"] = True
         if vel_bias_kms is not None:
             g.attrs["vel_bias_kms"] = float(vel_bias_kms)
             g.attrs["vel_bias_note"] = "global LOSVD shift applied at build"
         g.attrs["shape"] = (S, C, P, L)
         g.attrs["chunks"] = models.chunks
+        g.attrs["cp_flux_ref_mode"] = cp_flux_ref_mode
+
 
         # help h5py close cleanly
         del models, losvd_ds, done, g, E_ds
@@ -10252,6 +10615,14 @@ def main():
     props['redraw'] = bool(args.redraw)
     print(f"redraw = {props['redraw']}")
 
+    os.environ['CUBEFIT_NNLS_ENABLE']=str(0)
+    os.environ['CUBEFIT_NNLS_EVERY']=str(5)
+    os.environ['CUBEFIT_NNLS_MIN_IMPROVE']=str(0.9995)
+    os.environ['CUBEFIT_NNLS_MAX_COLS']=str(64)
+    os.environ['CUBEFIT_NNLS_SUB_L']=str(512)
+    os.environ['CUBEFIT_NNLS_SOLVER']='fista'
+    os.environ['CUBEFIT_NNLS_L2']=str(1e-6)
+
     print(props)
 
     genCubeFit(**props)
@@ -10728,13 +11099,15 @@ def render_dashboard(h5_path: str, out_png: str,
         # Use reader's C,P to reshape safely
         X_cp = np.asarray(x, float).ravel().reshape(C, P)
         usage = X_cp.sum(axis=1)
-        ax.bar(np.arange(C), usage, label="usage")
+        ax.bar(np.arange(C), usage, label="usage", color='r')
         if ow is not None and ow.size == usage.size:
-            ax.plot(np.arange(C), ow, marker="o", linestyle="--", label="target w_c")
+            ax.plot(np.arange(C), ow, marker="o", linestyle="--", label="target w_c", color='k')
             maxerr = float(np.max(np.abs(usage - ow))) if usage.size else np.nan
             ax.set_title(f"Component usage vs target (max|e|={maxerr:.3g})")
+            ax.set_ylim(0.0, float(1.05 * np.max(ow)) if ow.size else 1.0)
         else:
             ax.set_title("Component usage (sum over P)")
+            ax.set_ylim(0.0, float(1.05 * np.max(usage)) if usage.size else 1.0)
         ax.set_xlabel("component c")
         ax.legend(loc="best")
 
@@ -10846,7 +11219,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-# ipython -- /data/phys-gal-dynamics/phys2603/CubeFit/live_fit_dashboard.py /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/NGC4365_00.h5 --out /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/fit_live.png --apertures 0,2000,1400,740 --apertures-separate-dir /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/apertures/
+# ipython -- /data/phys-gal-dynamics/phys2603/CubeFit/live_fit_dashboard.py /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/NGC4365_03.h5 --out /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/figures/fit_live.png --apertures 0,2000,1400,740 --apertures-separate-dir /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/figures/apertures/
 </file>
 
 <file path="logger.py">
@@ -13199,7 +13572,7 @@ def plot_prefit_panel(
     If include_mix=True and x_global is provided, overlays reconstructed model A_s^T x.
     """
     galaxy = Path(base_h5).stem.split("_")[0]
-    pDir = Path(base_h5).parent/galaxy
+    pDir = Path(base_h5).parent/galaxy/'figures'
     pDir.mkdir(parents=True, exist_ok=True)
 
     lam_obs, y = read_observed_spectrum(base_h5, s, apply_mask=True)
@@ -14213,8 +14586,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Directories
     bDir = mDir/'tri_models'/mPath
     pDir = curdir.parent/'pxf'
-    spDir = bDir/'SPDec'
-    MKDIRS = [bDir, pDir, spDir]
+    figDir = curdir/galaxy/'figures'
+    MKDIRS = [bDir, pDir, figDir]
     [plp.Path(DIR).mkdir(parents=True, exist_ok=True) for DIR in MKDIRS]
     if isinstance(decDir, type(None)):
         with open(bDir/'decomp.dir', 'r+') as dd:
@@ -14292,13 +14665,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     nSSP = int(np.prod((nMetals, nAges, nAlphas), dtype=int))
     pred = f"0{len(repr(nComp)):d}"
     nComp = int(nComp)
-    afDir = spDir/'apers'/f"C{nComp:04d}"
-    sfDir = spDir/'SSPFit'/f"C{nComp:04d}"
-    MKDIRS = [afDir, sfDir]
-    [DIR.mkdir(parents=True, exist_ok=True) for DIR in MKDIRS]
-    lAPF = "{}_{}_c.npy"
-    globAper = afDir.rglob(lAPF.format('*', f"{lOrder:02}"))
-    runAper = np.arange(nSpat)
 
     oDict = uu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
     if 'binFN' not in oDict.keys():
@@ -14507,7 +14873,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # is built, so we don't return early here.
     # Should be zero-cost if already built
 
-    prefit_png = spDir / f"prefit_overlay_from_models_C{nComp:03d}.png"
+    prefit_png = figDir / f"prefit_overlay_from_models_C{nComp:03d}.png"
     live_prefit_snapshot_from_models(
         h5_path=str(hdf5Path),
         max_components=4,
@@ -14572,12 +14938,20 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     RC = cu.RatioCfg(
-        anchor="target",  # pull toward /CompWeights
-        eta=0.8,          # strength
-        gamma=2.0,        # slightly superlinear
-        prob=1.0,         # apply every tile
-        batch=0,          
-        minw=1e-4         # ignore components with ~zero target weight
+        anchor="target",   # pull toward /CompWeights
+        eta=0.8,           # per-tile multiplicative strength
+        gamma=2.0,         # clamp for multiplicative factors
+        prob=1.0,          # apply every tile
+        batch=0,           # consider all active components
+        minw=1e-4,         # ignore ~zero-weight targets
+        # epoch-level projection (gentle, blended)
+        epoch_project=True,
+        epoch_eta=0.6,     # how hard the epoch projection pushes
+        epoch_gamma=3.0,   # clamp at epoch projection
+        epoch_beta=0.35,   # 0..1 blend toward the projected state
+        epoch_renorm=True, # keep target sum=1
+        tile_every=1,      # apply per tile
+        use=True           # <-- IMPORTANT: actually enable the ratio term
     )
     x_global, stats = runner.solve_all_mp_batched(
         epochs=4,
@@ -15095,6 +15469,15 @@ def reconstruct_modelcube_fast(
             raise RuntimeError(f"Unexpected /HyperCube/models rank {M.ndim}")
         S, C, P, L = map(int, M.shape)
 
+        # Use the same keep_idx as the solver would (from /Mask), so the ref is consistent.
+        keep_idx = None
+        if "/Mask" in f:
+            m = np.asarray(f["/Mask"][...], dtype=bool).ravel()
+            if int(m.size) == int(M.shape[-1]):
+                keep_idx = np.flatnonzero(m)
+        cp_flux_ref = cu._ensure_cp_flux_ref(h5_path, keep_idx)
+        inv_cp_flux_ref = (1.0 / cp_flux_ref).astype(np.float64, copy=False)
+
         # Choose tile sizes aligned to on-disk chunking unless overridden
         m_chunks = M.chunks or (S, 1, P, L)
         S_chunk_file, _, _, L_chunk_file = map(int, m_chunks)
@@ -15163,11 +15546,13 @@ def reconstruct_modelcube_fast(
                         A_c = np.asarray(
                             M[s0:s1, c, nz, l0:l1], dtype=np.float32, order="C"
                         )
+                        A_c = A_c * inv_cp_flux_ref[c, nz][None, :, None]
                     else:
                         w = x_cp[c, :]    # (P,)
                         A_c = np.asarray(
                             M[s0:s1, c, :, l0:l1], dtype=np.float32, order="C"
                         )
+                        A_c = A_c * inv_cp_flux_ref[c, :][None, :, None]
 
                     # y += sum_p w[p] * A[:, p, :]
                     band += np.tensordot(
@@ -15187,6 +15572,7 @@ def reconstruct_modelcube_fast(
             # Commit the finished S-tile
             out[s0:s1, :] = Y_tile.astype(want_dtype, copy=False)
 
+
             # SWMR-friendly: expose new data; keep UI responsive
             try: out.id.flush()
             except Exception: pass
@@ -15194,6 +15580,11 @@ def reconstruct_modelcube_fast(
             except Exception: pass
             sys.stdout.flush()
             trim_heap()
+        try:
+            out.attrs["basis.normalization"] = "cp_flux_ref"
+            out.attrs["basis.norm_ref_dset"] = "/HyperCube/norm/cp_flux_ref"
+        except Exception:
+            pass
 
         pbar.close()
 
@@ -15396,7 +15787,7 @@ def parallel_spectrum_plots(
             ax.set_ylim(y0, y1)
 
         # ax.set_title(f"spaxel {int(s_idx)}  χ={chi2[int(s_idx)]:.3f}")
-        ax.set_xlabel(rf"$\log(\lambda\ [\AA])$")
+        ax.set_xlabel("log(\u03bb [\u212B])")
         ax.set_ylabel("$F_\lambda$ (arb. units)")
         # ax.legend(loc="best", fontsize=8)
         fig.tight_layout()
@@ -15467,8 +15858,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Directories
     bDir = mDir/'tri_models'/mPath
     pDir = curdir.parent/'pxf'
-    spDir = bDir/'SPDec'
-    MKDIRS = [bDir, pDir, spDir]
+    figDir = curdir/galaxy/'figures'
+    MKDIRS = [bDir, pDir, figDir]
     [plp.Path(DIR).mkdir(parents=True, exist_ok=True) for DIR in MKDIRS]
     if isinstance(decDir, type(None)):
         with open(bDir/'decomp.dir', 'r+') as dd:
@@ -15741,7 +16132,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     plt.ylabel("Number of apertures")
     plt.title("Distribution of fit quality")
     plt.tight_layout()
-    plt.savefig(spDir/"chi2_hist.png")
+    plt.savefig(figDir/"chi2_hist.png")
     plt.close()
 
     if 'spec' in pplots:
@@ -15751,20 +16142,20 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 h5_or_path=str(hdf5Path),
                 chi2=rchi2,
                 n=10,
-                plot_dir=str(spDir),
+                plot_dir=str(figDir),
                 n_workers=min(12, max(1, nProcs)),
                 tag=f"C{nComp:04d}",
                 mask=mask_arr,
             )
 
     if 'mw' in pplots:
-        laGrid = np.ma.masked_less_equal(laGrid, 0.0)
+        data_cube = np.ma.masked_less_equal(data_cube, 0.0)
         model_cube = np.ma.masked_less_equal(model_cube, 0.0)
         flux = np.ma.masked_invalid(
             # (np.ma.sum(laGrid, axis=0)/binCounts)[binNum], 0.))
-            (np.ma.sum(laGrid, axis=0)/binCounts))
+            (np.ma.sum(data_cube[:, mask_arr], axis=0)/binCounts))
         modSB = np.ma.masked_array( # re-scale to original data levels
-            (np.ma.sum(model_cube, axis=1)/binCounts),
+            (np.ma.sum(model_cube[:, mask_arr], axis=1)/binCounts),
             # (np.ma.sum(model_cube, axis=0)*laScales/binCounts)[binNum],
             mask=np.ma.getmaskarray(flux))
         fmin, fmax = np.log10(np.ma.min(flux)), np.log10(np.ma.max(flux))
@@ -15825,7 +16216,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         BIG.set_xlabel(r'$x\ [{\rm arcsec}]$', labelpad=25)
         BIG.set_ylabel(r'$y\ [{\rm arcsec}]$', labelpad=25)
 
-        plt.savefig(spDir/\
+        plt.savefig(figDir/\
             f"modelCube_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
 
     if 'otype' not in oDict['cutOn']:
@@ -15913,7 +16304,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         BIG.set_yticks([])
         BIG.set_xlabel(r'$t\ [{\rm Gyr}]$', labelpad=20)
         BIG.set_ylabel(r'$[Z/H]$', labelpad=35)
-        plt.savefig(spDir/\
+        plt.savefig(figDir/\
             f"orbitSFH_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
 
     # 7. Print summary
@@ -15922,7 +16313,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     best = np.argmin(rchi2)
     print(f"Worst fit: aperture {worst} (χ² = {rchi2[worst]:.2f})")
     print(f"Best fit:  aperture {best} (χ² = {rchi2[best]:.2f})")
-    print(f"[CubeFit] All plots and maps saved in {str(spDir)}")
+    print(f"[CubeFit] All plots and maps saved in {str(figDir)}")
 
 # ------------------------------------------------------------------------------
 

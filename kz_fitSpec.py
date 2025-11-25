@@ -555,7 +555,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         use=True           # <-- IMPORTANT: actually enable the ratio term
     )
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=4,
+        epochs=2,
         lr=0.0075,
         project_nonneg=True,
         # orbit_weights=None,     # or None for “free” fit
@@ -1479,7 +1479,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         tEnd = 'full'
     w8Str = f"{weighting[0].upper()}W"
     tag = f"_SN{int(SN):02d}_{iso}_{IMF}{slope:.2f}_{w8Str}"
-
+ 
     pfs = pDir/galaxy/f"pixels_SN{SN:02d}.xz"
     vbSpec = pDir/galaxy/f"voronoi_SN{SN:02d}_{tEnd}.xz"
     infn = bDir/'infil.xz'
@@ -1754,7 +1754,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         model_cube = np.ma.masked_less_equal(model_cube, 0.0)
         flux = np.ma.masked_invalid(
             # (np.ma.sum(laGrid, axis=0)/binCounts)[binNum], 0.))
-            (np.ma.sum(data_cube[:, mask_arr], axis=0)/binCounts))
+            (np.ma.sum(data_cube[:, mask_arr], axis=1)/binCounts))
         modSB = np.ma.masked_array( # re-scale to original data levels
             (np.ma.sum(model_cube[:, mask_arr], axis=1)/binCounts),
             # (np.ma.sum(model_cube, axis=0)*laScales/binCounts)[binNum],
