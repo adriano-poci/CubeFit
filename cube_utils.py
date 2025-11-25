@@ -1454,3 +1454,175 @@ def kacz_weighted_tile_whitelight(h5_path, x_flat, s0=0, Sblk=128, use_mask=True
 # print("median(model/data) =", np.median(model_sum / np.maximum(1e-30, data_sum)))
 
 # ------------------------------------------------------------------------------
+
+def project_to_component_weights(
+    x_cp: np.ndarray,
+    t_vec: np.ndarray,          # target mixture for components (len C or C*P→C)
+    *,
+    E_cp: np.ndarray | None = None,   # (C,P) energy weights if you want energy-weighted usage
+    minw: float = 1e-12,        # floor for targets and shares
+) -> None:
+    """
+    Exact, mass-preserving projection of the global component mixture of x_cp
+    to t_vec in ONE pass. If E_cp is provided, the mixture is defined by the
+    energy-weighted usage s_c = sum_p x[c,p] * E[c,p]; otherwise by plain sums.
+    This is O(C*P) and essentially instantaneous for (207, 360).
+
+    In-place update of x_cp.
+    """
+    x = np.asarray(x_cp, dtype=np.float64, order="C")
+    C, P = x.shape
+
+    # --- sanitize target to length C and normalize to sum=1
+    t = np.asarray(t_vec, dtype=np.float64).ravel(order="C")
+    if t.size == C * P:
+        t = t.reshape(C, P, order="C").sum(axis=1)
+    elif t.size != C:
+        raise ValueError(f"[ratio] target len {t.size} not in {{C, C*P}}")
+    t = np.maximum(t, float(minw))
+    t /= float(np.sum(t) or 1.0)
+
+    # --- choose the usage definition (plain vs energy-weighted)
+    if E_cp is None:
+        s = np.sum(x, axis=1, dtype=np.float64)                # (C,)
+    else:
+        E = np.asarray(E_cp, dtype=np.float64, order="C")
+        if E.shape != (C, P):
+            raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C,P)}")
+        s = np.einsum("cp,cp->c", x, E, optimize=True)         # (C,)
+
+    S = float(np.sum(s))
+    if not np.isfinite(S) or S <= 0.0:
+        return
+    sh = s / S
+
+    # --- exact multiplicative scaling factors with global mass preservation
+    # F_c = (t_c / sh_c) / sum_k (sh_k * (t_k / sh_k))  =  t_c / sum_k t_k  = t_c
+    # but we must guard sh_c=0. We do the standard KL-projection normalization.
+    # Compute raw factors safely, then renormalize to preserve total mass.
+    sh_safe = np.maximum(sh, float(minw))
+    F = t / sh_safe
+    F = np.where(sh > 0.0, F, 0.0)                             # rows with zero share get handled by renorm
+
+    denom = float(np.sum(sh * F))
+    if not np.isfinite(denom) or denom <= 0.0:
+        # extremely degenerate state: add a tiny epsilon mass proportional to t, retry
+        eps = 1e-16
+        x += eps * t[:, None]
+        if E_cp is None:
+            s = np.sum(x, axis=1, dtype=np.float64)
+        else:
+            s = np.einsum("cp,cp->c", x, E, optimize=True)
+        S = float(np.sum(s)); sh = s / (S or 1.0)
+        sh_safe = np.maximum(sh, float(minw))
+        F = t / sh_safe
+        F = np.where(sh > 0.0, F, 0.0)
+        denom = float(np.sum(sh * F))
+        if not np.isfinite(denom) or denom <= 0.0:
+            return  # give up quietly; nothing sensible to do
+
+    F /= max(denom, 1e-30)
+
+    # --- apply, in-place, and keep nonnegativity
+    x *= F[:, None]
+    np.maximum(x, 0.0, out=x)
+
+# ------------------------------------------------------------------------------
+
+import numpy as np
+
+def project_to_component_weights_strict(
+    x_cp: np.ndarray,
+    w_c: np.ndarray | list,
+    *,
+    E_cp: np.ndarray | None = None,
+    min_target: float = 1e-10
+) -> None:
+    """
+    Enforce the target per-component mixture exactly, while preserving the
+    global mass. This is a single multiplicative rescale per component row.
+
+    The update is:
+        S  = sum_c sum_p x[c,p]            (or energy-weighted if E_cp given)
+        t  = max(w_c, min_target); t /= sum(t)
+        s  = row_sums(x_cp)                (or energy-weighted)
+        Fc = (t_c * S) / s_c
+        x'[c, p] = Fc * x[c, p]
+
+    With this, the post-update row sums satisfy:
+        sum_p x'[c,p]  =  t_c * S,  and  sum_c sum_p x'[c,p]  =  S.
+
+    Parameters
+    ----------
+    x_cp : ndarray, shape (C, P)
+        Current global solution, component-by-projector tile.
+    w_c : array-like, shape (C,) or (C*P,)
+        Target orbital weights. If (C*P,), they are reduced to (C,)
+        by summing over P before normalization.
+    E_cp : ndarray, optional, shape (C, P)
+        If given, the projector operates in the same energy-weighted
+        metric as your softbox/usage: s_c = sum_p x[c,p] * E[c,p].
+    min_target : float, default 1e-10
+        Floor applied to targets before normalization.
+
+    Returns
+    -------
+    None
+        Operates in-place on `x_cp`.
+
+    Exceptions
+    ----------
+    ValueError
+        If input shapes are incompatible.
+
+    Examples
+    --------
+    >>> C, P = 3, 4
+    >>> X = np.ones((C, P))
+    >>> w = np.array([0.7, 0.2, 0.1])
+    >>> project_to_component_weights_strict(X, w)
+    >>> np.allclose(X.sum(axis=1) / X.sum(), w)
+    True
+    """
+    x = np.asarray(x_cp, dtype=np.float64, order="C")
+    C, P = map(int, x.shape)
+
+    w = np.asarray(w_c, dtype=np.float64).ravel(order="C")
+    if w.size == C:
+        t = w.copy()
+    elif w.size == C * P:
+        t = w.reshape(C, P, order="C").sum(axis=1)
+    else:
+        raise ValueError(
+            f"w_c length {w.size} incompatible with C={C}, P={P}."
+        )
+
+    # Normalize target to sum=1 with a floor for stability.
+    t = np.maximum(t, float(min_target))
+    t /= float(np.sum(t))
+
+    # Usage metric: plain sums or energy-weighted sums.
+    if E_cp is None:
+        s = np.sum(x, axis=1, dtype=np.float64)           # (C,)
+        S = float(np.sum(s))
+    else:
+        E = np.asarray(E_cp, dtype=np.float64, order="C")
+        if E.shape != (C, P):
+            raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C,P)}")
+        s = np.sum(x * E, axis=1, dtype=np.float64)       # (C,)
+        S = float(np.sum(s))
+
+    if not np.isfinite(S) or S <= 0.0:
+        # Nothing to do (or degenerate state).
+        return
+
+    # Exact mass-preserving rescale per component.
+    # After this, row sums equal t_c * S exactly (in the chosen metric).
+    with np.errstate(divide="ignore", invalid="ignore"):
+        F = (t * S) / np.maximum(s, 1e-300)               # (C,)
+    F = np.where(np.isfinite(F), F, 0.0)
+
+    x *= F[:, None]
+    np.maximum(x, 0.0, out=x)
+
+# ------------------------------------------------------------------------------

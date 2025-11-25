@@ -25,6 +25,7 @@
 #SBATCH --mail-user=adriano.poci@physics.ox.ac.uk
 
 module purge
+module load foss/2023a
 module load Python/3.11.3-GCCcore-12.3.0
 
 # glibc / allocator hygiene

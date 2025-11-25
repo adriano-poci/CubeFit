@@ -42,7 +42,7 @@ import numpy as np
 from dataclasses import dataclass
 
 from CubeFit.hdf5_manager import H5Manager, H5Dims, open_h5
-from CubeFit.hypercube_builder import build_hypercube
+from CubeFit.hypercube_builder import build_hypercube, read_global_column_energy
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
 from CubeFit.kaczmarz_solver import solve_global_kaczmarz, SolverCfg
 from CubeFit.kaczmarz_solver_cchunk_mp_nnls import (
@@ -565,7 +565,7 @@ class PipelineRunner:
                 use_mask=True,
                 use_lambda=True,
                 lam_dset="/HyperCube/lambda_weights",
-                out_dir=plp.Path(self.h5_path).parent,
+                out_dir=plp.Path(self.h5_path).parent/'figures',
                 write_seed=False,
                 seed_path="/Seeds/x0_nnls_patch",
                 normalize_columns=True,
@@ -621,15 +621,13 @@ class PipelineRunner:
                     sample = np.linspace(0, S - 1, n_plot,
                                          dtype=int).tolist()
 
-                    base = plp.Path(self.h5_path)
-                    out_fits = str(base.with_name(base.stem
-                                           + "_jacobi_fits.png"))
+                    base = plp.Path(self.h5_path).parent/'figures'
+                    out_fits = base/'jacobi_fits.png'
                     render_aperture_fits_with_x(self.h5_path, x0_effective,
                         out_fits, apertures=sample, show_residual=True,
                         title=f"Jacobi seed overlays (spaxels={sample})")
 
-                    out_sfh = str(base.with_name(base.stem
-                                          + "_jacobi_sfh.png"))
+                    out_sfh = base/'jacobi_sfh.png'
                     render_sfh_from_x(self.h5_path, x0_effective, out_sfh)
 
             except Exception as e:
@@ -806,7 +804,7 @@ class PipelineRunner:
                 use_mask=True,
                 use_lambda=True,
                 lam_dset="/HyperCube/lambda_weights",
-                out_dir=plp.Path(self.h5_path).parent,
+                out_dir=plp.Path(self.h5_path).parent/'figures',
                 write_seed=bool((seed_cfg or {}).get("write_seed", True)),
                 seed_path="/Seeds/x0_nnls_patch",
                 normalize_columns=True,
@@ -862,19 +860,17 @@ class PipelineRunner:
                     sample = np.linspace(0, S - 1, n_plot,
                                          dtype=int).tolist()
 
-                    base = plp.Path(self.h5_path)
-                    out_fits = str(base.with_name(base.stem
-                                           + "_jacobi_fits.png"))
+                    base = plp.Path(self.h5_path).parent/'figures'
+                    out_fits = base/'jacobi_fits.png'
                     render_aperture_fits_with_x(self.h5_path, x0_effective,
                         out_fits, apertures=sample, show_residual=True,
                         title=f"Jacobi seed overlays (spaxels={sample})")
 
-                    out_sfh = str(base.with_name(base.stem
-                                          + "_jacobi_sfh.png"))
+                    out_sfh = base/'jacobi_sfh.png'
                     render_sfh_from_x(self.h5_path, x0_effective, out_sfh)
             except Exception as e:
                 logger.log('[JacobiDiag] WARNING: could not run Jacobi '
-                           'diagnostics:')
+                    'diagnostics:')
                 logger.log_exc(e)
 
         # ---------------- Reader ----------------
@@ -934,6 +930,49 @@ class PipelineRunner:
                 tracker=tracker,
                 ratio_cfg=ratio_cfg,
             )
+
+
+            logger.log("[Pipeline] Initial MP solve done; starting quick polish...")
+
+            E_global = read_global_column_energy(self.h5_path)   # (C,P) or None
+            # Tile budget for quick polish (no extra I/O; use the reader’s known shapes)
+            total_tiles = (
+                math.ceil(reader.nSpat / reader_s_tile)
+                * math.ceil(reader.nComp / reader_c_tile)
+                * math.ceil(reader.nPop  / reader_p_tile)
+            )
+            # --- STRICT projection (mass preserving, exact per-component)
+            if orbit_weights is not None:
+                cu.project_to_component_weights_strict(
+                    x_global, orbit_weights, E_cp=E_global, min_target=1e-10
+                )
+            # --- QUICK POLISH (cheap 1-epoch touch-up, no projector/softbox)
+            # Use the solver's own API; seed it with the just-projected x_global.
+            # Keep it lightweight: a small fraction of tiles, no ratio projector, no softbox.
+            try:
+                small_tile_budget = np.max((1, int(0.1 * total_tiles)))# ~10%
+            except Exception:
+                small_tile_budget = 0  # fall back to solver default if your solver ignores max_tiles
+
+            cfg_polish = MPConfig(
+                epochs=1,
+                lr=float(lr),
+                project_nonneg=bool(project_nonneg),
+                processes=int(processes),
+                blas_threads=int(blas_threads),
+                apply_mask=bool(reader_apply_mask),
+            )
+
+            x_global, _ = solve_global_kaczmarz_cchunk_mp(
+                self.h5_path,
+                cfg_polish,
+                orbit_weights=None, # keep the enforced mixture; no projector here
+                x0=np.asarray(x_global, np.float64, order="C"),
+                tracker=NullTracker(),       # silent + cheap
+                ratio_cfg=None,              # disable ratio projector
+                max_tiles=small_tile_budget  # your solver already supports this arg
+            )
+
         finally:
             try:
                 reader.close()
