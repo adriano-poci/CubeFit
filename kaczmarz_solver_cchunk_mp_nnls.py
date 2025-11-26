@@ -1190,13 +1190,18 @@ def solve_global_kaczmarz_cchunk_mp(
             print(f"[orbit-weights] epoch {ep+1}: sync took {dt_ob:.4f}s",
                 flush=True)
             if E_global is not None:
+                print("[global energy] computing L1-to-target...", flush=True)
+                print("[global energy] using x_CP (dtype="
+                      f"{x_CP.dtype}, shape={x_CP.shape})", flush=True)
+                print("[global energy] and E_global (dtype="
+                      f"{E_global.dtype}, shape={E_global.shape})", flush=True)
                 s = np.einsum("cp,cp->c", x_CP.astype(np.float64), E_global, optimize=True)
             else:
                 s = x_CP.sum(axis=1, dtype=np.float64)
 
             S = float(np.sum(s) or 1.0)
             l1 = float(np.sum(np.abs((s / S) - (t / np.sum(t)))))
-            print(f"[ratio] epoch L1-to-target = {l1:.5e}")
+            print(f"[ratio] epoch L1-to-target = {l1:.5e}", flush=True)
 
             print(f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs} snapshotting...",
                 flush=True)
