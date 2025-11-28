@@ -793,8 +793,8 @@ class PipelineRunner:
             # Mirror nnls_patch defaults: mask+lambda on, nnls solver, normalized columns, zero ridge
             res = _nnls_patch_run(
                 h5_path=self.h5_path,
-                s_sel=None,                 # like nnls_patch default: first min(32, S) spaxels
-                k_per_comp=12,              # same default as CLI
+                s_sel=None, # like nnls_patch default: first min(32, S) spaxels
+                k_per_comp=24,              # same default as CLI
                 pick_mode="energy",
                 solver="nnls",
                 ridge=0.0,
