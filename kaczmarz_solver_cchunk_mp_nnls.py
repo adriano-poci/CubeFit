@@ -1175,7 +1175,7 @@ def solve_global_kaczmarz_cchunk_mp(
 
             # ---------- optional orbit weights enforcement -----------
             t0_ob = time.perf_counter()
-            cu.project_to_component_weights(
+            cu.project_to_component_weights_strict(
                 x_CP,
                 (orbit_weights if orbit_weights is not None else w_target),
                 # target
@@ -1191,23 +1191,74 @@ def solve_global_kaczmarz_cchunk_mp(
                 flush=True)
 
             t0_usage = time.perf_counter()
-            X64 = np.asarray(x_CP, dtype=np.float64, order="C")
-            # no copy if already f64
-            if E_global is not None:
-                # energy–weighted usage
-                s = (X64 * E_global).sum(axis=1) # (C,)
-            else:
-                # plain usage
-                s = X64.sum(axis=1) # (C,)
+            # --- global energy L1-to-target diagnostic (robust) ---
+            try:
+                if E_global is not None:
+                    print("[global energy] computing L1-to-target...", flush=True)
+                    X64 = np.asarray(x_CP, dtype=np.float64)
+                    E64 = np.asarray(E_global, dtype=np.float64)
 
-            S = float(s.sum() or 1.0)
+                    # Sanitize E_global and X64 to avoid NaN/Inf poisoning
+                    bad_E = ~np.isfinite(E64)
+                    bad_X = ~np.isfinite(X64)
+                    n_bad_E = int(bad_E.sum())
+                    n_bad_X = int(bad_X.sum())
+                    if n_bad_E or n_bad_X:
+                        print(f"[global energy] WARNING: non-finite entries detected "
+                            f"in X/E (X bad={n_bad_X}, E bad={n_bad_E}); zeroing.",
+                            flush=True)
+                        if n_bad_E:
+                            E64[bad_E] = 0.0
+                        if n_bad_X:
+                            X64[bad_X] = 0.0
 
-            t_flat = np.asarray(t, dtype=np.float64).ravel(order="C")
-            tS = float(t_flat.sum() or 1.0)
-            l1 = float(np.abs((s / S) - (t_flat / tS)).sum())
+                    # Energy–weighted usage per component
+                    s = (X64 * E64).sum(axis=1)  # (C,)
+                else:
+                    # Plain usage
+                    X64 = np.asarray(x_CP, dtype=np.float64)
+                    bad_X = ~np.isfinite(X64)
+                    if bad_X.any():
+                        print(f"[global energy] WARNING: non-finite entries in X "
+                            f"(bad={int(bad_X.sum())}); zeroing.", flush=True)
+                        X64[bad_X] = 0.0
+                    s = X64.sum(axis=1)
 
+                # Now compute L1 safely
+                s = np.maximum(s, 0.0)
+                S = float(np.sum(s))
+                if not np.isfinite(S) or S <= 0.0:
+                    print("[global energy] S is non-finite or <=0; skipping L1 diagnostic.",
+                        flush=True)
+                else:
+                    s_frac = s / S
+
+                    # t is your target mix; make sure it's finite too
+                    t_vec = (t_x0 if (rc.anchor == "x0" and t_x0 is not None) else w_target)
+                    t = np.asarray(t_vec, np.float64).ravel(order="C")
+                    if t.size == C * P:
+                        t = t.reshape(C, P, order="C").sum(axis=1)
+                    elif t.size != C:
+                        raise ValueError(f"[ratio] target len {t.size} not in {{C, C*P}}")
+
+                    t = np.maximum(np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0), rc.minw)
+                    T = float(np.sum(t))
+                    if not np.isfinite(T) or T <= 0.0:
+                        print("[global energy] target sum non-finite or <=0; skipping L1.",
+                            flush=True)
+                    else:
+                        t_frac = t / T
+                        diff = s_frac - t_frac
+                        # clean diff just in case
+                        diff = np.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0)
+                        l1 = float(np.sum(np.abs(diff)))
+                        print(f"[ratio] epoch L1-to-target = {l1:.5e}", flush=True)
+
+            except Exception as e:
+                # Last-resort guard so the solver never 'hangs' here
+                print(f"[global energy] ERROR while computing L1-to-target: {e!r}",
+                    flush=True)
             dt_usage = time.perf_counter() - t0_usage
-            print(f"[ratio] epoch L1-to-target = {l1:.5e}", flush=True)
             print(f"[ratio] epoch {ep+1}: usage calc took {dt_usage:.4f}s",
                 flush=True)
 
