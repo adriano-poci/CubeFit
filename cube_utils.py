@@ -1481,166 +1481,184 @@ def project_to_component_weights(
     minw: float = 1e-12,        # floor for targets and shares
 ) -> None:
     """
-    Exact, mass-preserving projection of the global component mixture of x_cp
-    to t_vec in ONE pass. If E_cp is provided, the mixture is defined by the
-    energy-weighted usage s_c = sum_p x[c,p] * E[c,p]; otherwise by plain sums.
-    This is O(C*P) and essentially instantaneous for (207, 360).
+    Mass-preserving projection of the global component mixture of x_cp onto
+    t_vec in ONE pass.
 
-    In-place update of x_cp.
+    If E_cp is provided, the mixture is defined by the energy-weighted usage:
+        s_c = sum_p x[c,p] * E[c,p]
+    otherwise by plain sums:
+        s_c = sum_p x[c,p].
+
+    This is O(C*P) and essentially instantaneous for (C,P)≈(207,360).
+
+    In-place update of x_cp. Numerically safe: no NaNs/Infs are left behind.
     """
-    x = np.asarray(x_cp, dtype=np.float64, order="C")
-    C, P = x.shape
+    # Ensure writable, C-contiguous float64 view
+    X = np.require(x_cp, dtype=np.float64, requirements=["C", "W"])
+    if X.ndim != 2:
+        raise ValueError("x_cp must be 2-D (C,P).")
+    C, P = X.shape
 
-    # --- sanitize target to length C and normalize to sum=1
-    t = np.asarray(t_vec, dtype=np.float64).ravel(order="C")
-    if t.size == C * P:
-        t = t.reshape(C, P, order="C").sum(axis=1)
-    elif t.size != C:
-        raise ValueError(f"[ratio] target len {t.size} not in {{C, C*P}}")
-    t = np.maximum(t, float(minw))
-    t /= float(np.sum(t) or 1.0)
+    # ---------- sanitize target t_vec -> per-component target t[c] ----------
+    t_raw = np.asarray(t_vec, dtype=np.float64).ravel(order="C")
+    if t_raw.size == C * P:
+        t_raw = t_raw.reshape(C, P, order="C").sum(axis=1)
+    elif t_raw.size != C:
+        raise ValueError(f"[ratio] target len {t_raw.size} not in {{C, C*P}}")
 
-    # --- choose the usage definition (plain vs energy-weighted)
-    if E_cp is None:
-        s = np.sum(x, axis=1, dtype=np.float64)                # (C,)
-    else:
-        E = np.asarray(E_cp, dtype=np.float64, order="C")
-        if E.shape != (C, P):
-            raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C,P)}")
-        s = np.einsum("cp,cp->c", x, E, optimize=True)         # (C,)
+    t_raw = np.nan_to_num(t_raw, nan=0.0, posinf=0.0, neginf=0.0)
+    t_raw = np.maximum(t_raw, 0.0)
 
-    S = float(np.sum(s))
-    if not np.isfinite(S) or S <= 0.0:
+    # Apply a floor so very small targets don't blow up ratios
+    t = np.maximum(t_raw, float(minw))
+    T = float(t.sum())
+    if not np.isfinite(T) or T <= 0.0:
+        # Nothing meaningful to enforce
         return
-    sh = s / S
 
-    # --- exact multiplicative scaling factors with global mass preservation
-    # F_c = (t_c / sh_c) / sum_k (sh_k * (t_k / sh_k))  =  t_c / sum_k t_k  = t_c
-    # but we must guard sh_c=0. We do the standard KL-projection normalization.
-    # Compute raw factors safely, then renormalize to preserve total mass.
-    sh_safe = np.maximum(sh, float(minw))
-    F = t / sh_safe
-    F = np.where(sh > 0.0, F, 0.0)                             # rows with zero share get handled by renorm
+    # ---------- current usage s[c] in chosen metric (plain vs energy) ----------
+    if E_cp is not None:
+        E = np.asarray(E_cp, dtype=np.float64)
+        if E.shape != (C, P):
+            raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C, P)}")
+        E = np.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
+        s = (X * E).sum(axis=1)
+    else:
+        s = X.sum(axis=1)
 
-    denom = float(np.sum(sh * F))
-    if not np.isfinite(denom) or denom <= 0.0:
-        # extremely degenerate state: add a tiny epsilon mass proportional to t, retry
-        eps = 1e-16
-        x += eps * t[:, None]
-        if E_cp is None:
-            s = np.sum(x, axis=1, dtype=np.float64)
+    s = np.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+    s = np.maximum(s, 0.0)
+    S = float(s.sum())
+    if not np.isfinite(S) or S <= 0.0:
+        # Degenerate solution; nothing to rescale
+        return
+
+    # ---------- sprinkle tiny mass where s[c]==0 but t[c]>0 ----------
+    need = (s <= 0.0) & (t > 0.0)
+    if np.any(need):
+        eps = 1.0e-12 * S
+        X[need, :] = eps / float(P)
+        # recompute usage in the same metric
+        if E_cp is not None:
+            s = (X * E).sum(axis=1)
         else:
-            s = np.einsum("cp,cp->c", x, E, optimize=True)
-        S = float(np.sum(s)); sh = s / (S or 1.0)
-        sh_safe = np.maximum(sh, float(minw))
-        F = t / sh_safe
-        F = np.where(sh > 0.0, F, 0.0)
-        denom = float(np.sum(sh * F))
-        if not np.isfinite(denom) or denom <= 0.0:
-            return  # give up quietly; nothing sensible to do
+            s = X.sum(axis=1)
+        s = np.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+        s = np.maximum(s, 1.0e-30)
+        S = float(s.sum())
+        if not np.isfinite(S) or S <= 0.0:
+            return
 
-    F /= max(denom, 1e-30)
+    # ---------- compute safe scale factors G[c] ----------
+    # We want new usage s'_c proportional to t_c, but with the same total mass S:
+    #     s'_c = t_c * (S / T)
+    target_usage = t * (S / T)           # (C,)
+    s_safe = np.maximum(s, 1.0e-30)
+    G = target_usage / s_safe            # (C,)
 
-    # --- apply, in-place, and keep nonnegativity
-    x *= F[:, None]
-    np.maximum(x, 0.0, out=x)
+    # Clean any residual NaNs/Infs in G
+    G = np.nan_to_num(G, nan=1.0, posinf=1.0, neginf=0.0)
+
+    # ---------- apply scaling in-place & clean ----------
+    X *= G[:, None]
+    np.maximum(X, 0.0, out=X)
+    np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
 # ------------------------------------------------------------------------------
 
-import numpy as np
-
 def project_to_component_weights_strict(
     x_cp: np.ndarray,
-    w_c: np.ndarray | list,
+    orbit_weights: np.ndarray,
     *,
     E_cp: np.ndarray | None = None,
-    min_target: float = 1e-10
+    min_target: float = 1e-10,
 ) -> None:
     """
-    Enforce the target per-component mixture exactly, while preserving the
-    global mass. This is a single multiplicative rescale per component row.
+    In-place rescale of X[c,p] so that component usage matches orbit_weights.
 
-    The update is:
-        S  = sum_c sum_p x[c,p]            (or energy-weighted if E_cp given)
-        t  = max(w_c, min_target); t /= sum(t)
-        s  = row_sums(x_cp)                (or energy-weighted)
-        Fc = (t_c * S) / s_c
-        x'[c, p] = Fc * x[c, p]
+    If E_cp is provided (C,P), usage is energy-weighted:
+        s_c = sum_p X[c,p] * E[c,p]
+    Otherwise usage is plain:
+        s_c = sum_p X[c,p]
 
-    With this, the post-update row sums satisfy:
-        sum_p x'[c,p]  =  t_c * S,  and  sum_c sum_p x'[c,p]  =  S.
-
-    Parameters
-    ----------
-    x_cp : ndarray, shape (C, P)
-        Current global solution, component-by-projector tile.
-    w_c : array-like, shape (C,) or (C*P,)
-        Target orbital weights. If (C*P,), they are reduced to (C,)
-        by summing over P before normalization.
-    E_cp : ndarray, optional, shape (C, P)
-        If given, the projector operates in the same energy-weighted
-        metric as your softbox/usage: s_c = sum_p x[c,p] * E[c,p].
-    min_target : float, default 1e-10
-        Floor applied to targets before normalization.
-
-    Returns
-    -------
-    None
-        Operates in-place on `x_cp`.
-
-    Exceptions
-    ----------
-    ValueError
-        If input shapes are incompatible.
-
-    Examples
-    --------
-    >>> C, P = 3, 4
-    >>> X = np.ones((C, P))
-    >>> w = np.array([0.7, 0.2, 0.1])
-    >>> project_to_component_weights_strict(X, w)
-    >>> np.allclose(X.sum(axis=1) / X.sum(), w)
-    True
+    The projection is:
+        - mass-preserving in the chosen metric (plain or energy-weighted),
+        - strictly non-negative,
+        - numerically safe (no NaNs / Infs).
     """
-    x = np.asarray(x_cp, dtype=np.float64, order="C")
-    C, P = map(int, x.shape)
+    # Ensure writable, C-contiguous float64 view
+    X = np.require(x_cp, dtype=np.float64, requirements=["C", "W"])
+    if X.ndim != 2:
+        raise ValueError("x_cp must be 2-D (C,P).")
+    C, P = X.shape
 
-    w = np.asarray(w_c, dtype=np.float64).ravel(order="C")
-    if w.size == C:
-        t = w.copy()
-    elif w.size == C * P:
-        t = w.reshape(C, P, order="C").sum(axis=1)
-    else:
+    # ---------- sanitize orbit_weights -> per-component target t_c ----------
+    w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
+    if w.size == C * P:
+        w = w.reshape(C, P, order="C").sum(axis=1)
+    elif w.size != C:
         raise ValueError(
-            f"w_c length {w.size} incompatible with C={C}, P={P}."
+            f"orbit_weights size {w.size} incompatible; expected {C} or {C*P}."
         )
 
-    # Normalize target to sum=1 with a floor for stability.
-    t = np.maximum(t, float(min_target))
-    t /= float(np.sum(t))
-
-    # Usage metric: plain sums or energy-weighted sums.
-    if E_cp is None:
-        s = np.sum(x, axis=1, dtype=np.float64)           # (C,)
-        S = float(np.sum(s))
-    else:
-        E = np.asarray(E_cp, dtype=np.float64, order="C")
-        if E.shape != (C, P):
-            raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C,P)}")
-        s = np.sum(x * E, axis=1, dtype=np.float64)       # (C,)
-        S = float(np.sum(s))
-
-    if not np.isfinite(S) or S <= 0.0:
-        # Nothing to do (or degenerate state).
+    w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+    w = np.maximum(w, 0.0)
+    Wsum = float(w.sum())
+    if not np.isfinite(Wsum) or Wsum <= 0.0:
+        # Nothing meaningful to enforce
         return
 
-    # Exact mass-preserving rescale per component.
-    # After this, row sums equal t_c * S exactly (in the chosen metric).
-    with np.errstate(divide="ignore", invalid="ignore"):
-        F = (t * S) / np.maximum(s, 1e-300)               # (C,)
-    F = np.where(np.isfinite(F), F, 0.0)
+    # Target fractions per component in [min_target, 1]
+    t = w / Wsum
+    t = np.maximum(t, float(min_target))
+    T = float(t.sum())
+    if not np.isfinite(T) or T <= 0.0:
+        return
 
-    x *= F[:, None]
-    np.maximum(x, 0.0, out=x)
+    # ---------- usage in the chosen metric ----------
+    if E_cp is not None:
+        E = np.asarray(E_cp, dtype=np.float64)
+        if E.shape != (C, P):
+            raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C, P)}")
+        E = np.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
+        s = (X * E).sum(axis=1)
+    else:
+        s = X.sum(axis=1)
+
+    s = np.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+    s = np.maximum(s, 0.0)
+    S = float(s.sum())
+
+    if not np.isfinite(S) or S <= 0.0:
+        # Degenerate solution; nothing to rescale
+        return
+
+    # ---------- sprinkle tiny mass where usage is zero but target > 0 ----------
+    need = (s <= 0.0) & (t > 0.0)
+    if np.any(need):
+        eps = 1.0e-12 * S
+        X[need, :] = eps / float(P)
+        if E_cp is not None:
+            s = (X * E).sum(axis=1)
+        else:
+            s = X.sum(axis=1)
+        s = np.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+        s = np.maximum(s, 1.0e-30)
+        S = float(s.sum())
+
+    # ---------- compute safe scale factors G[c] ----------
+    # We want new usage s'_c ∝ t_c, but keep the same total mass S in this metric:
+    #   s'_c = t_c * (S / T)
+    target_usage = t * (S / T)              # (C,)
+    s_safe = np.maximum(s, 1.0e-30)
+    G = target_usage / s_safe               # (C,)
+
+    # Clean any residual nastiness
+    G = np.nan_to_num(G, nan=1.0, posinf=1.0, neginf=0.0)
+
+    # ---------- apply in-place + final cleanup ----------
+    X *= G[:, None]
+    np.maximum(X, 0.0, out=X)
+    np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
 # ------------------------------------------------------------------------------
