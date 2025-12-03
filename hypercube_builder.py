@@ -1133,19 +1133,23 @@ def build_hypercube(
                     if masked_flag:
                         Yv = Ycp[:, keep_idx]  # (ΔP, Lk)
                     else:
-                        Yv = Ycp               # (ΔP, L)
+                        Yv = Ycp               # (ΔP, L or Lk)
+
+                    # Compute per-population contribution for this (s_idx, c_idx, P-block)
                     if w_lam_sqrt is not None:
-                        E_acc[c_idx, p0:p1] += np.einsum(
-                            "pl,pl->p",
-                            Yv * w_lam_sqrt[None, :],
-                            Yv * w_lam_sqrt[None, :],
-                            dtype=np.float64, optimize=True
-                        )
+                        # weighted: sum_λ (√w·Y)^2 = sum_λ (w * Y^2)
+                        e_local = np.sum(
+                            np.square(Yv, dtype=np.float64) * w_lam_sqrt[None, :],
+                            axis=1
+                        )  # (ΔP,)
                     else:
-                        E_acc[c_idx, p0:p1] += np.einsum(
-                            "pl,pl->p", Yv, Yv,
-                            dtype=np.float64, optimize=True
-                        )
+                        # unweighted: sum_λ Y^2
+                        e_local = np.sum(
+                            np.square(Yv, dtype=np.float64),
+                            axis=1
+                        )  # (ΔP,)
+
+                    E_acc[c_idx, p0:p1] += e_local
 
                     # --- cp_flux_ref: per-(c,p) masked λ-sum, one sample per spaxel
                     if do_ref:

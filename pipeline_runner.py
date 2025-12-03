@@ -925,47 +925,55 @@ class PipelineRunner:
                 ratio_cfg=ratio_cfg,
             )
 
-
-            logger.log("[Pipeline] Initial MP solve done; starting quick polish...")
-
-            E_global = read_global_column_energy(self.h5_path)   # (C,P) or None
-            # Tile budget for quick polish (no extra I/O; use the reader’s known shapes)
-            total_tiles = (
-                math.ceil(reader.nSpat / reader_s_tile)
-                * math.ceil(reader.nComp / reader_c_tile)
-                * math.ceil(reader.nPop  / reader_p_tile)
-            )
-            # --- STRICT projection (mass preserving, exact per-component)
+            # Do we need to project + polish?
             if orbit_weights is not None:
-                cu.project_to_component_weights_strict(
-                    x_global, orbit_weights, E_cp=E_global, min_target=1e-10
+                logger.log("[Pipeline] Initial MP solve done; starting quick polish...")
+                E_global = read_global_column_energy(self.h5_path)   # (C,P) or None
+                # Tile budget for quick polish (no extra I/O; use the reader’s known shapes)
+                # --- STRICT projection (mass preserving, exact per-component)
+                logger.log('[Pipeline] Enforcing orbit weights via strict '\
+                    'projection.')
+                cu.project_to_component_weights(
+                    x_global, orbit_weights, E_cp=E_global, min_target=1e-10,
+                    beta=1.0
                 )
-            # --- QUICK POLISH (cheap 1-epoch touch-up, no projector/softbox)
-            # Use the solver's own API; seed it with the just-projected x_global.
-            # Keep it lightweight: a small fraction of tiles, no ratio projector, no softbox.
-            try:
-                small_tile_budget = np.max((1, int(0.1 * total_tiles)))# ~10%
-            except Exception:
-                small_tile_budget = 0  # fall back to solver default if your solver ignores max_tiles
+                logger.log('[Pipeline] Post-projection total mass: '\
+                    f'{float(np.sum(x_global)):.6e}')
+                total_tiles = (
+                    math.ceil(reader.nSpat / reader_s_tile)
+                    * math.ceil(reader.nComp / reader_c_tile)
+                    * math.ceil(reader.nPop  / reader_p_tile)
+                )
+                # --- QUICK POLISH (cheap 1-epoch touch-up, no projector/softbox)
+                # Use the solver's own API; seed it with the just-projected x_global.
+                # Keep it lightweight: a small fraction of tiles, no ratio projector, no softbox.
+                try:
+                    small_tile_budget = np.max((1, int(0.1 * total_tiles)))# ~10%
+                except Exception:
+                    small_tile_budget = 0  # fall back to solver default if your solver ignores max_tiles
+                logger.log(f"[Pipeline] Running quick polish with tile budget: "
+                    f"{small_tile_budget} tiles (~10% of total {total_tiles}).")
 
-            cfg_polish = MPConfig(
-                epochs=1,
-                lr=float(lr),
-                project_nonneg=bool(project_nonneg),
-                processes=int(processes),
-                blas_threads=int(blas_threads),
-                apply_mask=bool(reader_apply_mask),
-            )
+                cfg_polish = MPConfig(
+                    epochs=1,
+                    lr=float(lr),
+                    project_nonneg=bool(project_nonneg),
+                    processes=int(processes),
+                    blas_threads=int(blas_threads),
+                    apply_mask=bool(reader_apply_mask),
+                    max_tiles=int(small_tile_budget)
+                )
 
-            x_global, _ = solve_global_kaczmarz_cchunk_mp(
-                self.h5_path,
-                cfg_polish,
-                orbit_weights=None, # keep the enforced mixture; no projector here
-                x0=np.asarray(x_global, np.float64, order="C"),
-                tracker=NullTracker(),       # silent + cheap
-                ratio_cfg=None,              # disable ratio projector
-                max_tiles=small_tile_budget  # your solver already supports this arg
-            )
+                x_global, _ = solve_global_kaczmarz_cchunk_mp(
+                    self.h5_path,
+                    cfg_polish,
+                    orbit_weights=None,
+                    # keep the enforced mixture; no projector here
+                    x0=np.asarray(x_global, np.float64, order="C"),
+                    tracker=NullTracker(), # silent + cheap
+                    ratio_cfg=None, # disable ratio projector
+                )
+                logger.log("[Pipeline] Quick polish done.")
 
         finally:
             try:
@@ -978,9 +986,8 @@ class PipelineRunner:
                 del f_wr["/X_global"]
             x1d = np.asarray(x_global, np.float64).ravel(order="C")
             f_wr.create_dataset("/X_global", data=x1d, dtype=np.float64,
-                                chunks=(min(8192, x1d.size),),
-                                compression="gzip", compression_opts=4,
-                                shuffle=True)
+                chunks=(min(8192, x1d.size),), compression=None,
+                shuffle=True)
 
         if tracker is not None:
             try: tracker.close()

@@ -37,6 +37,9 @@ class MPConfig:
     dset_slots: int = 1_000_003
     dset_bytes: int = 256 * 1024**2
     dset_w0: float = 0.90
+    s_tile_override: Optional[int] = None
+    pixels_per_aperture: int = 256
+    max_tiles: Optional[int] = None
 
 # ------------------------- Norm mode guard ----------------------------
 
@@ -548,19 +551,68 @@ def solve_global_kaczmarz_cchunk_mp(
         
     cp_flux_ref = np.asarray(cp_flux_ref, dtype=np.float64, order="C")
     inv_cp_flux_ref = 1.0 / cp_flux_ref  # broadcasted column scaling
+    print(
+        f"[Kaczmarz-MP] DataCube S={S}, L={L} (kept Lk={Lk}), "
+        f"Hypercube C={C}, P={P}, s_tile={s_tile}, "
+        f"epochs={cfg.epochs}, lr={cfg.lr}, "
+        f"processes={cfg.processes}, blas_threads={cfg.blas_threads}",
+        flush=True
+    )
 
     # --- Persist orbit_weights and push into tracker ---
+    print("[Kaczmarz-MP] Preparing orbit weights...", flush=True)
+    print("[Kaczmarz-MP] _canon_orbit_weights(...)...", flush=True)
     w_prior = _canon_orbit_weights(h5_path, orbit_weights, C, P)
+    print("[Kaczmarz-MP] done.", flush=True)
     if (w_prior is not None) and (tracker is not None) and hasattr(tracker, "set_orbit_weights"):
+        print("[Kaczmarz-MP] Setting orbit weights in tracker...", flush=True)
         tracker.set_orbit_weights(w_prior)  # this mirrors your SP path behavior
+        print("[Kaczmarz-MP] done.", flush=True)
 
-    s_ranges = [sr for _, sr in sorted(
-        zip(norms, s_ranges), key=lambda t: -t[0]
-    )]
+    # sort by descending norm (hard / bright tiles first)
+    paired = sorted(zip(norms, s_ranges), key=lambda t: -t[0])
+    norms_sorted = [t[0] for t in paired]
+    s_ranges_sorted = [t[1] for t in paired]
+
+    # Optional tile budget for quick polish runs
+    print("[Kaczmarz-MP] Applying max_tiles constraint...", flush=True)
+    max_tiles = cfg.max_tiles
+    if max_tiles is not None:
+        max_tiles = int(max_tiles)
+        if 0 < max_tiles < len(s_ranges_sorted):
+            import math
+            rng = np.random.default_rng(
+                int(os.environ.get("CUBEFIT_POLISH_SEED", "12345"))
+            )
+
+            k_bright = max(1, int(math.ceil(0.7 * max_tiles)))
+            k_rand   = max(0, max_tiles - k_bright)
+
+            bright_idx = np.arange(k_bright, dtype=int)
+            tail_idx = np.arange(k_bright, len(s_ranges_sorted), dtype=int)
+            if k_rand > 0 and tail_idx.size > 0:
+                rng.shuffle(tail_idx)
+                rand_idx = tail_idx[:k_rand]
+                keep_idx = np.concatenate([bright_idx, rand_idx])
+            else:
+                keep_idx = bright_idx
+
+            keep_idx = np.sort(keep_idx)
+            s_ranges = [s_ranges_sorted[i] for i in keep_idx]
+            norms_sorted = [norms_sorted[i] for i in keep_idx]
+        else:
+            s_ranges = s_ranges_sorted
+    else:
+        s_ranges = s_ranges_sorted
+    print(f"[Kaczmarz-MP] Using {len(s_ranges)} tiles for fitting.", flush=True)
+
     Y_glob_norm = float(np.sqrt(Y_glob_norm2))
 
+
     # ------------------- global column energy & knobs -----------------
+    print("[Kaczmarz-MP] Reading global column energy...", flush=True)
     E_global = read_global_column_energy(h5_path)  # (C,P) float64
+    print("[Kaczmarz-MP] done.", flush=True)
     tau_global = float(os.environ.get("CUBEFIT_GLOBAL_TAU", "0.5"))
     beta_blend = float(os.environ.get("CUBEFIT_GLOBAL_ENERGY_BLEND", "1e-2"))
 
@@ -574,6 +626,7 @@ def solve_global_kaczmarz_cchunk_mp(
         x_CP = x0.reshape(C, P)
 
     # Tiny symmetry breaking (optional)
+    print("[Kaczmarz-MP] Applying symmetry breaking (if needed)...", flush=True)
     sym_eps  = float(os.environ.get("CUBEFIT_SYMBREAK_EPS", "1e-6"))
     sym_mode = os.environ.get("CUBEFIT_SYMBREAK_MODE", "qr").lower()
     if sym_eps > 0.0 and sym_mode != "off" and (
@@ -590,7 +643,7 @@ def solve_global_kaczmarz_cchunk_mp(
             x_CP += sym_eps * rng.random((C, P))
         if cfg.project_nonneg:
             np.maximum(x_CP, 0.0, out=x_CP)
-
+    print("[Kaczmarz-MP] done.", flush=True)
     # ------------------- ratio penalty (argument-driven) -------------------
     t_norm = None  # per-epoch normalized target, sum=1
 
@@ -600,6 +653,7 @@ def solve_global_kaczmarz_cchunk_mp(
     # prepare the ratio regularizer
     have_ratio = (orbit_weights is not None) and (ratio_cfg is not None) and ratio_cfg.use
     if have_ratio:
+        print("[Kaczmarz-MP] Preparing ratio regularizer...", flush=True)
         w_in = np.asarray(orbit_weights, np.float64).ravel(order="C")
         if w_in.size != C:
             raise ValueError(f"orbit_weights length {w_in.size} != C={C}.")
@@ -663,6 +717,7 @@ def solve_global_kaczmarz_cchunk_mp(
             x_mat *= F[:, None]
             if cfg.project_nonneg:
                 np.maximum(x_mat, 0.0, out=x_mat)
+        print("[Kaczmarz-MP] done.", flush=True)
 
     # ------------------- bands & pool -------------------
     nprocs = np.max((1, int(cfg.processes)))
@@ -679,7 +734,7 @@ def solve_global_kaczmarz_cchunk_mp(
     print("[Kaczmarz-MP] Spinning up workers…", file=sys.__stdout__,
           flush=True)
 
-    ctx_name = os.environ.get("CUBEFIT_MP_CTX", "forkserver")
+    ctx_name = os.environ.get("CUBEFIT_MP_CTX", "spawn")
     try:
         ctx = mp.get_context(ctx_name)
     except ValueError:
@@ -1175,92 +1230,94 @@ def solve_global_kaczmarz_cchunk_mp(
 
             # ---------- optional orbit weights enforcement -----------
             t0_ob = time.perf_counter()
-            cu.project_to_component_weights_strict(
-                x_CP,
-                (orbit_weights if orbit_weights is not None else w_target),
-                # target
-                E_cp=E_global, # use the SAME energy definition as softbox
-                minw=rc.minw
-            )
-            dt_ob = time.perf_counter() - t0_ob
-            print(f"[orbit-weights] epoch {ep+1}: took {dt_ob:.4f}s", flush=True)
-            t0_ob = time.perf_counter()
-            x[:] = x_CP.ravel(order="C")  # keep your flattened view in sync
-            dt_ob = time.perf_counter() - t0_ob
-            print(f"[orbit-weights] epoch {ep+1}: sync took {dt_ob:.4f}s",
-                flush=True)
+            if orbit_weights is not None and rc.epoch_project:
+                cu.project_to_component_weights(
+                    x_CP,
+                    orbit_weights,
+                    E_cp=E_global,     # (C,P) from /HyperCube/col_energy
+                    minw=1e-10,
+                    beta=rc.epoch_beta  # e.g. 0.1–0.3
+                )
 
-            t0_usage = time.perf_counter()
-            # --- global energy L1-to-target diagnostic (robust) ---
-            try:
-                if E_global is not None:
-                    print("[global energy] computing L1-to-target...", flush=True)
-                    X64 = np.asarray(x_CP, dtype=np.float64)
-                    E64 = np.asarray(E_global, dtype=np.float64)
+                dt_ob = time.perf_counter() - t0_ob
+                print(f"[orbit-weights] epoch {ep+1}: took {dt_ob:.4f}s", flush=True)
+                t0_ob = time.perf_counter()
+                x[:] = x_CP.ravel(order="C")  # keep your flattened view in sync
+                dt_ob = time.perf_counter() - t0_ob
+                print(f"[orbit-weights] epoch {ep+1}: sync took {dt_ob:.4f}s",
+                    flush=True)
 
-                    # Sanitize E_global and X64 to avoid NaN/Inf poisoning
-                    bad_E = ~np.isfinite(E64)
-                    bad_X = ~np.isfinite(X64)
-                    n_bad_E = int(bad_E.sum())
-                    n_bad_X = int(bad_X.sum())
-                    if n_bad_E or n_bad_X:
-                        print(f"[global energy] WARNING: non-finite entries detected "
-                            f"in X/E (X bad={n_bad_X}, E bad={n_bad_E}); zeroing.",
-                            flush=True)
-                        if n_bad_E:
-                            E64[bad_E] = 0.0
-                        if n_bad_X:
+                t0_usage = time.perf_counter()
+                # --- global energy L1-to-target diagnostic (robust) ---
+                try:
+                    if E_global is not None:
+                        print("[global energy] computing L1-to-target...", flush=True)
+                        X64 = np.asarray(x_CP, dtype=np.float64)
+                        E64 = np.asarray(E_global, dtype=np.float64)
+
+                        # Sanitize E_global and X64 to avoid NaN/Inf poisoning
+                        bad_E = ~np.isfinite(E64)
+                        bad_X = ~np.isfinite(X64)
+                        n_bad_E = int(bad_E.sum())
+                        n_bad_X = int(bad_X.sum())
+                        if n_bad_E or n_bad_X:
+                            print(f"[global energy] WARNING: non-finite entries detected "
+                                f"in X/E (X bad={n_bad_X}, E bad={n_bad_E}); zeroing.",
+                                flush=True)
+                            if n_bad_E:
+                                E64[bad_E] = 0.0
+                            if n_bad_X:
+                                X64[bad_X] = 0.0
+
+                        # Energy–weighted usage per component
+                        s = (X64 * E64).sum(axis=1)  # (C,)
+                    else:
+                        # Plain usage
+                        X64 = np.asarray(x_CP, dtype=np.float64)
+                        bad_X = ~np.isfinite(X64)
+                        if bad_X.any():
+                            print(f"[global energy] WARNING: non-finite entries in X "
+                                f"(bad={int(bad_X.sum())}); zeroing.", flush=True)
                             X64[bad_X] = 0.0
+                        s = X64.sum(axis=1)
 
-                    # Energy–weighted usage per component
-                    s = (X64 * E64).sum(axis=1)  # (C,)
-                else:
-                    # Plain usage
-                    X64 = np.asarray(x_CP, dtype=np.float64)
-                    bad_X = ~np.isfinite(X64)
-                    if bad_X.any():
-                        print(f"[global energy] WARNING: non-finite entries in X "
-                            f"(bad={int(bad_X.sum())}); zeroing.", flush=True)
-                        X64[bad_X] = 0.0
-                    s = X64.sum(axis=1)
-
-                # Now compute L1 safely
-                s = np.maximum(s, 0.0)
-                S = float(np.sum(s))
-                if not np.isfinite(S) or S <= 0.0:
-                    print("[global energy] S is non-finite or <=0; skipping L1 diagnostic.",
-                        flush=True)
-                else:
-                    s_frac = s / S
-
-                    # t is your target mix; make sure it's finite too
-                    t_vec = (t_x0 if (rc.anchor == "x0" and t_x0 is not None) else w_target)
-                    t = np.asarray(t_vec, np.float64).ravel(order="C")
-                    if t.size == C * P:
-                        t = t.reshape(C, P, order="C").sum(axis=1)
-                    elif t.size != C:
-                        raise ValueError(f"[ratio] target len {t.size} not in {{C, C*P}}")
-
-                    t = np.maximum(np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0), rc.minw)
-                    T = float(np.sum(t))
-                    if not np.isfinite(T) or T <= 0.0:
-                        print("[global energy] target sum non-finite or <=0; skipping L1.",
+                    # Now compute L1 safely
+                    s = np.maximum(s, 0.0)
+                    S = float(np.sum(s))
+                    if not np.isfinite(S) or S <= 0.0:
+                        print("[global energy] S is non-finite or <=0; skipping L1 diagnostic.",
                             flush=True)
                     else:
-                        t_frac = t / T
-                        diff = s_frac - t_frac
-                        # clean diff just in case
-                        diff = np.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0)
-                        l1 = float(np.sum(np.abs(diff)))
-                        print(f"[ratio] epoch L1-to-target = {l1:.5e}", flush=True)
+                        s_frac = s / S
 
-            except Exception as e:
-                # Last-resort guard so the solver never 'hangs' here
-                print(f"[global energy] ERROR while computing L1-to-target: {e!r}",
+                        # t is your target mix; make sure it's finite too
+                        t_vec = (t_x0 if (rc.anchor == "x0" and t_x0 is not None) else w_target)
+                        t = np.asarray(t_vec, np.float64).ravel(order="C")
+                        if t.size == C * P:
+                            t = t.reshape(C, P, order="C").sum(axis=1)
+                        elif t.size != C:
+                            raise ValueError(f"[ratio] target len {t.size} not in {{C, C*P}}")
+
+                        t = np.maximum(np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0), rc.minw)
+                        T = float(np.sum(t))
+                        if not np.isfinite(T) or T <= 0.0:
+                            print("[global energy] target sum non-finite or <=0; skipping L1.",
+                                flush=True)
+                        else:
+                            t_frac = t / T
+                            diff = s_frac - t_frac
+                            # clean diff just in case
+                            diff = np.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0)
+                            l1 = float(np.sum(np.abs(diff)))
+                            print(f"[ratio] epoch L1-to-target = {l1:.5e}", flush=True)
+
+                except Exception as e:
+                    # Last-resort guard so the solver never 'hangs' here
+                    print(f"[global energy] ERROR while computing L1-to-target: {e!r}",
+                        flush=True)
+                dt_usage = time.perf_counter() - t0_usage
+                print(f"[ratio] epoch {ep+1}: usage calc took {dt_usage:.4f}s",
                     flush=True)
-            dt_usage = time.perf_counter() - t0_usage
-            print(f"[ratio] epoch {ep+1}: usage calc took {dt_usage:.4f}s",
-                flush=True)
 
             print(f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs} snapshotting...",
                 flush=True)
