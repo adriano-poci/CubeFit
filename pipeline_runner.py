@@ -32,6 +32,8 @@ v1.1:   Added global (full-cube) Kaczmarz and block constraint support. 2025
 v1.2:   Supports continuum, velocity-shift, and reference fits. 2025
 v1.3:   Full workflow Zarr integration and flexible test sub-selection. 2025
 v1.4:   Complete re-write to use HDF5. 7 September 2025
+v1.5:   Wrap `solve_global_kaczmarz_cchunk_mp` in `logger.capture_all_output`
+            in `PipelineRunner.solve_all_mp_batched`. 4 December 2025
 """
 
 from __future__ import annotations
@@ -916,14 +918,15 @@ class PipelineRunner:
         )
 
         try:
-            x_global, stats = solve_global_kaczmarz_cchunk_mp(
-                self.h5_path,
-                cfg,
-                orbit_weights=orbit_weights,
-                x0=x0_effective,
-                tracker=tracker,
-                ratio_cfg=ratio_cfg,
-            )
+            with logger.capture_all_output():
+                x_global, stats = solve_global_kaczmarz_cchunk_mp(
+                    self.h5_path,
+                    cfg,
+                    orbit_weights=orbit_weights,
+                    x0=x0_effective,
+                    tracker=tracker,
+                    ratio_cfg=ratio_cfg,
+                )
 
             # Do we need to project + polish?
             if orbit_weights is not None:

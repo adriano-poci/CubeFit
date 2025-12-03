@@ -647,11 +647,26 @@ def solve_global_kaczmarz_cchunk_mp(
     # ------------------- ratio penalty (argument-driven) -------------------
     t_norm = None  # per-epoch normalized target, sum=1
 
-    if ratio_cfg is not None and not isinstance(ratio_cfg, cu.RatioCfg):
-        ratio_cfg = cu.RatioCfg(**dict(ratio_cfg))
+    print(f"[Kaczmarz-MP] ratio_cfg pre-normalization: {type(ratio_cfg)}", flush=True)
 
-    # prepare the ratio regularizer
-    have_ratio = (orbit_weights is not None) and (ratio_cfg is not None) and ratio_cfg.use
+    try:
+        if ratio_cfg is not None and not isinstance(ratio_cfg, cu.RatioCfg):
+            # Be conservative: only accept actual dict-like configs
+            ratio_cfg = cu.RatioCfg(**dict(ratio_cfg))
+        print(f"[Kaczmarz-MP] ratio_cfg post-normalization: {type(ratio_cfg)}",
+            flush=True)
+    except Exception as e:
+        # If anything goes wrong, disable ratio and log
+        print(f"[Kaczmarz-MP] ratio_cfg normalization failed: {e!r}. "
+            f"Disabling ratio regularizer.", flush=True)
+        ratio_cfg = None
+
+    have_ratio = (
+        (orbit_weights is not None)
+        and (ratio_cfg is not None)
+        and bool(getattr(ratio_cfg, "use", False))
+    )
+    print(f"[Kaczmarz-MP] have_ratio = {have_ratio}", flush=True)
     if have_ratio:
         print("[Kaczmarz-MP] Preparing ratio regularizer...", flush=True)
         w_in = np.asarray(orbit_weights, np.float64).ravel(order="C")
@@ -720,66 +735,106 @@ def solve_global_kaczmarz_cchunk_mp(
         print("[Kaczmarz-MP] done.", flush=True)
 
     # ------------------- bands & pool -------------------
-    nprocs = np.max((1, int(cfg.processes)))
-    band_size = math.ceil(C / nprocs)
+    print(f"[Kaczmarz-MP] Spinning up workers with {cfg.processes} processes...",
+        flush=True)
+
+    # Compute band layout from the requested process count
+    nprocs_req = max(1, int(cfg.processes))
+    band_size = math.ceil(C / nprocs_req)
     bands: List[Tuple[int, int]] = []
     c0 = 0
-    for _ in range(nprocs):
-        c1 = np.min((C, c0 + band_size))
+    for _ in range(nprocs_req):
+        c1 = min(C, c0 + band_size)
         if c1 > c0:
             bands.append((c0, c1))
         c0 = c1
     nprocs = len(bands)
 
-    print("[Kaczmarz-MP] Spinning up workers…", file=sys.__stdout__,
-          flush=True)
+    print(
+        f"[Kaczmarz-MP] Using {nprocs} processes, band_size={band_size}.",
+        flush=True,
+    )
 
-    ctx_name = os.environ.get("CUBEFIT_MP_CTX", "spawn")
-    try:
-        ctx = mp.get_context(ctx_name)
-    except ValueError:
-        ctx = mp.get_context("spawn")
+    # If we only have one band, we can skip mp.Pool entirely. This is both
+    # a useful fallback and a very clean way to see if the hang is MP-only.
+    use_pool = nprocs > 1
 
-    os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
-    os.environ.setdefault("OMP_NUM_THREADS", str(cfg.blas_threads))
-    os.environ.setdefault("OPENBLAS_NUM_THREADS", str(cfg.blas_threads))
-    os.environ.setdefault("MKL_NUM_THREADS", str(cfg.blas_threads))
-    max_tasks = int(os.environ.get("CUBEFIT_WORKER_MAXTASKS", "0"))
-    ping_timeout = float(os.environ.get("CUBEFIT_POOL_PING_TIMEOUT", "5.0"))
-    renew_each_epoch = os.environ.get(
-        "CUBEFIT_POOL_RENEW_EVERY_EPOCH", "0"
-    ).lower() not in ("0", "false", "no", "off")
-
-    def _make_pool():
-        return ctx.Pool(
-            processes=nprocs,
-            initializer=_worker_init,
-            initargs=(int(cfg.blas_threads),),
-            maxtasksperchild=(None if max_tasks <= 0 else max_tasks),
+    if not use_pool:
+        print(
+            "[Kaczmarz-MP] Single-process mode "
+            "(no multiprocessing pool will be used).",
+            flush=True,
         )
+        pool = None
+    else:
+        ctx_name = os.environ.get("CUBEFIT_MP_CTX", "forkserver")
+        print(
+            f"[Kaczmarz-MP] Using multiprocessing context '{ctx_name}'",
+            flush=True,
+        )
+        try:
+            ctx = mp.get_context(ctx_name)
+        except ValueError:
+            print(
+                "[Kaczmarz-MP] Context '{ctx_name}' unavailable; "
+                "falling back to 'spawn'.",
+                flush=True,
+            )
+            ctx = mp.get_context("spawn")
 
-    pool = _make_pool()
-    print("[Kaczmarz-MP] Workers ready. Starting epochs…",
-          file=sys.__stdout__, flush=True)
+        # Anti-deadlock knobs in the parent
+        os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
+        os.environ.setdefault("OMP_NUM_THREADS", str(cfg.blas_threads))
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", str(cfg.blas_threads))
+        os.environ.setdefault("MKL_NUM_THREADS", str(cfg.blas_threads))
+
+        max_tasks = int(os.environ.get("CUBEFIT_WORKER_MAXTASKS", "0"))
+        ping_timeout = float(
+            os.environ.get("CUBEFIT_POOL_PING_TIMEOUT", "5.0")
+        )
+        renew_each_epoch = os.environ.get(
+            "CUBEFIT_POOL_RENEW_EVERY_EPOCH", "0"
+        ).lower() not in ("0", "false", "no", "off")
+
+        def _make_pool():
+            print(
+                f"[Kaczmarz-MP] Creating pool with {nprocs} workers...",
+                flush=True,
+            )
+            ppool = ctx.Pool(
+                processes=nprocs,
+                initializer=_worker_init,
+                initargs=(int(cfg.blas_threads),),
+                maxtasksperchild=(None if max_tasks <= 0 else max_tasks),
+            )
+            print("[Kaczmarz-MP] Pool created.", flush=True)
+            return ppool
+
+        pool = _make_pool()
+        print(
+            "[Kaczmarz-MP] Workers ready. Starting epochs...",
+            flush=True,
+        )
 
     # Optional integer-shift diagnostic (cheap sampling)
     want_shift_diag = os.environ.get(
         "CUBEFIT_SHIFT_DIAG", "0"
     ).lower() not in ("0", "false", "no", "off")
 
-    x = x_CP.ravel(order="C")   # x is a view; keep and reuse everywhere
+    x = x_CP.ravel(order="C")   # view; keep and reuse everywhere
 
     try:
         for ep in range(cfg.epochs):
-            if not _pool_ok(pool, timeout=ping_timeout) or renew_each_epoch:
-                try:
-                    pool.close(); pool.join()
-                except Exception:
+            if use_pool:
+                if not _pool_ok(pool, timeout=ping_timeout) or renew_each_epoch:
                     try:
-                        pool.terminate()
+                        pool.close(); pool.join()
                     except Exception:
-                        pass
-                pool = _make_pool()
+                        try:
+                            pool.terminate()
+                        except Exception:
+                            pass
+                    pool = _make_pool()
 
             pbar = tqdm(total=len(s_ranges),
                         desc=f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs}",
@@ -861,22 +916,40 @@ def solve_global_kaczmarz_cchunk_mp(
                 jobs = []
                 for (c_start, c_stop) in bands:
                     x_band = x_CP[c_start:c_stop, :].copy()
-                    w_band = None if w_full is None else \
-                        w_full[c_start:c_stop].copy()
-                    E_band = E_global[c_start:c_stop, :]              # (band_size,P)
+                    w_band = None if w_full is None else w_full[
+                        c_start:c_stop
+                    ].copy()
+                    E_band = E_global[c_start:c_stop, :]  # (band_size, P)
                     inv_ref_band = inv_cp_flux_ref[c_start:c_stop, :] # (band_size,P)
-                    jobs.append((
-                        h5_path, s0, s1, keep_idx,
-                        c_start, c_stop, x_band,
-                        float(lr_tile), bool(cfg.project_nonneg),
-                        R.copy(), w_band,
-                        cfg.dset_slots, cfg.dset_bytes, cfg.dset_w0,
-                        E_band, float(beta_blend),
+                jobs.append(
+                    (
+                        h5_path,
+                        s0,
+                        s1,
+                        keep_idx,
+                        c_start,
+                        c_stop,
+                        x_band,
+                        float(lr_tile),
+                        bool(cfg.project_nonneg),
+                        R.copy(),
+                        w_band,
+                        cfg.dset_slots,
+                        cfg.dset_bytes,
+                        cfg.dset_w0,
+                        E_band,
+                        float(beta_blend),
                         w_lam_sqrt,
                         inv_ref_band
                     ))
 
-                results = pool.map(_worker_tile_job_with_R, jobs)
+                if use_pool:
+                    results = pool.map(_worker_tile_job_with_R, jobs)
+                else:
+                    # Single-process fallback: call the worker directly
+                    results = [
+                        _worker_tile_job_with_R(job) for job in jobs
+                    ]
 
                 # --------------- aggregate & tile backtracking ---------------
                 R_delta_agg = np.zeros_like(R)

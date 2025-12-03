@@ -1,0 +1,2 @@
+* Improved speed of `col_energy` computation, switching from `einsum` to `square` in `hypercube_builder`
+* Wrap `solve_global_kaczmarz_cchunk_mp` in `logger.capture_all_output` in `pipeline_runner.PipelineRunner.solve_all_mp_batched`
