@@ -24,6 +24,8 @@ History
 v1.0:   Initial design and validation. 14 August 2025
 v1.1:   Added Zarr v3 sharding support and safe-direct writes. 5 September 2025
 v1.2:   Complete re-write to use HDF5. 7 September 2025
+v1.3:   Improved speed of `col_energy` computation, switching from `einsum` to
+            `square`. 4 December 2025
 
 
 Hypercube builder (LOSVD convolution in log-λ, then rebin to observed grid)
