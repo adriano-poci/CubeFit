@@ -544,7 +544,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         gamma=2.0,         # clamp for multiplicative factors
         prob=1.0,          # apply every tile
         batch=0,           # consider all active components
-        minw=1e-4,         # ignore ~zero-weight targets
+        minw=1e-5,         # ignore ~zero-weight targets
         # epoch-level projection (gentle, blended)
         epoch_project=True,
         epoch_eta=0.6,     # how hard the epoch projection pushes
@@ -555,15 +555,16 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         use=True           # <-- IMPORTANT: actually enable the ratio term
     )
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=2,
+        epochs=1,
         lr=0.0075,
         project_nonneg=True,
-        # orbit_weights=None,     # or None for “free” fit
-        orbit_weights=cWeights,
+        orbit_weights=None,     # or None for “free” fit
+        # orbit_weights=cWeights,
         processes=4,                # 4 workers
         blas_threads=12,            # 12 BLAS threads each → 48 total
         reader_s_tile=128,          # match /HyperCube/models chunking on S
         verbose=True,
+        # warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
         warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=24, L_sub=1200, K_cols=768, per_comp_cap=24),
         ratio_cfg=RC,
@@ -1391,7 +1392,6 @@ def parallel_spectrum_plots(
         ax.set_xlabel("log(\u03bb [\u212B])")
         ax.set_ylabel("$F_\lambda$ (arb. units)")
         # ax.legend(loc="best", fontsize=8)
-        fig.tight_layout()
         fig.savefig(os.path.join(
             plot_dir, f"{rank_tag}_{tag}_spax{int(s_idx):05d}.png"
         ), dpi=120)
@@ -1732,7 +1732,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     plt.xlabel(r"${\rm Norm}/\sqrt{N_{\rm pix}}$")
     plt.ylabel("Number of apertures")
     plt.title("Distribution of fit quality")
-    plt.tight_layout()
     plt.savefig(figDir/"chi2_hist.png")
     plt.close()
 
@@ -2030,7 +2029,6 @@ def plot_sparse_spectra_from_x(
             ax.set_xlabel("λ (log space)")
             ax.set_ylabel("flux")
             ax.legend(loc="best", fontsize=8)
-            fig.tight_layout()
             fn = os.path.join(plot_dir, f"diag_sparse_{tag}_spax{int(s):05d}.png")
             fig.savefig(fn, dpi=120)
             plt.close(fig)
@@ -2190,7 +2188,6 @@ def compare_orbit_vs_solution(
     ax2.set_xlabel("input prior w_in[c]")
     ax2.set_ylabel("solution mass fraction")
     ax2.set_title(f"scatter vs y=x  (cos={cos:.3f}, L1={l1:.3f})")
-    fig.tight_layout()
 
     if save:
         fig.savefig(save, dpi=140)
