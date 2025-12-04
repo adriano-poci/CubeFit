@@ -1,2 +1,4 @@
-* Improved speed of `col_energy` computation, switching from `einsum` to `square` in `hypercube_builder`
-* Wrap `solve_global_kaczmarz_cchunk_mp` in `logger.capture_all_output` in `pipeline_runner.PipelineRunner.solve_all_mp_batched`
+* Capture exceptions around `loadCubeFit` call in `kz_rio`
+* Capture exceptions around `genCubeFit` call in `kz_run`
+* Fixed bug in computing `nprocs` in `kaczmarz_solver_cchunk_mp_nnls`;
+* Wrapped entire `kaczmarz_solver_cchunk_mp_nnls.solve_global_kaczmarz_cchunk_mp` in `try/except`

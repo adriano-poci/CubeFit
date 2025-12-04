@@ -1,9 +1,11 @@
 """
-
+History
+-------
+v1.0:	Capture exceptions around `genCubeFit` call. 4 December 2025
 """
 
 import numpy as np
-import os, re
+import os, re, sys
 import pathlib as plp
 import argparse
 
@@ -64,7 +66,18 @@ def main():
 
     print(props)
 
-    genCubeFit(**props)
+    try:
+        genCubeFit(**props)
+    except SystemExit:
+        # Let explicit sys.exit()s behave normally
+        raise
+    except BaseException as e:
+        # Log + print the traceback explicitly
+        import traceback
+        print("[kz_run] FATAL: unhandled exception in genCubeFit", file=sys.__stderr__, flush=True)
+        traceback.print_exc()
+        # This *forces* the interpreter to exit, even under IPython
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

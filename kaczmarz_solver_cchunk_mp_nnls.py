@@ -1,13 +1,36 @@
+# -*- coding: utf-8 -*-
+r"""
+    kaczmarz_solver_cchunk_mp_nnls.py
+    Adriano Poci
+    University of Oxford
+    2025
+
+    Platforms
+    ---------
+    Unix, Windows
+
+    Synopsis
+    --------
+    Modestly-MP, chunk-friendly solver aligned to /HyperCube/models chunking.
+    `x` is 1-D (length C*P) in/out. Warm start handled by caller; we accept `x0`.
+    `orbit_weights` is accepted (optional); free fit if None
+
+    Authors
+    -------
+    Adriano Poci <adriano.poci@physics.ox.ac.uk>
+
+History
+-------
+v1.0:   Fixed bug in computing `nprocs`;
+        Wrapped entire `solve_global_kaczmarz_cchunk_mp` in `try/except`. 4
+            December 2025
+"""
 # kaczmarz_solver_cchunk_mp.py
-# Modestly-MP, chunk-friendly solver aligned to /HyperCube/models chunking.
-# External contract matches your other solvers:
-#   - x is 1-D (length C*P) in/out
-#   - warm start handled by caller; we accept x0
-#   - orbit_weights is accepted (optional); free fit if None
+
 
 from __future__ import annotations, print_function
 
-import os, sys
+import os, sys, traceback
 import math
 import time
 from dataclasses import dataclass
@@ -466,956 +489,973 @@ def solve_global_kaczmarz_cchunk_mp(
     ratio_cfg: cu.RatioCfg | None = None,
 ) -> tuple[np.ndarray, dict]:
 
-    def _set_chunk_cache(dset, cfg_obj):
-        try:
-            dset.id.set_chunk_cache(
-                cfg_obj.dset_slots, cfg_obj.dset_bytes, cfg_obj.dset_w0
-            )
-        except Exception:
-            pass
+    try:
 
-    # ---- guard: ensure HyperCube normalization mode is declared
-    mode = _assert_norm_mode(h5_path, expect=None)
-    print(f"[Kaczmarz-MP] HyperCube norm.mode = '{mode}'", flush=True)
-
-    # ------------------- read dims, chunks, mask -------------------
-    t0 = time.perf_counter()
-    with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]           # (S,L) float64
-        M  = f["/HyperCube/models"]   # (S,C,P,L) float32
-        _set_chunk_cache(M, cfg)
-
-        S, L = map(int, DC.shape)
-        _, C, P, Lm = map(int, M.shape)
-        if Lm != L:
-            raise RuntimeError(f"L mismatch: models L={Lm} vs data L={L}.")
-
-        mask = cu._get_mask(f) if cfg.apply_mask else None
-        keep_idx = np.flatnonzero(mask) if mask is not None else None
-        Lk = int(keep_idx.size) if keep_idx is not None else L
-        cp_flux_ref = cu._ensure_cp_flux_ref(h5_path, keep_idx)   # (C,P) float64
-
-        # ------------------- λ-weights (feature emphasis) -------------
-        lamw_enable = os.environ.get(
-            "CUBEFIT_LAMBDA_WEIGHTS_ENABLE", "1"
-        ).lower() not in ("0", "false", "no", "off")
-        lamw_dset   = os.environ.get(
-            "CUBEFIT_LAMBDA_WEIGHTS_DSET", "/HyperCube/lambda_weights"
-        )
-        lamw_floor  = float(os.environ.get("CUBEFIT_LAMBDA_MIN_W", "1e-6"))
-        lamw_auto   = os.environ.get(
-            "CUBEFIT_LAMBDA_WEIGHTS_AUTO", "1"
-        ).lower() not in ("0", "false", "no", "off")
-
-        if lamw_enable:
-            print(
-                f"[Kaczmarz-MP] Reading λ-weights from '{lamw_dset}' "
-                f"(floor={lamw_floor}, auto={lamw_auto})...", flush=True
-            )
+        def _set_chunk_cache(dset, cfg_obj):
             try:
-                w_full = cu.read_lambda_weights(
-                    h5_path, dset_name=lamw_dset, floor=lamw_floor
+                dset.id.set_chunk_cache(
+                    cfg_obj.dset_slots, cfg_obj.dset_bytes, cfg_obj.dset_w0
                 )
             except Exception:
-                w_full = cu.ensure_lambda_weights(
-                    h5_path, dset_name=lamw_dset
-                ) if lamw_auto else np.ones(L, dtype=np.float64)
-            print(
-                "[Kaczmarz-MP] λ-weights min={:.3e}, max={:.3e}, mean={:.3e}"
-                .format(float(np.min(w_full)),
-                        float(np.max(w_full)),
-                        float(np.mean(w_full))),
-                flush=True
+                pass
+
+        # ---- guard: ensure HyperCube normalization mode is declared
+        mode = _assert_norm_mode(h5_path, expect=None)
+        print(f"[Kaczmarz-MP] HyperCube norm.mode = '{mode}'", flush=True)
+
+        # ------------------- read dims, chunks, mask -------------------
+        t0 = time.perf_counter()
+        with open_h5(h5_path, role="reader") as f:
+            DC = f["/DataCube"]           # (S,L) float64
+            M  = f["/HyperCube/models"]   # (S,C,P,L) float32
+            _set_chunk_cache(M, cfg)
+
+            S, L = map(int, DC.shape)
+            _, C, P, Lm = map(int, M.shape)
+            if Lm != L:
+                raise RuntimeError(f"L mismatch: models L={Lm} vs data L={L}.")
+
+            mask = cu._get_mask(f) if cfg.apply_mask else None
+            keep_idx = np.flatnonzero(mask) if mask is not None else None
+            Lk = int(keep_idx.size) if keep_idx is not None else L
+            cp_flux_ref = cu._ensure_cp_flux_ref(h5_path, keep_idx)   # (C,P) float64
+
+            # ------------------- λ-weights (feature emphasis) -------------
+            lamw_enable = os.environ.get(
+                "CUBEFIT_LAMBDA_WEIGHTS_ENABLE", "1"
+            ).lower() not in ("0", "false", "no", "off")
+            lamw_dset   = os.environ.get(
+                "CUBEFIT_LAMBDA_WEIGHTS_DSET", "/HyperCube/lambda_weights"
             )
-            w_lam = w_full[keep_idx] if keep_idx is not None else w_full
-            # Use sqrt(w) on both A and R (weighted LS)
-            w_lam_sqrt = np.sqrt(np.clip(w_lam, lamw_floor, None)).astype(
-                np.float64, order="C"
-            )
-        else:
-            w_lam_sqrt = None
+            lamw_floor  = float(os.environ.get("CUBEFIT_LAMBDA_MIN_W", "1e-6"))
+            lamw_auto   = os.environ.get(
+                "CUBEFIT_LAMBDA_WEIGHTS_AUTO", "1"
+            ).lower() not in ("0", "false", "no", "off")
 
-        # Spaxel tiling (follow /HyperCube/models chunking)
-        s_tile = int(M.chunks[0]) if (M.chunks and M.chunks[0] > 0) else 128
-        s_ranges = [(s0, np.min((S, s0 + s_tile))) for s0 in range(0, S, s_tile)]
-
-        # ordering + global ||Y|| while we touch DC
-        norms = []
-        Y_glob_norm2 = 0.0
-        for (ss0, ss1) in s_ranges:
-            Yt = np.asarray(DC[ss0:ss1, :], np.float64)
-            if keep_idx is not None:
-                Yt = Yt[:, keep_idx]
-            norms.append(float(np.linalg.norm(Yt)))
-            Y_glob_norm2 += float(np.sum(Yt * Yt))
-        
-    cp_flux_ref = np.asarray(cp_flux_ref, dtype=np.float64, order="C")
-    inv_cp_flux_ref = 1.0 / cp_flux_ref  # broadcasted column scaling
-    print(
-        f"[Kaczmarz-MP] DataCube S={S}, L={L} (kept Lk={Lk}), "
-        f"Hypercube C={C}, P={P}, s_tile={s_tile}, "
-        f"epochs={cfg.epochs}, lr={cfg.lr}, "
-        f"processes={cfg.processes}, blas_threads={cfg.blas_threads}",
-        flush=True
-    )
-
-    # --- Persist orbit_weights and push into tracker ---
-    print("[Kaczmarz-MP] Preparing orbit weights...", flush=True)
-    print("[Kaczmarz-MP] _canon_orbit_weights(...)...", flush=True)
-    w_prior = _canon_orbit_weights(h5_path, orbit_weights, C, P)
-    print("[Kaczmarz-MP] done.", flush=True)
-    if (w_prior is not None) and (tracker is not None) and hasattr(tracker, "set_orbit_weights"):
-        print("[Kaczmarz-MP] Setting orbit weights in tracker...", flush=True)
-        tracker.set_orbit_weights(w_prior)  # this mirrors your SP path behavior
-        print("[Kaczmarz-MP] done.", flush=True)
-
-    # sort by descending norm (hard / bright tiles first)
-    paired = sorted(zip(norms, s_ranges), key=lambda t: -t[0])
-    norms_sorted = [t[0] for t in paired]
-    s_ranges_sorted = [t[1] for t in paired]
-
-    # Optional tile budget for quick polish runs
-    print("[Kaczmarz-MP] Applying max_tiles constraint...", flush=True)
-    max_tiles = cfg.max_tiles
-    if max_tiles is not None:
-        max_tiles = int(max_tiles)
-        if 0 < max_tiles < len(s_ranges_sorted):
-            import math
-            rng = np.random.default_rng(
-                int(os.environ.get("CUBEFIT_POLISH_SEED", "12345"))
-            )
-
-            k_bright = max(1, int(math.ceil(0.7 * max_tiles)))
-            k_rand   = max(0, max_tiles - k_bright)
-
-            bright_idx = np.arange(k_bright, dtype=int)
-            tail_idx = np.arange(k_bright, len(s_ranges_sorted), dtype=int)
-            if k_rand > 0 and tail_idx.size > 0:
-                rng.shuffle(tail_idx)
-                rand_idx = tail_idx[:k_rand]
-                keep_idx = np.concatenate([bright_idx, rand_idx])
+            if lamw_enable:
+                print(
+                    f"[Kaczmarz-MP] Reading λ-weights from '{lamw_dset}' "
+                    f"(floor={lamw_floor}, auto={lamw_auto})...", flush=True
+                )
+                try:
+                    w_full = cu.read_lambda_weights(
+                        h5_path, dset_name=lamw_dset, floor=lamw_floor
+                    )
+                except Exception:
+                    w_full = cu.ensure_lambda_weights(
+                        h5_path, dset_name=lamw_dset
+                    ) if lamw_auto else np.ones(L, dtype=np.float64)
+                print(
+                    "[Kaczmarz-MP] λ-weights min={:.3e}, max={:.3e}, mean={:.3e}"
+                    .format(float(np.min(w_full)),
+                            float(np.max(w_full)),
+                            float(np.mean(w_full))),
+                    flush=True
+                )
+                w_lam = w_full[keep_idx] if keep_idx is not None else w_full
+                # Use sqrt(w) on both A and R (weighted LS)
+                w_lam_sqrt = np.sqrt(np.clip(w_lam, lamw_floor, None)).astype(
+                    np.float64, order="C"
+                )
             else:
-                keep_idx = bright_idx
+                w_lam_sqrt = None
 
-            keep_idx = np.sort(keep_idx)
-            s_ranges = [s_ranges_sorted[i] for i in keep_idx]
-            norms_sorted = [norms_sorted[i] for i in keep_idx]
+            # Spaxel tiling (follow /HyperCube/models chunking)
+            s_tile = int(M.chunks[0]) if (M.chunks and M.chunks[0] > 0) else 128
+            s_ranges = [(s0, np.min((S, s0 + s_tile))) for s0 in range(0, S, s_tile)]
+
+            # ordering + global ||Y|| while we touch DC
+            norms = []
+            Y_glob_norm2 = 0.0
+            for (ss0, ss1) in s_ranges:
+                Yt = np.asarray(DC[ss0:ss1, :], np.float64)
+                if keep_idx is not None:
+                    Yt = Yt[:, keep_idx]
+                norms.append(float(np.linalg.norm(Yt)))
+                Y_glob_norm2 += float(np.sum(Yt * Yt))
+            
+        cp_flux_ref = np.asarray(cp_flux_ref, dtype=np.float64, order="C")
+        inv_cp_flux_ref = 1.0 / cp_flux_ref  # broadcasted column scaling
+        print(
+            f"[Kaczmarz-MP] DataCube S={S}, L={L} (kept Lk={Lk}), "
+            f"Hypercube C={C}, P={P}, s_tile={s_tile}, "
+            f"epochs={cfg.epochs}, lr={cfg.lr}, "
+            f"processes={cfg.processes}, blas_threads={cfg.blas_threads}",
+            flush=True
+        )
+
+        # --- Persist orbit_weights and push into tracker ---
+        print("[Kaczmarz-MP] Preparing orbit weights...", flush=True)
+        print("[Kaczmarz-MP] _canon_orbit_weights(...)...", flush=True)
+        w_prior = _canon_orbit_weights(h5_path, orbit_weights, C, P)
+        print("[Kaczmarz-MP] done.", flush=True)
+        if (w_prior is not None) and (tracker is not None) and hasattr(tracker, "set_orbit_weights"):
+            print("[Kaczmarz-MP] Setting orbit weights in tracker...", flush=True)
+            tracker.set_orbit_weights(w_prior)  # this mirrors your SP path behavior
+            print("[Kaczmarz-MP] done.", flush=True)
+
+        # sort by descending norm (hard / bright tiles first)
+        paired = sorted(zip(norms, s_ranges), key=lambda t: -t[0])
+        norms_sorted = [t[0] for t in paired]
+        s_ranges_sorted = [t[1] for t in paired]
+
+        # Optional tile budget for quick polish runs
+        print("[Kaczmarz-MP] Applying max_tiles constraint...", flush=True)
+        max_tiles = cfg.max_tiles
+        if max_tiles is not None:
+            max_tiles = int(max_tiles)
+            if 0 < max_tiles < len(s_ranges_sorted):
+                import math
+                rng = np.random.default_rng(
+                    int(os.environ.get("CUBEFIT_POLISH_SEED", "12345"))
+                )
+
+                k_bright = max(1, int(math.ceil(0.7 * max_tiles)))
+                k_rand   = max(0, max_tiles - k_bright)
+
+                bright_idx = np.arange(k_bright, dtype=int)
+                tail_idx = np.arange(k_bright, len(s_ranges_sorted), dtype=int)
+                if k_rand > 0 and tail_idx.size > 0:
+                    rng.shuffle(tail_idx)
+                    rand_idx = tail_idx[:k_rand]
+                    keep_idx = np.concatenate([bright_idx, rand_idx])
+                else:
+                    keep_idx = bright_idx
+
+                keep_idx = np.sort(keep_idx)
+                s_ranges = [s_ranges_sorted[i] for i in keep_idx]
+                norms_sorted = [norms_sorted[i] for i in keep_idx]
+            else:
+                s_ranges = s_ranges_sorted
         else:
             s_ranges = s_ranges_sorted
-    else:
-        s_ranges = s_ranges_sorted
-    print(f"[Kaczmarz-MP] Using {len(s_ranges)} tiles for fitting.", flush=True)
+        print(f"[Kaczmarz-MP] Using {len(s_ranges)} tiles for fitting.", flush=True)
 
-    Y_glob_norm = float(np.sqrt(Y_glob_norm2))
+        Y_glob_norm = float(np.sqrt(Y_glob_norm2))
 
 
-    # ------------------- global column energy & knobs -----------------
-    print("[Kaczmarz-MP] Reading global column energy...", flush=True)
-    E_global = read_global_column_energy(h5_path)  # (C,P) float64
-    print("[Kaczmarz-MP] done.", flush=True)
-    tau_global = float(os.environ.get("CUBEFIT_GLOBAL_TAU", "0.5"))
-    beta_blend = float(os.environ.get("CUBEFIT_GLOBAL_ENERGY_BLEND", "1e-2"))
+        # ------------------- global column energy & knobs -----------------
+        print("[Kaczmarz-MP] Reading global column energy...", flush=True)
+        E_global = read_global_column_energy(h5_path)  # (C,P) float64
+        print("[Kaczmarz-MP] done.", flush=True)
+        tau_global = float(os.environ.get("CUBEFIT_GLOBAL_TAU", "0.5"))
+        beta_blend = float(os.environ.get("CUBEFIT_GLOBAL_ENERGY_BLEND", "1e-2"))
 
-    # ------------------- x init --------------------------------------
-    if x0 is None:
-        x_CP = np.zeros((C, P), dtype=np.float64, order="C")
-    else:
-        x0 = np.asarray(x0, np.float64).ravel(order="C")
-        if x0.size != C * P:
-            raise ValueError(f"x0 length {x0.size} != C*P={C*P}.")
-        x_CP = x0.reshape(C, P)
-
-    # Tiny symmetry breaking (optional)
-    print("[Kaczmarz-MP] Applying symmetry breaking (if needed)...", flush=True)
-    sym_eps  = float(os.environ.get("CUBEFIT_SYMBREAK_EPS", "1e-6"))
-    sym_mode = os.environ.get("CUBEFIT_SYMBREAK_MODE", "qr").lower()
-    if sym_eps > 0.0 and sym_mode != "off" and (
-        x0 is None or np.count_nonzero(x_CP) == 0
-    ):
-        rng = np.random.default_rng(int(os.environ.get("CUBEFIT_SEED",
-                                                       "12345")))
-        if sym_mode == "qr":
-            Rmat = rng.standard_normal((C, P))
-            Q, _ = np.linalg.qr(Rmat.T, mode="reduced")
-            Q = Q[:, :C].T  # (C,P)
-            x_CP += sym_eps * np.abs(Q)
+        # ------------------- x init --------------------------------------
+        if x0 is None:
+            x_CP = np.zeros((C, P), dtype=np.float64, order="C")
         else:
-            x_CP += sym_eps * rng.random((C, P))
-        if cfg.project_nonneg:
-            np.maximum(x_CP, 0.0, out=x_CP)
-    print("[Kaczmarz-MP] done.", flush=True)
-    # ------------------- ratio penalty (argument-driven) -------------------
-    t_norm = None  # per-epoch normalized target, sum=1
+            x0 = np.asarray(x0, np.float64).ravel(order="C")
+            if x0.size != C * P:
+                raise ValueError(f"x0 length {x0.size} != C*P={C*P}.")
+            x_CP = x0.reshape(C, P)
 
-    print(f"[Kaczmarz-MP] ratio_cfg pre-normalization: {type(ratio_cfg)}", flush=True)
+        # Tiny symmetry breaking (optional)
+        print("[Kaczmarz-MP] Applying symmetry breaking (if needed)...", flush=True)
+        sym_eps  = float(os.environ.get("CUBEFIT_SYMBREAK_EPS", "1e-6"))
+        sym_mode = os.environ.get("CUBEFIT_SYMBREAK_MODE", "qr").lower()
+        if sym_eps > 0.0 and sym_mode != "off" and (
+            x0 is None or np.count_nonzero(x_CP) == 0
+        ):
+            rng = np.random.default_rng(int(os.environ.get("CUBEFIT_SEED",
+                                                        "12345")))
+            if sym_mode == "qr":
+                Rmat = rng.standard_normal((C, P))
+                Q, _ = np.linalg.qr(Rmat.T, mode="reduced")
+                Q = Q[:, :C].T  # (C,P)
+                x_CP += sym_eps * np.abs(Q)
+            else:
+                x_CP += sym_eps * rng.random((C, P))
+            if cfg.project_nonneg:
+                np.maximum(x_CP, 0.0, out=x_CP)
+        print("[Kaczmarz-MP] done.", flush=True)
+        # ------------------- ratio penalty (argument-driven) -------------------
+        t_norm = None  # per-epoch normalized target, sum=1
 
-    try:
-        if ratio_cfg is not None and not isinstance(ratio_cfg, cu.RatioCfg):
-            # Be conservative: only accept actual dict-like configs
-            ratio_cfg = cu.RatioCfg(**dict(ratio_cfg))
-        print(f"[Kaczmarz-MP] ratio_cfg post-normalization: {type(ratio_cfg)}",
-            flush=True)
-    except Exception as e:
-        # If anything goes wrong, disable ratio and log
-        print(f"[Kaczmarz-MP] ratio_cfg normalization failed: {e!r}. "
-            f"Disabling ratio regularizer.", flush=True)
-        ratio_cfg = None
+        print(f"[Kaczmarz-MP] ratio_cfg pre-normalization: {type(ratio_cfg)}", flush=True)
 
-    have_ratio = (
-        (orbit_weights is not None)
-        and (ratio_cfg is not None)
-        and bool(getattr(ratio_cfg, "use", False))
-    )
-    print(f"[Kaczmarz-MP] have_ratio = {have_ratio}", flush=True)
-    if have_ratio:
-        print("[Kaczmarz-MP] Preparing ratio regularizer...", flush=True)
-        w_in = np.asarray(orbit_weights, np.float64).ravel(order="C")
-        if w_in.size != C:
-            raise ValueError(f"orbit_weights length {w_in.size} != C={C}.")
+        try:
+            if ratio_cfg is not None and not isinstance(ratio_cfg, cu.RatioCfg):
+                # Be conservative: only accept actual dict-like configs
+                ratio_cfg = cu.RatioCfg(**dict(ratio_cfg))
+            print(f"[Kaczmarz-MP] ratio_cfg post-normalization: {type(ratio_cfg)}",
+                flush=True)
+        except Exception as e:
+            # If anything goes wrong, disable ratio and log
+            print(f"[Kaczmarz-MP] ratio_cfg normalization failed: {e!r}. "
+                f"Disabling ratio regularizer.", flush=True)
+            ratio_cfg = None
 
-        rc = ratio_cfg
+        have_ratio = (
+            (orbit_weights is not None)
+            and (ratio_cfg is not None)
+            and bool(getattr(ratio_cfg, "use", False))
+        )
+        print(f"[Kaczmarz-MP] have_ratio = {have_ratio}", flush=True)
+        if have_ratio:
+            print("[Kaczmarz-MP] Preparing ratio regularizer...", flush=True)
+            w_in = np.asarray(orbit_weights, np.float64).ravel(order="C")
+            if w_in.size != C:
+                raise ValueError(f"orbit_weights length {w_in.size} != C={C}.")
 
-        # Base target mixture (normalize with a floor)
-        w_target = np.maximum(w_in, rc.minw)
-        w_target = w_target / np.maximum(np.sum(w_target), 1.0)
+            rc = ratio_cfg
 
-        # Optionally keep a copy of the true x0 mixture for 'x0' anchor
-        if x0 is not None and x0.size == C * P:
-            x0_mat = np.asarray(x0, np.float64).reshape(C, P, order="C")
-            s0 = np.sum(np.maximum(x0_mat, 0.0), axis=1)
-            S0 = np.sum(s0)
-            t_x0 = (s0 / np.maximum(S0, 1.0)) if S0 > 0.0 else w_target
-        else:
-            t_x0 = None
+            # Base target mixture (normalize with a floor)
+            w_target = np.maximum(w_in, rc.minw)
+            w_target = w_target / np.maximum(np.sum(w_target), 1.0)
 
-        rng = np.random.default_rng()
+            # Optionally keep a copy of the true x0 mixture for 'x0' anchor
+            if x0 is not None and x0.size == C * P:
+                x0_mat = np.asarray(x0, np.float64).reshape(C, P, order="C")
+                s0 = np.sum(np.maximum(x0_mat, 0.0), axis=1)
+                S0 = np.sum(s0)
+                t_x0 = (s0 / np.maximum(S0, 1.0)) if S0 > 0.0 else w_target
+            else:
+                t_x0 = None
 
-        def _ratio_update_in_place(x_mat: np.ndarray, t_vec: np.ndarray) -> None:
-            """
-            Mass-preserving multiplicative update toward t_vec (sum=1).
-            Uses only NumPy ops.
-            """
-            s = np.sum(x_mat, axis=1)                       # (C,)
-            S = np.sum(s)
-            if not np.isfinite(S) or S <= 0.0:
-                return
-            sh = s / np.maximum(S, 1.0)                     # ŝ
+            rng = np.random.default_rng()
 
-            active = np.isfinite(sh) & np.isfinite(t_vec) & (t_vec > 0.0)
-            idx = np.nonzero(active)[0]
-            if idx.size == 0:
-                return
+            def _ratio_update_in_place(x_mat: np.ndarray, t_vec: np.ndarray) -> None:
+                """
+                Mass-preserving multiplicative update toward t_vec (sum=1).
+                Uses only NumPy ops.
+                """
+                s = np.sum(x_mat, axis=1)                       # (C,)
+                S = np.sum(s)
+                if not np.isfinite(S) or S <= 0.0:
+                    return
+                sh = s / np.maximum(S, 1.0)                     # ŝ
 
-            if rc.prob < 1.0:
-                keep = rng.random(idx.size) < rc.prob
-                idx = idx[keep]
+                active = np.isfinite(sh) & np.isfinite(t_vec) & (t_vec > 0.0)
+                idx = np.nonzero(active)[0]
                 if idx.size == 0:
                     return
-            if (rc.batch > 0) and (idx.size > rc.batch):
-                idx = rng.choice(idx, size=int(rc.batch), replace=False)
 
-            # Multiplicative factors in log-space
-            e = np.log(np.maximum(sh[idx], rc.minw)) - np.log(
-                np.maximum(t_vec[idx], rc.minw)
-            )
-            f_idx = np.exp(-rc.eta * e)
-            f_idx = np.clip(f_idx, 1.0 / rc.gamma, rc.gamma)
+                if rc.prob < 1.0:
+                    keep = rng.random(idx.size) < rc.prob
+                    idx = idx[keep]
+                    if idx.size == 0:
+                        return
+                if (rc.batch > 0) and (idx.size > rc.batch):
+                    idx = rng.choice(idx, size=int(rc.batch), replace=False)
 
-            F = np.ones((C,), dtype=np.float64)
-            F[idx] = f_idx
+                # Multiplicative factors in log-space
+                e = np.log(np.maximum(sh[idx], rc.minw)) - np.log(
+                    np.maximum(t_vec[idx], rc.minw)
+                )
+                f_idx = np.exp(-rc.eta * e)
+                f_idx = np.clip(f_idx, 1.0 / rc.gamma, rc.gamma)
 
-            denom = np.sum(sh * F)
-            if not np.isfinite(denom) or denom <= 0.0:
-                return
-            F = F / np.maximum(denom, 1.0e-30)
+                F = np.ones((C,), dtype=np.float64)
+                F[idx] = f_idx
 
-            x_mat *= F[:, None]
-            if cfg.project_nonneg:
-                np.maximum(x_mat, 0.0, out=x_mat)
-        print("[Kaczmarz-MP] done.", flush=True)
+                denom = np.sum(sh * F)
+                if not np.isfinite(denom) or denom <= 0.0:
+                    return
+                F = F / np.maximum(denom, 1.0e-30)
 
-    # ------------------- bands & pool -------------------
-    print(f"[Kaczmarz-MP] Spinning up workers with {cfg.processes} processes...",
-        flush=True)
+                x_mat *= F[:, None]
+                if cfg.project_nonneg:
+                    np.maximum(x_mat, 0.0, out=x_mat)
+            print("[Kaczmarz-MP] done.", flush=True)
 
-    # Compute band layout from the requested process count
-    nprocs_req = max(1, int(cfg.processes))
-    band_size = math.ceil(C / nprocs_req)
-    bands: List[Tuple[int, int]] = []
-    c0 = 0
-    for _ in range(nprocs_req):
-        c1 = min(C, c0 + band_size)
-        if c1 > c0:
-            bands.append((c0, c1))
-        c0 = c1
-    nprocs = len(bands)
+        # ------------------- bands & pool -------------------
+        print(f"[Kaczmarz-MP] Spinning up workers with {cfg.processes} processes...",
+            flush=True)
 
-    print(
-        f"[Kaczmarz-MP] Using {nprocs} processes, band_size={band_size}.",
-        flush=True,
-    )
+        # Compute band layout from the requested process count
+        print("[Kaczmarz-MP] Spinning up workers (entry)...", flush=True)
+        nprocs_req = max(1, int(cfg.processes))
+        print(f"[Kaczmarz-MP] nprocs_req = {nprocs_req}", flush=True)
+        band_size = np.ceil(C / nprocs_req).astype(int)
+        print(f"[Kaczmarz-MP] band_size = {band_size}", flush=True)
+        bands: List[Tuple[int, int]] = []
+        c0 = 0
+        for i in range(nprocs_req):
+            c1 = np.min((C, c0 + band_size))
+            print(f"[Kaczmarz-MP] band loop i={i}, c0={c0}, c1={c1}", flush=True)
+            if c1 > c0:
+                bands.append((c0, c1))
+            c0 = c1
+        nprocs = len(bands)
+        print(f"[Kaczmarz-MP] Using {nprocs} processes, band_size={band_size}.",
+            flush=True)
 
-    # If we only have one band, we can skip mp.Pool entirely. This is both
-    # a useful fallback and a very clean way to see if the hang is MP-only.
-    use_pool = nprocs > 1
-
-    if not use_pool:
         print(
-            "[Kaczmarz-MP] Single-process mode "
-            "(no multiprocessing pool will be used).",
+            f"[Kaczmarz-MP] Using {nprocs} processes, band_size={band_size}.",
             flush=True,
         )
-        pool = None
-    else:
-        ctx_name = os.environ.get("CUBEFIT_MP_CTX", "forkserver")
-        print(
-            f"[Kaczmarz-MP] Using multiprocessing context '{ctx_name}'",
-            flush=True,
-        )
-        try:
-            ctx = mp.get_context(ctx_name)
-        except ValueError:
+
+        # If we only have one band, we can skip mp.Pool entirely. This is both
+        # a useful fallback and a very clean way to see if the hang is MP-only.
+        use_pool = nprocs > 1
+
+        if not use_pool:
             print(
-                "[Kaczmarz-MP] Context '{ctx_name}' unavailable; "
-                "falling back to 'spawn'.",
+                "[Kaczmarz-MP] Single-process mode "
+                "(no multiprocessing pool will be used).",
                 flush=True,
             )
-            ctx = mp.get_context("spawn")
+            pool = None
+        else:
+            ctx_name = os.environ.get("CUBEFIT_MP_CTX", "forkserver")
+            print(
+                f"[Kaczmarz-MP] Using multiprocessing context '{ctx_name}'",
+                flush=True,
+            )
+            try:
+                ctx = mp.get_context(ctx_name)
+            except ValueError:
+                print(
+                    "[Kaczmarz-MP] Context '{ctx_name}' unavailable; "
+                    "falling back to 'spawn'.",
+                    flush=True,
+                )
+                ctx = mp.get_context("spawn")
 
-        # Anti-deadlock knobs in the parent
-        os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
-        os.environ.setdefault("OMP_NUM_THREADS", str(cfg.blas_threads))
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", str(cfg.blas_threads))
-        os.environ.setdefault("MKL_NUM_THREADS", str(cfg.blas_threads))
+            # Anti-deadlock knobs in the parent
+            os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
+            os.environ.setdefault("OMP_NUM_THREADS", str(cfg.blas_threads))
+            os.environ.setdefault("OPENBLAS_NUM_THREADS", str(cfg.blas_threads))
+            os.environ.setdefault("MKL_NUM_THREADS", str(cfg.blas_threads))
 
-        max_tasks = int(os.environ.get("CUBEFIT_WORKER_MAXTASKS", "0"))
-        ping_timeout = float(
-            os.environ.get("CUBEFIT_POOL_PING_TIMEOUT", "5.0")
-        )
-        renew_each_epoch = os.environ.get(
-            "CUBEFIT_POOL_RENEW_EVERY_EPOCH", "0"
+            max_tasks = int(os.environ.get("CUBEFIT_WORKER_MAXTASKS", "0"))
+            ping_timeout = float(
+                os.environ.get("CUBEFIT_POOL_PING_TIMEOUT", "5.0")
+            )
+            renew_each_epoch = os.environ.get(
+                "CUBEFIT_POOL_RENEW_EVERY_EPOCH", "0"
+            ).lower() not in ("0", "false", "no", "off")
+
+            def _make_pool():
+                print(
+                    f"[Kaczmarz-MP] Creating pool with {nprocs} workers...",
+                    flush=True,
+                )
+                ppool = ctx.Pool(
+                    processes=nprocs,
+                    initializer=_worker_init,
+                    initargs=(int(cfg.blas_threads),),
+                    maxtasksperchild=(None if max_tasks <= 0 else max_tasks),
+                )
+                print("[Kaczmarz-MP] Pool created.", flush=True)
+                return ppool
+
+            pool = _make_pool()
+            print(
+                "[Kaczmarz-MP] Workers ready. Starting epochs...",
+                flush=True,
+            )
+
+        # Optional integer-shift diagnostic (cheap sampling)
+        want_shift_diag = os.environ.get(
+            "CUBEFIT_SHIFT_DIAG", "0"
         ).lower() not in ("0", "false", "no", "off")
 
-        def _make_pool():
-            print(
-                f"[Kaczmarz-MP] Creating pool with {nprocs} workers...",
-                flush=True,
-            )
-            ppool = ctx.Pool(
-                processes=nprocs,
-                initializer=_worker_init,
-                initargs=(int(cfg.blas_threads),),
-                maxtasksperchild=(None if max_tasks <= 0 else max_tasks),
-            )
-            print("[Kaczmarz-MP] Pool created.", flush=True)
-            return ppool
+        x = x_CP.ravel(order="C")   # view; keep and reuse everywhere
 
-        pool = _make_pool()
-        print(
-            "[Kaczmarz-MP] Workers ready. Starting epochs...",
-            flush=True,
-        )
-
-    # Optional integer-shift diagnostic (cheap sampling)
-    want_shift_diag = os.environ.get(
-        "CUBEFIT_SHIFT_DIAG", "0"
-    ).lower() not in ("0", "false", "no", "off")
-
-    x = x_CP.ravel(order="C")   # view; keep and reuse everywhere
-
-    try:
-        for ep in range(cfg.epochs):
-            if use_pool:
-                if not _pool_ok(pool, timeout=ping_timeout) or renew_each_epoch:
-                    try:
-                        pool.close(); pool.join()
-                    except Exception:
+        try:
+            for ep in range(cfg.epochs):
+                if use_pool:
+                    if not _pool_ok(pool, timeout=ping_timeout) or renew_each_epoch:
                         try:
-                            pool.terminate()
+                            pool.close(); pool.join()
+                        except Exception:
+                            try:
+                                pool.terminate()
+                            except Exception:
+                                pass
+                        pool = _make_pool()
+
+                pbar = tqdm(total=len(s_ranges),
+                            desc=f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs}",
+                            mininterval=2.0, dynamic_ncols=True)
+                pbar.refresh()
+
+                # Per-epoch target mixture t_norm (sum=1)
+                if have_ratio:
+                    if rc.anchor == "x0" and (t_x0 is not None):
+                        t_epoch = t_x0.copy()
+                    elif rc.anchor == "auto" and (t_x0 is not None):
+                        t_epoch = t_x0.copy()
+                    else:
+                        t_epoch = w_target.copy()
+
+                    if rc.epoch_renorm:
+                        # keep a small floor to avoid zeros
+                        t_epoch = np.maximum(t_epoch, rc.minw)
+                        t_epoch = t_epoch / np.maximum(np.sum(t_epoch), 1.0)
+
+                    t_norm = t_epoch
+                else:
+                    t_norm = None
+
+                for tile_idx, (s0, s1) in enumerate(s_ranges):
+                    Sblk = s1 - s0
+
+                    # ---------- Build residual R = Y - yhat ----------
+                    with open_h5(h5_path, role="reader") as f:
+                        DC = f["/DataCube"]; M  = f["/HyperCube/models"]
+                        try: M.id.set_chunk_cache(cfg.dset_slots,
+                            cfg.dset_bytes, cfg.dset_w0)
+                        except Exception: pass
+
+                        Y = np.asarray(DC[s0:s1, :], np.float64, order="C")
+                        if keep_idx is not None:
+                            Y = Y[:, keep_idx]
+
+                        yhat = np.zeros((Sblk, Lk), np.float64)
+                        for c in range(C):
+                            A = np.asarray(M[s0:s1, c, :, :], np.float32, order="C")
+                            if keep_idx is not None:
+                                A = A[:, :, keep_idx]
+                            # Mode A: same cp normalization here
+                            A = A * (inv_cp_flux_ref[c, :][None, :, None])
+                            xc = x_CP[c, :].astype(np.float64, copy=False)
+                            for s in range(Sblk):
+                                yhat[s, :] += xc @ A[s, :, :]
+                        R = Y - yhat
+
+                    # Optional: light shift diagnostic on 1 spaxel in the tile
+                    if want_shift_diag and Sblk > 0:
+                        s_pick = s0
+                        try:
+                            y_obs = np.asarray(DC[s_pick, :], np.float64)
+                            if keep_idx is not None:
+                                y_obs = y_obs[keep_idx]
+                            y_fit = yhat[s_pick - s0, :]
+                            sh = _xcorr_int_shift(y_obs, y_fit)
+                            if sh != 0:
+                                print(f"[diag] spaxel {s_pick}: "
+                                    f"data↔model integer shift = {sh} px")
                         except Exception:
                             pass
-                    pool = _make_pool()
 
-            pbar = tqdm(total=len(s_ranges),
-                        desc=f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs}",
-                        mininterval=2.0, dynamic_ncols=True)
-            pbar.refresh()
+                    if tracker is not None:
+                        tracker.on_batch_rmse(float(np.sqrt(np.mean(R * R))))
 
-            # Per-epoch target mixture t_norm (sum=1)
-            if have_ratio:
-                if rc.anchor == "x0" and (t_x0 is not None):
-                    t_epoch = t_x0.copy()
-                elif rc.anchor == "auto" and (t_x0 is not None):
-                    t_epoch = t_x0.copy()
-                else:
-                    t_epoch = w_target.copy()
-
-                if rc.epoch_renorm:
-                    # keep a small floor to avoid zeros
-                    t_epoch = np.maximum(t_epoch, rc.minw)
-                    t_epoch = t_epoch / np.maximum(np.sum(t_epoch), 1.0)
-
-                t_norm = t_epoch
-            else:
-                t_norm = None
-
-            for tile_idx, (s0, s1) in enumerate(s_ranges):
-                Sblk = s1 - s0
-
-                # ---------- Build residual R = Y - yhat ----------
-                with open_h5(h5_path, role="reader") as f:
-                    DC = f["/DataCube"]; M  = f["/HyperCube/models"]
-                    try: M.id.set_chunk_cache(cfg.dset_slots,
-                        cfg.dset_bytes, cfg.dset_w0)
-                    except Exception: pass
-
-                    Y = np.asarray(DC[s0:s1, :], np.float64, order="C")
-                    if keep_idx is not None:
-                        Y = Y[:, keep_idx]
-
-                    yhat = np.zeros((Sblk, Lk), np.float64)
-                    for c in range(C):
-                        A = np.asarray(M[s0:s1, c, :, :], np.float32, order="C")
-                        if keep_idx is not None:
-                            A = A[:, :, keep_idx]
-                        # Mode A: same cp normalization here
-                        A = A * (inv_cp_flux_ref[c, :][None, :, None])
-                        xc = x_CP[c, :].astype(np.float64, copy=False)
-                        for s in range(Sblk):
-                            yhat[s, :] += xc @ A[s, :, :]
-                    R = Y - yhat
-
-                # Optional: light shift diagnostic on 1 spaxel in the tile
-                if want_shift_diag and Sblk > 0:
-                    s_pick = s0
-                    try:
-                        y_obs = np.asarray(DC[s_pick, :], np.float64)
-                        if keep_idx is not None:
-                            y_obs = y_obs[keep_idx]
-                        y_fit = yhat[s_pick - s0, :]
-                        sh = _xcorr_int_shift(y_obs, y_fit)
-                        if sh != 0:
-                            print(f"[diag] spaxel {s_pick}: "
-                                  f"data↔model integer shift = {sh} px")
-                    except Exception:
-                        pass
-
-                if tracker is not None:
-                    tracker.on_batch_rmse(float(np.sqrt(np.mean(R * R))))
-
-                # Cosine LR decay across tiles
-                if cfg.epochs >= 1:
-                    frac = (tile_idx + 1) / len(s_ranges)
-                    lr_tile = float(cfg.lr) * (0.5 + 0.5 * np.cos(
-                        np.pi * frac
-                    ))
-                else:
-                    lr_tile = float(cfg.lr)
-
-                # ---------- Workers ----------
-                jobs = []
-                for (c_start, c_stop) in bands:
-                    x_band = x_CP[c_start:c_stop, :].copy()
-                    w_band = None if w_full is None else w_full[
-                        c_start:c_stop
-                    ].copy()
-                    E_band = E_global[c_start:c_stop, :]  # (band_size, P)
-                    inv_ref_band = inv_cp_flux_ref[c_start:c_stop, :] # (band_size,P)
-                jobs.append(
-                    (
-                        h5_path,
-                        s0,
-                        s1,
-                        keep_idx,
-                        c_start,
-                        c_stop,
-                        x_band,
-                        float(lr_tile),
-                        bool(cfg.project_nonneg),
-                        R.copy(),
-                        w_band,
-                        cfg.dset_slots,
-                        cfg.dset_bytes,
-                        cfg.dset_w0,
-                        E_band,
-                        float(beta_blend),
-                        w_lam_sqrt,
-                        inv_ref_band
-                    ))
-
-                if use_pool:
-                    results = pool.map(_worker_tile_job_with_R, jobs)
-                else:
-                    # Single-process fallback: call the worker directly
-                    results = [
-                        _worker_tile_job_with_R(job) for job in jobs
-                    ]
-
-                # --------------- aggregate & tile backtracking ---------------
-                R_delta_agg = np.zeros_like(R)
-                band_updates = []
-                cand_pairs = []
-                upd_energy_sq_total = 0.0
-
-                for item in results:
-                    if isinstance(item, tuple) and len(item) == 3:
-                        R_delta, dx_list, cands = item
-                        if cands:
-                            cand_pairs.extend(cands)
+                    # Cosine LR decay across tiles
+                    if cfg.epochs >= 1:
+                        frac = (tile_idx + 1) / len(s_ranges)
+                        lr_tile = float(cfg.lr) * (0.5 + 0.5 * np.cos(
+                            np.pi * frac
+                        ))
                     else:
-                        R_delta, dx_list = item
-                    R_delta_agg += R_delta
-                    for tup in dx_list:
-                        if len(tup) == 3:
-                            c, dx_c, e2 = tup
-                            upd_energy_sq_total += float(e2)
+                        lr_tile = float(cfg.lr)
+
+                    # ---------- Workers ----------
+                    jobs = []
+                    for (c_start, c_stop) in bands:
+                        x_band = x_CP[c_start:c_stop, :].copy()
+                        w_band = None if w_full is None else w_full[
+                            c_start:c_stop
+                        ].copy()
+                        E_band = E_global[c_start:c_stop, :]  # (band_size, P)
+                        inv_ref_band = inv_cp_flux_ref[c_start:c_stop, :] # (band_size,P)
+                    jobs.append(
+                        (
+                            h5_path,
+                            s0,
+                            s1,
+                            keep_idx,
+                            c_start,
+                            c_stop,
+                            x_band,
+                            float(lr_tile),
+                            bool(cfg.project_nonneg),
+                            R.copy(),
+                            w_band,
+                            cfg.dset_slots,
+                            cfg.dset_bytes,
+                            cfg.dset_w0,
+                            E_band,
+                            float(beta_blend),
+                            w_lam_sqrt,
+                            inv_ref_band
+                        ))
+
+                    if use_pool:
+                        results = pool.map(_worker_tile_job_with_R, jobs)
+                    else:
+                        # Single-process fallback: call the worker directly
+                        results = [
+                            _worker_tile_job_with_R(job) for job in jobs
+                        ]
+
+                    # --------------- aggregate & tile backtracking ---------------
+                    R_delta_agg = np.zeros_like(R)
+                    band_updates = []
+                    cand_pairs = []
+                    upd_energy_sq_total = 0.0
+
+                    for item in results:
+                        if isinstance(item, tuple) and len(item) == 3:
+                            R_delta, dx_list, cands = item
+                            if cands:
+                                cand_pairs.extend(cands)
                         else:
-                            c, dx_c = tup
-                        band_updates.append((c, dx_c))
+                            R_delta, dx_list = item
+                        R_delta_agg += R_delta
+                        for tup in dx_list:
+                            if len(tup) == 3:
+                                c, dx_c, e2 = tup
+                                upd_energy_sq_total += float(e2)
+                            else:
+                                c, dx_c = tup
+                            band_updates.append((c, dx_c))
 
-                bt_steps_tile  = int(
-                    np.max((0, int(os.environ.get("CUBEFIT_TILE_BT_STEPS", "6"))))
-                )
-                bt_factor_tile = float(
-                    os.environ.get("CUBEFIT_TILE_BT_FACTOR", "0.5")
-                )
+                    bt_steps_tile  = int(
+                        np.max((0, int(os.environ.get("CUBEFIT_TILE_BT_STEPS", "6"))))
+                    )
+                    bt_factor_tile = float(
+                        os.environ.get("CUBEFIT_TILE_BT_FACTOR", "0.5")
+                    )
 
-                rmse_before = float(np.sqrt(np.mean(R * R)))
-                alpha = 1.0
-                rmse_after = float(
-                    np.sqrt(np.mean((R + alpha * R_delta_agg) ** 2))
-                )
-                for _ in range(bt_steps_tile):
-                    if rmse_after < rmse_before:
-                        break
-                    alpha *= bt_factor_tile
-                    if alpha <= 0.0:
-                        break
+                    rmse_before = float(np.sqrt(np.mean(R * R)))
+                    alpha = 1.0
                     rmse_after = float(
                         np.sqrt(np.mean((R + alpha * R_delta_agg) ** 2))
                     )
-
-                if not np.isfinite(rmse_after):
-                    alpha *= 0.0
-                    rmse_after = rmse_before
-                if tracker is not None:
-                    tracker.on_batch_rmse(rmse_after)
-
-                # -------- GLOBAL trust region (global energy & ||Y||) -------
-                if (upd_energy_sq_total > 0.0) and (Y_glob_norm > 0.0):
-                    global_step_norm = float(
-                        np.sqrt(upd_energy_sq_total)
-                    ) * alpha
-                    cap = float(tau_global * Y_glob_norm)
-                    if global_step_norm > cap:
-                        alpha *= float(cap / np.max((1e-12, global_step_norm)))
-
-                # ----------------- apply α ONCE to x and R -------------------
-                # ----------------- APPLY α (NaN-hardened) -----------------
-                # If backtracking produced nonsense, neutralize it.
-                if not np.isfinite(alpha):
-                    alpha = 0.0
-
-                # R update: sanitize the aggregated residual step if needed.
-                if not np.all(np.isfinite(R_delta_agg)):
-                    R_delta_agg = np.nan_to_num(
-                        R_delta_agg, nan=0.0, posinf=0.0, neginf=0.0
-                    )
-
-                R += alpha * R_delta_agg
-
-                # x updates: sanitize each band’s dx before applying.
-                for (c, dx_c) in band_updates:
-                    if not np.all(np.isfinite(dx_c)):
-                        # Zero-out any NaN/Inf in the step; keep shape, no copy.
-                        dx_c = np.nan_to_num(dx_c, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
-                    x_CP[c, :] += alpha * dx_c
-                    if cfg.project_nonneg:
-                        np.maximum(x_CP[c, :], 0.0, out=x_CP[c, :])
-
-                # Safety net: if any NaNs still leaked into x_CP, zero them.
-                if not np.all(np.isfinite(x_CP)):
-                    bad = ~np.isfinite(x_CP)
-                    x_CP[bad] = 0.0
-
-                # ---------- optional ratio penalty --------------------------
-                if have_ratio and (t_norm is not None) and ((tile_idx % rc.tile_every) == 0):
-                    _ratio_update_in_place(x_CP, t_norm)
-
-                # ---------- Optional: tile-local NNLS polish ----------------
-                nnls_enable = os.environ.get(
-                    "CUBEFIT_NNLS_ENABLE", "1"
-                ).lower() not in ("0", "false", "no", "off")
-                nnls_every = int(os.environ.get("CUBEFIT_NNLS_EVERY", "5"))
-                nnls_max_cols = int(
-                    os.environ.get("CUBEFIT_NNLS_MAX_COLS", "256")
-                )
-                nnls_max_bytes = int(os.environ.get(
-                    "CUBEFIT_NNLS_MAX_BYTES", str(1_000_000_000)
-                ))
-                nnls_sub_L = int(os.environ.get("CUBEFIT_NNLS_SUB_L", "0"))
-                nnls_solver = os.environ.get(
-                    "CUBEFIT_NNLS_SOLVER", "nnls"
-                ).lower()  # "pg"|"fista"|"nnls"|"lsq"
-                nnls_max_iter = int(
-                    os.environ.get("CUBEFIT_NNLS_MAX_ITER", "200")
-                )
-                nnls_min_improve = float(os.environ.get("CUBEFIT_NNLS_MIN_IMPROVE", "0.9995"))
-                nnls_l2         = float(os.environ.get("CUBEFIT_NNLS_L2", "0.0"))
-                # allow a small worsening of ratio misfit when polishing (>=1 means allow)
-                # e.g. 1.02 allows up to +2% worse local ratio misfit; 1.00 = never worsen.
-                nnls_ratio_worsen = float(os.environ.get("CUBEFIT_NNLS_RATIO_WORSEN", "1.02"))
-
-                do_nnls = (
-                    nnls_enable and ((tile_idx % nnls_every) == 0)
-                    and (len(cand_pairs) > 0)
-                )
-
-                if do_nnls:
-                    # Deduplicate by best score per global index
-                    idxs = np.asarray(
-                        [int(t[0]) for t in cand_pairs], np.int64
-                    )
-                    scrs = np.asarray(
-                        [float(t[1]) for t in cand_pairs], np.float64
-                    )
-                    best = {}
-                    for i, sc in zip(idxs, scrs):
-                        if (i not in best) or (sc > best[i]):
-                            best[i] = sc
-                    uniq_idx = np.fromiter(best.keys(), dtype=np.int64)
-                    uniq_scr = np.fromiter(best.values(), dtype=np.float64)
-                    order = np.argsort(uniq_scr)[::-1]
-                    uniq_idx = uniq_idx[order]
-
-                    Lk_loc = int(R.shape[1])
-                    if (nnls_sub_L > 0) and (Lk_loc > nnls_sub_L):
-                        rng = np.random.default_rng(12345 + tile_idx)
-                        lam_sel = np.sort(
-                            rng.choice(Lk_loc, size=int(nnls_sub_L),
-                                      replace=False)
+                    for _ in range(bt_steps_tile):
+                        if rmse_after < rmse_before:
+                            break
+                        alpha *= bt_factor_tile
+                        if alpha <= 0.0:
+                            break
+                        rmse_after = float(
+                            np.sqrt(np.mean((R + alpha * R_delta_agg) ** 2))
                         )
-                    else:
-                        lam_sel = np.arange(Lk_loc, dtype=np.int64)
 
-                    rows = int(Sblk * lam_sel.size)
-                    bytes_per_col = int(rows * 8)  # float64
-                    cap_by_mem = int(np.max((1, nnls_max_bytes // np.max((1, bytes_per_col)))))
-                    K_use = int(np.min((uniq_idx.size, nnls_max_cols, cap_by_mem)))
+                    if not np.isfinite(rmse_after):
+                        alpha *= 0.0
+                        rmse_after = rmse_before
+                    if tracker is not None:
+                        tracker.on_batch_rmse(rmse_after)
 
-                    if (K_use >= 2) and (rows >= 2):
-                        W_idx = uniq_idx[:K_use]
+                    # -------- GLOBAL trust region (global energy & ||Y||) -------
+                    if (upd_energy_sq_total > 0.0) and (Y_glob_norm > 0.0):
+                        global_step_norm = float(
+                            np.sqrt(upd_energy_sq_total)
+                        ) * alpha
+                        cap = float(tau_global * Y_glob_norm)
+                        if global_step_norm > cap:
+                            alpha *= float(cap / np.max((1e-12, global_step_norm)))
 
-                        # λ-weights on the subsample
-                        if w_lam_sqrt is not None:
-                            wlam_sel = w_lam_sqrt[lam_sel].astype(
-                                np.float64, copy=False
+                    # ----------------- apply α ONCE to x and R -------------------
+                    # ----------------- APPLY α (NaN-hardened) -----------------
+                    # If backtracking produced nonsense, neutralize it.
+                    if not np.isfinite(alpha):
+                        alpha = 0.0
+
+                    # R update: sanitize the aggregated residual step if needed.
+                    if not np.all(np.isfinite(R_delta_agg)):
+                        R_delta_agg = np.nan_to_num(
+                            R_delta_agg, nan=0.0, posinf=0.0, neginf=0.0
+                        )
+
+                    R += alpha * R_delta_agg
+
+                    # x updates: sanitize each band’s dx before applying.
+                    for (c, dx_c) in band_updates:
+                        if not np.all(np.isfinite(dx_c)):
+                            # Zero-out any NaN/Inf in the step; keep shape, no copy.
+                            dx_c = np.nan_to_num(dx_c, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+                        x_CP[c, :] += alpha * dx_c
+                        if cfg.project_nonneg:
+                            np.maximum(x_CP[c, :], 0.0, out=x_CP[c, :])
+
+                    # Safety net: if any NaNs still leaked into x_CP, zero them.
+                    if not np.all(np.isfinite(x_CP)):
+                        bad = ~np.isfinite(x_CP)
+                        x_CP[bad] = 0.0
+
+                    # ---------- optional ratio penalty --------------------------
+                    if have_ratio and (t_norm is not None) and ((tile_idx % rc.tile_every) == 0):
+                        _ratio_update_in_place(x_CP, t_norm)
+
+                    # ---------- Optional: tile-local NNLS polish ----------------
+                    nnls_enable = os.environ.get(
+                        "CUBEFIT_NNLS_ENABLE", "1"
+                    ).lower() not in ("0", "false", "no", "off")
+                    nnls_every = int(os.environ.get("CUBEFIT_NNLS_EVERY", "5"))
+                    nnls_max_cols = int(
+                        os.environ.get("CUBEFIT_NNLS_MAX_COLS", "256")
+                    )
+                    nnls_max_bytes = int(os.environ.get(
+                        "CUBEFIT_NNLS_MAX_BYTES", str(1_000_000_000)
+                    ))
+                    nnls_sub_L = int(os.environ.get("CUBEFIT_NNLS_SUB_L", "0"))
+                    nnls_solver = os.environ.get(
+                        "CUBEFIT_NNLS_SOLVER", "nnls"
+                    ).lower()  # "pg"|"fista"|"nnls"|"lsq"
+                    nnls_max_iter = int(
+                        os.environ.get("CUBEFIT_NNLS_MAX_ITER", "200")
+                    )
+                    nnls_min_improve = float(os.environ.get("CUBEFIT_NNLS_MIN_IMPROVE", "0.9995"))
+                    nnls_l2         = float(os.environ.get("CUBEFIT_NNLS_L2", "0.0"))
+                    # allow a small worsening of ratio misfit when polishing (>=1 means allow)
+                    # e.g. 1.02 allows up to +2% worse local ratio misfit; 1.00 = never worsen.
+                    nnls_ratio_worsen = float(os.environ.get("CUBEFIT_NNLS_RATIO_WORSEN", "1.02"))
+
+                    do_nnls = (
+                        nnls_enable and ((tile_idx % nnls_every) == 0)
+                        and (len(cand_pairs) > 0)
+                    )
+
+                    if do_nnls:
+                        # Deduplicate by best score per global index
+                        idxs = np.asarray(
+                            [int(t[0]) for t in cand_pairs], np.int64
+                        )
+                        scrs = np.asarray(
+                            [float(t[1]) for t in cand_pairs], np.float64
+                        )
+                        best = {}
+                        for i, sc in zip(idxs, scrs):
+                            if (i not in best) or (sc > best[i]):
+                                best[i] = sc
+                        uniq_idx = np.fromiter(best.keys(), dtype=np.int64)
+                        uniq_scr = np.fromiter(best.values(), dtype=np.float64)
+                        order = np.argsort(uniq_scr)[::-1]
+                        uniq_idx = uniq_idx[order]
+
+                        Lk_loc = int(R.shape[1])
+                        if (nnls_sub_L > 0) and (Lk_loc > nnls_sub_L):
+                            rng = np.random.default_rng(12345 + tile_idx)
+                            lam_sel = np.sort(
+                                rng.choice(Lk_loc, size=int(nnls_sub_L),
+                                        replace=False)
                             )
                         else:
-                            wlam_sel = np.ones(lam_sel.size, np.float64)
-                        sqrt_w_rows = np.tile(wlam_sel, Sblk).astype(
-                            np.float64
-                        )  # (rows,)
+                            lam_sel = np.arange(Lk_loc, dtype=np.int64)
 
-                        # Build B and xW on the subsample
-                        with open_h5(h5_path, role="reader") as f:
-                            M = f["/HyperCube/models"]
-                            PP = int(M.shape[2])
-                            groups = {}
-                            for j, g in enumerate(W_idx):
-                                cc = int(g // PP); pp = int(g % PP)
-                                groups.setdefault(cc, []).append((pp, j))
+                        rows = int(Sblk * lam_sel.size)
+                        bytes_per_col = int(rows * 8)  # float64
+                        cap_by_mem = int(np.max((1, nnls_max_bytes // np.max((1, bytes_per_col)))))
+                        K_use = int(np.min((uniq_idx.size, nnls_max_cols, cap_by_mem)))
 
-                            B = np.empty((rows, K_use), dtype=np.float64)
-                            xW = np.zeros((K_use,), dtype=np.float64)
+                        if (K_use >= 2) and (rows >= 2):
+                            W_idx = uniq_idx[:K_use]
 
-                            for cc, plist in groups.items():
-                                A_c = np.asarray(M[s0:s1, cc, :, :],
-                                                 np.float32, order="C")
-                                if keep_idx is not None:
-                                    A_c = A_c[:, :, keep_idx]
-                                A_c = A_c[:, :, lam_sel]
-                                for pp, j in plist:
-                                    col = A_c[:, int(pp), :].astype(
-                                        np.float64, copy=False
-                                    ).reshape(rows, order="C")
-                                    # Mode A: normalize this (c,p) column
-                                    col *= float(inv_cp_flux_ref[int(cc), int(pp)])
-                                    B[:, int(j)] = col
-                                    xW[int(j)]   = float(x_CP[int(cc), int(pp)])
-
-
-                        r_sub = R[:, lam_sel].reshape(rows, order="C")
-                        y_rhs = B @ xW + r_sub
-
-                        # Weighted system
-                        B_w     = B * sqrt_w_rows[:, None]
-                        y_rhs_w = y_rhs * sqrt_w_rows
-
-                        xW_new = None
-                        if nnls_solver in ("pg", "fista"):
-                            # Column-normalize local system (conditioning)
-                            col_norm = np.linalg.norm(B_w, axis=0)
-                            col_norm = np.where(col_norm > 0.0, col_norm, 1.0)
-                            Bn = B_w / col_norm
-                            x  = xW / col_norm
-
-                            # FISTA with backtracking (fast & robust)
-                            if K_use <= 2048:
-                                L_est = float(np.linalg.norm(Bn, ord=2)**2
-                                              + nnls_l2)
-                            else:
-                                L_est = float(
-                                    (Bn**2).sum(axis=0).max() + nnls_l2
+                            # λ-weights on the subsample
+                            if w_lam_sqrt is not None:
+                                wlam_sel = w_lam_sqrt[lam_sel].astype(
+                                    np.float64, copy=False
                                 )
-                            t = 1.0
-                            z = np.maximum(0.0, x.copy())
-                            x_old = z.copy()
+                            else:
+                                wlam_sel = np.ones(lam_sel.size, np.float64)
+                            sqrt_w_rows = np.tile(wlam_sel, Sblk).astype(
+                                np.float64
+                            )  # (rows,)
 
-                            def _f_and_grad(zvec):
-                                r = Bn @ zvec - y_rhs_w
-                                f = 0.5 * float(r @ r) + 0.5 * nnls_l2 * \
-                                    float(zvec @ zvec)
-                                g = Bn.T @ r + nnls_l2 * zvec
-                                return f, g, r
+                            # Build B and xW on the subsample
+                            with open_h5(h5_path, role="reader") as f:
+                                M = f["/HyperCube/models"]
+                                PP = int(M.shape[2])
+                                groups = {}
+                                for j, g in enumerate(W_idx):
+                                    cc = int(g // PP); pp = int(g % PP)
+                                    groups.setdefault(cc, []).append((pp, j))
 
-                            fz, gz, rz = _f_and_grad(z)
-                            step = 1.0 / max(L_est, 1e-6)
+                                B = np.empty((rows, K_use), dtype=np.float64)
+                                xW = np.zeros((K_use,), dtype=np.float64)
 
-                            for _it in range(nnls_max_iter):
-                                # Armijo backtracking
-                                while True:
-                                    x_try = z - step * gz
-                                    np.maximum(x_try, 0.0, out=x_try)
-                                    r_try = Bn @ x_try - y_rhs_w
-                                    f_try = 0.5 * float(r_try @ r_try) \
-                                            + 0.5 * nnls_l2 * \
-                                            float(x_try @ x_try)
-                                    if f_try <= fz - 1e-4 * step * \
-                                           float(gz @ gz) or step < 1e-12:
-                                        break
-                                    step *= 0.5
-                                # FISTA momentum
-                                t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t*t))
-                                z = x_try + ((t - 1.0) / t_new) * (x_try - x_old)
-                                x_old = x_try
-                                t = t_new
+                                for cc, plist in groups.items():
+                                    A_c = np.asarray(M[s0:s1, cc, :, :],
+                                                    np.float32, order="C")
+                                    if keep_idx is not None:
+                                        A_c = A_c[:, :, keep_idx]
+                                    A_c = A_c[:, :, lam_sel]
+                                    for pp, j in plist:
+                                        col = A_c[:, int(pp), :].astype(
+                                            np.float64, copy=False
+                                        ).reshape(rows, order="C")
+                                        # Mode A: normalize this (c,p) column
+                                        col *= float(inv_cp_flux_ref[int(cc), int(pp)])
+                                        B[:, int(j)] = col
+                                        xW[int(j)]   = float(x_CP[int(cc), int(pp)])
+
+
+                            r_sub = R[:, lam_sel].reshape(rows, order="C")
+                            y_rhs = B @ xW + r_sub
+
+                            # Weighted system
+                            B_w     = B * sqrt_w_rows[:, None]
+                            y_rhs_w = y_rhs * sqrt_w_rows
+
+                            xW_new = None
+                            if nnls_solver in ("pg", "fista"):
+                                # Column-normalize local system (conditioning)
+                                col_norm = np.linalg.norm(B_w, axis=0)
+                                col_norm = np.where(col_norm > 0.0, col_norm, 1.0)
+                                Bn = B_w / col_norm
+                                x  = xW / col_norm
+
+                                # FISTA with backtracking (fast & robust)
+                                if K_use <= 2048:
+                                    L_est = float(np.linalg.norm(Bn, ord=2)**2
+                                                + nnls_l2)
+                                else:
+                                    L_est = float(
+                                        (Bn**2).sum(axis=0).max() + nnls_l2
+                                    )
+                                t = 1.0
+                                z = np.maximum(0.0, x.copy())
+                                x_old = z.copy()
+
+                                def _f_and_grad(zvec):
+                                    r = Bn @ zvec - y_rhs_w
+                                    f = 0.5 * float(r @ r) + 0.5 * nnls_l2 * \
+                                        float(zvec @ zvec)
+                                    g = Bn.T @ r + nnls_l2 * zvec
+                                    return f, g, r
+
                                 fz, gz, rz = _f_and_grad(z)
-                                if float(rz @ rz) < 1e-12:
-                                    break
+                                step = 1.0 / max(L_est, 1e-6)
 
-                            xW_new = x_try * col_norm
+                                for _it in range(nnls_max_iter):
+                                    # Armijo backtracking
+                                    while True:
+                                        x_try = z - step * gz
+                                        np.maximum(x_try, 0.0, out=x_try)
+                                        r_try = Bn @ x_try - y_rhs_w
+                                        f_try = 0.5 * float(r_try @ r_try) \
+                                                + 0.5 * nnls_l2 * \
+                                                float(x_try @ x_try)
+                                        if f_try <= fz - 1e-4 * step * \
+                                            float(gz @ gz) or step < 1e-12:
+                                            break
+                                        step *= 0.5
+                                    # FISTA momentum
+                                    t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t*t))
+                                    z = x_try + ((t - 1.0) / t_new) * (x_try - x_old)
+                                    x_old = x_try
+                                    t = t_new
+                                    fz, gz, rz = _f_and_grad(z)
+                                    if float(rz @ rz) < 1e-12:
+                                        break
 
-                        elif nnls_solver == "lsq":
-                            try:
-                                from scipy.optimize import lsq_linear
-                                res = lsq_linear(B_w, y_rhs_w,
-                                                 bounds=(0.0, np.inf),
-                                                 method="trf",
-                                                 max_iter=nnls_max_iter,
-                                                 verbose=0)
-                                xW_new = np.maximum(0.0, res.x)
-                            except Exception:
-                                xW_new = None
-                        elif nnls_solver == "nnls":
-                            try:
-                                from scipy.optimize import nnls as _scipy_nnls
-                                xW_new, _ = _scipy_nnls(B_w, y_rhs_w)
-                            except Exception:
-                                xW_new = None
+                                xW_new = x_try * col_norm
 
-                        # Commit only if we actually solved something and it helped enough
-                        if xW_new is not None:
-                            dxW = xW_new - xW
-                            if np.any(dxW != 0.0):
+                            elif nnls_solver == "lsq":
+                                try:
+                                    from scipy.optimize import lsq_linear
+                                    res = lsq_linear(B_w, y_rhs_w,
+                                                    bounds=(0.0, np.inf),
+                                                    method="trf",
+                                                    max_iter=nnls_max_iter,
+                                                    verbose=0)
+                                    xW_new = np.maximum(0.0, res.x)
+                                except Exception:
+                                    xW_new = None
+                            elif nnls_solver == "nnls":
+                                try:
+                                    from scipy.optimize import nnls as _scipy_nnls
+                                    xW_new, _ = _scipy_nnls(B_w, y_rhs_w)
+                                except Exception:
+                                    xW_new = None
 
-                                # --- Weighted RMSE accept criterion (unchanged) ---
-                                def _wrmse(vec_1d: np.ndarray) -> float:
-                                    w2 = sqrt_w_rows * sqrt_w_rows
-                                    num = float(np.dot(w2, vec_1d * vec_1d))
-                                    den = float(np.sum(w2)) or 1.0
-                                    return math.sqrt(num / den)
+                            # Commit only if we actually solved something and it helped enough
+                            if xW_new is not None:
+                                dxW = xW_new - xW
+                                if np.any(dxW != 0.0):
 
-                                r_after = r_sub - (B @ dxW)   # NOTE: unweighted residual update
-                                rmse_before = _wrmse(r_sub)
-                                rmse_after  = _wrmse(r_after)
-                                ok_rmse = (rmse_after / max(1e-12, rmse_before)) < nnls_min_improve
+                                    # --- Weighted RMSE accept criterion (unchanged) ---
+                                    def _wrmse(vec_1d: np.ndarray) -> float:
+                                        w2 = sqrt_w_rows * sqrt_w_rows
+                                        num = float(np.dot(w2, vec_1d * vec_1d))
+                                        den = float(np.sum(w2)) or 1.0
+                                        return math.sqrt(num / den)
 
-                                # --- ratio-drift guard vs global prior w_prior ---
-                                ok_ratio = True
-                                if have_ratio:
-                                    # totals before
-                                    s_before = x_CP.sum(axis=1)             # (C,)
-                                    S_b = float(np.sum(s_before))
-                                    if S_b > 0.0:
-                                        mix_b = s_before / S_b
+                                    r_after = r_sub - (B @ dxW)   # NOTE: unweighted residual update
+                                    rmse_before = _wrmse(r_sub)
+                                    rmse_after  = _wrmse(r_after)
+                                    ok_rmse = (rmse_after / max(1e-12, rmse_before)) < nnls_min_improve
 
-                                        # apply dxW only to the touched (c,p) indices
-                                        comp_of_j = (W_idx // P).astype(np.int64)
-                                        dS = np.zeros(C, dtype=np.float64)
-                                        np.add.at(dS, comp_of_j, dxW)
+                                    # --- ratio-drift guard vs global prior w_prior ---
+                                    ok_ratio = True
+                                    if have_ratio:
+                                        # totals before
+                                        s_before = x_CP.sum(axis=1)             # (C,)
+                                        S_b = float(np.sum(s_before))
+                                        if S_b > 0.0:
+                                            mix_b = s_before / S_b
 
-                                        s_after = s_before + dS
-                                        S_a = float(np.sum(s_after))
-                                        if S_a > 0.0:
-                                            mix_a = s_after / S_a
-                                            # L1 deviation from target mixture w_prior
-                                            dev_b = float(np.sum(np.abs(mix_b - w_prior)))
-                                            dev_a = float(np.sum(np.abs(mix_a - w_prior)))
-                                            ok_ratio = (dev_a <= dev_b * nnls_ratio_worsen + 1e-18)
+                                            # apply dxW only to the touched (c,p) indices
+                                            comp_of_j = (W_idx // P).astype(np.int64)
+                                            dS = np.zeros(C, dtype=np.float64)
+                                            np.add.at(dS, comp_of_j, dxW)
 
-                                if ok_rmse and ok_ratio:
-                                    # Commit to x_CP and to the *unweighted* residual R
-                                    for j, g in enumerate(W_idx):
-                                        cc = int(g // P); pp = int(g % P)
-                                        x_CP[cc, pp] = float(max(0.0, x_CP[cc, pp] + dxW[j]))
-                                    R[:, lam_sel] = r_after.reshape(Sblk, lam_sel.size, order="C")
-                                # else: reject this NNLS polish
+                                            s_after = s_before + dS
+                                            S_a = float(np.sum(s_after))
+                                            if S_a > 0.0:
+                                                mix_a = s_after / S_a
+                                                # L1 deviation from target mixture w_prior
+                                                dev_b = float(np.sum(np.abs(mix_b - w_prior)))
+                                                dev_a = float(np.sum(np.abs(mix_a - w_prior)))
+                                                ok_ratio = (dev_a <= dev_b * nnls_ratio_worsen + 1e-18)
 
-                # ---------- end NNLS polish ----------
+                                    if ok_rmse and ok_ratio:
+                                        # Commit to x_CP and to the *unweighted* residual R
+                                        for j, g in enumerate(W_idx):
+                                            cc = int(g // P); pp = int(g % P)
+                                            x_CP[cc, pp] = float(max(0.0, x_CP[cc, pp] + dxW[j]))
+                                        R[:, lam_sel] = r_after.reshape(Sblk, lam_sel.size, order="C")
+                                    # else: reject this NNLS polish
 
-                if tracker is not None:
-                    tracker.on_progress(
-                        epoch=ep + 1,
-                        spax_done=tile_idx + 1,
-                        spax_total=len(s_ranges),
-                        rmse_ewma=None
+                    # ---------- end NNLS polish ----------
+
+                    if tracker is not None:
+                        tracker.on_progress(
+                            epoch=ep + 1,
+                            spax_done=tile_idx + 1,
+                            spax_total=len(s_ranges),
+                            rmse_ewma=None
+                        )
+                        tracker.maybe_snapshot_x(x_CP, epoch=ep,
+                                                rmse=rmse_after)
+
+                    pbar.update(1)
+                    pbar.refresh()
+
+                pbar.close()
+
+                if w_prior is not None:
+                    t0_sb = time.perf_counter()
+                    orbBand, orbStep = softbox_params_smooth(eq=ep, E=cfg.epochs)
+                    cu.apply_component_softbox_energy(
+                        x_CP, E_global,
+                        (orbit_weights if orbit_weights is not None else np.ones(x_CP.shape[0])),
+                        band=float(orbBand), step=float(orbStep), min_target=1e-10
                     )
-                    tracker.maybe_snapshot_x(x_CP, epoch=ep,
-                                             rmse=rmse_after)
 
-                pbar.update(1)
-                pbar.refresh()
+                    dt_sb = time.perf_counter() - t0_sb
+                    print(f"[softbox] epoch {ep+1}: took {dt_sb:.4f}s", flush=True)
 
-            pbar.close()
-
-            if w_prior is not None:
-                t0_sb = time.perf_counter()
-                orbBand, orbStep = softbox_params_smooth(eq=ep, E=cfg.epochs)
-                cu.apply_component_softbox_energy(
-                    x_CP, E_global,
-                    (orbit_weights if orbit_weights is not None else np.ones(x_CP.shape[0])),
-                    band=float(orbBand), step=float(orbStep), min_target=1e-10
-                )
-
-                dt_sb = time.perf_counter() - t0_sb
-                print(f"[softbox] epoch {ep+1}: took {dt_sb:.4f}s", flush=True)
-
-            # ---------- optional orbit weights enforcement -----------
-            t0_ob = time.perf_counter()
-            if orbit_weights is not None and rc.epoch_project:
-                cu.project_to_component_weights(
-                    x_CP,
-                    orbit_weights,
-                    E_cp=E_global,     # (C,P) from /HyperCube/col_energy
-                    minw=1e-10,
-                    beta=rc.epoch_beta  # e.g. 0.1–0.3
-                )
-
-                dt_ob = time.perf_counter() - t0_ob
-                print(f"[orbit-weights] epoch {ep+1}: took {dt_ob:.4f}s", flush=True)
+                # ---------- optional orbit weights enforcement -----------
                 t0_ob = time.perf_counter()
-                x[:] = x_CP.ravel(order="C")  # keep your flattened view in sync
-                dt_ob = time.perf_counter() - t0_ob
-                print(f"[orbit-weights] epoch {ep+1}: sync took {dt_ob:.4f}s",
-                    flush=True)
+                if orbit_weights is not None and rc.epoch_project:
+                    cu.project_to_component_weights(
+                        x_CP,
+                        orbit_weights,
+                        E_cp=E_global,     # (C,P) from /HyperCube/col_energy
+                        minw=1e-10,
+                        beta=rc.epoch_beta  # e.g. 0.1–0.3
+                    )
 
-                t0_usage = time.perf_counter()
-                # --- global energy L1-to-target diagnostic (robust) ---
-                try:
-                    if E_global is not None:
-                        print("[global energy] computing L1-to-target...", flush=True)
-                        X64 = np.asarray(x_CP, dtype=np.float64)
-                        E64 = np.asarray(E_global, dtype=np.float64)
+                    dt_ob = time.perf_counter() - t0_ob
+                    print(f"[orbit-weights] epoch {ep+1}: took {dt_ob:.4f}s", flush=True)
+                    t0_ob = time.perf_counter()
+                    x[:] = x_CP.ravel(order="C")  # keep your flattened view in sync
+                    dt_ob = time.perf_counter() - t0_ob
+                    print(f"[orbit-weights] epoch {ep+1}: sync took {dt_ob:.4f}s",
+                        flush=True)
 
-                        # Sanitize E_global and X64 to avoid NaN/Inf poisoning
-                        bad_E = ~np.isfinite(E64)
-                        bad_X = ~np.isfinite(X64)
-                        n_bad_E = int(bad_E.sum())
-                        n_bad_X = int(bad_X.sum())
-                        if n_bad_E or n_bad_X:
-                            print(f"[global energy] WARNING: non-finite entries detected "
-                                f"in X/E (X bad={n_bad_X}, E bad={n_bad_E}); zeroing.",
-                                flush=True)
-                            if n_bad_E:
-                                E64[bad_E] = 0.0
-                            if n_bad_X:
+                    t0_usage = time.perf_counter()
+                    # --- global energy L1-to-target diagnostic (robust) ---
+                    try:
+                        if E_global is not None:
+                            print("[global energy] computing L1-to-target...", flush=True)
+                            X64 = np.asarray(x_CP, dtype=np.float64)
+                            E64 = np.asarray(E_global, dtype=np.float64)
+
+                            # Sanitize E_global and X64 to avoid NaN/Inf poisoning
+                            bad_E = ~np.isfinite(E64)
+                            bad_X = ~np.isfinite(X64)
+                            n_bad_E = int(bad_E.sum())
+                            n_bad_X = int(bad_X.sum())
+                            if n_bad_E or n_bad_X:
+                                print(f"[global energy] WARNING: non-finite entries detected "
+                                    f"in X/E (X bad={n_bad_X}, E bad={n_bad_E}); zeroing.",
+                                    flush=True)
+                                if n_bad_E:
+                                    E64[bad_E] = 0.0
+                                if n_bad_X:
+                                    X64[bad_X] = 0.0
+
+                            # Energy–weighted usage per component
+                            s = (X64 * E64).sum(axis=1)  # (C,)
+                        else:
+                            # Plain usage
+                            X64 = np.asarray(x_CP, dtype=np.float64)
+                            bad_X = ~np.isfinite(X64)
+                            if bad_X.any():
+                                print(f"[global energy] WARNING: non-finite entries in X "
+                                    f"(bad={int(bad_X.sum())}); zeroing.", flush=True)
                                 X64[bad_X] = 0.0
+                            s = X64.sum(axis=1)
 
-                        # Energy–weighted usage per component
-                        s = (X64 * E64).sum(axis=1)  # (C,)
-                    else:
-                        # Plain usage
-                        X64 = np.asarray(x_CP, dtype=np.float64)
-                        bad_X = ~np.isfinite(X64)
-                        if bad_X.any():
-                            print(f"[global energy] WARNING: non-finite entries in X "
-                                f"(bad={int(bad_X.sum())}); zeroing.", flush=True)
-                            X64[bad_X] = 0.0
-                        s = X64.sum(axis=1)
-
-                    # Now compute L1 safely
-                    s = np.maximum(s, 0.0)
-                    S = float(np.sum(s))
-                    if not np.isfinite(S) or S <= 0.0:
-                        print("[global energy] S is non-finite or <=0; skipping L1 diagnostic.",
-                            flush=True)
-                    else:
-                        s_frac = s / S
-
-                        # t is your target mix; make sure it's finite too
-                        t_vec = (t_x0 if (rc.anchor == "x0" and t_x0 is not None) else w_target)
-                        t = np.asarray(t_vec, np.float64).ravel(order="C")
-                        if t.size == C * P:
-                            t = t.reshape(C, P, order="C").sum(axis=1)
-                        elif t.size != C:
-                            raise ValueError(f"[ratio] target len {t.size} not in {{C, C*P}}")
-
-                        t = np.maximum(np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0), rc.minw)
-                        T = float(np.sum(t))
-                        if not np.isfinite(T) or T <= 0.0:
-                            print("[global energy] target sum non-finite or <=0; skipping L1.",
+                        # Now compute L1 safely
+                        s = np.maximum(s, 0.0)
+                        S = float(np.sum(s))
+                        if not np.isfinite(S) or S <= 0.0:
+                            print("[global energy] S is non-finite or <=0; skipping L1 diagnostic.",
                                 flush=True)
                         else:
-                            t_frac = t / T
-                            diff = s_frac - t_frac
-                            # clean diff just in case
-                            diff = np.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0)
-                            l1 = float(np.sum(np.abs(diff)))
-                            print(f"[ratio] epoch L1-to-target = {l1:.5e}", flush=True)
+                            s_frac = s / S
 
-                except Exception as e:
-                    # Last-resort guard so the solver never 'hangs' here
-                    print(f"[global energy] ERROR while computing L1-to-target: {e!r}",
+                            # t is your target mix; make sure it's finite too
+                            t_vec = (t_x0 if (rc.anchor == "x0" and t_x0 is not None) else w_target)
+                            t = np.asarray(t_vec, np.float64).ravel(order="C")
+                            if t.size == C * P:
+                                t = t.reshape(C, P, order="C").sum(axis=1)
+                            elif t.size != C:
+                                raise ValueError(f"[ratio] target len {t.size} not in {{C, C*P}}")
+
+                            t = np.maximum(np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0), rc.minw)
+                            T = float(np.sum(t))
+                            if not np.isfinite(T) or T <= 0.0:
+                                print("[global energy] target sum non-finite or <=0; skipping L1.",
+                                    flush=True)
+                            else:
+                                t_frac = t / T
+                                diff = s_frac - t_frac
+                                # clean diff just in case
+                                diff = np.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0)
+                                l1 = float(np.sum(np.abs(diff)))
+                                print(f"[ratio] epoch L1-to-target = {l1:.5e}", flush=True)
+
+                    except Exception as e:
+                        # Last-resort guard so the solver never 'hangs' here
+                        print(f"[global energy] ERROR while computing L1-to-target: {e!r}",
+                            flush=True)
+                    dt_usage = time.perf_counter() - t0_usage
+                    print(f"[ratio] epoch {ep+1}: usage calc took {dt_usage:.4f}s",
                         flush=True)
-                dt_usage = time.perf_counter() - t0_usage
-                print(f"[ratio] epoch {ep+1}: usage calc took {dt_usage:.4f}s",
+
+                print(f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs} snapshotting...",
                     flush=True)
+                try:
+                    if tracker is not None:
+                        tracker.on_epoch_end(ep + 1, dict(), block=False)
+                except Exception:
+                    pass
+                try:
+                    if tracker is not None:
+                        tracker.maybe_snapshot_x(x_CP, epoch=ep+1,
+                            rmse=rmse_after, force=True)
+                except Exception:
+                    pass
+                print(f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs} housekeeping "
+                    f"done.", flush=True)
 
-            print(f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs} snapshotting...",
-                flush=True)
-            try:
-                if tracker is not None:
-                    tracker.on_epoch_end(ep + 1, dict(), block=False)
-            except Exception:
-                pass
-            try:
-                if tracker is not None:
-                    tracker.maybe_snapshot_x(x_CP, epoch=ep+1,
-                        rmse=rmse_after, force=True)
-            except Exception:
-                pass
-            print(f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs} housekeeping "
-                  f"done.", flush=True)
+            elapsed = time.perf_counter() - t0
 
-        elapsed = time.perf_counter() - t0
-
-        np.nan_to_num(x_CP, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
-        return x_CP.ravel(order="C"), dict(epochs=cfg.epochs,
-                                           elapsed_sec=elapsed)
-    finally:
-        pool.close()
-        pool.join()
+            np.nan_to_num(x_CP, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+            return x_CP.ravel(order="C"), dict(epochs=cfg.epochs,
+                                            elapsed_sec=elapsed)
+        finally:
+            pool.close()
+            pool.join()
+    except Exception as e:
+        print(
+            "[Kaczmarz-MP] FATAL exception in "
+            "solve_global_kaczmarz_cchunk_mp:",
+            flush=True,
+        )
+        print(traceback.format_exc(), flush=True)
+        # re-raise so the pipeline still fails loudly
+        raise
 
 # ------------------------------------------------------------------------------
 
