@@ -21,6 +21,8 @@ History
 -------
 v1.0:   2025
 v1.1:   Read `zarrDir` from `kwargs` instead of hardcoding it. 12 August 2025
+v1.2:   Removed `cp_flux_ref` from `reconstruct_modelcube_fast`, since now all
+            public `x` API is scaled to physical units. 5 December 2025
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -555,7 +557,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         use=True           # <-- IMPORTANT: actually enable the ratio term
     )
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=1,
+        epochs=2,
         lr=0.0075,
         project_nonneg=True,
         orbit_weights=None,     # or None for “free” fit
@@ -566,7 +568,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         reader_s_tile=128,          # match /HyperCube/models chunking on S
         verbose=True,
         # warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
-        warm_start='zeros',  # 'zeros', 'resume', 'jacobi', 'nnls'
+        warm_start='resume',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=24, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
@@ -1011,7 +1013,8 @@ def reconstruct_modelcube_fast(
     h5_path : str
         Path to the CubeFit HDF5 file.
     x_cp : ndarray
-        Solution weights as shape (C, P) or flat (C*P,).
+        Solution weights as shape (C, P) or flat (C*P,). These must be in the
+        same physical normalization as `/HyperCube/models`.
     out_dset : str, optional
         Destination dataset name. Default is "/ModelCube".
     s_chunk : int or None, optional
@@ -1070,15 +1073,6 @@ def reconstruct_modelcube_fast(
         if M.ndim != 4:
             raise RuntimeError(f"Unexpected /HyperCube/models rank {M.ndim}")
         S, C, P, L = map(int, M.shape)
-
-        # Use the same keep_idx as the solver would (from /Mask), so the ref is consistent.
-        keep_idx = None
-        if "/Mask" in f:
-            m = np.asarray(f["/Mask"][...], dtype=bool).ravel()
-            if int(m.size) == int(M.shape[-1]):
-                keep_idx = np.flatnonzero(m)
-        cp_flux_ref = cu._ensure_cp_flux_ref(h5_path, keep_idx)
-        inv_cp_flux_ref = (1.0 / cp_flux_ref).astype(np.float64, copy=False)
 
         # Choose tile sizes aligned to on-disk chunking unless overridden
         m_chunks = M.chunks or (S, 1, P, L)
@@ -1148,13 +1142,11 @@ def reconstruct_modelcube_fast(
                         A_c = np.asarray(
                             M[s0:s1, c, nz, l0:l1], dtype=np.float32, order="C"
                         )
-                        A_c = A_c * inv_cp_flux_ref[c, nz][None, :, None]
                     else:
                         w = x_cp[c, :]    # (P,)
                         A_c = np.asarray(
                             M[s0:s1, c, :, l0:l1], dtype=np.float32, order="C"
                         )
-                        A_c = A_c * inv_cp_flux_ref[c, :][None, :, None]
 
                     # y += sum_p w[p] * A[:, p, :]
                     band += np.tensordot(
@@ -1171,22 +1163,20 @@ def reconstruct_modelcube_fast(
                 pbar.refresh()
                 sys.stdout.flush()
 
-            # Commit the finished S-tile
-            out[s0:s1, :] = Y_tile.astype(want_dtype, copy=False)
+            # Write the finished S-tile
+            out[s0:s1, :] = Y_tile
 
-
-            # SWMR-friendly: expose new data; keep UI responsive
-            try: out.id.flush()
-            except Exception: pass
-            try: f.flush()
-            except Exception: pass
+            # Try to flush to disk eagerly for SWMR friendliness
+            try:
+                out.id.flush()
+            except Exception:
+                pass
+            try:
+                f.flush()
+            except Exception:
+                pass
             sys.stdout.flush()
             trim_heap()
-        try:
-            out.attrs["basis.normalization"] = "cp_flux_ref"
-            out.attrs["basis.norm_ref_dset"] = "/HyperCube/norm/cp_flux_ref"
-        except Exception:
-            pass
 
         pbar.close()
 

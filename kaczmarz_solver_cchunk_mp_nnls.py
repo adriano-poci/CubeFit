@@ -24,6 +24,7 @@ History
 v1.0:   Fixed bug in computing `nprocs`;
         Wrapped entire `solve_global_kaczmarz_cchunk_mp` in `try/except`. 4
             December 2025
+v1.1:   Added column-flux scaling bypass (`cp_flux_ref=None`). 5 December 2025
 """
 # kaczmarz_solver_cchunk_mp.py
 
@@ -272,13 +273,16 @@ def _worker_tile_job_with_R(args):
             A = np.asarray(M[s0:s1, c, :, :], np.float32, order="C")
             if keep_idx is not None:
                 A = A[:, :, keep_idx]  # (Sblk,P,Lk)
-            inv_ref = np.asarray(inv_ref_band[bi, :], dtype=np.float64)
+            inv_ref = np.asarray(inv_ref_band[bi, :], dtype=np.float64) if inv_ref_band is not None else np.ones((P,), dtype=np.float64)
             # Broadcast over (Sblk, P, Lk)
             A = A * inv_ref[None, :, None]
             _finite_inplace(A, f"A_nonfinite_c{c}", stats)
 
             # λ-weighted view for gradient/denominator
-            A_w = A * w_lam_sqrt[None, None, :] if w_lam_sqrt is not None else A
+            if w_lam_sqrt is not None:
+                A_w = A * w_lam_sqrt[None, None, :]
+            else:
+                A_w = A
 
             # Gradient g = (√w A)^T (√w R)
             g = np.zeros((P,), dtype=np.float64)
@@ -518,7 +522,23 @@ def solve_global_kaczmarz_cchunk_mp(
             mask = cu._get_mask(f) if cfg.apply_mask else None
             keep_idx = np.flatnonzero(mask) if mask is not None else None
             Lk = int(keep_idx.size) if keep_idx is not None else L
-            cp_flux_ref = cu._ensure_cp_flux_ref(h5_path, keep_idx)   # (C,P) float64
+            # ------------------- column-flux scaling -------------------
+            # cp_flux_ref[c,p] is the reference flux for column (c,p) in the *physical* basis
+            cp_flux_ref = cu._ensure_cp_flux_ref(h5_path, keep_idx=keep_idx)  # shape (C,P) or None
+            cp_flux_ref = None
+
+            if cp_flux_ref is not None:
+                print("[Kaczmarz-MP] Using column-flux scaling.", flush=True)
+                print(f"[Kaczmarz-MP] {'cp_flux_ref'}.min={np.min(cp_flux_ref):.3e}, "
+                      f"max={np.max(cp_flux_ref):.3e}, "
+                      f"median={np.median(cp_flux_ref[cp_flux_ref>0]):.3e}",
+                      flush=True)
+                cp_flux_ref = np.asarray(cp_flux_ref, np.float64).reshape(C, P)
+                inv_cp_flux_ref = 1.0 / np.maximum(cp_flux_ref, 1.0e-30)
+            else:
+                # no scaling; everything stays physical
+                cp_flux_ref = None
+                inv_cp_flux_ref = None
 
             # ------------------- λ-weights (feature emphasis) -------------
             lamw_enable = os.environ.get(
@@ -573,9 +593,7 @@ def solve_global_kaczmarz_cchunk_mp(
                     Yt = Yt[:, keep_idx]
                 norms.append(float(np.linalg.norm(Yt)))
                 Y_glob_norm2 += float(np.sum(Yt * Yt))
-            
-        cp_flux_ref = np.asarray(cp_flux_ref, dtype=np.float64, order="C")
-        inv_cp_flux_ref = 1.0 / cp_flux_ref  # broadcasted column scaling
+
         print(
             f"[Kaczmarz-MP] DataCube S={S}, L={L} (kept Lk={Lk}), "
             f"Hypercube C={C}, P={P}, s_tile={s_tile}, "
@@ -643,12 +661,20 @@ def solve_global_kaczmarz_cchunk_mp(
 
         # ------------------- x init --------------------------------------
         if x0 is None:
+            # Start from zero *in the normalized basis*
             x_CP = np.zeros((C, P), dtype=np.float64, order="C")
         else:
             x0 = np.asarray(x0, np.float64).ravel(order="C")
             if x0.size != C * P:
                 raise ValueError(f"x0 length {x0.size} != C*P={C*P}.")
-            x_CP = x0.reshape(C, P)
+
+            X_phys = x0.reshape(C, P)  # x0 is always in the physical basis
+
+            if cp_flux_ref is not None:
+                # Encode physical weights into the normalized basis the solver uses
+                x_CP = X_phys * cp_flux_ref   # x_norm = x_phys * cp_flux_ref
+            else:
+                x_CP = X_phys.copy(order="C")
 
         # Tiny symmetry breaking (optional)
         print("[Kaczmarz-MP] Applying symmetry breaking (if needed)...", flush=True)
@@ -704,10 +730,10 @@ def solve_global_kaczmarz_cchunk_mp(
             w_target = np.maximum(w_in, rc.minw)
             w_target = w_target / np.maximum(np.sum(w_target), 1.0)
 
-            # Optionally keep a copy of the true x0 mixture for 'x0' anchor
+            # Optional anchor: mixture implied by the input x0 (also in physical units)
             if x0 is not None and x0.size == C * P:
                 x0_mat = np.asarray(x0, np.float64).reshape(C, P, order="C")
-                s0 = np.sum(np.maximum(x0_mat, 0.0), axis=1)
+                s0 = np.sum(np.maximum(x0_mat, 0.0), axis=1)  # physical mass per component
                 S0 = np.sum(s0)
                 t_x0 = (s0 / np.maximum(S0, 1.0)) if S0 > 0.0 else w_target
             else:
@@ -715,22 +741,39 @@ def solve_global_kaczmarz_cchunk_mp(
 
             rng = np.random.default_rng()
 
-            def _ratio_update_in_place(x_mat: np.ndarray, t_vec: np.ndarray) -> None:
+            # Choose which target mixture to use at each update; for now just w_target.
+            # You can later blend w_target and t_x0 if rc supports that.
+            def _get_target_mix() -> np.ndarray:
+                return w_target
+
+            def _ratio_update_in_place(x_norm_mat: np.ndarray) -> None:
                 """
-                Mass-preserving multiplicative update toward t_vec (sum=1).
-                Uses only NumPy ops.
+                Mass-preserving multiplicative update toward the target mixture
+                in *physical* space. x_norm_mat is the solver's internal normalized
+                weights (x_norm = x_phys * cp_flux_ref).
                 """
-                s = np.sum(x_mat, axis=1)                       # (C,)
+                # 1) Convert to physical weights
+                if cp_flux_ref is not None:
+                    x_phys = x_norm_mat * inv_cp_flux_ref     # x_phys = x_norm / cp_flux_ref
+                else:
+                    x_phys = x_norm_mat
+
+                # 2) Compute physical mixture per component
+                s = np.sum(x_phys, axis=1)                    # (C,)
                 S = np.sum(s)
                 if not np.isfinite(S) or S <= 0.0:
                     return
-                sh = s / np.maximum(S, 1.0)                     # ŝ
+
+                sh = s / np.maximum(S, 1.0)                   # current physical mixture ŝ
+
+                t_vec = _get_target_mix()                     # target physical mixture (sum=1)
 
                 active = np.isfinite(sh) & np.isfinite(t_vec) & (t_vec > 0.0)
                 idx = np.nonzero(active)[0]
                 if idx.size == 0:
                     return
 
+                # Optional stochastic subsampling
                 if rc.prob < 1.0:
                     keep = rng.random(idx.size) < rc.prob
                     idx = idx[keep]
@@ -739,7 +782,7 @@ def solve_global_kaczmarz_cchunk_mp(
                 if (rc.batch > 0) and (idx.size > rc.batch):
                     idx = rng.choice(idx, size=int(rc.batch), replace=False)
 
-                # Multiplicative factors in log-space
+                # 3) Compute multiplicative factors (in log space) to move ŝ → t_vec
                 e = np.log(np.maximum(sh[idx], rc.minw)) - np.log(
                     np.maximum(t_vec[idx], rc.minw)
                 )
@@ -752,12 +795,21 @@ def solve_global_kaczmarz_cchunk_mp(
                 denom = np.sum(sh * F)
                 if not np.isfinite(denom) or denom <= 0.0:
                     return
+
+                # Renormalize to keep total mass fixed
                 F = F / np.maximum(denom, 1.0e-30)
 
-                x_mat *= F[:, None]
+                # 4) Apply update in *physical* space, then convert back to normalized
+                x_phys *= F[:, None]
                 if cfg.project_nonneg:
-                    np.maximum(x_mat, 0.0, out=x_mat)
-            print("[Kaczmarz-MP] done.", flush=True)
+                    np.maximum(x_phys, 0.0, out=x_phys)
+
+                if cp_flux_ref is not None:
+                    x_norm_mat[:, :] = x_phys * cp_flux_ref   # back to normalized basis
+                else:
+                    x_norm_mat[:, :] = x_phys
+
+            print("[Kaczmarz-MP] Ratio regularizer ready.", flush=True)
 
         # ------------------- bands & pool -------------------
         print(f"[Kaczmarz-MP] Spinning up workers with {cfg.processes} processes...",
@@ -909,11 +961,12 @@ def solve_global_kaczmarz_cchunk_mp(
                             A = np.asarray(M[s0:s1, c, :, :], np.float32, order="C")
                             if keep_idx is not None:
                                 A = A[:, :, keep_idx]
-                            # Mode A: same cp normalization here
-                            A = A * (inv_cp_flux_ref[c, :][None, :, None])
-                            xc = x_CP[c, :].astype(np.float64, copy=False)
+                            if cp_flux_ref is not None:
+                                # same cp normalization here
+                                A = A * (inv_cp_flux_ref[c, :][None, :, None])
+                            xc_norm = x_CP[c, :].astype(np.float64, copy=False)
                             for s in range(Sblk):
-                                yhat[s, :] += xc @ A[s, :, :]
+                                yhat[s, :] += xc_norm @ A[s, :, :]
                         R = Y - yhat
 
                     # Optional: light shift diagnostic on 1 spaxel in the tile
@@ -951,28 +1004,29 @@ def solve_global_kaczmarz_cchunk_mp(
                             c_start:c_stop
                         ].copy()
                         E_band = E_global[c_start:c_stop, :]  # (band_size, P)
-                        inv_ref_band = inv_cp_flux_ref[c_start:c_stop, :] # (band_size,P)
-                    jobs.append(
-                        (
-                            h5_path,
-                            s0,
-                            s1,
-                            keep_idx,
-                            c_start,
-                            c_stop,
-                            x_band,
-                            float(lr_tile),
-                            bool(cfg.project_nonneg),
-                            R.copy(),
-                            w_band,
-                            cfg.dset_slots,
-                            cfg.dset_bytes,
-                            cfg.dset_w0,
-                            E_band,
-                            float(beta_blend),
-                            w_lam_sqrt,
-                            inv_ref_band
-                        ))
+                        inv_ref_band = inv_cp_flux_ref[c_start:c_stop, :] if cp_flux_ref is not None else None
+                        # (band_size,P)
+                        jobs.append(
+                            (
+                                h5_path,
+                                s0,
+                                s1,
+                                keep_idx,
+                                c_start,
+                                c_stop,
+                                x_band,
+                                float(lr_tile),
+                                bool(cfg.project_nonneg),
+                                R.copy(),
+                                w_band,
+                                cfg.dset_slots,
+                                cfg.dset_bytes,
+                                cfg.dset_w0,
+                                E_band,
+                                float(beta_blend),
+                                w_lam_sqrt,
+                                inv_ref_band
+                            ))
 
                     if use_pool:
                         results = pool.map(_worker_tile_job_with_R, jobs)
@@ -1070,8 +1124,8 @@ def solve_global_kaczmarz_cchunk_mp(
                         x_CP[bad] = 0.0
 
                     # ---------- optional ratio penalty --------------------------
-                    if have_ratio and (t_norm is not None) and ((tile_idx % rc.tile_every) == 0):
-                        _ratio_update_in_place(x_CP, t_norm)
+                    if have_ratio and ((tile_idx % rc.tile_every) == 0):
+                        _ratio_update_in_place(x_CP)
 
                     # ---------- Optional: tile-local NNLS polish ----------------
                     nnls_enable = os.environ.get(
@@ -1170,8 +1224,9 @@ def solve_global_kaczmarz_cchunk_mp(
                                         col = A_c[:, int(pp), :].astype(
                                             np.float64, copy=False
                                         ).reshape(rows, order="C")
-                                        # Mode A: normalize this (c,p) column
-                                        col *= float(inv_cp_flux_ref[int(cc), int(pp)])
+                                        # normalize this (c,p) column
+                                        if cp_flux_ref is not None:
+                                            col *= float(inv_cp_flux_ref[int(cc), int(pp)])
                                         B[:, int(j)] = col
                                         xW[int(j)]   = float(x_CP[int(cc), int(pp)])
 
@@ -1442,8 +1497,18 @@ def solve_global_kaczmarz_cchunk_mp(
             elapsed = time.perf_counter() - t0
 
             np.nan_to_num(x_CP, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
-            return x_CP.ravel(order="C"), dict(epochs=cfg.epochs,
-                                            elapsed_sec=elapsed)
+
+            # ------------------- finalize / convert back to physical basis -------------------
+            if cp_flux_ref is not None:
+                # Decode normalized solution back to physical weights
+                X_norm = x_CP
+                X_phys = X_norm * inv_cp_flux_ref   # x_phys = x_norm / cp_flux_ref
+            else:
+                X_phys = x_CP
+
+            x_out = np.asarray(X_phys, np.float64, order="C").ravel(order="C")
+
+            return x_out, dict(epochs=cfg.epochs, elapsed_sec=elapsed)
         finally:
             pool.close()
             pool.join()
