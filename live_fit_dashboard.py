@@ -584,4 +584,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# ipython -- /data/phys-gal-dynamics/phys2603/CubeFit/live_fit_dashboard.py /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/NGC4365_03.h5 --out /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/figures/fit_live.png --apertures 0,2000,1400,740 --apertures-separate-dir /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/figures/apertures/
+# ipython -- /data/phys-gal-dynamics/phys2603/CubeFit/live_fit_dashboard.py /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/NGC4365_12.h5 --out /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/figures/fit_live.png --apertures 0,2000,1400,740 --apertures-separate-dir /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/figures/apertures/
