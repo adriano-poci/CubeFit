@@ -456,17 +456,17 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             rt_flat_tol=3e-8,
             verbose=True,
         )
-    
-    with logger.capture_all_output():
+
         est = estimate_global_velocity_bias_prebuild(hdf5Path,
             n_spax=96, n_features=24, window_len=31, lag_px=12)
+
     logger.log(f"[CubeFit] Estimated global velocity bias (km/s): "\
         f"{est['vel_bias_kms']:.3f}")
     logger.log(f"[CubeFit] Building /HyperCube in {hdf5Path}...")
     with logger.capture_all_output():
         build_hypercube(
             hdf5Path,
-            norm_mode="data", # choose "model" or "data"
+            norm_mode="model", # choose "model" or "data"
             # "model" preserves relative contribution to both spaxel and components
             amp_mode="sum", # "sum" or "trapz"
             S_chunk=nS, C_chunk=nC, P_chunk=nP,
@@ -477,12 +477,13 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Should be zero-cost if already built
 
     prefit_png = figDir / f"prefit_overlay_from_models_C{nComp:03d}.png"
-    live_prefit_snapshot_from_models(
-        h5_path=str(hdf5Path),
-        max_components=4,
-        templates_per_pair=3,
-        out_png=str(prefit_png),
-    )
+    with logger.capture_all_output():
+        live_prefit_snapshot_from_models(
+            h5_path=str(hdf5Path),
+            max_components=4,
+            templates_per_pair=3,
+            out_png=str(prefit_png),
+        )
     logger.log(f"[Prefit] wrote {prefit_png}")
     if 'gen' in runSwitch:
         return
@@ -558,7 +559,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     )
     x_global, stats = runner.solve_all_mp_batched(
         epochs=2,
-        lr=0.0075,
+        lr=0.0001,
         project_nonneg=True,
         orbit_weights=None,     # or None for “free” fit
         ratio_cfg=None,
@@ -568,8 +569,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         reader_s_tile=128,          # match /HyperCube/models chunking on S
         verbose=True,
         # warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
-        warm_start='resume',  # 'zeros', 'resume', 'jacobi', 'nnls'
-        seed_cfg=dict(Ns=24, L_sub=1200, K_cols=768, per_comp_cap=24),
+        warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
+        seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
     logger.log("[CubeFit] Global fit completed.")

@@ -1,2 +1,1 @@
-* Removed `cp_flux_ref` from `kz_fitSpec.reconstruct_modelcube_fast`, since now all public `x` API is scaled to physical units.
-* Added column-flux scaling bypass (`cp_flux_ref=None`) in `solve_global_kaczmarz_cchunk_mp_nnls.solve_global_kaczmarz_cchunk_mp`.
+* Experimenting with RMSE cap in `kaczmarz_solver_cchunk_mp_nnls`

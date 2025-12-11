@@ -559,8 +559,8 @@ class PipelineRunner:
             # Mirror nnls_patch defaults: mask+lambda on, nnls solver, normalized columns, zero ridge
             res = _nnls_patch_run(
                 h5_path=self.h5_path,
-                s_sel=None,                 # like nnls_patch default: first min(32, S) spaxels
-                k_per_comp=12,              # same default as CLI
+                s_sel=None,# like nnls_patch default: first min(32, S) spaxels
+                k_per_comp=24, # same default as CLI
                 pick_mode="energy",
                 solver="nnls",
                 ridge=0.0,
@@ -792,23 +792,23 @@ class PipelineRunner:
             if verbose:
                 logger.log("[Pipeline] Warm-start mode: nnls_patch seed (exact semantics)")
 
-            # Mirror nnls_patch defaults: mask+lambda on, nnls solver, normalized columns, zero ridge
-            res = _nnls_patch_run(
-                h5_path=self.h5_path,
-                s_sel=None, # like nnls_patch default: first min(32, S) spaxels
-                k_per_comp=24,              # same default as CLI
-                pick_mode="energy",
-                solver="nnls",
-                ridge=0.0,
-                use_mask=True,
-                use_lambda=True,
-                lam_dset="/HyperCube/lambda_weights",
-                out_dir=plp.Path(self.h5_path).parent/'figures',
-                write_seed=bool((seed_cfg or {}).get("write_seed", True)),
-                seed_path="/Seeds/x0_nnls_patch",
-                normalize_columns=True,
-                orbit_weights=orbit_weights,
-            )
+            with logger.capture_all_output():
+                res = _nnls_patch_run(
+                    h5_path=self.h5_path,
+                    s_sel=None, # first min(32, S) spaxels
+                    k_per_comp=12, # same default as CLI
+                    pick_mode="energy",
+                    solver="nnls",
+                    ridge=0.0,
+                    use_mask=True,
+                    use_lambda=True,
+                    lam_dset="/HyperCube/lambda_weights",
+                    out_dir=plp.Path(self.h5_path).parent/'figures',
+                    write_seed=bool((seed_cfg or {}).get("write_seed", True)),
+                    seed_path="/Seeds/x0_nnls_patch",
+                    normalize_columns=True,
+                    orbit_weights=orbit_weights,
+                )
             Xcp = np.asarray(res["x_CP"], np.float64, order="C")
 
             x0_effective = Xcp.ravel(order="C")
