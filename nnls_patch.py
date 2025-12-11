@@ -24,19 +24,48 @@ def _get_mask_local(f) -> np.ndarray:
     # fallback: keep all
     return np.ones(int(f["/DataCube"].shape[1]), dtype=bool)
 
-def _pick_spaxels(S: int, s_sel: Optional[str]) -> np.ndarray:
-    if s_sel is None:
-        n = min(32, S)
-        return np.arange(n, dtype=np.int64)
+def _pick_spaxels(S: int,
+                  s_sel: Optional[str],
+                  Ns_default: int = 32) -> np.ndarray:
+    """
+    Return a 1-D array of spaxel indices to use in the patch NNLS.
+
+    If `s_sel` is None or empty, we pick `Ns_default` spaxels that are
+    approximately evenly spaced across [0, S-1], so the seed sees the whole
+    field instead of just the first Ns spaxels.
+
+    If `s_sel` is of the form "start:count", we honour that exactly.
+    Otherwise we treat it as a comma-separated list of explicit indices.
+    """
+    if s_sel is None or s_sel.strip() == "":
+        Ns = int(min(Ns_default, S))
+        if S <= Ns:
+            return np.arange(S, dtype=np.int64)
+
+        # Evenly spaced indices across [0, S-1]
+        idx = np.linspace(0, S - 1, Ns, dtype=np.int64)
+        # Just to be safe, enforce uniqueness and sort
+        idx = np.unique(idx)
+        return idx.astype(np.int64)
+
+    s_sel = s_sel.strip()
     if ":" in s_sel:
-        a, b = s_sel.split(":")
-        start = max(0, min(S-1, int(a)))
-        count = max(1, int(b))
-        end   = max(start, min(S, start + count))
-        return np.arange(start, end, dtype=np.int64)
-    idx = np.array([int(x) for x in s_sel.split(",") if x.strip() != ""], dtype=np.int64)
-    idx = np.unique(idx)
-    return idx[(idx >= 0) & (idx < S)]
+        start_str, cnt_str = s_sel.split(":", 1)
+        start = int(start_str)
+        cnt   = int(cnt_str)
+        stop  = min(S, start + cnt)
+        if start < 0 or start >= S or cnt <= 0:
+            raise ValueError(f"Bad s_sel='{s_sel}' for S={S}")
+        return np.arange(start, stop, dtype=np.int64)
+
+    # Explicit comma-separated list
+    parts = [p for p in s_sel.split(",") if p.strip()]
+    idx = np.array([int(p) for p in parts], dtype=np.int64)
+    if idx.size == 0:
+        raise ValueError(f"Empty s_sel='{s_sel}' for S={S}")
+    if np.any(idx < 0) or np.any(idx >= S):
+        raise ValueError(f"s_sel indices out of range for S={S}: {idx}")
+    return np.unique(idx)
 
 def _choose_pops(E: np.ndarray, K_per_comp: int, mode: str = "energy") -> List[np.ndarray]:
     C, P = map(int, E.shape)
@@ -409,7 +438,8 @@ def run_patch(h5_path: str,
         w_full = np.ones(L, dtype=np.float64)
     w_lam = w_full if keep_idx is None else w_full[keep_idx]
 
-    s_idx = _pick_spaxels(S, s_sel)
+    s_idx = _pick_spaxels(S, s_sel, Ns_default=64)
+    s_idx = np.sort(np.asarray(s_idx, dtype=int))
     if s_idx.size < 1:
         raise RuntimeError("Empty spaxel selection.")
 
@@ -445,49 +475,41 @@ def run_patch(h5_path: str,
     print(f"[triage] lambda weights on mask min/med/max: "
         f"{w_masked.min():.3g}/{np.median(w_masked):.3g}/{w_masked.max():.3g}")
 
-    # hypercube scale sanity for your spaxels
+    # Subsample the selected spaxels for this expensive check
+    if s_idx.size > 12:
+        rng = np.random.default_rng(12345)
+        tri_s = np.sort(
+            rng.choice(s_idx, size=12, replace=False)
+        )
+    else:
+        tri_s = s_idx
+
     with open_h5(h5_path, role="reader") as f:
         mode = str(f["/HyperCube"].attrs.get("norm.mode", "model"))
-        df   = f["/HyperCube/data_flux"][s_idx] if "/HyperCube/data_flux" in f else None
-        la   = f["/HyperCube/norm/losvd_amp_sum"][s_idx] if "/HyperCube/norm/losvd_amp_sum" in f else None
+        df   = (np.asarray(f["/HyperCube/data_flux"][s_idx], float)
+                if "/HyperCube/data_flux" in f else None)
+        la   = (np.asarray(f["/HyperCube/norm/losvd_amp_sum"][s_idx], float)
+                if "/HyperCube/norm/losvd_amp_sum" in f else None)
 
-        mmax = np.empty(s_idx.size, float)
-        for i, s in enumerate(s_idx):
-            Ms = np.asarray(f["/HyperCube/models"][s, :, :, :], float)  # (C,P,L)
-            mmax[i] = np.nanmax(np.abs(Ms))
+        E_cp = np.asarray(f["/HyperCube/col_energy"][...], float)  # (C,P)
+        S, L = map(int, f["/DataCube"].shape)
+        rms_cp = np.sqrt(E_cp / max(1, S * L)) # RMS amplitude
+
     print(f"[triage] norm.mode={mode}")
-    print(f"[triage] max |model| per spaxel (min/med/max): "
-        f"{mmax.min():.3g}/{np.median(mmax):.3g}/{mmax.max():.3g}")
+    print(
+        "[triage] model RMS amplitude per (c,p) column (min/med/max): "
+        f"{rms_cp.min():.3g}/{np.median(rms_cp):.3g}/{rms_cp.max():.3g}"
+    )
     if df is not None:
-        print(f"[triage] data_flux[s] (min/med/max): "
-            f"{df.min():.3g}/{np.median(df):.3g}/{df.max():.3g}")
+        print(
+            "[triage] data_flux (min/med/max): "
+            f"{df.min():.3g}/{np.median(df):.3g}/{df.max():.3g}"
+        )
     if la is not None:
-        print(f"[triage] losvd_amp_sum[s] (min/med/max): "
-            f"{la.min():.3g}/{np.median(la):.3g}/{la.max():.3g}")
-
-    with open_h5(h5_path, role="reader") as f:
-        amp_ok = None
-        if "/HyperCube/norm/losvd_amp_sum" in f:
-            amp_ok = np.asarray(f["/HyperCube/norm/losvd_amp_sum"][s_idx], float)
-        data_flux = None
-        if "/HyperCube/data_flux" in f:
-            data_flux = np.asarray(f["/HyperCube/data_flux"][s_idx], float)
-
-        # Max model value per selected spaxel across all (c,p,λ) — cheap sanity check
-        mmax = np.empty(s_idx.size, float)
-        for i, s in enumerate(s_idx):
-            # read just this spaxel; mask later
-            Ms = np.asarray(f["/HyperCube/models"][s, :, :, :], dtype=np.float64)
-            mmax[i] = np.nanmax(np.abs(Ms))
-
-    print(f"[patch] norm.mode={norm_mode} | max(|model|) per spaxel "
-          f"(min/med/max): {mmax.min():.3g}/{np.median(mmax):.3g}/{mmax.max():.3g}")
-    if amp_ok is not None:
-        print(f"[patch] losvd_amp_sum (min/med/max): "
-              f"{amp_ok.min():.3g}/{np.median(amp_ok):.3g}/{amp_ok.max():.3g}")
-    if data_flux is not None:
-        print(f"[patch] data_flux (min/med/max): "
-              f"{data_flux.min():.3g}/{np.median(data_flux):.3g}/{data_flux.max():.3g}")
+        print(
+            "[triage] losvd_amp_sum (min/med/max): "
+            f"{la.min():.3g}/{np.median(la):.3g}/{la.max():.3g}"
+        )
     
     E = read_global_column_energy(h5_path)  # (C,P)
     picks = _choose_pops(E, k_per_comp, pick_mode)
@@ -523,37 +545,69 @@ def run_patch(h5_path: str,
     # --- Build design B: concat columns (one per chosen (c,p))
     K = int(sum(len(pc) for pc in picks))
     B = np.empty((rows, K), dtype=np.float64)
-    col_map: List[Tuple[int,int]] = []
+    col_map: List[Tuple[int, int]] = []
+
+    # Map (c, p) -> column index in B
+    cp_to_col: dict[Tuple[int, int], int] = {}
     j = 0
-    print(f"[patch] Building design: K={K} columns from chosen pops…")
+    for c, plist in enumerate(picks):
+        for p_idx in plist:
+            p_int = int(p_idx)
+            cp_to_col[(c, p_int)] = j
+            col_map.append((c, p_int))
+            j += 1
+
+    print(f"[patch] Building design (blockwise): rows={rows}, K={K}")
+
+    # Reshape row weights once; they depend only on (spaxel, λ)
+    # sqrt_w_rows has length rows = Ns * Lk
+    Ns = int(s_idx.size)
+    sqrt_w_2d = sqrt_w_rows.reshape(Ns, Lk)
+    row_mask = (sqrt_w_2d > 0.0)  # True where data are finite / used
+
     with open_h5(h5_path, role="reader") as f:
-        M = f["/HyperCube/models"]
-        for c, plist in enumerate(tqdm(picks, desc="[patch] comps", mininterval=0.5, dynamic_ncols=True)):
-            for p_idx in plist:
-                col = np.empty(rows, dtype=np.float64)
-                pos = 0
-                for s in s_idx:
-                    A_sp = np.asarray(M[s, c, p_idx, :], dtype=np.float64)
-                    if keep_idx is not None:
-                        A_sp = A_sp[keep_idx]
-                    # NEW: sanitize model values to avoid NaN/Inf propagation
-                    # and zero out rows where the DATA are bad for this spaxel.
-                    A_sp = np.where(np.isfinite(A_sp), A_sp, 0.0)
-                    good_rows = (sqrt_w_rows[pos:pos+Lk] > 0.0)
-                    if not np.all(good_rows):
-                        # zero-out model rows that correspond to non-finite data
-                        A_sp = A_sp * good_rows.astype(np.float64)
-                    col[pos:pos+Lk] = A_sp
-                    pos += Lk
-                B[:, j] = col
-                col_map.append((c, int(p_idx)))
-                j += 1
+        M = f["/HyperCube/models"]  # (S, C, P, L)
+
+        for c, plist in enumerate(
+            tqdm(
+                picks,
+                desc="[patch] comps",
+                mininterval=0.5,
+                dynamic_ncols=True,
+            )
+        ):
+            # plist can be a list or a numpy array; in both cases len(...) works.
+            if plist is None or len(plist) == 0:
+                continue
+
+            # (optional) normalize to a 1D iterable of ints
+            plist_iter = [int(p) for p in plist]
+
+            # Block read: all selected spaxels, all pops for this component
+            A_c = np.asarray(M[s_idx, c, :, :], dtype=np.float32)
+
+            if keep_idx is not None:
+                A_c = A_c[:, :, keep_idx]  # (Ns, P, Lk)
+
+            A_c = np.nan_to_num(
+                A_c, nan=0.0, posinf=0.0, neginf=0.0, copy=False
+            )
+
+            A_c *= row_mask[:, None, :]   # (Ns, P, Lk)
+
+            for p_idx in plist_iter:
+                p_int = int(p_idx)
+                j = cp_to_col[(c, p_int)]
+                B[:, j] = A_c[:, p_int, :].reshape(rows, order="C")
+
 
     # final sanitation guard (paranoia)
     if not np.isfinite(B).all():
         bad_cols = np.any(~np.isfinite(B), axis=0).nonzero()[0]
-        print(f"[patch] WARNING: non-finite values in {bad_cols.size} columns; "
-              f"sanitizing to 0.")
+        print(
+            f"[patch] WARNING: non-finite values in {bad_cols.size} columns; "
+            "sanitizing to 0."
+        )
         B[:, bad_cols] = np.nan_to_num(B[:, bad_cols], copy=False)
 
     # quick column-norm diagnostics on the weighted system

@@ -25,8 +25,8 @@ v1.0:   Fixed bug in computing `nprocs`;
         Wrapped entire `solve_global_kaczmarz_cchunk_mp` in `try/except`. 4
             December 2025
 v1.1:   Added column-flux scaling bypass (`cp_flux_ref=None`). 5 December 2025
+v1.2:   Experimenting with RMSE cap. 11 December 2025
 """
-# kaczmarz_solver_cchunk_mp.py
 
 
 from __future__ import annotations, print_function
@@ -525,7 +525,7 @@ def solve_global_kaczmarz_cchunk_mp(
             # ------------------- column-flux scaling -------------------
             # cp_flux_ref[c,p] is the reference flux for column (c,p) in the *physical* basis
             cp_flux_ref = cu._ensure_cp_flux_ref(h5_path, keep_idx=keep_idx)  # shape (C,P) or None
-            cp_flux_ref = None
+            # cp_flux_ref = None
 
             if cp_flux_ref is not None:
                 print("[Kaczmarz-MP] Using column-flux scaling.", flush=True)
@@ -677,12 +677,12 @@ def solve_global_kaczmarz_cchunk_mp(
                 x_CP = X_phys.copy(order="C")
 
         # Tiny symmetry breaking (optional)
-        print("[Kaczmarz-MP] Applying symmetry breaking (if needed)...", flush=True)
         sym_eps  = float(os.environ.get("CUBEFIT_SYMBREAK_EPS", "1e-6"))
         sym_mode = os.environ.get("CUBEFIT_SYMBREAK_MODE", "qr").lower()
         if sym_eps > 0.0 and sym_mode != "off" and (
             x0 is None or np.count_nonzero(x_CP) == 0
         ):
+            print("[Kaczmarz-MP] Applying symmetry breaking...", flush=True)
             rng = np.random.default_rng(int(os.environ.get("CUBEFIT_SEED",
                                                         "12345")))
             if sym_mode == "qr":
@@ -694,7 +694,7 @@ def solve_global_kaczmarz_cchunk_mp(
                 x_CP += sym_eps * rng.random((C, P))
             if cfg.project_nonneg:
                 np.maximum(x_CP, 0.0, out=x_CP)
-        print("[Kaczmarz-MP] done.", flush=True)
+            print("[Kaczmarz-MP] done.", flush=True)
         # ------------------- ratio penalty (argument-driven) -------------------
         t_norm = None  # per-epoch normalized target, sum=1
 
@@ -948,9 +948,11 @@ def solve_global_kaczmarz_cchunk_mp(
                     # ---------- Build residual R = Y - yhat ----------
                     with open_h5(h5_path, role="reader") as f:
                         DC = f["/DataCube"]; M  = f["/HyperCube/models"]
-                        try: M.id.set_chunk_cache(cfg.dset_slots,
-                            cfg.dset_bytes, cfg.dset_w0)
-                        except Exception: pass
+                        try:
+                            M.id.set_chunk_cache(cfg.dset_slots,
+                                                cfg.dset_bytes, cfg.dset_w0)
+                        except Exception:
+                            pass
 
                         Y = np.asarray(DC[s0:s1, :], np.float64, order="C")
                         if keep_idx is not None:
@@ -984,8 +986,20 @@ def solve_global_kaczmarz_cchunk_mp(
                         except Exception:
                             pass
 
+                    # ---------- RMSE BEFORE ANY UPDATES ----------
+                    rmse_before = float(np.sqrt(np.mean(R * R)))
+
+                    # Optional hard guard:
+                    rmse_cap = float(os.environ.get("CUBEFIT_RMSE_ABORT",
+                        "1e7"))
+                    if (rmse_cap > 0.0) and (rmse_before > rmse_cap):
+                        if tracker is not None:
+                            tracker.on_batch_rmse(rmse_cap)
+                        # Skip updates for this tile; keep x_CP and R as-is
+                        continue
+
                     if tracker is not None:
-                        tracker.on_batch_rmse(float(np.sqrt(np.mean(R * R))))
+                        tracker.on_batch_rmse(rmse_before)
 
                     # Cosine LR decay across tiles
                     if cfg.epochs >= 1:
@@ -1065,7 +1079,6 @@ def solve_global_kaczmarz_cchunk_mp(
                         os.environ.get("CUBEFIT_TILE_BT_FACTOR", "0.5")
                     )
 
-                    rmse_before = float(np.sqrt(np.mean(R * R)))
                     alpha = 1.0
                     rmse_after = float(
                         np.sqrt(np.mean((R + alpha * R_delta_agg) ** 2))

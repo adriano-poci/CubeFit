@@ -12,10 +12,10 @@
 #SBATCH -D "/data/phys-gal-dynamics/phys2603/muse"
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
-#SBATCH -p short
+#SBATCH -p medium
 
 #SBATCH --job-name="CubeFit_2Fit"
-#SBATCH --time=0-12:00
+#SBATCH --time=0-48:00
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=48
@@ -48,7 +48,7 @@ export CUBEFIT_RDCC_W0=0.9
 
 export HDF5_USE_FILE_LOCKING=FALSE
 
-export CUBEFIT_NNLS_ENABLE=0
+# export CUBEFIT_NNLS_ENABLE=0
 
 # File descriptors
 ulimit -n 8192

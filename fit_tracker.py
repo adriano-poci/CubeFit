@@ -312,11 +312,29 @@ class FitTracker:
         - Enqueues at most every `self._rmse_stride` batches.
         - Queue put is non-blocking by default; drops if full.
         """
-        if not np.isfinite(rmse):
+        try:
+            r = float(rmse)
+        except Exception:
+            return
+        if not np.isfinite(r):
             return
 
-        r = float(rmse)
-        self._ewma = r if self._ewma is None else (1.0 - self._alpha) * self._ewma + self._alpha * r
+        
+        # ---- drop pathological outliers to avoid huge spikes ----
+        if self._ewma is not None:
+            # Use the current EWMA as a scale; protect against 0.
+            scale = max(self._ewma, 1.0)
+            # Factor 1e3 is deliberately generous; tune if needed.
+            if r > 1e3 * scale:
+                # Ignore this sample completely; don't update EWMA or write to disk.
+                return
+        # ----------------------------------------------------------------
+
+        # standard EWMA update
+        if self._ewma is None:
+            self._ewma = r
+        else:
+            self._ewma = (1.0 - self._alpha) * self._ewma + self._alpha * r
 
         self._rmse_ctr += 1
         if (self._rmse_ctr % max(1, self._rmse_stride)) != 0:
