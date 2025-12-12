@@ -438,7 +438,7 @@ def run_patch(h5_path: str,
         w_full = np.ones(L, dtype=np.float64)
     w_lam = w_full if keep_idx is None else w_full[keep_idx]
 
-    s_idx = _pick_spaxels(S, s_sel, Ns_default=64)
+    s_idx = _pick_spaxels(S, s_sel, Ns_default=32)
     s_idx = np.sort(np.asarray(s_idx, dtype=int))
     if s_idx.size < 1:
         raise RuntimeError("Empty spaxel selection.")

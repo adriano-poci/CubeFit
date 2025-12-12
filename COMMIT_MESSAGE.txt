@@ -1,2 +1,1 @@
-* Updated `solve_all_mp_batched` `warm_start` options to match `solve_all` in `pipeline_runner`
-* 
+* Disabled buggy `w_band` which was implemented incorrectly in `kaczmarz_solver_cchunk_mp_nnls.solve_global_kaczmarz_cchunk_mp`

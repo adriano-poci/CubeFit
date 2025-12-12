@@ -27,7 +27,9 @@ v1.0:   Fixed bug in computing `nprocs`;
 v1.1:   Added column-flux scaling bypass (`cp_flux_ref=None`). 5 December 2025
 v1.2:   Experimenting with RMSE cap. 11 December 2025
 v1.3:   Introduced L2 into Kaczmarz solving to be consistent with NNLS
-            initilisation. 12 December 2025
+            initilisation;
+        Disabled buggy `w_band` which was implemented incorrectly. 12 December
+            2025
 """
 
 
@@ -1031,9 +1033,10 @@ def solve_global_kaczmarz_cchunk_mp(
                     jobs = []
                     for (c_start, c_stop) in bands:
                         x_band = x_CP[c_start:c_stop, :].copy()
-                        w_band = None if w_full is None else w_full[
-                            c_start:c_stop
-                        ].copy()
+                        # w_band = None if w_full is None else w_full[
+                        #     c_start:c_stop
+                        # ].copy()
+                        w_band = None
                         E_band = E_global[c_start:c_stop, :]  # (band_size, P)
                         inv_ref_band = inv_cp_flux_ref[c_start:c_stop, :] if cp_flux_ref is not None else None
                         # (band_size,P)

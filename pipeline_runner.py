@@ -823,13 +823,16 @@ class PipelineRunner:
                 logger.log("[Pipeline] Warm-start mode: nnls_patch seed (exact semantics)")
 
             with logger.capture_all_output():
+                nnls_l2 = float(os.environ.get("CUBEFIT_NNLS_L2", "0.0"))
+                if not np.isfinite(nnls_l2) or nnls_l2 < 0.0:
+                    nnls_l2 = 0.0
                 res = _nnls_patch_run(
                     h5_path=self.h5_path,
                     s_sel=None, # first min(32, S) spaxels
-                    k_per_comp=12, # same default as CLI
+                    k_per_comp=24,
                     pick_mode="energy",
                     solver="nnls",
-                    ridge=0.0,
+                    ridge=nnls_l2,
                     use_mask=True,
                     use_lambda=True,
                     lam_dset="/HyperCube/lambda_weights",
