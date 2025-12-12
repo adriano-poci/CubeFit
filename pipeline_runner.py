@@ -34,6 +34,8 @@ v1.3:   Full workflow Zarr integration and flexible test sub-selection. 2025
 v1.4:   Complete re-write to use HDF5. 7 September 2025
 v1.5:   Wrap `solve_global_kaczmarz_cchunk_mp` in `logger.capture_all_output`
             in `PipelineRunner.solve_all_mp_batched`. 4 December 2025
+v1.6:   Updated `solve_all_mp_batched` `warm_start` options to match `solve_all`.
+            12 December 2025
 """
 
 from __future__ import annotations
@@ -497,8 +499,7 @@ class PipelineRunner:
         elif warm_start == "seed":
             path = os.environ.get("CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch")
             x_seed, src_seed = self._read_seed_from_h5(self.h5_path,
-                                                       N_expected,
-                                                       dset=path)
+                N_expected, dset=path)
             if x_seed is not None:
                 x0_effective = x_seed
                 if verbose:
@@ -761,6 +762,21 @@ class PipelineRunner:
         if x0 is not None:
             x0_effective = np.asarray(x0, dtype=np.float64, order="C")
 
+        elif warm_start == "seed":
+            path = os.environ.get("CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch")
+            x_seed, src_seed = self._read_seed_from_h5(self.h5_path,
+                N_expected, dset=path)
+            if x_seed is not None:
+                x0_effective = x_seed
+                if verbose:
+                    logger.log(f"[Pipeline] Warm-start from seed {src_seed} "
+                               f"(n={x0_effective.size}).")
+            else:
+                x0_effective = None
+                if verbose:
+                    logger.log(f"[Pipeline] No seed found at {path}; "
+                               f"continuing without warm-start.")
+
         elif warm_start == "resume":
             sidecar = cu._find_latest_sidecar(self.h5_path)
             x_side, src_side = (None, None)
@@ -768,25 +784,39 @@ class PipelineRunner:
                 x_side, src_side = self._read_latest_from_sidecar(
                     sidecar, N_expected
                 )
-
             x_main, src_main = self._read_latest_from_main(self.h5_path,
                                                            N_expected)
 
             choose_side = False
             if x_side is not None and x_main is None:
-                choose_side = True
+                choose_side = True  # prefer main unless missing
 
             x0_effective, src_label, src_file = (
                 (x_side, src_side, sidecar) if choose_side
                 else (x_main, src_main, self.h5_path)
             )
 
+            # Fallback: /Seeds/x0_nnls_patch
+            if x0_effective is None:
+                seed_path = os.environ.get("CUBEFIT_SEED_PATH",
+                                           "/Seeds/x0_nnls_patch")
+                x_seed, src_seed = self._read_seed_from_h5(self.h5_path,
+                    N_expected, dset=seed_path)
+                if x_seed is not None:
+                    x0_effective = x_seed
+                    if verbose:
+                        logger.log("[Pipeline] Warm-start fallback from seed "
+                                   f"{src_seed} (n={x0_effective.size}).")
+
             if x0_effective is not None and verbose:
-                logger.log(
-                    f"[Pipeline] Warm-start from {src_label} "
-                    f"({'sidecar' if choose_side else 'main'}: {src_file}) "
-                    f"(n={x0_effective.size})."
-                )
+                if x0_effective is x_seed:
+                    pass
+                else:
+                    logger.log(
+                        f"[Pipeline] Warm-start from {src_label} "
+                        f"({'sidecar' if choose_side else 'main'}: "
+                        f"{src_file}) (n={x0_effective.size})."
+                    )
 
         elif warm_start == "nnls":
             if verbose:
