@@ -26,6 +26,8 @@ v1.0:   Fixed bug in computing `nprocs`;
             December 2025
 v1.1:   Added column-flux scaling bypass (`cp_flux_ref=None`). 5 December 2025
 v1.2:   Experimenting with RMSE cap. 11 December 2025
+v1.3:   Introduced L2 into Kaczmarz solving to be consistent with NNLS
+            initilisation. 12 December 2025
 """
 
 
@@ -226,6 +228,9 @@ def _worker_tile_job_with_R(args):
     abs_zero   = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-24"))
     dbg        = os.environ.get("CUBEFIT_DEBUG_SAFE", "0") == "1"
     nnls_prop_per_band = int(os.environ.get("CUBEFIT_NNLS_PROP_PER_BAND", "6"))
+    nnls_l2 = float(os.environ.get("CUBEFIT_NNLS_L2", "0.0"))
+    if not np.isfinite(nnls_l2) or nnls_l2 < 0.0:
+        nnls_l2 = 0.0
 
     bt_steps = np.max((0, bt_steps))
     beta_blend = float(beta_blend)
@@ -273,7 +278,12 @@ def _worker_tile_job_with_R(args):
             A = np.asarray(M[s0:s1, c, :, :], np.float32, order="C")
             if keep_idx is not None:
                 A = A[:, :, keep_idx]  # (Sblk,P,Lk)
-            inv_ref = np.asarray(inv_ref_band[bi, :], dtype=np.float64) if inv_ref_band is not None else np.ones((P,), dtype=np.float64)
+                
+            inv_ref = (
+                np.asarray(inv_ref_band[bi, :], dtype=np.float64)
+                if inv_ref_band is not None
+                else np.ones((P,), dtype=np.float64)
+            )
             # Broadcast over (Sblk, P, Lk)
             A = A * inv_ref[None, :, None]
             _finite_inplace(A, f"A_nonfinite_c{c}", stats)
@@ -308,6 +318,18 @@ def _worker_tile_job_with_R(args):
                 Eg_row = np.asarray(E_global_band[bi, :], dtype=np.float64)
                 if Eg_row.size == col_denom.size:
                     col_denom = np.maximum(col_denom, beta_blend * Eg_row)
+
+            # ----- L2 (ridge) term on x_band (normalized basis) -----------
+            # Objective:
+            #   J(x) = 0.5||√w (Y - A_norm x)||^2 + 0.5 * λ ||x||^2
+            # ∇J = -g + λ x_norm  ⇒ negative gradient = g - λ x_norm.
+            if nnls_l2 > 0.0:
+                x_c = np.asarray(x_band[bi, :], dtype=np.float64, copy=False)
+                if freeze.any():
+                    mask = ~freeze
+                    g[mask] -= nnls_l2 * x_c[mask]
+                else:
+                    g -= nnls_l2 * x_c
 
             invD = 1.0 / np.maximum(col_denom, eps)
             dx_c = float(lr) * (g * invD)  # (P,)
@@ -525,7 +547,7 @@ def solve_global_kaczmarz_cchunk_mp(
             # ------------------- column-flux scaling -------------------
             # cp_flux_ref[c,p] is the reference flux for column (c,p) in the *physical* basis
             cp_flux_ref = cu._ensure_cp_flux_ref(h5_path, keep_idx=keep_idx)  # shape (C,P) or None
-            # cp_flux_ref = None
+            cp_flux_ref = None
 
             if cp_flux_ref is not None:
                 print("[Kaczmarz-MP] Using column-flux scaling.", flush=True)
@@ -711,20 +733,15 @@ def solve_global_kaczmarz_cchunk_mp(
             print(f"[Kaczmarz-MP] ratio_cfg normalization failed: {e!r}. "
                 f"Disabling ratio regularizer.", flush=True)
             ratio_cfg = None
+        rc = ratio_cfg
 
-        have_ratio = (
-            (orbit_weights is not None)
-            and (ratio_cfg is not None)
-            and bool(getattr(ratio_cfg, "use", False))
-        )
+        have_ratio = (orbit_weights is not None and rc is not None and rc.use)
         print(f"[Kaczmarz-MP] have_ratio = {have_ratio}", flush=True)
         if have_ratio:
             print("[Kaczmarz-MP] Preparing ratio regularizer...", flush=True)
             w_in = np.asarray(orbit_weights, np.float64).ravel(order="C")
             if w_in.size != C:
                 raise ValueError(f"orbit_weights length {w_in.size} != C={C}.")
-
-            rc = ratio_cfg
 
             # Base target mixture (normalize with a floor)
             w_target = np.maximum(w_in, rc.minw)
@@ -1159,7 +1176,9 @@ def solve_global_kaczmarz_cchunk_mp(
                         os.environ.get("CUBEFIT_NNLS_MAX_ITER", "200")
                     )
                     nnls_min_improve = float(os.environ.get("CUBEFIT_NNLS_MIN_IMPROVE", "0.9995"))
-                    nnls_l2         = float(os.environ.get("CUBEFIT_NNLS_L2", "0.0"))
+                    nnls_l2 = float(os.environ.get("CUBEFIT_NNLS_L2", "0.0"))
+                    if not np.isfinite(nnls_l2) or nnls_l2 < 0.0:
+                        nnls_l2 = 0.0
                     # allow a small worsening of ratio misfit when polishing (>=1 means allow)
                     # e.g. 1.02 allows up to +2% worse local ratio misfit; 1.00 = never worsen.
                     nnls_ratio_worsen = float(os.environ.get("CUBEFIT_NNLS_RATIO_WORSEN", "1.02"))
@@ -1251,30 +1270,54 @@ def solve_global_kaczmarz_cchunk_mp(
                             B_w     = B * sqrt_w_rows[:, None]
                             y_rhs_w = y_rhs * sqrt_w_rows
 
+                            # Optional L2 via Tikhonov augmentation:
+                            # J(x) = 0.5||B_w x - y_rhs_w||^2
+                            #      + 0.5*nnls_l2*||x||^2
+                            if nnls_l2 > 0.0:
+                                lam_sqrt = float(np.sqrt(nnls_l2))
+                                # Augment with sqrt(λ) I and 0 target
+                                B_aug = np.vstack([
+                                    B_w,
+                                    lam_sqrt * np.eye(K_use, dtype=np.float64)
+                                ])
+                                y_aug = np.concatenate([
+                                    y_rhs_w,
+                                    np.zeros(K_use, dtype=np.float64)
+                                ])
+                            else:
+                                B_aug = B_w
+                                y_aug = y_rhs_w
+
                             xW_new = None
                             if nnls_solver in ("pg", "fista"):
                                 # Column-normalize local system (conditioning)
                                 col_norm = np.linalg.norm(B_w, axis=0)
-                                col_norm = np.where(col_norm > 0.0, col_norm, 1.0)
+                                col_norm = np.where(col_norm > 0.0,
+                                                    col_norm, 1.0)
                                 Bn = B_w / col_norm
                                 x  = xW / col_norm
 
-                                # FISTA with backtracking (fast & robust)
+                                # FISTA with L2 term in gradient
                                 if K_use <= 2048:
-                                    L_est = float(np.linalg.norm(Bn, ord=2)**2
-                                                + nnls_l2)
+                                    L_est = float(
+                                        np.linalg.norm(Bn, ord=2)**2
+                                        + nnls_l2
+                                    )
                                 else:
                                     L_est = float(
-                                        (Bn**2).sum(axis=0).max() + nnls_l2
+                                        (Bn**2).sum(axis=0).max()
+                                        + nnls_l2
                                     )
+
                                 t = 1.0
                                 z = np.maximum(0.0, x.copy())
                                 x_old = z.copy()
 
                                 def _f_and_grad(zvec):
                                     r = Bn @ zvec - y_rhs_w
-                                    f = 0.5 * float(r @ r) + 0.5 * nnls_l2 * \
-                                        float(zvec @ zvec)
+                                    f = 0.5 * float(r @ r) \
+                                        + 0.5 * nnls_l2 * \
+                                          float(zvec @ zvec)
                                     g = Bn.T @ r + nnls_l2 * zvec
                                     return f, g, r
 
@@ -1289,14 +1332,17 @@ def solve_global_kaczmarz_cchunk_mp(
                                         r_try = Bn @ x_try - y_rhs_w
                                         f_try = 0.5 * float(r_try @ r_try) \
                                                 + 0.5 * nnls_l2 * \
-                                                float(x_try @ x_try)
+                                                  float(x_try @ x_try)
                                         if f_try <= fz - 1e-4 * step * \
                                             float(gz @ gz) or step < 1e-12:
                                             break
                                         step *= 0.5
                                     # FISTA momentum
-                                    t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t*t))
-                                    z = x_try + ((t - 1.0) / t_new) * (x_try - x_old)
+                                    t_new = 0.5 * (
+                                        1.0 + np.sqrt(1.0 + 4.0 * t * t)
+                                    )
+                                    z = x_try + ((t - 1.0) / t_new) * \
+                                        (x_try - x_old)
                                     x_old = x_try
                                     t = t_new
                                     fz, gz, rz = _f_and_grad(z)
@@ -1308,18 +1354,20 @@ def solve_global_kaczmarz_cchunk_mp(
                             elif nnls_solver == "lsq":
                                 try:
                                     from scipy.optimize import lsq_linear
-                                    res = lsq_linear(B_w, y_rhs_w,
-                                                    bounds=(0.0, np.inf),
-                                                    method="trf",
-                                                    max_iter=nnls_max_iter,
-                                                    verbose=0)
+                                    res = lsq_linear(
+                                        B_aug, y_aug,
+                                        bounds=(0.0, np.inf),
+                                        method="trf",
+                                        max_iter=nnls_max_iter,
+                                        verbose=0,
+                                    )
                                     xW_new = np.maximum(0.0, res.x)
                                 except Exception:
                                     xW_new = None
                             elif nnls_solver == "nnls":
                                 try:
                                     from scipy.optimize import nnls as _scipy_nnls
-                                    xW_new, _ = _scipy_nnls(B_w, y_rhs_w)
+                                    xW_new, _ = _scipy_nnls(B_aug, y_aug)
                                 except Exception:
                                     xW_new = None
 
@@ -1402,7 +1450,7 @@ def solve_global_kaczmarz_cchunk_mp(
 
                 # ---------- optional orbit weights enforcement -----------
                 t0_ob = time.perf_counter()
-                if orbit_weights is not None and rc.epoch_project:
+                if orbit_weights is not None and rc is not None and rc.epoch_project:
                     cu.project_to_component_weights(
                         x_CP,
                         orbit_weights,
@@ -1470,7 +1518,9 @@ def solve_global_kaczmarz_cchunk_mp(
                             elif t.size != C:
                                 raise ValueError(f"[ratio] target len {t.size} not in {{C, C*P}}")
 
-                            t = np.maximum(np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0), rc.minw)
+                            t = np.maximum(np.nan_to_num(t, nan=0.0, posinf=0.0,
+                                neginf=0.0),
+                                rc.minw if rc is not None else 1e-10)
                             T = float(np.sum(t))
                             if not np.isfinite(T) or T <= 0.0:
                                 print("[global energy] target sum non-finite or <=0; skipping L1.",

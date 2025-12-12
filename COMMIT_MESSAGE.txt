@@ -1,1 +1,2 @@
-* Experimenting with RMSE cap in `kaczmarz_solver_cchunk_mp_nnls`
+* Updated `solve_all_mp_batched` `warm_start` options to match `solve_all` in `pipeline_runner`
+* 

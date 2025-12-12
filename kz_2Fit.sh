@@ -48,8 +48,6 @@ export CUBEFIT_RDCC_W0=0.9
 
 export HDF5_USE_FILE_LOCKING=FALSE
 
-# export CUBEFIT_NNLS_ENABLE=0
-
 # File descriptors
 ulimit -n 8192
 
