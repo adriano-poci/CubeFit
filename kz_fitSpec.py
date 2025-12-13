@@ -561,12 +561,13 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         epochs=1,
         lr=0.0001,
         project_nonneg=True,
-        orbit_weights=None,     # or None for “free” fit
+        orbit_weights=None, # or None for “free” fit
         ratio_cfg=None,
         # orbit_weights=cWeights,
-        processes=4,                # 4 workers
-        blas_threads=12,            # 12 BLAS threads each → 48 total
-        reader_s_tile=128,          # match /HyperCube/models chunking on S
+        # ratio_cfg=RC,
+        processes=4, # 4 workers
+        blas_threads=12, # 12 BLAS threads each → 48 total
+        reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
         warm_start='seed',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),

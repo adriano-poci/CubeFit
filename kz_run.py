@@ -61,8 +61,9 @@ def main():
     os.environ['CUBEFIT_NNLS_MIN_IMPROVE']=str(0.9995)
     os.environ['CUBEFIT_NNLS_MAX_COLS']=str(64)
     os.environ['CUBEFIT_NNLS_SUB_L']=str(512)
-    os.environ['CUBEFIT_NNLS_SOLVER']='fista'
-    os.environ['CUBEFIT_NNLS_L2']=str(1e-6)
+    os.environ['CUBEFIT_NNLS_SOLVER']='nnls'
+    os.environ["CUBEFIT_USE_NNLS_PRIOR"] = "0"
+    os.environ['CUBEFIT_NNLS_L2']=str(0)
 
     print(props)
 

@@ -161,10 +161,6 @@ def render_aperture_fits_with_x(h5_path, x_vec, out_png, apertures, show_residua
             ax.set_xlabel("λ (log space)"); ax.set_ylabel("flux")
             ax.legend(loc="upper right")
         if title: fig.suptitle(title)
-        try:
-            fig.tight_layout()
-        except Exception:
-            pass
         fig.savefig(out_png, dpi=130); plt.close(fig)
 
 def render_sfh_from_x(h5_path: str,
@@ -196,7 +192,7 @@ def render_sfh_from_x(h5_path: str,
             fig, ax = plt.subplots(1, 1, figsize=(6, 3))
             ax.plot(np.arange(P), W, lw=1)
             ax.set_title("Population weights (flattened)")
-            fig.tight_layout(); fig.savefig(out_png, dpi=130); plt.close(fig); return
+            fig.savefig(out_png, dpi=130); plt.close(fig); return
 
         # assume (nZ, nT, nA) order
         nZ, nT, nA = pop_shape
@@ -214,7 +210,7 @@ def render_sfh_from_x(h5_path: str,
             if a == 0:
                 ax.set_ylabel("Metal index")
         fig.colorbar(im, ax=axes.tolist(), shrink=0.8, pad=0.02)
-        fig.tight_layout(); fig.savefig(out_png, dpi=130); plt.close(fig)
+        fig.savefig(out_png, dpi=130); plt.close(fig)
 
     logger.log(f"[JacobiDiag] wrote {out_png}")
 
@@ -477,7 +473,6 @@ def render_dashboard(h5_path: str, out_png: str,
         ax.set_xlabel("component c")
         ax.legend(loc="best")
 
-        fig.tight_layout()
         fig.savefig(out_png, dpi=140)
         plt.close(fig)
         print(f"[Dashboard] Wrote {out_png}  [{Path(sidecar).name if sidecar else 'legacy'}]")
@@ -531,7 +526,6 @@ def render_aperture_fits(h5_path: str, out_png: str,
 
         if title:
             fig.suptitle(title, y=0.995, fontsize=12)
-        fig.tight_layout()
         fig.savefig(out_png, dpi=150)
         plt.close(fig)
         print(f"Wrote {out_png}")

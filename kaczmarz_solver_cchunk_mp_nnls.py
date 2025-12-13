@@ -30,8 +30,10 @@ v1.3:   Introduced L2 into Kaczmarz solving to be consistent with NNLS
             initilisation;
         Disabled buggy `w_band` which was implemented incorrectly. 12 December
             2025
+v1.4:   Use the seed vector as a numerical prior during the Kaczmarz solving;
+        Implement global RMSE evaluation, and keep only globally-best solution;
+        Optionally disable seed prior. 13 December 2025
 """
-
 
 from __future__ import annotations, print_function
 
@@ -39,13 +41,13 @@ import os, sys, traceback
 import math
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Iterable, Tuple, Optional, List
 from contextlib import contextmanager
 
 import multiprocessing as mp
 import numpy as np
 import h5py
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from CubeFit.hdf5_manager import open_h5
 from CubeFit.hypercube_builder import read_global_column_energy
@@ -145,6 +147,186 @@ def _xcorr_int_shift(a: np.ndarray, b: np.ndarray) -> int:
         j -= 2*n
     return j
 
+# ------------------------------------------------------------------------------
+
+def _compute_global_rmse(
+    h5_path: str,
+    x_CP: np.ndarray,
+    *,
+    s_ranges: list[tuple[int, int]],
+    keep_idx: np.ndarray | None,
+    w_lam_sqrt: np.ndarray | None,
+    cp_flux_ref: np.ndarray | None,
+    inv_cp_flux_ref: np.ndarray | None,
+    dset_slots: int,
+    dset_bytes: int,
+    dset_w0: float,
+    weighted: bool = True,
+    show_progress: bool = True,
+) -> float:
+    """
+    Compute the global RMSE over the full (masked) cube for a given x_CP.
+
+    This evaluates the same least–squares objective as the Kaczmarz solver
+    in a single streaming pass over the cube. It is optimized for the common
+    case cp_flux_ref is None (no column–flux normalization).
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the HDF5 file containing /DataCube and /HyperCube/models.
+    x_CP : ndarray, shape (C, P)
+        Current solution in the solver's internal basis. If cp_flux_ref is
+        not None, this is the normalized basis used by Kaczmarz; otherwise
+        it is in the physical basis.
+    s_ranges : list of (int, int)
+        Spatial tile ranges covering the full spaxel axis S. Should match
+        the tiling used by the solver.
+    keep_idx : ndarray or None
+        Wavelength indices that are kept after applying the mask. If None,
+        all wavelengths are used.
+    w_lam_sqrt : ndarray or None
+        sqrt(λ-weights) on the masked grid. If weighted=True and this is
+        not None, residuals are multiplied by w_lam_sqrt before forming
+        ||R||^2.
+    cp_flux_ref, inv_cp_flux_ref : ndarray or None
+        Column–flux scaling arrays of shape (C, P). If cp_flux_ref is None,
+        no column-normalization is assumed and x_CP is used directly.
+    dset_slots, dset_bytes, dset_w0 : int
+        Chunk-cache parameters for /HyperCube/models.
+    weighted : bool, optional
+        If True (default) and w_lam_sqrt is provided, compute a λ-weighted
+        RMSE. If False, compute an unweighted RMSE.
+    show_progress : bool, optional
+        If True, wrap the tile loop in a tqdm progress bar.
+
+    Returns
+    -------
+    rmse : float
+        Global (optionally weighted) RMSE over all spaxels and masked
+        wavelengths.
+    """
+    # Normalize inputs
+    keep_idx = None if keep_idx is None else np.asarray(
+        keep_idx, dtype=np.int64
+    )
+    use_weight = bool(weighted and (w_lam_sqrt is not None))
+
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]           # (S, L)
+        M  = f["/HyperCube/models"]   # (S, C, P, L)
+        try:
+            M.id.set_chunk_cache(dset_slots, dset_bytes, dset_w0)
+        except Exception:
+            pass
+
+        S, L = map(int, DC.shape)
+        _, C, P, Lm = map(int, M.shape)
+        if Lm != L:
+            raise RuntimeError(
+                f"_compute_global_rmse: models L={Lm} vs data L={L}"
+            )
+
+        if x_CP.shape != (C, P):
+            raise ValueError(
+                f"_compute_global_rmse: x_CP shape {x_CP.shape} "
+                f"!= (C,P)=({C},{P})"
+            )
+
+        # Effective coefficients: if there *is* column normalization, push
+        # inv_cp_flux_ref onto x_CP once; otherwise just copy x_CP.
+        if inv_cp_flux_ref is not None:
+            x_eff = (
+                np.asarray(x_CP, np.float64, order="C")
+                * np.asarray(inv_cp_flux_ref, np.float64, order="C")
+            )
+        else:
+            x_eff = np.asarray(x_CP, np.float64, order="C")
+
+        if keep_idx is None:
+            Lk = L
+        else:
+            Lk = int(keep_idx.size)
+
+        if use_weight:
+            wvec = np.asarray(w_lam_sqrt, np.float64).ravel()
+            if wvec.size != Lk:
+                raise RuntimeError(
+                    f"_compute_global_rmse: w_lam_sqrt length "
+                    f"{wvec.size} != Lk={Lk}"
+                )
+        else:
+            wvec = None
+
+        num = 0.0
+        den = 0  # scalar residual count
+
+        iterator = s_ranges
+        pbar = None
+        if show_progress:
+            pbar = tqdm(
+                s_ranges,
+                total=len(s_ranges),
+                desc="[Kaczmarz-MP] global RMSE",
+                mininterval=1.0,
+                dynamic_ncols=True,
+            )
+            iterator = pbar
+
+        for (s0, s1) in iterator:
+            s0 = int(s0)
+            s1 = int(s1)
+            if s0 >= s1:
+                continue
+            Sblk = s1 - s0
+
+            # Data slice
+            Y = np.asarray(DC[s0:s1, :], np.float64, order="C")
+            if keep_idx is not None:
+                Y = Y[:, keep_idx]  # (Sblk, Lk)
+
+            # Optional λ-weighting on the data side (so we never need to
+            # explicitly form R and then multiply).
+            if wvec is not None:
+                Yw = Y * wvec[None, :]
+            else:
+                Yw = Y
+
+            # Model slice: yhat_w[s, λ] =
+            #   Σ_{c,p} x_eff[c,p] * (M[s,c,p,λ] * (√w_λ if weighted))
+            yhat_w = np.zeros((Sblk, Lk), dtype=np.float64)
+
+            for c in range(C):
+                A = np.asarray(M[s0:s1, c, :, :], dtype=np.float32, order="C")
+                if keep_idx is not None:
+                    A = A[:, :, keep_idx]  # (Sblk, P, Lk)
+
+                A = A.astype(np.float64, copy=False)
+                if wvec is not None:
+                    A = A * wvec[None, None, :]  # λ-weights
+
+                xc = np.asarray(x_eff[c, :], np.float64, copy=False)
+
+                # yhat_w += Σ_p xc[p] * A[:, p, :]
+                yhat_w += np.tensordot(xc, A, axes=(0, 1))
+
+            # Weighted residual: Rw = Yw - yhat_w
+            Rw = Yw - yhat_w
+
+            num += float(np.sum(Rw * Rw))
+            den += int(Rw.size)
+
+            if pbar is not None:
+                pbar.update(1)
+
+        if pbar is not None:
+            pbar.close()
+
+    if den <= 0:
+        return 0.0
+
+    return float(math.sqrt(num / float(den)))
+
 # ---------------------------- Worker ---------------------------------
 
 def _worker_tile_job_with_R(args):
@@ -215,7 +397,8 @@ def _worker_tile_job_with_R(args):
       update self-consistent.
     """
     (h5_path, s0, s1, keep_idx,
-     c_start, c_stop, x_band, lr, project_nonneg, R, w_band,
+     c_start, c_stop, x_band, x_prior_band,
+     lr, project_nonneg, R,
      dset_slots, dset_bytes, dset_w0,
      E_global_band, beta_blend,
      w_lam_sqrt,
@@ -280,7 +463,7 @@ def _worker_tile_job_with_R(args):
             A = np.asarray(M[s0:s1, c, :, :], np.float32, order="C")
             if keep_idx is not None:
                 A = A[:, :, keep_idx]  # (Sblk,P,Lk)
-                
+
             inv_ref = (
                 np.asarray(inv_ref_band[bi, :], dtype=np.float64)
                 if inv_ref_band is not None
@@ -321,23 +504,45 @@ def _worker_tile_job_with_R(args):
                 if Eg_row.size == col_denom.size:
                     col_denom = np.maximum(col_denom, beta_blend * Eg_row)
 
-            # ----- L2 (ridge) term on x_band (normalized basis) -----------
-            # Objective:
-            #   J(x) = 0.5||√w (Y - A_norm x)||^2 + 0.5 * λ ||x||^2
-            # ∇J = -g + λ x_norm  ⇒ negative gradient = g - λ x_norm.
+            # Optional L2 term.
+            #
+            # If x_prior_band is not None:
+            #   J_L2 = 0.5 * nnls_l2 * ||x_c - x_prior_c||^2   (seed as prior)
+            # If x_prior_band is None:
+            #   J_L2 = 0.5 * nnls_l2 * ||x_c||^2               (ridge to 0)
+            #
+            # Our g currently carries +A^T W R, i.e. the negative gradient
+            # of the data term. The L2 term contributes
+            #   -nnls_l2 * (x_c - x_prior_c)   or   -nnls_l2 * x_c
+            # to this same descent direction, restricted to non-frozen cols.
             if nnls_l2 > 0.0:
-                x_c = np.asarray(x_band[bi, :], dtype=np.float64, copy=False)
-                if freeze.any():
-                    mask = ~freeze
-                    g[mask] -= nnls_l2 * x_c[mask]
+                x_c = np.asarray(
+                    x_band[bi, :], dtype=np.float64, copy=False
+                )
+
+                if x_prior_band is not None:
+                    # pull toward prior
+                    x_prior_c = np.asarray(
+                        x_prior_band[bi, :],
+                        dtype=np.float64,
+                        copy=False,
+                    )
+                    delta = x_c - x_prior_c
+                    if freeze.any():
+                        mask = ~freeze
+                        g[mask] -= nnls_l2 * delta[mask]
+                    else:
+                        g -= nnls_l2 * delta
                 else:
-                    g -= nnls_l2 * x_c
+                    # No prior supplied: pure ridge to zero
+                    if freeze.any():
+                        mask = ~freeze
+                        g[mask] -= nnls_l2 * x_c[mask]
+                    else:
+                        g -= nnls_l2 * x_c
 
             invD = 1.0 / np.maximum(col_denom, eps)
             dx_c = float(lr) * (g * invD)  # (P,)
-
-            if w_band is not None:
-                dx_c *= float(w_band[bi])
 
             # Propose NNLS candidates (optional polish)
             if nnls_prop_per_band > 0:
@@ -517,6 +722,7 @@ def solve_global_kaczmarz_cchunk_mp(
     ratio_cfg: cu.RatioCfg | None = None,
 ) -> tuple[np.ndarray, dict]:
 
+    pool = None
     try:
 
         def _set_chunk_cache(dset, cfg_obj):
@@ -719,11 +925,60 @@ def solve_global_kaczmarz_cchunk_mp(
             if cfg.project_nonneg:
                 np.maximum(x_CP, 0.0, out=x_CP)
             print("[Kaczmarz-MP] done.", flush=True)
-        # ------------------- ratio penalty (argument-driven) -------------------
-        t_norm = None  # per-epoch normalized target, sum=1
+        # x_CP holds the normalized weights actually updated by Kaczmarz.
+        # Optionally keep a fixed prior (e.g. NNLS seed) for L2.
+        use_prior = os.environ.get(
+            "CUBEFIT_USE_NNLS_PRIOR", "1"
+        ).lower() not in ("0", "false", "no", "off")
 
+        if use_prior:
+            print("[Kaczmarz-MP] Using NNLS seed as prior.", flush=True)
+            x_CP_prior = x_CP.copy(order="C")
+        else:
+            print("[Kaczmarz-MP] Seed prior disabled.", flush=True)
+            x_CP_prior = None
+
+        # ----- global RMSE configuration (weighted/unweighted & guard) -----
+        rmse_weighted = os.environ.get(
+            "CUBEFIT_RMSE_WEIGHTED", "1"
+        ).lower() not in ("0", "false", "no", "off")
+
+        # Tolerance for "best epoch" tracking (used only for logging).
+        rmse_guard_tol = float(
+            os.environ.get("CUBEFIT_RMSE_GUARD_TOL", "0.0")
+        )
+
+        print(
+            f"[Kaczmarz-MP] Global RMSE will be computed "
+            f"{'with' if rmse_weighted else 'without'} λ-weights.",
+            flush=True,
+        )
+
+        # ------------------- global RMSE for the seed ----------------------
+        print("[Kaczmarz-MP] Computing global RMSE for the seed...", flush=True)
+        rmse_seed = _compute_global_rmse(
+            h5_path,
+            x_CP,
+            s_ranges=s_ranges,
+            keep_idx=keep_idx,
+            w_lam_sqrt=w_lam_sqrt,
+            cp_flux_ref=cp_flux_ref,
+            inv_cp_flux_ref=inv_cp_flux_ref,
+            dset_slots=cfg.dset_slots,
+            dset_bytes=cfg.dset_bytes,
+            dset_w0=cfg.dset_w0,
+            weighted=rmse_weighted,
+        )
+        print(
+            f"[Kaczmarz-MP] seed global RMSE = {rmse_seed:.6e}",
+            flush=True,
+        )
+
+        best_rmse = float(rmse_seed)
+        best_x_CP = x_CP.copy(order="C")
+
+        # ------------------- ratio penalty (argument-driven) ------------------
         print(f"[Kaczmarz-MP] ratio_cfg pre-normalization: {type(ratio_cfg)}", flush=True)
-
         try:
             if ratio_cfg is not None and not isinstance(ratio_cfg, cu.RatioCfg):
                 # Be conservative: only accept actual dict-like configs
@@ -1033,13 +1288,17 @@ def solve_global_kaczmarz_cchunk_mp(
                     jobs = []
                     for (c_start, c_stop) in bands:
                         x_band = x_CP[c_start:c_stop, :].copy()
-                        # w_band = None if w_full is None else w_full[
-                        #     c_start:c_stop
-                        # ].copy()
+                        if x_CP_prior is not None:
+                            x_prior_band = x_CP_prior[c_start:c_stop, :].copy()
+                        else:
+                            x_prior_band = None
                         w_band = None
                         E_band = E_global[c_start:c_stop, :]  # (band_size, P)
-                        inv_ref_band = inv_cp_flux_ref[c_start:c_stop, :] if cp_flux_ref is not None else None
-                        # (band_size,P)
+                        inv_ref_band = (
+                            inv_cp_flux_ref[c_start:c_stop, :]
+                            if cp_flux_ref is not None else None
+                        )
+
                         jobs.append(
                             (
                                 h5_path,
@@ -1049,18 +1308,19 @@ def solve_global_kaczmarz_cchunk_mp(
                                 c_start,
                                 c_stop,
                                 x_band,
+                                x_prior_band,
                                 float(lr_tile),
                                 bool(cfg.project_nonneg),
                                 R.copy(),
-                                w_band,
                                 cfg.dset_slots,
                                 cfg.dset_bytes,
                                 cfg.dset_w0,
                                 E_band,
                                 float(beta_blend),
                                 w_lam_sqrt,
-                                inv_ref_band
-                            ))
+                                inv_ref_band,
+                            )
+                        )
 
                     if use_pool:
                         results = pool.map(_worker_tile_job_with_R, jobs)
@@ -1248,6 +1508,9 @@ def solve_global_kaczmarz_cchunk_mp(
 
                                 B = np.empty((rows, K_use), dtype=np.float64)
                                 xW = np.zeros((K_use,), dtype=np.float64)
+                                xW_prior = np.zeros(
+                                    (K_use,), dtype=np.float64
+                                )
 
                                 for cc, plist in groups.items():
                                     A_c = np.asarray(M[s0:s1, cc, :, :],
@@ -1256,14 +1519,24 @@ def solve_global_kaczmarz_cchunk_mp(
                                         A_c = A_c[:, :, keep_idx]
                                     A_c = A_c[:, :, lam_sel]
                                     for pp, j in plist:
-                                        col = A_c[:, int(pp), :].astype(
-                                            np.float64, copy=False
-                                        ).reshape(rows, order="C")
-                                        # normalize this (c,p) column
+                                        col = np.asarray(
+                                            M[s0:s1, cc, pp, :],
+                                            dtype=np.float64,
+                                        )
+                                        if keep_idx is not None:
+                                            col = col[:, keep_idx]
                                         if cp_flux_ref is not None:
-                                            col *= float(inv_cp_flux_ref[int(cc), int(pp)])
+                                            col *= float(
+                                                inv_cp_flux_ref[int(cc),
+                                                                int(pp)]
+                                            )
                                         B[:, int(j)] = col
-                                        xW[int(j)]   = float(x_CP[int(cc), int(pp)])
+                                        xW[int(j)] = float(
+                                            x_CP[int(cc), int(pp)]
+                                        )
+                                        xW_prior[int(j)] = float(
+                                            x_CP_prior[int(cc), int(pp)]
+                                        )
 
 
                             r_sub = R[:, lam_sel].reshape(rows, order="C")
@@ -1295,20 +1568,26 @@ def solve_global_kaczmarz_cchunk_mp(
                             if nnls_solver in ("pg", "fista"):
                                 # Column-normalize local system (conditioning)
                                 col_norm = np.linalg.norm(B_w, axis=0)
-                                col_norm = np.where(col_norm > 0.0,
-                                                    col_norm, 1.0)
+                                col_norm = np.where(
+                                    col_norm > 0.0, col_norm, 1.0
+                                )
                                 Bn = B_w / col_norm
-                                x  = xW / col_norm
+                                x = xW / col_norm
 
-                                # FISTA with L2 term in gradient
+                                if nnls_l2 > 0.0:
+                                    x_prior_norm = xW_prior / col_norm
+                                else:
+                                    x_prior_norm = np.zeros_like(x)
+
+                                # FISTA with backtracking (fast & robust)
                                 if K_use <= 2048:
                                     L_est = float(
-                                        np.linalg.norm(Bn, ord=2)**2
+                                        np.linalg.norm(Bn, ord=2) ** 2
                                         + nnls_l2
                                     )
                                 else:
                                     L_est = float(
-                                        (Bn**2).sum(axis=0).max()
+                                        (Bn ** 2).sum(axis=0).max()
                                         + nnls_l2
                                     )
 
@@ -1318,10 +1597,17 @@ def solve_global_kaczmarz_cchunk_mp(
 
                                 def _f_and_grad(zvec):
                                     r = Bn @ zvec - y_rhs_w
-                                    f = 0.5 * float(r @ r) \
-                                        + 0.5 * nnls_l2 * \
-                                          float(zvec @ zvec)
-                                    g = Bn.T @ r + nnls_l2 * zvec
+                                    if nnls_l2 > 0.0:
+                                        diff = zvec - x_prior_norm
+                                        f = (
+                                            0.5 * float(r @ r)
+                                            + 0.5 * nnls_l2
+                                            * float(diff @ diff)
+                                        )
+                                        g = Bn.T @ r + nnls_l2 * diff
+                                    else:
+                                        f = 0.5 * float(r @ r)
+                                        g = Bn.T @ r
                                     return f, g, r
 
                                 fz, gz, rz = _f_and_grad(z)
@@ -1333,19 +1619,32 @@ def solve_global_kaczmarz_cchunk_mp(
                                         x_try = z - step * gz
                                         np.maximum(x_try, 0.0, out=x_try)
                                         r_try = Bn @ x_try - y_rhs_w
-                                        f_try = 0.5 * float(r_try @ r_try) \
-                                                + 0.5 * nnls_l2 * \
-                                                  float(x_try @ x_try)
-                                        if f_try <= fz - 1e-4 * step * \
-                                            float(gz @ gz) or step < 1e-12:
+                                        if nnls_l2 > 0.0:
+                                            diff_try = x_try - x_prior_norm
+                                            f_try = (
+                                                0.5 * float(r_try @ r_try)
+                                                + 0.5 * nnls_l2
+                                                * float(diff_try @ diff_try)
+                                            )
+                                        else:
+                                            f_try = 0.5 * float(r_try @ r_try)
+
+                                        if (
+                                            f_try
+                                            <= fz
+                                            - 1e-4 * step * float(gz @ gz)
+                                            or step < 1e-12
+                                        ):
                                             break
                                         step *= 0.5
+
                                     # FISTA momentum
                                     t_new = 0.5 * (
                                         1.0 + np.sqrt(1.0 + 4.0 * t * t)
                                     )
-                                    z = x_try + ((t - 1.0) / t_new) * \
-                                        (x_try - x_old)
+                                    z = x_try + ((t - 1.0) / t_new) * (
+                                        x_try - x_old
+                                    )
                                     x_old = x_try
                                     t = t_new
                                     fz, gz, rz = _f_and_grad(z)
@@ -1557,27 +1856,86 @@ def solve_global_kaczmarz_cchunk_mp(
                             rmse=rmse_after, force=True)
                 except Exception:
                     pass
+
+                # ------------------- global RMSE for this epoch -------------
+                print(
+                    f"[Kaczmarz-MP] Computing global RMSE for "
+                    f"epoch {ep+1}...",
+                    flush=True,
+                )
+                rmse_epoch = _compute_global_rmse(
+                    h5_path,
+                    x_CP,
+                    s_ranges=s_ranges,
+                    keep_idx=keep_idx,
+                    w_lam_sqrt=w_lam_sqrt,
+                    cp_flux_ref=cp_flux_ref,
+                    inv_cp_flux_ref=inv_cp_flux_ref,
+                    dset_slots=cfg.dset_slots,
+                    dset_bytes=cfg.dset_bytes,
+                    dset_w0=cfg.dset_w0,
+                    weighted=rmse_weighted,
+                )
+                print(
+                    f"[Kaczmarz-MP] epoch {ep+1} global RMSE = "
+                    f"{rmse_epoch:.6e}",
+                    flush=True,
+                )
+
+                # Track best epoch by global RMSE
+                if rmse_epoch + rmse_guard_tol < best_rmse:
+                    best_rmse = float(rmse_epoch)
+                    best_x_CP = x_CP.copy(order="C")
+                    print(
+                        f"[Kaczmarz-MP] New best RMSE "
+                        f"{best_rmse:.6e} at epoch {ep+1}.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[Kaczmarz-MP] RMSE did not improve over "
+                        f"best={best_rmse:.6e}.",
+                        flush=True,
+                    )
+
                 print(f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs} housekeeping "
                     f"done.", flush=True)
 
             elapsed = time.perf_counter() - t0
 
-            np.nan_to_num(x_CP, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+            # Sanitize the final solution and convert to physical basis
+            np.nan_to_num(
+                best_x_CP, nan=0.0, posinf=0.0, neginf=0.0, copy=False
+            )
 
-            # ------------------- finalize / convert back to physical basis -------------------
             if cp_flux_ref is not None:
                 # Decode normalized solution back to physical weights
-                X_norm = x_CP
+                X_norm = best_x_CP
                 X_phys = X_norm * inv_cp_flux_ref   # x_phys = x_norm / cp_flux_ref
             else:
-                X_phys = x_CP
+                X_phys = best_x_CP
 
-            x_out = np.asarray(X_phys, np.float64, order="C").ravel(order="C")
+            x_out = np.asarray(
+                X_phys, np.float64, order="C"
+            ).ravel(order="C")
 
-            return x_out, dict(epochs=cfg.epochs, elapsed_sec=elapsed)
+            return x_out, dict(
+                epochs=cfg.epochs,
+                elapsed_sec=elapsed,
+                rmse_seed=rmse_seed,
+                rmse_best=best_rmse,
+            )
         finally:
-            pool.close()
-            pool.join()
+            if pool is not None:
+                try:
+                    pool.close()
+                    pool.join()
+                except Exception:
+                    try:
+                        pool.terminate()
+                    except Exception:
+                        pass
+
     except Exception as e:
         print(
             "[Kaczmarz-MP] FATAL exception in "
