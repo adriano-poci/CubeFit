@@ -1,1 +1,6 @@
-* Disabled buggy `w_band` which was implemented incorrectly in `kaczmarz_solver_cchunk_mp_nnls.solve_global_kaczmarz_cchunk_mp`
+* Read in NNLs `L2` ridge from environment variable in `pipeline_runner.solve_all_mp_batched`
+* Use the seed vector as a numerical prior during the Kaczmarz solving in `kaczmarz_solver_cchunk_mp_nnls`
+* Started history in `cube_debug`
+* Added `nnls_seed_diagnostics` to `cube_debug` to investigate how the NNLS seed behaves as a full solution
+* Implement global RMSE evaluation, and keep only globally-best solution in `kaczmarz_solver_cchunk_mp_nnls`
+* Optionally disable seed prior in `kaczmarz_solver_cchunk_mp_nnls`

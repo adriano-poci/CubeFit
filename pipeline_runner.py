@@ -36,6 +36,8 @@ v1.5:   Wrap `solve_global_kaczmarz_cchunk_mp` in `logger.capture_all_output`
             in `PipelineRunner.solve_all_mp_batched`. 4 December 2025
 v1.6:   Updated `solve_all_mp_batched` `warm_start` options to match `solve_all`.
             12 December 2025
+v1.7:   Read in NNLs `L2` ridge from environment variable in
+            `solve_all_mp_batched`. 13 December 2025
 """
 
 from __future__ import annotations
@@ -832,7 +834,7 @@ class PipelineRunner:
                     k_per_comp=24,
                     pick_mode="energy",
                     solver="nnls",
-                    ridge=nnls_l2,
+                    ridge=float(nnls_l2),
                     use_mask=True,
                     use_lambda=True,
                     lam_dset="/HyperCube/lambda_weights",

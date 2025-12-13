@@ -1,17 +1,44 @@
-# cube_debug.py
-import time
+# -*- coding: utf-8 -*-
+r"""
+    cube_debug.py
+    Adriano Poci
+    University of Oxford
+    2025
+
+    Platforms
+    ---------
+    Unix, Windows
+
+    Synopsis
+    --------
+    A collection of helpful functionality to assist in debugging aspects of the CubeFit pipeline.
+
+    Authors
+    -------
+    Adriano Poci <adriano.poci@physics.ox.ac.uk>
+
+History
+-------
+v1.0:   Added `nnls_seed_diagnostics` to investigate how the NNLS seed behaves
+            as a full solution. 13 December 2025
+"""
+import time, os
 import numpy as np
+from pathlib import Path
+from typing import Optional, Sequence
 
 from CubeFit.hdf5_manager import open_h5
 from CubeFit.hypercube_builder import read_global_column_energy
 from CubeFit.cube_utils import (
     project_to_component_weights,
-    project_to_component_weights_strict,
+    # project_to_component_weights_strict,
+)
+from CubeFit.live_fit_dashboard import (
+    render_aperture_fits_with_x,
+    render_sfh_from_x,
 )
 
 # ------------------------------------------------------------------------------
-
-
 
 def _read_C_P(f) -> tuple[int, int]:
     M = f["/HyperCube/models"]
@@ -165,31 +192,129 @@ def debug_test_projectors_on_h5(
     _report("plain-usage", u_plain1)
     _report("energy-usage", u_energy1)
 
-    # ---------- strict projector (hard constraint, post-epoch) ----------
-    X2 = X0.copy()
-    t0 = time.perf_counter()
-    project_to_component_weights_strict(
-        X2,
-        orbit_weights=w_c,        # or full (C*P,) if you want; fn should handle both
-        E_cp=(E_cp if use_energy_metric else None),
-        min_target=1e-12,
-    )
-    dt2 = time.perf_counter() - t0
+    # # ---------- strict projector (hard constraint, post-epoch) ----------
+    # X2 = X0.copy()
+    # t0 = time.perf_counter()
+    # project_to_component_weights_strict(
+    #     X2,
+    #     orbit_weights=w_c,        # or full (C*P,) if you want; fn should handle both
+    #     E_cp=(E_cp if use_energy_metric else None),
+    #     min_target=1e-12,
+    # )
+    # dt2 = time.perf_counter() - t0
 
-    s_plain2, u_plain2 = _usage(X2, E=None)
-    s_energy2, u_energy2 = _usage(X2, E_cp if use_energy_metric else None)
+    # s_plain2, u_plain2 = _usage(X2, E=None)
+    # s_energy2, u_energy2 = _usage(X2, E_cp if use_energy_metric else None)
 
-    print("\n[strict] after project_to_component_weights_strict:")
-    print(f"  runtime = {dt2:.4e} s")
-    print("  finite X2? ", np.isfinite(X2).all(),
-          "  min(X2) =", float(np.nanmin(X2)))
-    print("  mass_plain  (before/after) =",
-          float(s_plain0.sum()), "→", float(s_plain2.sum()))
-    print("  mass_energy (before/after) =",
-          float(s_energy0.sum()), "→", float(s_energy2.sum()))
-    _report("plain-usage", u_plain2)
-    _report("energy-usage", u_energy2)
+    # print("\n[strict] after project_to_component_weights_strict:")
+    # print(f"  runtime = {dt2:.4e} s")
+    # print("  finite X2? ", np.isfinite(X2).all(),
+    #       "  min(X2) =", float(np.nanmin(X2)))
+    # print("  mass_plain  (before/after) =",
+    #       float(s_plain0.sum()), "→", float(s_plain2.sum()))
+    # print("  mass_energy (before/after) =",
+    #       float(s_energy0.sum()), "→", float(s_energy2.sum()))
+    # _report("plain-usage", u_plain2)
+    # _report("energy-usage", u_energy2)
 
     print("\n[debug] done.\n")
+
+# ------------------------------------------------------------------------------
+
+def nnls_seed_diagnostics(
+    h5_path: str,
+    *,
+    seed_path: Optional[str] = None,
+    n_apertures: int = 6,
+    apertures: Optional[Sequence[int]] = None,
+    show_residual: bool = True,
+) -> dict:
+    """
+    Treat the NNLS seed as the final solution and render standard diagnostics.
+
+    This is a convenience wrapper around `render_aperture_fits_with_x` and
+    `render_sfh_from_x` that:
+      - reads the seed vector X from the main HDF5 file,
+      - flattens it to (C*P,) in the runtime layout,
+      - renders a small set of representative aperture fits, and
+      - renders the orbital SFH panel.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the main CubeFit HDF5 file.
+    seed_path : str, optional
+        Dataset to use for the seed X. Defaults to the environment
+        variable CUBEFIT_SEED_PATH if set, otherwise "/Seeds/x0_nnls_patch".
+    n_apertures : int, optional
+        Number of apertures to sample uniformly across the field if
+        `apertures` is not provided. Default is 6.
+    apertures : sequence of int, optional
+        Explicit list of aperture indices to plot. If provided, this
+        overrides `n_apertures`.
+    show_residual : bool, optional
+        Whether to overlay residuals in the aperture-fit panel.
+
+    Returns
+    -------
+    info : dict
+        Dictionary with keys:
+          - "seed_path" : str
+          - "apertures" : list[int]
+          - "fits_png" : str
+          - "sfh_png" : str
+    """
+
+    if seed_path is None:
+        seed_path = os.environ.get(
+            "CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch"
+        )
+
+    # Read geometry and seed vector as (C,P)
+    with open_h5(h5_path, role="reader", swmr=True) as f:
+        C, P = _read_C_P(f)
+        S = int(f["/DataCube"].shape[0])
+
+    X_cp = _read_X(h5_path, x_dset=seed_path, C=C, P=P)
+    x_flat = np.asarray(X_cp, dtype=np.float64).ravel(order="C")
+    x_flat = np.nan_to_num(
+        x_flat, copy=False, nan=0.0, posinf=0.0, neginf=0.0
+    )
+
+    # Choose apertures to plot
+    if apertures is not None:
+        ap_idx = [int(i) for i in apertures if 0 <= int(i) < S]
+    else:
+        n_plot = int(min(max(1, n_apertures), S))
+        ap_idx = np.linspace(0, S - 1, n_plot, dtype=int).tolist()
+
+    base = Path(h5_path).parent / "figures"
+    base.mkdir(parents=True, exist_ok=True)
+
+    fits_png = base / "nnls_seed_fits.png"
+    sfh_png = base / "nnls_seed_sfh.png"
+
+    if ap_idx:
+        render_aperture_fits_with_x(
+            h5_path,
+            x_flat,
+            fits_png,
+            apertures=ap_idx,
+            show_residual=show_residual,
+            title="NNLS seed treated as final solution",
+        )
+
+    render_sfh_from_x(
+        h5_path,
+        x_flat,
+        sfh_png,
+    )
+
+    return {
+        "seed_path": str(seed_path),
+        "apertures": ap_idx,
+        "fits_png": str(fits_png),
+        "sfh_png": str(sfh_png),
+    }
 
 # ------------------------------------------------------------------------------
