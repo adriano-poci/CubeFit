@@ -558,12 +558,12 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         use=True           # actually enable the ratio term
     )
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=1,
+        epochs=2,
         lr=0.0001,
         project_nonneg=True,
         orbit_weights=None, # or None for “free” fit
         ratio_cfg=None,
-        # orbit_weights=cWeights,
+        # orbit_weights=cWeights, # Make sure to enable `CUBEFIT_ORBIT_BETA`
         # ratio_cfg=RC,
         processes=4, # 4 workers
         blas_threads=12, # 12 BLAS threads each → 48 total

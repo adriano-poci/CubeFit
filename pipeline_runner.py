@@ -52,7 +52,8 @@ from CubeFit.hypercube_builder import build_hypercube, read_global_column_energy
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
 from CubeFit.kaczmarz_solver import solve_global_kaczmarz, SolverCfg
 from CubeFit.kaczmarz_solver_cchunk_mp_nnls import (
-    MPConfig, solve_global_kaczmarz_cchunk_mp)
+    MPConfig, solve_global_kaczmarz_global_step_mp)
+    # solve_global_kaczmarz_cchunk_mp)
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
 )
@@ -954,7 +955,7 @@ class PipelineRunner:
 
         try:
             with logger.capture_all_output():
-                x_global, stats = solve_global_kaczmarz_cchunk_mp(
+                x_global, stats = solve_global_kaczmarz_global_step_mp(
                     self.h5_path,
                     cfg,
                     orbit_weights=orbit_weights,
@@ -972,7 +973,7 @@ class PipelineRunner:
                 logger.log('[Pipeline] Enforcing orbit weights via strict '\
                     'projection.')
                 cu.project_to_component_weights(
-                    x_global, orbit_weights, E_cp=E_global, min_target=1e-10,
+                    x_global, orbit_weights, E_cp=E_global, minw=1e-10,
                     beta=1.0
                 )
                 logger.log('[Pipeline] Post-projection total mass: '\

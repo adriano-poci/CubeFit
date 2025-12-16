@@ -33,6 +33,10 @@ v1.3:   Introduced L2 into Kaczmarz solving to be consistent with NNLS
 v1.4:   Use the seed vector as a numerical prior during the Kaczmarz solving;
         Implement global RMSE evaluation, and keep only globally-best solution;
         Optionally disable seed prior. 13 December 2025
+v1.5:   Use RMSE proxy as guard for epoch solution. 15 December 2025
+v2.0:   Implemented global Kaczmarz gradient instead of per-tile updates; added
+            `_worker_tile_global_grad_band` and
+            `solve_global_kaczmarz_global_step_mp`. 16 December 2025
 """
 
 from __future__ import annotations, print_function
@@ -149,6 +153,25 @@ def _xcorr_int_shift(a: np.ndarray, b: np.ndarray) -> int:
 
 # ------------------------------------------------------------------------------
 
+def _safe_scalar_rmse(val: float, label: str) -> float:
+    """
+    Ensure a scalar RMSE used for epoch comparison is finite.
+
+    If 'val' is NaN, Inf, or negative, print a warning and return +inf
+    so that this value will never be considered an improvement over a
+    finite best RMSE.
+    """
+    if not np.isfinite(val) or val < 0.0:
+        print(
+            f"[Kaczmarz-MP] WARNING: {label} RMSE={val!r} is non-finite "
+            f"or negative; treating as +inf.",
+            flush=True,
+        )
+        return float("inf")
+    return float(val)
+
+# ------------------------------------------------------------------------------
+
 def _compute_global_rmse(
     h5_path: str,
     x_CP: np.ndarray,
@@ -233,8 +256,8 @@ def _compute_global_rmse(
                 f"!= (C,P)=({C},{P})"
             )
 
-        # Effective coefficients: if there *is* column normalization, push
-        # inv_cp_flux_ref onto x_CP once; otherwise just copy x_CP.
+        # Push any column normalization onto x_CP once; in your current
+        # runs cp_flux_ref is None, so this is just a cheap copy.
         if inv_cp_flux_ref is not None:
             x_eff = (
                 np.asarray(x_CP, np.float64, order="C")
@@ -254,6 +277,16 @@ def _compute_global_rmse(
                 raise RuntimeError(
                     f"_compute_global_rmse: w_lam_sqrt length "
                     f"{wvec.size} != Lk={Lk}"
+                )
+            # Harden λ-weights once
+            if not np.all(np.isfinite(wvec)):
+                print(
+                    "[RMSE] WARNING: non-finite λ-weights detected; "
+                    "cleaning with nan_to_num.",
+                    flush=True,
+                )
+                wvec = np.nan_to_num(
+                    wvec, nan=0.0, posinf=0.0, neginf=0.0
                 )
         else:
             wvec = None
@@ -285,19 +318,24 @@ def _compute_global_rmse(
             if keep_idx is not None:
                 Y = Y[:, keep_idx]  # (Sblk, Lk)
 
-            # Optional λ-weighting on the data side (so we never need to
-            # explicitly form R and then multiply).
+            # Clean any non-finite data just in case
+            if not np.all(np.isfinite(Y)):
+                Y = np.nan_to_num(
+                    Y, nan=0.0, posinf=0.0, neginf=0.0, copy=False
+                )
+
             if wvec is not None:
                 Yw = Y * wvec[None, :]
             else:
                 Yw = Y
 
-            # Model slice: yhat_w[s, λ] =
-            #   Σ_{c,p} x_eff[c,p] * (M[s,c,p,λ] * (√w_λ if weighted))
+            # Model slice, weighted or unweighted
             yhat_w = np.zeros((Sblk, Lk), dtype=np.float64)
 
             for c in range(C):
-                A = np.asarray(M[s0:s1, c, :, :], dtype=np.float32, order="C")
+                A = np.asarray(
+                    M[s0:s1, c, :, :], dtype=np.float32, order="C"
+                )  # (Sblk, P, L)
                 if keep_idx is not None:
                     A = A[:, :, keep_idx]  # (Sblk, P, Lk)
 
@@ -305,13 +343,24 @@ def _compute_global_rmse(
                 if wvec is not None:
                     A = A * wvec[None, None, :]  # λ-weights
 
+                # Clean design slice if needed
+                if not np.all(np.isfinite(A)):
+                    A = np.nan_to_num(
+                        A, nan=0.0, posinf=0.0, neginf=0.0, copy=False
+                    )
+
                 xc = np.asarray(x_eff[c, :], np.float64, copy=False)
 
                 # yhat_w += Σ_p xc[p] * A[:, p, :]
                 yhat_w += np.tensordot(xc, A, axes=(0, 1))
 
-            # Weighted residual: Rw = Yw - yhat_w
             Rw = Yw - yhat_w
+
+            # Final guard: ensure residuals are finite before accumulation
+            if not np.all(np.isfinite(Rw)):
+                Rw = np.nan_to_num(
+                    Rw, nan=0.0, posinf=0.0, neginf=0.0, copy=False
+                )
 
             num += float(np.sum(Rw * Rw))
             den += int(Rw.size)
@@ -322,10 +371,161 @@ def _compute_global_rmse(
         if pbar is not None:
             pbar.close()
 
-    if den <= 0:
-        return 0.0
+    if (not np.isfinite(num)) or (not np.isfinite(den)) or (den <= 0):
+        print(
+            "[RMSE] WARNING: aggregate num/den non-finite or den<=0; "
+            "returning +inf RMSE.",
+            flush=True,
+        )
+        return float("inf")
 
     return float(math.sqrt(num / float(den)))
+
+# ---------------------------- Worker ---------------------------------
+
+def _worker_tile_global_grad_band(args):
+    r"""
+    Compute global Kaczmarz-style gradient contributions for one spatial
+    tile and one contiguous band of components.
+
+    This worker does **not** update x or R. It only returns the
+    band-local contributions to the global gradient and diagonal
+    preconditioner:
+
+        g_band[c,p]  = sum_{s,λ} (√w_λ A_{s,c,p,λ}) * (√w_λ R_{s,λ})
+        D_band[c,p]  = sum_{s,λ} (√w_λ A_{s,c,p,λ})^2,
+
+    where R = Y - ŷ is the residual for the current epoch's global x_CP,
+    and A already includes any column-flux normalization in the "model"
+    basis.
+
+    Parameters
+    ----------
+    args : tuple
+        (h5_path, s0, s1, keep_idx,
+         c_start, c_stop,
+         x_band,
+         R_tile,
+         w_lam_sqrt,
+         inv_ref_band,
+         dset_slots, dset_bytes, dset_w0)
+
+        h5_path : str
+            Path to the HDF5 file with /DataCube and /HyperCube/models.
+        s0, s1 : int
+            Spatial index range [s0, s1) for this tile.
+        keep_idx : ndarray[int] or None
+            Wavelength mask indices, or None for full λ-range.
+        c_start, c_stop : int
+            Inclusive/exclusive component index range for this band.
+        x_band : ndarray, shape (band_size, P), float64
+            Current normalized weights for this band (x_CP[c_start:c_stop,:]).
+            Included here mainly for future extensions (e.g. L2); not used
+            directly in the gradient.
+        R_tile : ndarray, shape (Sblk, Lk), float64
+            Current residual R = Y - yhat for this tile, unweighted but
+            already masked to Lk.
+        w_lam_sqrt : ndarray or None
+            √(λ-weights) on the masked λ-grid, or None for unweighted LS.
+        inv_ref_band : ndarray, shape (band_size, P) or None
+            If column-flux normalization is active, this contains
+            inv_cp_flux_ref[c_start:c_stop, :]; otherwise None.
+        dset_slots, dset_bytes, dset_w0 : HDF5 chunk-cache knobs.
+
+    Returns
+    -------
+    g_band : ndarray, shape (band_size, P), float64
+        Band-local contribution to the global gradient accumulator:
+        g_band[c_rel, p] = Σ_{tile} (√w A)^T (√w R).
+    D_band : ndarray, shape (band_size, P), float64
+        Band-local contribution to the diagonal preconditioner:
+        D_band[c_rel, p] = Σ_{tile} (√w A)^2.
+    """
+    (h5_path, s0, s1, keep_idx,
+     c_start, c_stop,
+     x_band,
+     R_tile,
+     w_lam_sqrt,
+     inv_ref_band,
+     dset_slots, dset_bytes, dset_w0) = args
+
+    eps = float(os.environ.get("CUBEFIT_EPS", "1e-12"))
+
+    # Shapes
+    R_tile = np.asarray(R_tile, dtype=np.float64, order="C")
+    Sblk, Lk = R_tile.shape
+
+    # λ-weights (optional)
+    if w_lam_sqrt is not None:
+        wvec = np.asarray(w_lam_sqrt, np.float64).ravel()
+        if wvec.size != Lk:
+            raise RuntimeError(
+                f"_worker_tile_global_grad_band: w_lam_sqrt length "
+                f"{wvec.size} != Lk={Lk}"
+            )
+        # Weighted residual
+        Rw = R_tile * wvec[None, :]
+    else:
+        wvec = None
+        Rw = R_tile
+
+    band_size, P = x_band.shape
+
+    g_band = np.zeros((band_size, P), dtype=np.float64)
+    D_band = np.zeros((band_size, P), dtype=np.float64)
+
+    with open_h5(h5_path, role="reader") as f:
+        M = f["/HyperCube/models"]  # (S, C, P, L)
+        try:
+            M.id.set_chunk_cache(dset_slots, dset_bytes, dset_w0)
+        except Exception:
+            pass
+
+        for bi, c in enumerate(range(c_start, c_stop)):
+            A = np.asarray(
+                M[s0:s1, c, :, :], dtype=np.float32, order="C"
+            )  # (Sblk, P, L_full)
+            if keep_idx is not None:
+                A = A[:, :, keep_idx]  # (Sblk, P, Lk)
+
+            # Apply column-flux normalization if present
+            if inv_ref_band is not None:
+                inv_ref = np.asarray(
+                    inv_ref_band[bi, :], dtype=np.float64, copy=False
+                )  # (P,)
+                A = A * inv_ref[None, :, None]
+
+            # Promote to float64 for safe dot products
+            A = A.astype(np.float64, copy=False)
+
+            if wvec is not None:
+                A_w = A * wvec[None, None, :]  # (Sblk, P, Lk)
+            else:
+                A_w = A
+
+            # Gradient contribution: g_p = Σ_{s,λ} A_w[s,p,λ] * Rw[s,λ]
+            # We can do this as a double contraction over s and λ.
+            g_band[bi, :] = np.tensordot(
+                A_w, Rw, axes=([0, 2], [0, 1])
+            )
+
+            # Diagonal preconditioner: D_p = Σ_{s,λ} (A_w[s,p,λ])^2
+            D_band[bi, :] = np.sum(
+                np.square(A_w, dtype=np.float64), axis=(0, 2)
+            )
+
+    # Small numerical guard: avoid negative or non-finite entries
+    if not np.all(np.isfinite(g_band)):
+        g_band = np.nan_to_num(
+            g_band, nan=0.0, posinf=0.0, neginf=0.0, copy=False
+        )
+    if not np.all(np.isfinite(D_band)):
+        D_band = np.nan_to_num(
+            D_band, nan=0.0, posinf=0.0, neginf=0.0, copy=False
+        )
+        D_band = np.maximum(D_band, eps)
+
+    return g_band, D_band
 
 # ---------------------------- Worker ---------------------------------
 
@@ -853,7 +1053,6 @@ def solve_global_kaczmarz_cchunk_mp(
         if max_tiles is not None:
             max_tiles = int(max_tiles)
             if 0 < max_tiles < len(s_ranges_sorted):
-                import math
                 rng = np.random.default_rng(
                     int(os.environ.get("CUBEFIT_POLISH_SEED", "12345"))
                 )
@@ -954,28 +1153,32 @@ def solve_global_kaczmarz_cchunk_mp(
             flush=True,
         )
 
-        # ------------------- global RMSE for the seed ----------------------
-        print("[Kaczmarz-MP] Computing global RMSE for the seed...", flush=True)
-        rmse_seed = _compute_global_rmse(
-            h5_path,
-            x_CP,
-            s_ranges=s_ranges,
-            keep_idx=keep_idx,
-            w_lam_sqrt=w_lam_sqrt,
-            cp_flux_ref=cp_flux_ref,
-            inv_cp_flux_ref=inv_cp_flux_ref,
-            dset_slots=cfg.dset_slots,
-            dset_bytes=cfg.dset_bytes,
-            dset_w0=cfg.dset_w0,
-            weighted=rmse_weighted,
-        )
-        print(
-            f"[Kaczmarz-MP] seed global RMSE = {rmse_seed:.6e}",
-            flush=True,
-        )
+        # # ------------------- global RMSE for the seed ----------------------
+        # print("[Kaczmarz-MP] Computing global RMSE for the seed...", flush=True)
+        # rmse_seed_raw = _compute_global_rmse(
+        #     h5_path,
+        #     x_CP,
+        #     s_ranges=s_ranges,
+        #     keep_idx=keep_idx,
+        #     w_lam_sqrt=w_lam_sqrt,
+        #     cp_flux_ref=cp_flux_ref,
+        #     inv_cp_flux_ref=inv_cp_flux_ref,
+        #     dset_slots=cfg.dset_slots,
+        #     dset_bytes=cfg.dset_bytes,
+        #     dset_w0=cfg.dset_w0,
+        #     weighted=rmse_weighted,
+        # )
+        # rmse_seed = _safe_scalar_rmse(rmse_seed_raw, "seed")
+        # print(
+        #     f"[Kaczmarz-MP] seed global RMSE = {rmse_seed:.6e}",
+        #     flush=True,
+        # )
 
-        best_rmse = float(rmse_seed)
-        best_x_CP = x_CP.copy(order="C")
+        # best_rmse = float(rmse_seed)
+        # best_x_CP = x_CP.copy(order="C")
+
+        best_rmse_proxy = np.inf
+        best_x_CP       = x_CP.copy()
 
         # ------------------- ratio penalty (argument-driven) ------------------
         print(f"[Kaczmarz-MP] ratio_cfg pre-normalization: {type(ratio_cfg)}", flush=True)
@@ -1216,6 +1419,12 @@ def solve_global_kaczmarz_cchunk_mp(
                 else:
                     t_norm = None
 
+                # --------- epoch-level RMSE proxy accumulator --------------
+                # We sum ||R||^2 over all tiles using the *pre-update* R
+                # (unweighted, masked wavelengths) and track the total count.
+                rmse_sum_sq = 0.0
+                rmse_count  = 0
+
                 for tile_idx, (s0, s1) in enumerate(s_ranges):
                     Sblk = s1 - s0
 
@@ -1244,6 +1453,22 @@ def solve_global_kaczmarz_cchunk_mp(
                             for s in range(Sblk):
                                 yhat[s, :] += xc_norm @ A[s, :, :]
                         R = Y - yhat
+
+
+                    # --------- aggregate epoch RMSE proxy (pre-updates) -----
+                    if not np.all(np.isfinite(R)):
+                        bad = ~np.isfinite(R)
+                        n_bad = int(bad.sum())
+                        print(
+                            f"[Kaczmarz-MP] WARNING: non-finite residuals on "
+                            f"tile {tile_idx} (bad={n_bad}); zeroing.",
+                            flush=True,
+                        )
+                        R = np.nan_to_num(
+                            R, nan=0.0, posinf=0.0, neginf=0.0, copy=False
+                        )
+                    rmse_sum_sq += float(np.sum(R * R))
+                    rmse_count  += int(R.size)
 
                     # Optional: light shift diagnostic on 1 spaxel in the tile
                     if want_shift_diag and Sblk > 0:
@@ -1292,7 +1517,6 @@ def solve_global_kaczmarz_cchunk_mp(
                             x_prior_band = x_CP_prior[c_start:c_stop, :].copy()
                         else:
                             x_prior_band = None
-                        w_band = None
                         E_band = E_global[c_start:c_stop, :]  # (band_size, P)
                         inv_ref_band = (
                             inv_cp_flux_ref[c_start:c_stop, :]
@@ -1738,17 +1962,56 @@ def solve_global_kaczmarz_cchunk_mp(
 
                 pbar.close()
 
+                # --------- finalize epoch-level RMSE proxy -----------------
+                if rmse_count > 0:
+                    mean_sq = rmse_sum_sq / float(rmse_count)
+                else:
+                    mean_sq = 0.0
+
+                if (not np.isfinite(mean_sq)) or (mean_sq < 0.0):
+                    print(
+                        f"[Kaczmarz-MP] WARNING: epoch {ep+1} RMSE(proxy) "
+                        f"mean_sq={mean_sq!r} non-finite or negative; "
+                        f"setting RMSE(proxy)=+inf.",
+                        flush=True,
+                    )
+                    rmse_epoch_proxy = float("inf")
+                else:
+                    rmse_epoch_proxy = float(math.sqrt(mean_sq))
+
+                print(
+                    f"[Kaczmarz-MP] epoch {ep+1} RMSE(proxy) = "
+                    f"{rmse_epoch_proxy:.6e}",
+                    flush=True,
+                )
+
+                if tracker is not None:
+                    try:
+                        tracker.on_epoch_end(
+                            ep + 1,
+                            {"rmse_epoch_proxy": rmse_epoch_proxy},
+                            block=False,
+                        )
+                    except TypeError:
+                        tracker.on_epoch_end(
+                            ep + 1,
+                            {"rmse_epoch_proxy": rmse_epoch_proxy},
+                        )
+
                 if w_prior is not None:
                     t0_sb = time.perf_counter()
-                    orbBand, orbStep = softbox_params_smooth(eq=ep, E=cfg.epochs)
+                    orbBand, orbStep = softbox_params_smooth(
+                        eq=ep, E=cfg.epochs)
                     cu.apply_component_softbox_energy(
                         x_CP, E_global,
                         (orbit_weights if orbit_weights is not None else np.ones(x_CP.shape[0])),
-                        band=float(orbBand), step=float(orbStep), min_target=1e-10
+                        band=float(orbBand), step=float(orbStep),
+                        min_target=1e-10
                     )
 
                     dt_sb = time.perf_counter() - t0_sb
-                    print(f"[softbox] epoch {ep+1}: took {dt_sb:.4f}s", flush=True)
+                    print(f"[softbox] epoch {ep+1}: took {dt_sb:.4f}s",
+                        flush=True)
 
                 # ---------- optional orbit weights enforcement -----------
                 t0_ob = time.perf_counter()
@@ -1762,7 +2025,8 @@ def solve_global_kaczmarz_cchunk_mp(
                     )
 
                     dt_ob = time.perf_counter() - t0_ob
-                    print(f"[orbit-weights] epoch {ep+1}: took {dt_ob:.4f}s", flush=True)
+                    print(f"[orbit-weights] epoch {ep+1}: took {dt_ob:.4f}s",
+                        flush=True)
                     t0_ob = time.perf_counter()
                     x[:] = x_CP.ravel(order="C")  # keep your flattened view in sync
                     dt_ob = time.perf_counter() - t0_ob
@@ -1845,11 +2109,7 @@ def solve_global_kaczmarz_cchunk_mp(
 
                 print(f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs} snapshotting...",
                     flush=True)
-                try:
-                    if tracker is not None:
-                        tracker.on_epoch_end(ep + 1, dict(), block=False)
-                except Exception:
-                    pass
+
                 try:
                     if tracker is not None:
                         tracker.maybe_snapshot_x(x_CP, epoch=ep+1,
@@ -1857,53 +2117,60 @@ def solve_global_kaczmarz_cchunk_mp(
                 except Exception:
                     pass
 
-                # ------------------- global RMSE for this epoch -------------
-                print(
-                    f"[Kaczmarz-MP] Computing global RMSE for "
-                    f"epoch {ep+1}...",
-                    flush=True,
-                )
-                rmse_epoch = _compute_global_rmse(
-                    h5_path,
-                    x_CP,
-                    s_ranges=s_ranges,
-                    keep_idx=keep_idx,
-                    w_lam_sqrt=w_lam_sqrt,
-                    cp_flux_ref=cp_flux_ref,
-                    inv_cp_flux_ref=inv_cp_flux_ref,
-                    dset_slots=cfg.dset_slots,
-                    dset_bytes=cfg.dset_bytes,
-                    dset_w0=cfg.dset_w0,
-                    weighted=rmse_weighted,
-                )
-                print(
-                    f"[Kaczmarz-MP] epoch {ep+1} global RMSE = "
-                    f"{rmse_epoch:.6e}",
-                    flush=True,
-                )
+                # # ------------------- global RMSE for this epoch -------------
+                # print(
+                #     f"[Kaczmarz-MP] Computing global RMSE for "
+                #     f"epoch {ep+1}...",
+                #     flush=True,
+                # )
+                # rmse_epoch_raw = _compute_global_rmse(
+                #     h5_path,
+                #     x_CP,
+                #     s_ranges=s_ranges,
+                #     keep_idx=keep_idx,
+                #     w_lam_sqrt=w_lam_sqrt,
+                #     cp_flux_ref=cp_flux_ref,
+                #     inv_cp_flux_ref=inv_cp_flux_ref,
+                #     dset_slots=cfg.dset_slots,
+                #     dset_bytes=cfg.dset_bytes,
+                #     dset_w0=cfg.dset_w0,
+                #     weighted=rmse_weighted,
+                # )
+                # rmse_epoch = _safe_scalar_rmse(rmse_epoch_raw, "epoch")
+                # print(
+                #     f"[Kaczmarz-MP] epoch {ep+1} global RMSE = "
+                #     f"{rmse_epoch:.6e}",
+                #     flush=True,
+                # )
 
-                # Track best epoch by global RMSE
-                if rmse_epoch + rmse_guard_tol < best_rmse:
-                    best_rmse = float(rmse_epoch)
-                    best_x_CP = x_CP.copy(order="C")
+                # Track best epoch by global RMSE (proxy)
+                if rmse_epoch_proxy + rmse_guard_tol < best_rmse_proxy:
+                    best_rmse_proxy = rmse_epoch_proxy
+                    best_x_CP = x_CP.copy()
                     print(
                         f"[Kaczmarz-MP] New best RMSE "
-                        f"{best_rmse:.6e} at epoch {ep+1}.",
+                        f"{best_rmse_proxy:.6e} at epoch {ep+1}.",
                         flush=True,
                     )
                 else:
                     print(
                         f"[Kaczmarz-MP] RMSE did not improve over "
-                        f"best={best_rmse:.6e}.",
+                        f"best={best_rmse_proxy:.6e}.",
                         flush=True,
                     )
 
                 print(f"[Kaczmarz-MP] epoch {ep+1}/{cfg.epochs} housekeeping "
-                    f"done.", flush=True)
+                    f"done.", flush=True)   
 
             elapsed = time.perf_counter() - t0
 
+            if np.isfinite(best_rmse_proxy):
+                x_CP[:, :] = best_x_CP
+
             # Sanitize the final solution and convert to physical basis
+            # np.nan_to_num(
+            #     x_CP, nan=0.0, posinf=0.0, neginf=0.0, copy=False
+            # )
             np.nan_to_num(
                 best_x_CP, nan=0.0, posinf=0.0, neginf=0.0, copy=False
             )
@@ -1922,8 +2189,8 @@ def solve_global_kaczmarz_cchunk_mp(
             return x_out, dict(
                 epochs=cfg.epochs,
                 elapsed_sec=elapsed,
-                rmse_seed=rmse_seed,
-                rmse_best=best_rmse,
+                # rmse_seed=rmse_seed,
+                rmse_best=best_rmse_proxy,
             )
         finally:
             if pool is not None:
@@ -1944,6 +2211,906 @@ def solve_global_kaczmarz_cchunk_mp(
         )
         print(traceback.format_exc(), flush=True)
         # re-raise so the pipeline still fails loudly
+        raise
+
+# ------------------------------------------------------------------------------
+
+def solve_global_kaczmarz_global_step_mp(
+    h5_path: str,
+    cfg: MPConfig,
+    *,
+    orbit_weights: Optional[np.ndarray] = None,
+    x0: Optional[np.ndarray] = None,
+    tracker: Optional[object] = None,
+    ratio_cfg: cu.RatioCfg | None = None,
+) -> tuple[np.ndarray, dict]:
+    """
+    Global-step Kaczmarz/gradient solver over the full HyperCube.
+
+    This variant treats the whole cube as a single least-squares problem
+    with objective
+
+        J(x) = 0.5 * sum_{s,λ} w_λ (Y_{s,λ} - yhat_{s,λ}(x))^2
+               + 0.5 * λ * ||x||^2,
+
+    where x is the component–population weight matrix in the solver's
+    normalized basis (x_CP). Each epoch does:
+
+    1. Sweep over all spatial tiles, using the current x_CP to build the
+       residual R_tile = Y_tile - yhat_tile(x_CP).
+    2. For each tile and band of components, accumulate local contributions
+       to the global gradient g_CP and diagonal preconditioner D_CP using
+       `_worker_tile_global_grad_band`.
+    3. After all tiles, take a single global projected step
+
+           dx = lr * (g_eff / D_eff),
+           x_CP <- max(0, x_CP + dx),
+
+       with an optional global trust-region cap based on E_global and
+       ||Y||.
+
+    There are **no per-tile Kaczmarz updates** in this solver, no tile-level
+    line search, and no tile-local NNLS polish. The only objective it
+    optimizes is the global LS (plus optional L2), making its behaviour
+    much easier to interpret relative to the NNLS seed.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the HDF5 cube with /DataCube and /HyperCube/models.
+    cfg : MPConfig
+        Configuration for tiling, multiprocessing, epochs, LR, etc.
+    orbit_weights : ndarray or None, optional
+        Ignored in the pure-LS global step, but kept for API parity.
+        Global orbit/ratio regularization is not applied here.
+    x0 : ndarray or None, optional
+        Initial weights in the **physical** basis, shape (C*P,). If None,
+        start from zeros in the solver's normalized basis.
+    tracker : object or None, optional
+        Optional FitTracker-like object with methods:
+            - on_batch_rmse(rmse: float)
+            - on_progress(epoch, spax_done, spax_total, rmse_ewma=None)
+            - on_epoch_end(epoch, stats_dict, block=True/False)
+            - maybe_snapshot_x(x_CP, epoch, rmse, force=False)
+    ratio_cfg : cu.RatioCfg or None, optional
+        Ignored in this pure-LS solver. Present only for API compatibility.
+
+    Returns
+    -------
+    x_out : ndarray, shape (C*P,), float64
+        Final physical component–population weights, flattened in C-major
+        order.
+    info : dict
+        Dictionary with basic run metadata, currently:
+            - epochs : int
+            - elapsed_sec : float
+
+    Notes
+    -----
+    • This solver assumes `mode='model'` normalization on the HyperCube.
+    • Column-flux normalization (`cp_flux_ref`) is allowed but disabled in
+      your current runs; when present it is handled in the "normalized"
+      basis internally and decoded back to physical at the end.
+    • All global orbit/ratio/softbox regularization is intentionally
+      disabled here to focus purely on the LS objective. You can layer it
+      back later if this behaves well.
+    """
+    try:
+        t0 = time.perf_counter()
+
+        def _set_chunk_cache(dset, cfg_obj):
+            try:
+                dset.id.set_chunk_cache(
+                    cfg_obj.dset_slots, cfg_obj.dset_bytes, cfg_obj.dset_w0
+                )
+            except Exception:
+                pass
+
+        # Normalization mode sanity check
+        mode = _assert_norm_mode(h5_path, expect=None)
+        print(f"[Kaczmarz-GLOBAL] HyperCube norm.mode = '{mode}'",
+              flush=True)
+
+        # ------------------- read dims, mask, cp_flux_ref -------------------
+        with open_h5(h5_path, role="reader") as f:
+            DC = f["/DataCube"]           # (S, L) float64
+            M  = f["/HyperCube/models"]   # (S, C, P, L) float32
+            _set_chunk_cache(M, cfg)
+
+            S, L = map(int, DC.shape)
+            _, C, P, Lm = map(int, M.shape)
+            if Lm != L:
+                raise RuntimeError(
+                    f"L mismatch: models L={Lm} vs data L={L}."
+                )
+
+            mask = cu._get_mask(f) if cfg.apply_mask else None
+            keep_idx = np.flatnonzero(mask) if mask is not None else None
+            Lk = int(keep_idx.size) if keep_idx is not None else L
+
+            # Column-flux scaling (model basis), explicitly gated by env
+            cp_enable = os.environ.get(
+                "CUBEFIT_CP_FLUX_ENABLE", "0"
+            ).lower() not in ("0", "false", "no", "off")
+
+            if cp_enable:
+                cp_flux_ref = cu._ensure_cp_flux_ref(
+                    h5_path, keep_idx=keep_idx
+                )  # shape (C, P) or None
+            else:
+                cp_flux_ref = None
+
+            if cp_flux_ref is not None:
+                print(
+                    "[Kaczmarz-GLOBAL] Using column-flux scaling.",
+                    flush=True,
+                )
+                cp_flux_ref = np.asarray(
+                    cp_flux_ref, np.float64
+                ).reshape(C, P)
+                print(
+                    "[Kaczmarz-GLOBAL] cp_flux_ref: "
+                    "min={:.3e}, max={:.3e}, median={:.3e}".format(
+                        float(np.min(cp_flux_ref)),
+                        float(np.max(cp_flux_ref)),
+                        float(
+                            np.median(cp_flux_ref[cp_flux_ref > 0.0])
+                        ),
+                    ),
+                    flush=True,
+                )
+                inv_cp_flux_ref = 1.0 / np.maximum(
+                    cp_flux_ref, 1.0e-30
+                )
+            else:
+                cp_flux_ref = None
+                inv_cp_flux_ref = None
+
+            # λ-weights (feature emphasis)
+            lamw_enable = os.environ.get(
+                "CUBEFIT_LAMBDA_WEIGHTS_ENABLE", "1"
+            ).lower() not in ("0", "false", "no", "off")
+            lamw_dset = os.environ.get(
+                "CUBEFIT_LAMBDA_WEIGHTS_DSET",
+                "/HyperCube/lambda_weights",
+            )
+            lamw_floor = float(
+                os.environ.get("CUBEFIT_LAMBDA_MIN_W", "1e-6")
+            )
+            lamw_auto = os.environ.get(
+                "CUBEFIT_LAMBDA_WEIGHTS_AUTO", "1"
+            ).lower() not in ("0", "false", "no", "off")
+
+            if lamw_enable:
+                print(
+                    "[Kaczmarz-GLOBAL] Reading λ-weights from "
+                    f"'{lamw_dset}' (floor={lamw_floor}, auto={lamw_auto})",
+                    flush=True,
+                )
+                try:
+                    w_full = cu.read_lambda_weights(
+                        h5_path, dset_name=lamw_dset, floor=lamw_floor
+                    )
+                except Exception:
+                    w_full = (
+                        cu.ensure_lambda_weights(
+                            h5_path, dset_name=lamw_dset
+                        )
+                        if lamw_auto
+                        else np.ones(L, dtype=np.float64)
+                    )
+                print(
+                    "[Kaczmarz-GLOBAL] λ-weights "
+                    "min={:.3e}, max={:.3e}, mean={:.3e}".format(
+                        float(np.min(w_full)),
+                        float(np.max(w_full)),
+                        float(np.mean(w_full)),
+                    ),
+                    flush=True,
+                )
+                w_lam = w_full[keep_idx] if keep_idx is not None else w_full
+                w_lam_sqrt = np.sqrt(
+                    np.clip(w_lam, lamw_floor, None)
+                ).astype(np.float64, order="C")
+            else:
+                w_lam_sqrt = None
+
+            # Spaxel tiling from HyperCube chunking
+            s_tile = int(M.chunks[0]) if (M.chunks and M.chunks[0] > 0) \
+                else 128
+            s_ranges = [
+                (s0, int(np.min((S, s0 + s_tile))))
+                for s0 in range(0, S, s_tile)
+            ]
+
+            # Tile norms and global ||Y||
+            norms = []
+            Y_glob_norm2 = 0.0
+            for (ss0, ss1) in s_ranges:
+                Yt = np.asarray(DC[ss0:ss1, :], np.float64)
+                if keep_idx is not None:
+                    Yt = Yt[:, keep_idx]
+                norms.append(float(np.linalg.norm(Yt)))
+                Y_glob_norm2 += float(np.sum(Yt * Yt))
+
+        print(
+            "[Kaczmarz-GLOBAL] DataCube S={}, L={} (kept Lk={}), "
+            "Hypercube C={}, P={}, s_tile={}, epochs={}, lr={}, "
+            "processes={}, blas_threads={}".format(
+                S, L, Lk, C, P, s_tile,
+                cfg.epochs, cfg.lr,
+                cfg.processes, cfg.blas_threads,
+            ),
+            flush=True,
+        )
+
+        # Sort tiles by descending norm (brightest first)
+        paired = sorted(
+            zip(norms, s_ranges), key=lambda t: -t[0]
+        )
+        norms_sorted = [t[0] for t in paired]
+        s_ranges_sorted = [t[1] for t in paired]
+
+        # Optional tile budget (max_tiles)
+        max_tiles = cfg.max_tiles
+        print("[Kaczmarz-GLOBAL] Applying max_tiles constraint...",
+              flush=True)
+        if max_tiles is not None:
+            max_tiles = int(max_tiles)
+            if 0 < max_tiles < len(s_ranges_sorted):
+                import math
+                rng_sel = np.random.default_rng(
+                    int(os.environ.get(
+                        "CUBEFIT_POLISH_SEED", "12345"
+                    ))
+                )
+
+                k_bright = max(1, int(math.ceil(0.7 * max_tiles)))
+                k_rand = max(0, max_tiles - k_bright)
+
+                bright_idx = np.arange(k_bright, dtype=int)
+                tail_idx = np.arange(
+                    k_bright, len(s_ranges_sorted), dtype=int
+                )
+                if k_rand > 0 and tail_idx.size > 0:
+                    rng_sel.shuffle(tail_idx)
+                    rand_idx = tail_idx[:k_rand]
+                    keep_idx_tiles = np.concatenate(
+                        [bright_idx, rand_idx]
+                    )
+                else:
+                    keep_idx_tiles = bright_idx
+
+                keep_idx_tiles = np.sort(keep_idx_tiles)
+                s_ranges = [s_ranges_sorted[i] for i in keep_idx_tiles]
+                norms_sorted = [norms_sorted[i] for i in keep_idx_tiles]
+            else:
+                s_ranges = s_ranges_sorted
+        else:
+            s_ranges = s_ranges_sorted
+
+        print(
+            f"[Kaczmarz-GLOBAL] Using {len(s_ranges)} tiles for fitting.",
+            flush=True,
+        )
+
+        Y_glob_norm = float(np.sqrt(Y_glob_norm2))
+
+        # Global column energy (for trust-region scaling)
+        print("[Kaczmarz-GLOBAL] Reading global column energy...",
+              flush=True)
+        E_global = read_global_column_energy(h5_path)  # (C, P) float64
+        print("[Kaczmarz-GLOBAL] done.", flush=True)
+
+        # ------------------- optional orbit_weights prior -------------------
+        # Here we only prepare the target mix; the actual use is an optional
+        # projection after each global step (see below).
+        w_prior = None
+        orbit_weights_arr = None
+        if orbit_weights is not None:
+            orbit_weights_arr = np.asarray(
+                orbit_weights, np.float64
+            ).ravel(order="C")
+            if orbit_weights_arr.size != C:
+                raise ValueError(
+                    f"orbit_weights length {orbit_weights_arr.size} != C={C}."
+                )
+            w_prior = orbit_weights_arr.copy()
+
+            if tracker is not None and hasattr(
+                tracker, "set_orbit_weights"
+            ):
+                try:
+                    tracker.set_orbit_weights(w_prior)
+                except Exception:
+                    pass
+
+        tau_global = float(
+            os.environ.get("CUBEFIT_GLOBAL_TAU", "0.5")
+        )
+        beta_blend = float(
+            os.environ.get("CUBEFIT_GLOBAL_ENERGY_BLEND", "1e-2")
+        )
+
+        # ------------------- x initialization -------------------
+        if x0 is None:
+            x_CP = np.zeros((C, P), dtype=np.float64, order="C")
+        else:
+            x0 = np.asarray(x0, np.float64).ravel(order="C")
+            if x0.size != C * P:
+                raise ValueError(
+                    f"x0 length {x0.size} != C*P={C*P}."
+                )
+            X_phys = x0.reshape(C, P)  # physical basis
+            if cp_flux_ref is not None:
+                x_CP = X_phys * cp_flux_ref
+            else:
+                x_CP = X_phys.copy(order="C")
+
+        # Small symmetry breaking if starting from exact zero
+        sym_eps = float(
+            os.environ.get("CUBEFIT_SYMBREAK_EPS", "1e-6")
+        )
+        sym_mode = os.environ.get(
+            "CUBEFIT_SYMBREAK_MODE", "qr"
+        ).lower()
+        if (
+            sym_eps > 0.0
+            and sym_mode != "off"
+            and (x0 is None or np.count_nonzero(x_CP) == 0)
+        ):
+            print("[Kaczmarz-GLOBAL] Applying symmetry breaking...",
+                  flush=True)
+            rng_sb = np.random.default_rng(
+                int(os.environ.get("CUBEFIT_SEED", "12345"))
+            )
+            if sym_mode == "qr":
+                Rmat = rng_sb.standard_normal((C, P))
+                Q, _ = np.linalg.qr(Rmat.T, mode="reduced")
+                Q = Q[:, :C].T  # (C, P)
+                x_CP += sym_eps * np.abs(Q)
+            else:
+                x_CP += sym_eps * rng_sb.random((C, P))
+            if cfg.project_nonneg:
+                np.maximum(x_CP, 0.0, out=x_CP)
+            print("[Kaczmarz-GLOBAL] done.", flush=True)
+
+        # This global-step solver ignores orbit_weights / ratio_cfg for now
+        have_ratio = False
+        w_prior = None
+
+        # ------------------- multiprocessing setup -------------------
+        print(
+            f"[Kaczmarz-GLOBAL] Spinning up workers with "
+            f"{cfg.processes} processes...",
+            flush=True,
+        )
+
+        nprocs_req = max(1, int(cfg.processes))
+        band_size = int(np.ceil(C / nprocs_req))
+        bands: list[tuple[int, int]] = []
+        c0 = 0
+        for _i in range(nprocs_req):
+            c1 = int(np.min((C, c0 + band_size)))
+            if c1 > c0:
+                bands.append((c0, c1))
+            c0 = c1
+        nprocs = len(bands)
+        print(
+            f"[Kaczmarz-GLOBAL] Using {nprocs} processes, "
+            f"band_size={band_size}.",
+            flush=True,
+        )
+
+        use_pool = nprocs > 1
+        if not use_pool:
+            print(
+                "[Kaczmarz-GLOBAL] Single-process mode "
+                "(no multiprocessing pool).",
+                flush=True,
+            )
+            pool = None
+        else:
+            ctx_name = os.environ.get(
+                "CUBEFIT_MP_CTX", "forkserver"
+            )
+            print(
+                f"[Kaczmarz-GLOBAL] Using multiprocessing context "
+                f"'{ctx_name}'",
+                flush=True,
+            )
+            try:
+                ctx = mp.get_context(ctx_name)
+            except ValueError:
+                print(
+                    "[Kaczmarz-GLOBAL] Context '{ctx_name}' unavailable; "
+                    "falling back to 'spawn'.",
+                    flush=True,
+                )
+                ctx = mp.get_context("spawn")
+
+            os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
+            os.environ.setdefault(
+                "OMP_NUM_THREADS", str(cfg.blas_threads)
+            )
+            os.environ.setdefault(
+                "OPENBLAS_NUM_THREADS", str(cfg.blas_threads)
+            )
+            os.environ.setdefault(
+                "MKL_NUM_THREADS", str(cfg.blas_threads)
+            )
+
+            max_tasks = int(
+                os.environ.get("CUBEFIT_WORKER_MAXTASKS", "0")
+            )
+            ping_timeout = float(
+                os.environ.get(
+                    "CUBEFIT_POOL_PING_TIMEOUT", "5.0"
+                )
+            )
+            renew_each_epoch = os.environ.get(
+                "CUBEFIT_POOL_RENEW_EVERY_EPOCH", "0"
+            ).lower() not in ("0", "false", "no", "off")
+
+            def _make_pool():
+                print(
+                    f"[Kaczmarz-GLOBAL] Creating pool with {nprocs} "
+                    f"workers...",
+                    flush=True,
+                )
+                ppool = ctx.Pool(
+                    processes=nprocs,
+                    initializer=_worker_init,
+                    initargs=(int(cfg.blas_threads),),
+                    maxtasksperchild=(
+                        None if max_tasks <= 0 else max_tasks
+                    ),
+                )
+                print("[Kaczmarz-GLOBAL] Pool created.", flush=True)
+                return ppool
+
+            pool = _make_pool()
+
+        want_shift_diag = os.environ.get(
+            "CUBEFIT_SHIFT_DIAG", "0"
+        ).lower() not in ("0", "false", "no", "off")
+
+        # Kacz-style global step hyperparameters
+        eps = float(os.environ.get("CUBEFIT_EPS", "1e-12"))
+        rel_zero = float(
+            os.environ.get("CUBEFIT_ZERO_COL_REL", "1e-12")
+        )
+        abs_zero = float(
+            os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-24")
+        )
+        kacz_l2 = float(
+            os.environ.get("CUBEFIT_KACZ_L2", "0.0")
+        )
+        if not np.isfinite(kacz_l2) or kacz_l2 < 0.0:
+            kacz_l2 = 0.0
+
+        # Optional orbit-mix projection strength (0 = off)
+        orbit_beta = float(
+            os.environ.get("CUBEFIT_ORBIT_BETA", "0.0")
+        )
+        if not np.isfinite(orbit_beta) or orbit_beta < 0.0:
+            orbit_beta = 0.0
+
+        rmse_cap = float(
+            os.environ.get("CUBEFIT_RMSE_ABORT", "0.0")
+        )
+
+        def _pool_ok(ppool, timeout=5.0) -> bool:
+            if ppool is None:
+                return True
+            try:
+                ppool.apply_async(lambda: None).get(timeout=timeout)
+                return True
+            except Exception:
+                return False
+
+        try:
+            for ep in range(cfg.epochs):
+                if use_pool:
+                    if (not _pool_ok(pool, timeout=ping_timeout)) or \
+                       renew_each_epoch:
+                        try:
+                            pool.close()
+                            pool.join()
+                        except Exception:
+                            try:
+                                pool.terminate()
+                            except Exception:
+                                pass
+                        pool = _make_pool()
+
+                # Global accumulators for this epoch
+                g_tot = np.zeros((C, P), dtype=np.float64)
+                D_tot = np.zeros((C, P), dtype=np.float64)
+                rmse_sum_sq = 0.0
+                rmse_count = 0
+
+                pbar = tqdm(
+                    total=len(s_ranges),
+                    desc=(
+                        f"[Kaczmarz-GLOBAL] epoch "
+                        f"{ep+1}/{cfg.epochs}"
+                    ),
+                    mininterval=2.0,
+                    dynamic_ncols=True,
+                )
+                pbar.refresh()
+
+                # Use a fixed LR per epoch for now
+                lr_epoch = float(cfg.lr)
+
+                for tile_idx, (s0, s1) in enumerate(s_ranges):
+                    Sblk = s1 - s0
+
+                    # ---------- Build residual R = Y - yhat ----------
+                    with open_h5(h5_path, role="reader") as f:
+                        DC = f["/DataCube"]
+                        M  = f["/HyperCube/models"]
+                        try:
+                            M.id.set_chunk_cache(
+                                cfg.dset_slots,
+                                cfg.dset_bytes,
+                                cfg.dset_w0,
+                            )
+                        except Exception:
+                            pass
+
+                        Y = np.asarray(
+                            DC[s0:s1, :], np.float64, order="C"
+                        )
+                        if keep_idx is not None:
+                            Y = Y[:, keep_idx]
+
+                        # Model prediction with current global x_CP
+                        yhat = np.zeros((Sblk, Lk), np.float64)
+                        for c in range(C):
+                            A = np.asarray(
+                                M[s0:s1, c, :, :],
+                                np.float32,
+                                order="C",
+                            )
+                            if keep_idx is not None:
+                                A = A[:, :, keep_idx]
+                            if cp_flux_ref is not None:
+                                A = (
+                                    A
+                                    * inv_cp_flux_ref[c, :][
+                                        None, :, None
+                                    ]
+                                )
+                            xc_norm = x_CP[c, :].astype(
+                                np.float64, copy=False
+                            )
+                            # yhat[s, :] += xc_norm @ A[s, :, :]
+                            yhat += np.tensordot(
+                                xc_norm, A, axes=(0, 1)
+                            )
+
+                        R = Y - yhat
+
+                    # Optional per-tile shift diagnostic
+                    if want_shift_diag and Sblk > 0:
+                        s_pick = s0
+                        try:
+                            y_obs = np.asarray(
+                                DC[s_pick, :], np.float64
+                            )
+                            if keep_idx is not None:
+                                y_obs = y_obs[keep_idx]
+                            y_fit = yhat[s_pick - s0, :]
+                            sh = _xcorr_int_shift(y_obs, y_fit)
+                            if sh != 0:
+                                print(
+                                    "[diag] spaxel {}: "
+                                    "data↔model integer shift "
+                                    "= {} px".format(
+                                        s_pick, int(sh)
+                                    ),
+                                    flush=True,
+                                )
+                        except Exception:
+                            pass
+
+                    # NaN/Inf guard on R
+                    if not np.all(np.isfinite(R)):
+                        bad = ~np.isfinite(R)
+                        n_bad = int(bad.sum())
+                        print(
+                            "[Kaczmarz-GLOBAL] WARNING: non-finite "
+                            f"residuals on tile {tile_idx} "
+                            f"(bad={n_bad}); zeroing.",
+                            flush=True,
+                        )
+                        R = np.nan_to_num(
+                            R,
+                            nan=0.0,
+                            posinf=0.0,
+                            neginf=0.0,
+                            copy=False,
+                        )
+
+                    # Per-tile RMSE (unweighted) before this global step
+                    rmse_before = float(
+                        np.sqrt(np.mean(R * R))
+                    )
+
+                    if (rmse_cap > 0.0) and (rmse_before > rmse_cap):
+                        if tracker is not None:
+                            tracker.on_batch_rmse(rmse_cap)
+                        # Skip this tile in gradient accumulation
+                        pbar.update(1)
+                        pbar.refresh()
+                        continue
+
+                    if tracker is not None:
+                        tracker.on_batch_rmse(rmse_before)
+
+                    # Accumulate into the epoch-level global RMSE proxy
+                    rmse_sum_sq += float(np.sum(R * R))
+                    rmse_count += int(R.size)
+
+                    # ---------- Gradient jobs for this tile ----------
+                    jobs = []
+                    inv_ref_band_full = (
+                        inv_cp_flux_ref
+                        if cp_flux_ref is not None
+                        else None
+                    )
+                    for (c_start, c_stop) in bands:
+                        x_band = x_CP[c_start:c_stop, :].copy(order="C")
+                        inv_ref_band = (
+                            inv_ref_band_full[c_start:c_stop, :]
+                            if inv_ref_band_full is not None
+                            else None
+                        )
+                        jobs.append(
+                            (
+                                h5_path,
+                                int(s0),
+                                int(s1),
+                                keep_idx,
+                                int(c_start),
+                                int(c_stop),
+                                x_band,
+                                R.copy(order="C"),
+                                w_lam_sqrt,
+                                inv_ref_band,
+                                cfg.dset_slots,
+                                cfg.dset_bytes,
+                                cfg.dset_w0,
+                            )
+                        )
+
+                    if use_pool:
+                        results = pool.map(
+                            _worker_tile_global_grad_band, jobs
+                        )
+                    else:
+                        results = [
+                            _worker_tile_global_grad_band(job)
+                            for job in jobs
+                        ]
+
+                    # Aggregate band contributions into global g_tot, D_tot
+                    for (c_start, c_stop), (g_band, D_band) in zip(
+                        bands, results
+                    ):
+                        c_start = int(c_start)
+                        c_stop = int(c_stop)
+                        g_tot[c_start:c_stop, :] += g_band
+                        D_tot[c_start:c_stop, :] += D_band
+
+                    if tracker is not None:
+                        tracker.on_progress(
+                            epoch=ep + 1,
+                            spax_done=tile_idx + 1,
+                            spax_total=len(s_ranges),
+                            rmse_ewma=None,
+                        )
+
+                    pbar.update(1)
+                    pbar.refresh()
+
+                pbar.close()
+
+                # --------- finalize epoch-level RMSE proxy ----------
+                if rmse_count > 0:
+                    mean_sq = rmse_sum_sq / float(rmse_count)
+                else:
+                    mean_sq = 0.0
+
+                if (not np.isfinite(mean_sq)) or (mean_sq < 0.0):
+                    print(
+                        "[Kaczmarz-GLOBAL] WARNING: epoch "
+                        f"{ep+1} RMSE(proxy) mean_sq={mean_sq!r} "
+                        "non-finite or negative; setting +inf.",
+                        flush=True,
+                    )
+                    rmse_epoch_proxy = float("inf")
+                else:
+                    rmse_epoch_proxy = float(np.sqrt(mean_sq))
+
+                print(
+                    "[Kaczmarz-GLOBAL] epoch {} RMSE(proxy) = "
+                    "{:.6e}".format(ep + 1, rmse_epoch_proxy),
+                    flush=True,
+                )
+
+                if tracker is not None:
+                    try:
+                        tracker.on_epoch_end(
+                            ep + 1,
+                            {"rmse_epoch_proxy": rmse_epoch_proxy},
+                            block=False,
+                        )
+                    except TypeError:
+                        tracker.on_epoch_end(
+                            ep + 1,
+                            {"rmse_epoch_proxy": rmse_epoch_proxy},
+                        )
+
+                # --------- global Kaczmarz-style update in x_CP -----
+                # Freeze numerically tiny columns based on global D_tot
+                D = np.asarray(D_tot, dtype=np.float64, order="C")
+                g = np.asarray(g_tot, dtype=np.float64, order="C")
+
+                if np.any(D > 0):
+                    med_energy = float(np.median(D[D > 0]))
+                else:
+                    med_energy = 0.0
+                tiny_col = np.max((abs_zero, rel_zero * med_energy))
+                freeze = D <= tiny_col
+                if freeze.any():
+                    g[freeze] = 0.0
+                    D = np.where(freeze, np.inf, D)
+
+                # Blend with global column energy to stabilize empty tiles
+                if E_global is not None:
+                    Eg = np.asarray(E_global, np.float64)
+                    if Eg.shape == D.shape:
+                        D = np.maximum(D, beta_blend * Eg)
+
+                # L2 term in the normalized basis (optional)
+                if kacz_l2 > 0.0:
+                    g -= kacz_l2 * x_CP
+
+                invD = 1.0 / np.maximum(D, eps)
+                dx = lr_epoch * (g * invD)
+
+                # Global trust region based on update energy and ||Y||
+                if (E_global is not None) and (Y_glob_norm > 0.0):
+                    Eg = np.asarray(E_global, np.float64)
+                    upd_energy_sq = float(
+                        np.sum((dx.astype(np.float64) ** 2) * Eg)
+                    )
+                else:
+                    upd_energy_sq = float(
+                        np.sum(dx.astype(np.float64) ** 2)
+                    )
+
+                if (upd_energy_sq > 0.0) and (Y_glob_norm > 0.0):
+                    global_step_norm = float(
+                        np.sqrt(upd_energy_sq)
+                    )
+                    cap = float(tau_global * Y_glob_norm)
+                    if global_step_norm > cap:
+                        alpha_glob = float(
+                            cap / np.maximum(global_step_norm, 1.0e-12)
+                        )
+                        dx *= alpha_glob
+
+                # Apply update with nonnegativity projection
+                if not np.all(np.isfinite(dx)):
+                    dx = np.nan_to_num(
+                        dx,
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                        copy=False,
+                    )
+
+                x_CP += dx
+                if cfg.project_nonneg:
+                    np.maximum(x_CP, 0.0, out=x_CP)
+
+                if not np.all(np.isfinite(x_CP)):
+                    bad = ~np.isfinite(x_CP)
+                    print(
+                        "[Kaczmarz-GLOBAL] WARNING: non-finite entries "
+                        f"in x_CP after update (bad={int(bad.sum())}); "
+                        "zeroing.",
+                        flush=True,
+                    )
+                    x_CP[bad] = 0.0
+
+                # Optional global projection toward orbit_weights
+                if (
+                    orbit_beta > 0.0
+                    and orbit_weights_arr is not None
+                    and E_global is not None
+                ):
+                    try:
+                        cu.project_to_component_weights(
+                            x_CP,
+                            orbit_weights_arr,
+                            E_cp=E_global,
+                            minw=1.0e-10,
+                            beta=float(orbit_beta),
+                        )
+                    except Exception as e:
+                        print(
+                            "[Kaczmarz-GLOBAL] WARNING: "
+                            "orbit_weights projection failed: "
+                            f"{e!r}",
+                            flush=True,
+                        )
+
+                # Snapshot after the global step
+                if tracker is not None:
+                    try:
+                        tracker.maybe_snapshot_x(
+                            x_CP,
+                            epoch=ep + 1,
+                            rmse=rmse_epoch_proxy,
+                            force=True,
+                        )
+                    except Exception:
+                        pass
+
+                print(
+                    "[Kaczmarz-GLOBAL] epoch {}/{} done.".format(
+                        ep + 1, cfg.epochs
+                    ),
+                    flush=True,
+                )
+
+            elapsed = time.perf_counter() - t0
+
+            # Convert back to physical basis
+            np.nan_to_num(
+                x_CP,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+                copy=False,
+            )
+
+            if cp_flux_ref is not None:
+                X_norm = x_CP
+                X_phys = X_norm * inv_cp_flux_ref
+            else:
+                X_phys = x_CP
+
+            x_out = np.asarray(
+                X_phys, np.float64, order="C"
+            ).ravel(order="C")
+
+            return x_out, dict(
+                epochs=cfg.epochs,
+                elapsed_sec=elapsed,
+            )
+        finally:
+            if use_pool and (pool is not None):
+                try:
+                    pool.close()
+                    pool.join()
+                except Exception:
+                    try:
+                        pool.terminate()
+                    except Exception:
+                        pass
+    except Exception:
+        print(
+            "[Kaczmarz-GLOBAL] FATAL exception in "
+            "solve_global_kaczmarz_global_step_mp:",
+            flush=True,
+        )
+        print(traceback.format_exc(), flush=True)
         raise
 
 # ------------------------------------------------------------------------------
