@@ -64,7 +64,11 @@ def main():
     os.environ['CUBEFIT_NNLS_SOLVER']='nnls'
     os.environ["CUBEFIT_USE_NNLS_PRIOR"] = "0"
     os.environ['CUBEFIT_NNLS_L2']=str(0)
-
+    os.environ["CUBEFIT_LAMBDA_WEIGHTS_ENABLE"] = "1"
+    os.environ["CUBEFIT_KACZ_L2"] = "0.0"
+    os.environ["CUBEFIT_RMSE_PROXY_GUARD"] = "0"
+    os.environ["CUBEFIT_NNLS_ENABLE"] = "0"             # no tile NNLS
+    os.environ["CUBEFIT_ORBIT_BETA"] = "0.0"
     print(props)
 
     try:
