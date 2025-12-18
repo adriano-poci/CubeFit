@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 
 from dynamics.IFU.Constants import Constants
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
+from CubeFit.hypercube_builder import read_global_column_energy
 from CubeFit.hdf5_manager import open_h5
 
 CTS = Constants()
@@ -1586,5 +1587,239 @@ def project_to_component_weights(
     np.nan_to_num(X_new, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
     x_cp[:] = X_new
+
+# ------------------------------------------------------------------------------
+
+def diagnose_zero_column_threshold(
+    h5_path: str,
+    rel_zero_candidates=None,
+    abs_zero: float = 1.0e-24,
+) -> None:
+    """
+    Diagnose the impact of the zero-column freeze threshold on this
+    HyperCube.
+
+    This inspects the global column energy array E_global(c,p) and reports
+    how many columns would be considered "tiny" for various choices of
+    rel_zero, using the same logic as the solver:
+
+        tiny_col = max(abs_zero, rel_zero * median(E_global[E_global>0])),
+        freeze_mask = (E_global <= tiny_col).
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the HDF5 file with /HyperCube and /HyperCube/col_energy.
+    rel_zero_candidates : sequence of float, optional
+        List of rel_zero values to test. If None, a default grid
+        [1e-12, 1e-11, ..., 1e-6] is used.
+    abs_zero : float, optional
+        Absolute floor for tiny_col, same meaning as in the solver.
+    """
+
+    if rel_zero_candidates is None:
+        rel_zero_candidates = np.logspace(-20, -2, num=int(19*2),
+            dtype=np.float64)
+
+    E_global = read_global_column_energy(h5_path)  # (C, P)
+    E = np.asarray(E_global, dtype=np.float64).ravel()
+
+    # Keep only positive, finite energies
+    mask_good = np.isfinite(E) & (E > 0.0)
+    E = E[mask_good]
+
+    if E.size == 0:
+        print(
+            "[diagnose_zero_column_threshold] No positive finite column "
+            "energies found."
+        )
+        return
+
+    med_energy = float(np.median(E))
+    q05 = float(np.quantile(E, 0.05))
+    q25 = float(np.quantile(E, 0.25))
+    q75 = float(np.quantile(E, 0.75))
+    q95 = float(np.quantile(E, 0.95))
+
+    print("[diagnose_zero_column_threshold] Global column energy stats:")
+    print(f"  N_cols   = {E.size}")
+    print(f"  min      = {float(E.min()):.3e}")
+    print(f"  5%       = {q05:.3e}")
+    print(f"  25%      = {q25:.3e}")
+    print(f"  median   = {med_energy:.3e}")
+    print(f"  75%      = {q75:.3e}")
+    print(f"  95%      = {q95:.3e}")
+    print(f"  max      = {float(E.max()):.3e}")
+    print()
+
+    for r in rel_zero_candidates:
+        if not np.isfinite(r) or r <= 0.0:
+            continue
+        tiny_col = float(max(abs_zero, r * med_energy))
+        frozen = int(np.count_nonzero(E <= tiny_col))
+        frac = frozen / float(E.size)
+        print(
+            f"  rel_zero = {r:9.1e} -> "
+            f"tiny_col = {tiny_col:.3e}, "
+            f"freeze {frozen:6d}/{E.size:6d} "
+            f"({100.0 * frac:6.3f} %)"
+        )
+
+# ------------------------------------------------------------------------------
+
+def diagnose_tile_col_denom_threshold(
+    h5_path: str,
+    *,
+    n_tiles: int = 8,
+    n_comps: int = 8,
+    seed: int = 12345,
+    rel_zero_grid: np.ndarray | None = None,
+    abs_zero: float | None = None,
+    mask_dset: str = "/Mask",
+    models_dset: str = "/HyperCube/models",
+    lamw_dset: str = "/HyperCube/lambda_weights",
+) -> dict:
+    """
+    Diagnose a reasonable ZERO_COL_REL based on tile-local denominators.
+
+    This samples a subset of spatial tiles and components, computes the
+    tile-local per-population denominator:
+
+        col_denom[p] = sum_{s,λ} ( (sqrt(w_λ) * A[s,p,λ])^2 )
+
+    and then evaluates freeze fractions for a grid of rel_zero values using:
+
+        tiny_col = max(abs_zero, rel_zero * median(col_denom[col_denom>0]))
+
+    Parameters
+    ----------
+    h5_path
+        Path to the CubeFit HDF5 file.
+    n_tiles
+        Number of spatial tiles to sample (uniform random).
+    n_comps
+        Number of components to sample (uniform random).
+    seed
+        RNG seed for reproducibility.
+    rel_zero_grid
+        Grid of rel_zero values to test. If None, uses a log grid.
+    abs_zero
+        Absolute floor. If None, read from env default (1e-24 behavior).
+    mask_dset
+        Mask dataset path, if present.
+    models_dset
+        HyperCube models dataset path.
+    lamw_dset
+        Lambda-weights dataset path (optional). If missing, weights=1.
+
+    Returns
+    -------
+    out : dict
+        Contains sampled denom statistics and freeze fractions.
+
+    Notes
+    -----
+    This is intended for choosing rel_zero. It does not run the solver.
+    """
+    if rel_zero_grid is None:
+        rel_zero_grid = np.logspace(-15, -2, 25)
+    rel_zero_grid = np.asarray(rel_zero_grid, dtype=np.float64)
+
+    if abs_zero is None:
+        abs_zero = 1.0e-24
+
+    rng = np.random.default_rng(int(seed))
+
+    with open_h5(h5_path, role="reader") as f:
+        M = f[models_dset]
+        S, C, P, L = map(int, M.shape)
+
+        # Mask -> keep_idx
+        keep_idx = None
+        if mask_dset in f:
+            mask = np.asarray(f[mask_dset][...], bool).ravel()
+            keep_idx = np.flatnonzero(mask)
+            Lk = int(keep_idx.size)
+        else:
+            Lk = L
+
+        # Lambda weights -> sqrt weights on kept grid
+        w_lam_sqrt = None
+        if lamw_dset in f:
+            w_full = np.asarray(f[lamw_dset][...], np.float64).ravel()
+            if w_full.size == L:
+                w = w_full[keep_idx] if keep_idx is not None else w_full
+                w_lam_sqrt = np.sqrt(np.clip(w, 1e-12, None)).astype(np.float64)
+
+        # Tile ranges from chunking (fallback 128)
+        s_tile = int(M.chunks[0]) if (M.chunks and M.chunks[0] > 0) else 128
+        s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
+
+        # Sample tiles/components
+        tile_idx = rng.choice(len(s_ranges),
+                              size=min(n_tiles, len(s_ranges)),
+                              replace=False)
+        comp_idx = rng.choice(C, size=min(n_comps, C), replace=False)
+
+        denoms = []
+
+        for ti in tile_idx:
+            s0, s1 = s_ranges[int(ti)]
+            for c in comp_idx:
+                A = np.asarray(M[s0:s1, int(c), :, :], np.float32, order="C")
+                if keep_idx is not None:
+                    A = A[:, :, keep_idx]  # (Sblk, P, Lk)
+
+                if w_lam_sqrt is not None:
+                    Aw = A * w_lam_sqrt[None, None, :]
+                else:
+                    Aw = A
+
+                # col_denom over (s,λ)
+                col_denom = np.sum(np.square(Aw, dtype=np.float64), axis=(0, 2))
+                denoms.append(col_denom.astype(np.float64, copy=False))
+
+        den = np.concatenate(denoms, axis=0) if denoms else np.zeros((0,))
+        den_pos = den[den > 0.0]
+
+        if den_pos.size == 0:
+            med = 0.0
+            q = {}
+        else:
+            med = float(np.median(den_pos))
+            q = {
+                "min": float(np.min(den_pos)),
+                "p05": float(np.percentile(den_pos, 5)),
+                "p25": float(np.percentile(den_pos, 25)),
+                "median": float(np.median(den_pos)),
+                "p75": float(np.percentile(den_pos, 75)),
+                "p95": float(np.percentile(den_pos, 95)),
+                "max": float(np.max(den_pos)),
+            }
+
+        rows = []
+        for rz in rel_zero_grid:
+            tiny_col = float(max(abs_zero, float(rz) * med))
+            frz = int(np.count_nonzero(den <= tiny_col))
+            tot = int(den.size)
+            pct = 0.0 if tot == 0 else 100.0 * frz / tot
+            rows.append((float(rz), tiny_col, frz, tot, pct))
+
+    out = {
+        "sampled_tiles": int(len(tile_idx)),
+        "sampled_components": int(len(comp_idx)),
+        "stats_pos": q,
+        "rows": rows,
+    }
+
+    print("[diagnose_tile_col_denom_threshold] denom stats (positive only):")
+    for k, v in q.items():
+        print(f"  {k:>7s} = {v:.3e}")
+    print("")
+    for rz, tiny, frz, tot, pct in rows:
+        print(f"  rel_zero={rz:9.2e} -> tiny_col={tiny:9.3e}, "
+              f"freeze {frz:6d}/{tot:6d} ({pct:6.3f} %)")
+
+    return out
 
 # ------------------------------------------------------------------------------
