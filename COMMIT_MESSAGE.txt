@@ -1,1 +1,2 @@
-* Added tiny-column freeze inside `kaczmarz_solver_cchunk_mp_nnls._worker_tile_global_grad_band`
+* Implemented mtime-based decision for sidecar vs main file loading in
+            `pipeline_runner.solve_all*` resume logic
