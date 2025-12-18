@@ -38,6 +38,8 @@ v1.6:   Updated `solve_all_mp_batched` `warm_start` options to match `solve_all`
             12 December 2025
 v1.7:   Read in NNLs `L2` ridge from environment variable in
             `solve_all_mp_batched`. 13 December 2025
+v1.8:   Implemented mtime-based decision for sidecar vs main file loading in
+            `solve_all*` resume logic. 18 December 2025
 """
 
 from __future__ import annotations
@@ -357,38 +359,158 @@ class PipelineRunner:
 
     @staticmethod
     def _read_latest_from_sidecar(sidecar_path: str, N_expected: int):
-        with open_h5(sidecar_path, role="reader") as g:
-            def _try(name):
-                if name in g:
-                    v = np.asarray(g[name][...], np.float64, order="C")
-                    return v if v.size == N_expected else None
-                return None
-            x = _try("/Fit/x_best")
-            src = "/Fit/x_best" if x is not None else None
-            if x is None:
-                x = _try("/Fit/x_last")
-                src = "/Fit/x_last" if x is not None else None
-            if x is None and "/Fit/x_hist" in g and g["/Fit/x_hist"].shape[0] > 0:
-                v = np.asarray(g["/Fit/x_hist"][-1, ...], np.float64,
-                               order="C")
-                if v.size == N_expected:
-                    x, src = v, "/Fit/x_hist[-1]"
-            return x, src
+        """
+        Read the most recent solution vector from a FitTracker sidecar file.
 
-    @staticmethod
-    def _read_latest_from_main(main_path: str, N_expected: int):
-        xb = xl = None
-        with open_h5(main_path, role="reader") as f_ro:
-            if "/Fit/x_best" in f_ro:
-                v = np.asarray(f_ro["/Fit/x_best"][...], np.float64,
-                               order="C")
-                if v.size == N_expected: xb = v
-            if "/X_global" in f_ro and xb is None:
-                v = np.asarray(f_ro["/X_global"][...], np.float64, order="C")
-                if v.size == N_expected: xl = v
-        if xb is not None: return xb, "/Fit/x_best"
-        if xl is not None: return xl, "/X_global"
+        For *resume semantics* we prefer the latest checkpoint, not the
+        best-so-far checkpoint. So we try, in order:
+
+        1) /Fit/x_last
+        2) /Fit/x_epoch_last
+        3) /Fit/x_snapshots[-1]
+        4) /Fit/x_best
+        5) /Fit/x_hist[-1] (legacy)
+
+        Parameters
+        ----------
+        sidecar_path : str
+            Path to the sidecar HDF5 file: <main>.fit.<pid>.<ts>.h5
+        N_expected : int
+            Expected flattened size (C*P).
+
+        Returns
+        -------
+        x : ndarray[float64] or None
+            Flattened solution vector of length N_expected, if found.
+        src : str or None
+            Dataset label used to load x (for logging).
+        """
+        if (sidecar_path is None) or (not os.path.exists(sidecar_path)):
+            return None, None
+
+        def _read_flat(g, name: str):
+            if name not in g:
+                return None
+            ds = g[name]
+            try:
+                if ds.ndim == 2 and ds.shape[0] > 0:
+                    v = np.asarray(ds[-1, :], np.float64, order="C")
+                else:
+                    v = np.asarray(ds[...], np.float64, order="C")
+            except Exception:
+                return None
+
+            v = np.asarray(v, np.float64).ravel(order="C")
+            if v.size != int(N_expected):
+                return None
+            return v
+
+        with open_h5(sidecar_path, role="reader", swmr=True) as g:
+            # Prefer latest progress for resume.
+            v = _read_flat(g, "/Fit/x_last")
+            if v is not None:
+                return v, "/Fit/x_last"
+
+            v = _read_flat(g, "/Fit/x_epoch_last")
+            if v is not None:
+                return v, "/Fit/x_epoch_last"
+
+            if "/Fit/x_snapshots" in g and g["/Fit/x_snapshots"].shape[0] > 0:
+                ds = g["/Fit/x_snapshots"]
+                try:
+                    v = np.asarray(ds[-1, :], np.float64, order="C")
+                    v = v.ravel(order="C")
+                    if v.size == int(N_expected):
+                        return v, "/Fit/x_snapshots[-1]"
+                except Exception:
+                    pass
+
+            # Fallback to best-so-far.
+            v = _read_flat(g, "/Fit/x_best")
+            if v is not None:
+                return v, "/Fit/x_best"
+
+            # Legacy fallback.
+            if "/Fit/x_hist" in g and g["/Fit/x_hist"].shape[0] > 0:
+                ds = g["/Fit/x_hist"]
+                try:
+                    v = np.asarray(ds[-1, :], np.float64, order="C")
+                    v = v.ravel(order="C")
+                    if v.size == int(N_expected):
+                        return v, "/Fit/x_hist[-1]"
+                except Exception:
+                    pass
+
         return None, None
+
+@staticmethod
+def _read_latest_from_main(h5_path: str, N_expected: int):
+    """
+    Read the best available solution vector from the *main* HDF5.
+
+    Priority is "most resume-correct" first:
+      1) /Fit/x_last
+      2) /Fit/x_epoch_last
+      3) /X_global
+      4) /Fit/x_best
+      5) legacy fallbacks
+
+    Returns
+    -------
+    x : ndarray[float64] or None
+        Flattened solution vector (length N_expected), if found.
+    src : str or None
+        Dataset label used to load x (for logging).
+    """
+    if (h5_path is None) or (not os.path.exists(h5_path)):
+        return None, None
+
+    def _read_flat(f, name: str):
+        if name not in f:
+            return None
+        ds = f[name]
+        try:
+            if ds.ndim == 2 and ds.shape[0] > 0:
+                v = np.asarray(ds[-1, :], np.float64, order="C")
+            else:
+                v = np.asarray(ds[...], np.float64, order="C")
+        except Exception:
+            return None
+
+        v = np.asarray(v, np.float64).ravel(order="C")
+        if v.size != int(N_expected):
+            return None
+        if not np.all(np.isfinite(v)):
+            v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+        return v
+
+    with open_h5(h5_path, role="reader", swmr=True) as f:
+        # Resume-correct (if present)
+        v = _read_flat(f, "/Fit/x_last")
+        if v is not None:
+            return v, "/Fit/x_last"
+
+        v = _read_flat(f, "/Fit/x_epoch_last")
+        if v is not None:
+            return v, "/Fit/x_epoch_last"
+
+        # Canonical committed solution
+        v = _read_flat(f, "/X_global")
+        if v is not None:
+            return v, "/X_global"
+
+        # Best-so-far fallback (if you keep it in main)
+        v = _read_flat(f, "/Fit/x_best")
+        if v is not None:
+            return v, "/Fit/x_best"
+
+        # Legacy candidates (only if they exist in your file)
+        for name in ("/X_best", "/X_last", "/Fit/x_hist"):
+            v = _read_flat(f, name)
+            if v is not None:
+                return v, name
+
+    return None, None
 
     def _read_seed_from_h5(self,
                         h5_path: str,
@@ -516,45 +638,95 @@ class PipelineRunner:
 
         elif warm_start == "resume":
             sidecar = cu._find_latest_sidecar(self.h5_path)
+
+            # Always define these (avoids UnboundLocalError patterns).
             x_side, src_side = (None, None)
-            if sidecar is not None:
+            x_main, src_main = (None, None)
+            x_seed, src_seed = (None, None)
+
+            # Candidate 1: newest sidecar (by filename/mtime), but may not exist.
+            if sidecar is not None and os.path.exists(sidecar):
                 x_side, src_side = self._read_latest_from_sidecar(
                     sidecar, N_expected
                 )
-            x_main, src_main = self._read_latest_from_main(self.h5_path,
-                                                           N_expected)
 
+            # Candidate 2: main file (committed solution).
+            x_main, src_main = self._read_latest_from_main(
+                self.h5_path, N_expected
+            )
+
+            def _safe_mtime(path: str | None) -> float:
+                if not path:
+                    return -np.inf
+                try:
+                    return float(os.path.getmtime(path))
+                except Exception:
+                    return -np.inf
+
+            def _try_epoch(path: str | None, dset: str | None) -> float | None:
+                if (path is None) or (dset is None):
+                    return None
+                try:
+                    with open_h5(path, role="reader", swmr=True) as f:
+                        if dset in f:
+                            e = f[dset].attrs.get("epoch", None)
+                            if e is None:
+                                return None
+                            e = float(e)
+                            return e if np.isfinite(e) else None
+                except Exception:
+                    return None
+                return None
+
+            # Decide: newest progress (prefer higher epoch if both have it;
+            # otherwise prefer newer file mtime).
             choose_side = False
             if x_side is not None and x_main is None:
-                choose_side = True  # prefer main unless missing
+                choose_side = True
+            elif x_side is None and x_main is not None:
+                choose_side = False
+            elif x_side is not None and x_main is not None:
+                e_side = _try_epoch(sidecar, src_side)
+                e_main = _try_epoch(self.h5_path, src_main)
+
+                if (e_side is not None) and (e_main is not None) and (e_side != e_main):
+                    choose_side = (e_side > e_main)
+                else:
+                    choose_side = (_safe_mtime(sidecar) > _safe_mtime(self.h5_path))
 
             x0_effective, src_label, src_file = (
                 (x_side, src_side, sidecar) if choose_side
                 else (x_main, src_main, self.h5_path)
             )
 
-            # Fallback: /Seeds/x0_nnls_patch
+            # Fallback: seed (optional but robust).
+            seed_used = False
             if x0_effective is None:
-                seed_path = os.environ.get("CUBEFIT_SEED_PATH",
-                                           "/Seeds/x0_nnls_patch")
-                x_seed, src_seed = self._read_seed_from_h5(self.h5_path,
-                                                           N_expected,
-                                                           dset=seed_path)
+                seed_path = os.environ.get("CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch")
+                x_seed, src_seed = self._read_seed_from_h5(
+                    self.h5_path, N_expected, dset=seed_path
+                )
                 if x_seed is not None:
                     x0_effective = x_seed
+                    src_label = src_seed
+                    src_file = self.h5_path
+                    choose_side = False
+                    seed_used = True
                     if verbose:
-                        logger.log("[Pipeline] Warm-start fallback from seed "
-                                   f"{src_seed} (n={x0_effective.size}).")
+                        logger.log(
+                            "[Pipeline] Warm-start fallback from seed "
+                            f"{src_seed} (n={x0_effective.size})."
+                        )
 
-            if x0_effective is not None and verbose:
-                if x0_effective is x_seed:
-                    pass
-                else:
-                    logger.log(
-                        f"[Pipeline] Warm-start from {src_label} "
-                        f"({'sidecar' if choose_side else 'main'}: "
-                        f"{src_file}) (n={x0_effective.size})."
-                    )
+            if x0_effective is not None and verbose and (not seed_used):
+                t_side = _safe_mtime(sidecar) if sidecar else -np.inf
+                t_main = _safe_mtime(self.h5_path)
+                logger.log(
+                    f"[Pipeline] Warm-start from {src_label} "
+                    f"({'sidecar' if choose_side else 'main'}: {src_file}) "
+                    f"(n={x0_effective.size}); "
+                    f"mtime(sidecar)={t_side:.0f}, mtime(main)={t_main:.0f}."
+                )
 
         elif warm_start == "nnls":
             if verbose:
@@ -783,56 +955,94 @@ class PipelineRunner:
         elif warm_start == "resume":
             sidecar = cu._find_latest_sidecar(self.h5_path)
 
-            # Ensure these are always defined
+            # Always define these (avoids UnboundLocalError patterns).
             x_side, src_side = (None, None)
+            x_main, src_main = (None, None)
             x_seed, src_seed = (None, None)
 
-            if sidecar is not None:
+            # Candidate 1: newest sidecar (by filename/mtime), but may not exist.
+            if sidecar is not None and os.path.exists(sidecar):
                 x_side, src_side = self._read_latest_from_sidecar(
                     sidecar, N_expected
                 )
 
+            # Candidate 2: main file (committed solution).
             x_main, src_main = self._read_latest_from_main(
                 self.h5_path, N_expected
             )
 
-            choose_side = True
+            def _safe_mtime(path: str | None) -> float:
+                if not path:
+                    return -np.inf
+                try:
+                    return float(os.path.getmtime(path))
+                except Exception:
+                    return -np.inf
+
+            def _try_epoch(path: str | None, dset: str | None) -> float | None:
+                if (path is None) or (dset is None):
+                    return None
+                try:
+                    with open_h5(path, role="reader", swmr=True) as f:
+                        if dset in f:
+                            e = f[dset].attrs.get("epoch", None)
+                            if e is None:
+                                return None
+                            e = float(e)
+                            return e if np.isfinite(e) else None
+                except Exception:
+                    return None
+                return None
+
+            # Decide: newest progress (prefer higher epoch if both have it;
+            # otherwise prefer newer file mtime).
+            choose_side = False
             if x_side is not None and x_main is None:
-                # Prefer main unless missing
                 choose_side = True
+            elif x_side is None and x_main is not None:
+                choose_side = False
+            elif x_side is not None and x_main is not None:
+                e_side = _try_epoch(sidecar, src_side)
+                e_main = _try_epoch(self.h5_path, src_main)
+
+                if (e_side is not None) and (e_main is not None) and (e_side != e_main):
+                    choose_side = (e_side > e_main)
+                else:
+                    choose_side = (_safe_mtime(sidecar) > _safe_mtime(self.h5_path))
 
             x0_effective, src_label, src_file = (
-                (x_side, src_side, sidecar)
-                if choose_side
+                (x_side, src_side, sidecar) if choose_side
                 else (x_main, src_main, self.h5_path)
             )
 
-            # Fallback: /Seeds/x0_nnls_patch
+            # Fallback: seed (optional but robust).
+            seed_used = False
             if x0_effective is None:
-                seed_path = os.environ.get(
-                    "CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch"
-                )
+                seed_path = os.environ.get("CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch")
                 x_seed, src_seed = self._read_seed_from_h5(
                     self.h5_path, N_expected, dset=seed_path
                 )
                 if x_seed is not None:
                     x0_effective = x_seed
+                    src_label = src_seed
+                    src_file = self.h5_path
+                    choose_side = False
+                    seed_used = True
                     if verbose:
                         logger.log(
                             "[Pipeline] Warm-start fallback from seed "
                             f"{src_seed} (n={x0_effective.size})."
                         )
 
-            if x0_effective is not None and verbose:
-                # If we already logged the seed fallback, do not log again
-                if x0_effective is x_seed:
-                    pass
-                else:
-                    logger.log(
-                        f"[Pipeline] Warm-start from {src_label} "
-                        f"({'sidecar' if choose_side else 'main'}: "
-                        f"{src_file}) (n={x0_effective.size})."
-                    )
+            if x0_effective is not None and verbose and (not seed_used):
+                t_side = _safe_mtime(sidecar) if sidecar else -np.inf
+                t_main = _safe_mtime(self.h5_path)
+                logger.log(
+                    f"[Pipeline] Warm-start from {src_label} "
+                    f"({'sidecar' if choose_side else 'main'}: {src_file}) "
+                    f"(n={x0_effective.size}); "
+                    f"mtime(sidecar)={t_side:.0f}, mtime(main)={t_main:.0f}."
+                )
 
         elif warm_start == "nnls":
             if verbose:
