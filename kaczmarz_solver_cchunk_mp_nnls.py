@@ -37,6 +37,8 @@ v1.5:   Use RMSE proxy as guard for epoch solution. 15 December 2025
 v2.0:   Implemented global Kaczmarz gradient instead of per-tile updates; added
             `_worker_tile_global_grad_band` and
             `solve_global_kaczmarz_global_step_mp`. 16 December 2025
+v2.1:   Added tiny-column freeze inside `_worker_tile_global_grad_band`. 18
+            December 2025
 """
 
 from __future__ import annotations, print_function
@@ -381,6 +383,41 @@ def _compute_global_rmse(
 
     return float(math.sqrt(num / float(den)))
 
+# ------------------------------------------------------------------------------
+
+def _tiny_col_freeze_inplace(col_denom, grad, rel_zero, abs_zero):
+    """
+    Freeze numerically tiny / unsupported columns for a given tile-band.
+
+    Parameters
+    ----------
+    col_denom : (P,) float array
+        Per-column denominator computed on the SAME weighted/scaled A used for
+        the gradient (e.g. after cp_flux_ref scaling and λ-weighting).
+    grad : (P,) float array
+        Per-column gradient/numerator (same space as col_denom).
+    rel_zero : float
+        Relative threshold multiplier applied to median positive denom.
+    abs_zero : float
+        Absolute floor threshold.
+    """
+    # robust median on strictly-positive finite entries
+    good = np.isfinite(col_denom) & (col_denom > 0.0)
+    if np.any(good):
+        med_energy = float(np.median(col_denom[good]))
+    else:
+        med_energy = 0.0
+
+    tiny_col = float(max(abs_zero, rel_zero * med_energy))
+
+    # freeze non-finite or tiny denom
+    freeze = (~np.isfinite(col_denom)) | (col_denom <= tiny_col)
+    if np.any(freeze):
+        grad[freeze] = 0.0
+        col_denom[freeze] = np.inf
+
+    return freeze, tiny_col, med_energy
+
 # ---------------------------- Worker ---------------------------------
 
 def _worker_tile_global_grad_band(args):
@@ -399,47 +436,23 @@ def _worker_tile_global_grad_band(args):
     and A already includes any column-flux normalization in the "model"
     basis.
 
-    Parameters
-    ----------
-    args : tuple
-        (h5_path, s0, s1, keep_idx,
-         c_start, c_stop,
-         x_band,
-         R_tile,
-         w_lam_sqrt,
-         inv_ref_band,
-         dset_slots, dset_bytes, dset_w0)
+    Additionally, this worker can apply a tile-local "tiny-column freeze"
+    safety guard: columns with numerically tiny denom are zeroed in the
+    numerator and excluded from the denom accumulator for this tile. This
+    prevents large/noisy updates later when the coordinator forms
+    invD = 1/max(D, eps).
 
-        h5_path : str
-            Path to the HDF5 file with /DataCube and /HyperCube/models.
-        s0, s1 : int
-            Spatial index range [s0, s1) for this tile.
-        keep_idx : ndarray[int] or None
-            Wavelength mask indices, or None for full λ-range.
-        c_start, c_stop : int
-            Inclusive/exclusive component index range for this band.
-        x_band : ndarray, shape (band_size, P), float64
-            Current normalized weights for this band (x_CP[c_start:c_stop,:]).
-            Included here mainly for future extensions (e.g. L2); not used
-            directly in the gradient.
-        R_tile : ndarray, shape (Sblk, Lk), float64
-            Current residual R = Y - yhat for this tile, unweighted but
-            already masked to Lk.
-        w_lam_sqrt : ndarray or None
-            √(λ-weights) on the masked λ-grid, or None for unweighted LS.
-        inv_ref_band : ndarray, shape (band_size, P) or None
-            If column-flux normalization is active, this contains
-            inv_cp_flux_ref[c_start:c_stop, :]; otherwise None.
-        dset_slots, dset_bytes, dset_w0 : HDF5 chunk-cache knobs.
+    Control knobs (env)
+    -------------------
+    CUBEFIT_ZERO_FREEZE_ENABLE : {0,1} (default 1)
+        Enable/disable tile-local freeze.
+    CUBEFIT_ZERO_COL_REL : float (default 1e-12)
+    CUBEFIT_ZERO_COL_ABS : float (default 1e-24)
 
     Returns
     -------
     g_band : ndarray, shape (band_size, P), float64
-        Band-local contribution to the global gradient accumulator:
-        g_band[c_rel, p] = Σ_{tile} (√w A)^T (√w R).
     D_band : ndarray, shape (band_size, P), float64
-        Band-local contribution to the diagonal preconditioner:
-        D_band[c_rel, p] = Σ_{tile} (√w A)^2.
     """
     (h5_path, s0, s1, keep_idx,
      c_start, c_stop,
@@ -450,6 +463,12 @@ def _worker_tile_global_grad_band(args):
      dset_slots, dset_bytes, dset_w0) = args
 
     eps = float(os.environ.get("CUBEFIT_EPS", "1e-12"))
+
+    freeze_enable = os.environ.get(
+        "CUBEFIT_ZERO_FREEZE_ENABLE", "1"
+    ).lower() not in ("0", "false", "no", "off")
+    rel_zero = float(os.environ.get("CUBEFIT_ZERO_COL_REL", "1e-12"))
+    abs_zero = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-24"))
 
     # Shapes
     R_tile = np.asarray(R_tile, dtype=np.float64, order="C")
@@ -463,7 +482,6 @@ def _worker_tile_global_grad_band(args):
                 f"_worker_tile_global_grad_band: w_lam_sqrt length "
                 f"{wvec.size} != Lk={Lk}"
             )
-        # Weighted residual
         Rw = R_tile * wvec[None, :]
     else:
         wvec = None
@@ -503,27 +521,46 @@ def _worker_tile_global_grad_band(args):
             else:
                 A_w = A
 
-            # Gradient contribution: g_p = Σ_{s,λ} A_w[s,p,λ] * Rw[s,λ]
-            # We can do this as a double contraction over s and λ.
-            g_band[bi, :] = np.tensordot(
-                A_w, Rw, axes=([0, 2], [0, 1])
-            )
+            # g_row[p] = Σ_{s,λ} A_w[s,p,λ] * Rw[s,λ]
+            g_row = np.tensordot(A_w, Rw, axes=([0, 2], [0, 1]))
 
-            # Diagonal preconditioner: D_p = Σ_{s,λ} (A_w[s,p,λ])^2
-            D_band[bi, :] = np.sum(
-                np.square(A_w, dtype=np.float64), axis=(0, 2)
-            )
+            # D_row[p] = Σ_{s,λ} (A_w[s,p,λ])^2
+            D_row = np.sum(np.square(A_w, dtype=np.float64), axis=(0, 2))
 
-    # Small numerical guard: avoid negative or non-finite entries
+            # ---- Tiny-column freeze (tile-local) -------------------------
+            # Use the existing helper. It sets denom[frozen]=inf; for a
+            # global accumulator we instead want to *exclude* this tile’s
+            # contribution, so we revert denom[frozen] -> 0 before storing.
+            if freeze_enable:
+                freeze, _, _ = _tiny_col_freeze_inplace(
+                    D_row, g_row, rel_zero, abs_zero
+                )
+                if np.any(freeze):
+                    D_row[freeze] = 0.0
+
+            g_band[bi, :] = g_row
+            D_band[bi, :] = D_row
+
+    # Numerical guards
     if not np.all(np.isfinite(g_band)):
         g_band = np.nan_to_num(
             g_band, nan=0.0, posinf=0.0, neginf=0.0, copy=False
         )
+
+    # For D: keep zeros (they are meaningful), but sanitize NaN/Inf.
     if not np.all(np.isfinite(D_band)):
         D_band = np.nan_to_num(
             D_band, nan=0.0, posinf=0.0, neginf=0.0, copy=False
         )
-        D_band = np.maximum(D_band, eps)
+
+    # Ensure no negative denom from numerical noise
+    np.maximum(D_band, 0.0, out=D_band)
+
+    # Optional hard floor (only if you later invert without g-masking);
+    # here we do NOT force a floor, because g has been frozen where denom
+    # is tiny/invalid.
+    if not np.isfinite(eps) or eps <= 0.0:
+        eps = 1e-12
 
     return g_band, D_band
 
@@ -2676,16 +2713,18 @@ def solve_global_kaczmarz_global_step_mp(
         ).lower() not in ("0", "false", "no", "off")
 
         # Kacz-style global step hyperparameters
-        eps = float(os.environ.get("CUBEFIT_EPS", "1e-12"))
-        rel_zero = float(
-            os.environ.get("CUBEFIT_ZERO_COL_REL", "1e-12")
-        )
-        abs_zero = float(
-            os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-24")
-        )
-        kacz_l2 = float(
-            os.environ.get("CUBEFIT_KACZ_L2", "0.0")
-        )
+        eps      = float(os.environ.get("CUBEFIT_EPS", "1e-12"))
+        rel_zero = float(os.environ.get("CUBEFIT_ZERO_COL_REL", "1e-12"))
+        abs_zero = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-24"))
+
+        # Allow disabling the tiny-column freeze for diagnostics.
+        # If CUBEFIT_ZERO_COL_FREEZE in {0, false, no, off}, no columns are
+        # frozen based on (rel_zero, abs_zero).
+        zero_col_freeze = os.environ.get(
+            "CUBEFIT_ZERO_COL_FREEZE", "1"
+        ).lower() not in ("0", "false", "no", "off")
+
+        kacz_l2 = float(os.environ.get("CUBEFIT_KACZ_L2", "0.0"))
         if not np.isfinite(kacz_l2) or kacz_l2 < 0.0:
             kacz_l2 = 0.0
 
@@ -2959,15 +2998,16 @@ def solve_global_kaczmarz_global_step_mp(
                 D = np.asarray(D_tot, dtype=np.float64, order="C")
                 g = np.asarray(g_tot, dtype=np.float64, order="C")
 
-                if np.any(D > 0):
+                # Freeze numerically tiny columns globally (optional)
+                if zero_col_freeze and np.any(D > 0):
                     med_energy = float(np.median(D[D > 0]))
+                    tiny_col = np.max((abs_zero, rel_zero * med_energy))
+                    freeze = D <= tiny_col
+                    if freeze.any():
+                        g[freeze] = 0.0
+                        D = np.where(freeze, np.inf, D)
                 else:
-                    med_energy = 0.0
-                tiny_col = np.max((abs_zero, rel_zero * med_energy))
-                freeze = D <= tiny_col
-                if freeze.any():
-                    g[freeze] = 0.0
-                    D = np.where(freeze, np.inf, D)
+                    tiny_col = 0.0  # not used, kept for potential logging
 
                 # Blend with global column energy to stabilize empty tiles
                 if E_global is not None:
@@ -2975,14 +3015,72 @@ def solve_global_kaczmarz_global_step_mp(
                     if Eg.shape == D.shape:
                         D = np.maximum(D, beta_blend * Eg)
 
-                # L2 term in the normalized basis (optional)
+                # Optional L2 term in the normalized basis
                 if kacz_l2 > 0.0:
                     g -= kacz_l2 * x_CP
 
                 invD = 1.0 / np.maximum(D, eps)
-                dx = lr_epoch * (g * invD)
 
-                # Global trust region based on update energy and ||Y||
+                # ---- Adaptive effective learning rate for this epoch ----
+                # Base step for lr=1.0
+                dx_base = g * invD
+
+                # Compute its energy in the same metric as the trust region
+                if E_global is not None:
+                    Eg = np.asarray(E_global, np.float64)
+                    upd_energy_sq_base = float(
+                        np.sum((dx_base.astype(np.float64) ** 2) * Eg)
+                    )
+                else:
+                    upd_energy_sq_base = float(
+                        np.sum(dx_base.astype(np.float64) ** 2)
+                    )
+
+                # Decide how aggressively we want to move relative to the
+                # global trust cap. target_frac <= 1.0 means "aim for this
+                # fraction of the cap when lr=effective_lr".
+                target_frac = float(
+                    os.environ.get("CUBEFIT_GLOBAL_STEP_FRAC", "0.3")
+                )
+                if (not np.isfinite(target_frac)) or (target_frac <= 0.0):
+                    target_frac = 0.3
+                if target_frac > 1.0:
+                    target_frac = 1.0
+
+                # Compute an effective lr that would give
+                # global_step_norm ≈ target_frac * tau_global * ||Y||
+                if (upd_energy_sq_base > 0.0) and (Y_glob_norm > 0.0):
+                    global_step_norm_base = float(
+                        np.sqrt(upd_energy_sq_base)
+                    )
+                    cap = float(tau_global * Y_glob_norm)
+                    lr_auto = (
+                        target_frac * cap
+                        / max(global_step_norm_base, 1.0e-12)
+                    )
+                    # Respect cfg.lr as a ceiling
+                    lr_eff = float(min(cfg.lr, lr_auto))
+                else:
+                    lr_eff = float(cfg.lr)
+
+                # Build the step with the per-epoch effective lr
+                dx = lr_eff * dx_base
+
+                # Optional debug print
+                print(
+                    "[Kaczmarz-GLOBAL] epoch {}: lr_eff={:.3e}, "
+                    "step_norm_base={:.3e}, "
+                    "Y_glob_norm={:.3e}".format(
+                        ep + 1,
+                        lr_eff,
+                        float(np.sqrt(max(upd_energy_sq_base, 0.0))),
+                        Y_glob_norm,
+                    ),
+                    flush=True,
+                )
+
+                # --------------- Global trust-region cap (safety) ---------------
+                alpha_glob = 1.0
                 if (E_global is not None) and (Y_glob_norm > 0.0):
                     Eg = np.asarray(E_global, np.float64)
                     upd_energy_sq = float(
@@ -3003,6 +3101,18 @@ def solve_global_kaczmarz_global_step_mp(
                             cap / np.maximum(global_step_norm, 1.0e-12)
                         )
                         dx *= alpha_glob
+
+                print(
+                    "[Kaczmarz-GLOBAL] epoch {}: "
+                    "global_step_norm={:.3e}, cap={:.3e}, alpha_glob={:.3e}"
+                    .format(
+                        ep + 1,
+                        float(np.sqrt(max(upd_energy_sq, 0.0))),
+                        float(tau_global * Y_glob_norm),
+                        float(alpha_glob),
+                    ),
+                    flush=True,
+                )
 
                 # Apply update with nonnegativity projection
                 if not np.all(np.isfinite(dx)):

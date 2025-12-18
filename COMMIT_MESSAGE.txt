@@ -1,2 +1,1 @@
-* Use RMSE proxy as guard for epoch solution in `kaczmarz_solver_cchunk_mp_nnls`
-* Implemented global Kaczmarz gradient instead of per-tile updates; added `_worker_tile_global_grad_band` and `solve_global_kaczmarz_global_step_mp` to `kaczmarz_solver_cchunk_mp_nnls`
+* Added tiny-column freeze inside `kaczmarz_solver_cchunk_mp_nnls._worker_tile_global_grad_band`

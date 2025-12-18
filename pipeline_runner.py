@@ -756,7 +756,7 @@ class PipelineRunner:
         seed_cfg=None,
         tracker_mode="on",
         verbose=True,
-        ratio_cfg: RatioCfg | None = None,  
+        ratio_cfg: RatioCfg | None = None,
     ):
 
         # --------------- Warm-start (same policy as SP path) -----------
@@ -782,36 +782,49 @@ class PipelineRunner:
 
         elif warm_start == "resume":
             sidecar = cu._find_latest_sidecar(self.h5_path)
+
+            # Ensure these are always defined
             x_side, src_side = (None, None)
+            x_seed, src_seed = (None, None)
+
             if sidecar is not None:
                 x_side, src_side = self._read_latest_from_sidecar(
                     sidecar, N_expected
                 )
-            x_main, src_main = self._read_latest_from_main(self.h5_path,
-                                                           N_expected)
 
-            choose_side = False
+            x_main, src_main = self._read_latest_from_main(
+                self.h5_path, N_expected
+            )
+
+            choose_side = True
             if x_side is not None and x_main is None:
-                choose_side = True  # prefer main unless missing
+                # Prefer main unless missing
+                choose_side = True
 
             x0_effective, src_label, src_file = (
-                (x_side, src_side, sidecar) if choose_side
+                (x_side, src_side, sidecar)
+                if choose_side
                 else (x_main, src_main, self.h5_path)
             )
 
             # Fallback: /Seeds/x0_nnls_patch
             if x0_effective is None:
-                seed_path = os.environ.get("CUBEFIT_SEED_PATH",
-                                           "/Seeds/x0_nnls_patch")
-                x_seed, src_seed = self._read_seed_from_h5(self.h5_path,
-                    N_expected, dset=seed_path)
+                seed_path = os.environ.get(
+                    "CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch"
+                )
+                x_seed, src_seed = self._read_seed_from_h5(
+                    self.h5_path, N_expected, dset=seed_path
+                )
                 if x_seed is not None:
                     x0_effective = x_seed
                     if verbose:
-                        logger.log("[Pipeline] Warm-start fallback from seed "
-                                   f"{src_seed} (n={x0_effective.size}).")
+                        logger.log(
+                            "[Pipeline] Warm-start fallback from seed "
+                            f"{src_seed} (n={x0_effective.size})."
+                        )
 
             if x0_effective is not None and verbose:
+                # If we already logged the seed fallback, do not log again
                 if x0_effective is x_seed:
                     pass
                 else:

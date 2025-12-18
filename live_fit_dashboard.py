@@ -13,6 +13,10 @@ from CubeFit.logger import get_logger
 
 logger = get_logger()
 
+divcmap = 'GECKOSdr'
+moncmap = 'inferno'
+moncmapr = 'inferno_r'
+
 # ------------------------------------------------------------------------------
 
 def render_aperture_fits_separate(h5_path: str,
@@ -136,32 +140,97 @@ def alpha_star_stats(h5_path, x_vec, n_spax=32, tile=None, swmr_main: bool | Non
                 return _compute(f)
         raise
 
-def render_aperture_fits_with_x(h5_path, x_vec, out_png, apertures, show_residual=True, title=None):
+def render_aperture_fits_with_x(
+    h5_path,
+    x_vec,
+    out_png,
+    apertures,
+    show_residual=True,
+    title=None,
+):
+    """
+    Render fits for selected spaxels using a global solution x_vec, but
+    stream the HyperCube per-component to avoid a large (C, P, L) slab
+    in memory.
+    """
     with open_h5(h5_path, role="reader") as f:
-        M = f["/HyperCube/models"]; Y = f["/DataCube"]
-        Mask = np.asarray(f["/Mask"][...], bool).ravel() if "/Mask" in f else None
-        C, P = int(M.shape[1]), int(M.shape[2])
-        X = np.asarray(x_vec, float).reshape(C, P)
+        M = f["/HyperCube/models"]   # (S, C, P, L)
+        Y = f["/DataCube"]           # (S, L)
 
-        fig, axes = plt.subplots(len(apertures), 1, figsize=(12, 2.7*len(apertures)))
-        if len(apertures) == 1: axes = [axes]
+        Mask = (
+            np.asarray(f["/Mask"][...], bool).ravel()
+            if "/Mask" in f
+            else None
+        )
+
+        S, C, P, L = map(int, M.shape)
+
+        X = np.asarray(x_vec, float).reshape(C, P)   # same basis as x_vec
+
+        # Precompute λ indices once
+        if Mask is not None:
+            keep = np.flatnonzero(Mask)
+        else:
+            keep = None
+
+        fig, axes = plt.subplots(
+            len(apertures),
+            1,
+            figsize=(12, 2.7 * len(apertures)),
+        )
+        if len(apertures) == 1:
+            axes = [axes]
+
         for ax, s in zip(axes, apertures):
-            slab = np.asarray(M[s, :, :, :], float)
-            yhat = np.tensordot(slab, X, axes=([0,1],[0,1]))
-            y    = np.asarray(Y[s, :], float)
-            if Mask is not None:
-                keep = np.flatnonzero(Mask)
-                yhat = yhat[keep]; y = y[keep]
-                good = np.isfinite(y)
-                ax.plot(np.flatnonzero(good), y[good],    label="data")
-                ax.plot(np.flatnonzero(good), yhat[good], label="model")
+            if not (0 <= s < S):
+                raise IndexError(f"spaxel index {s} out of range [0, {S})")
+
+            # Observed spectrum
+            y = np.asarray(Y[s, :], float)   # (L,)
+
+            # Model spectrum: stream over components c
+            yhat = np.zeros(L, float)
+            for c in range(C):
+                # A_c has shape (P, L) for this spaxel / component
+                A_c = np.asarray(M[s, c, :, :], float)  # (P, L)
+                # dot over P: (P,) @ (P, L) -> (L,)
+                yhat += X[c, :].astype(float, copy=False) @ A_c
+
+            if keep is not None:
+                y_plot = y[keep]
+                yhat_plot = yhat[keep]
+                good = np.isfinite(y_plot)
+                lam_idx = np.flatnonzero(good)
+                ax.plot(lam_idx, y_plot[good], label="data")
+                ax.plot(lam_idx, yhat_plot[good], label="model")
                 if show_residual:
-                    ax.plot(np.flatnonzero(good), y[good] - yhat[good], label="residual")
+                    ax.plot(
+                        lam_idx,
+                        (y_plot - yhat_plot)[good],
+                        label="residual",
+                    )
+            else:
+                good = np.isfinite(y)
+                lam_idx = np.flatnonzero(good)
+                ax.plot(lam_idx, y[good], label="data")
+                ax.plot(lam_idx, yhat[good], label="model")
+                if show_residual:
+                    ax.plot(
+                        lam_idx,
+                        (y - yhat)[good],
+                        label="residual",
+                    )
+
             ax.set_title(f"spaxel {s}")
-            ax.set_xlabel("λ (log space)"); ax.set_ylabel("flux")
+            ax.set_xlabel("λ (log space)")
+            ax.set_ylabel("flux")
             ax.legend(loc="upper right")
-        if title: fig.suptitle(title)
-        fig.savefig(out_png, dpi=130); plt.close(fig)
+
+        if title:
+            fig.suptitle(title)
+        fig.tight_layout(rect=(0, 0, 1, 0.96) if title else None)
+        fig.savefig(out_png, dpi=130)
+        plt.close(fig)
 
 def render_sfh_from_x(h5_path: str,
                       x_flat: np.ndarray,
@@ -196,19 +265,21 @@ def render_sfh_from_x(h5_path: str,
 
         # assume (nZ, nT, nA) order
         nZ, nT, nA = pop_shape
-        W = X.sum(axis=0)                   # (nZ, nT, nA)
-        vmax = float(np.max(W)) if np.isfinite(W).any() else 1.0
+        W = X.sum(axis=0) # (nZ, nT, nA)
+        vmax = float(np.max(np.log10(W))) if np.isfinite(W).any() else 1.0
 
         fig, axes = plt.subplots(1, nA, figsize=(3.0*nA, 3.4), squeeze=False)
         axes = axes[0]
         for a in range(nA):
             ax = axes[a]
-            im = ax.imshow(W[:, :, a], origin="lower", aspect="auto",
-                           norm=Normalize(vmin=0.0, vmax=vmax))
+            im = ax.imshow(np.log10(W[:, :, a]), origin="lower", aspect="auto",
+                cmap=moncmapr, norm=Normalize(vmin=0.0, vmax=vmax))
             ax.set_title(f"α index {a}")
             ax.set_xlabel("Age index")
             if a == 0:
                 ax.set_ylabel("Metal index")
+            if not ax.get_subplotspec().is_first_col():
+                ax.set_yticklabels([])
         fig.colorbar(im, ax=axes.tolist(), shrink=0.8, pad=0.02)
         fig.savefig(out_png, dpi=130); plt.close(fig)
 

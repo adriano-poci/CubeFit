@@ -558,8 +558,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         use=True           # actually enable the ratio term
     )
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=2,
-        lr=0.0001,
+        epochs=3,
+        lr=1.0,
         project_nonneg=True,
         orbit_weights=None, # or None for “free” fit
         ratio_cfg=None,
@@ -569,7 +569,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         blas_threads=12, # 12 BLAS threads each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
-        warm_start='seed',  # 'zeros', 'resume', 'jacobi', 'nnls'
+        warm_start='resume',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
@@ -1835,7 +1835,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     minT, maxT = np.min(uages), np.max(uages)
     minZ, maxZ = np.min(umetals), np.max(umetals)
 
-    wmax = np.max(np.array([coSFH, laSFH, boSFH]))
+    wmax = np.max(np.log10(np.array([coSFH, laSFH, boSFH])))
 
     if 'sfh' in pplots:
         fig = plt.figure(figsize=plt.figaspect(3./4.))
@@ -1844,8 +1844,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         print(nAlphas, ualphas)
         for ali in range(nAlphas):
             ax = fig.add_subplot(gs[0, ali])
-            ax.imshow(coSFH[:, :, ali], extent=[minT, maxT, minZ, maxZ],
-                aspect='auto', interpolation='bicubic', origin='lower',
+            cnt = ax.imshow(np.log10(coSFH[:, :, ali]),
+                extent=[minT, maxT, minZ, maxZ],
+                aspect='auto', interpolation='none', origin='lower',
                 cmap=moncmapr, norm=Normalize(vmin=0, vmax=wmax))
             if not ax.get_subplotspec().is_last_row():
                 ax.set_xticklabels([])
@@ -1863,8 +1864,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 lT.set_path_effects(
                     [PathEffects.withStroke(linewidth=1.5, foreground='k')])
             ax = fig.add_subplot(gs[1, ali])
-            ax.imshow(laSFH[:, :, ali], extent=[minT, maxT, minZ, maxZ],
-                aspect='auto', interpolation='bicubic', origin='lower',
+            ax.imshow(np.log10(laSFH[:, :, ali]),
+                extent=[minT, maxT, minZ, maxZ],
+                aspect='auto', interpolation='none', origin='lower',
                 cmap=moncmapr, norm=Normalize(vmin=0, vmax=wmax))
             if not ax.get_subplotspec().is_last_row():
                 ax.set_xticklabels([])
@@ -1876,8 +1878,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                     foreground='k')])
             ax = fig.add_subplot(gs[2, ali])
-            ax.imshow(boSFH[:, :, ali], extent=[minT, maxT, minZ, maxZ],
-                aspect='auto', interpolation='bicubic', origin='lower',
+            ax.imshow(np.log10(boSFH[:, :, ali]),
+                extent=[minT, maxT, minZ, maxZ],
+                aspect='auto', interpolation='none', origin='lower',
                 cmap=moncmapr, norm=Normalize(vmin=0, vmax=wmax))
             if not ax.get_subplotspec().is_last_row():
                 ax.set_xticklabels([])
@@ -1895,6 +1898,18 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         BIG.set_yticks([])
         BIG.set_xlabel(r'$t\ [{\rm Gyr}]$', labelpad=20)
         BIG.set_ylabel(r'$[Z/H]$', labelpad=35)
+        cax = POT.attachAxis(BIG, 'right', 0.05)
+        cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
+        lT = cax.text(0.5, 0.5, r'$\log_{10}($Mass Weight$)$',
+            va='center', ha='center', color=POT.pgreen,
+            transform=cax.transAxes, rotation=270)
+        lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+            foreground='k')])
+        cax.text(0.45, 1.0-1e-3, f"{wmax:.2f}", va='top', ha='center',
+            color='w', transform=cax.transAxes, rotation=270)
+        cax.text(0.45, 1e-3, f"0", va='bottom', ha='center',
+            color='k', transform=cax.transAxes, rotation=270)
+        cb.set_ticks([])
         plt.savefig(figDir/\
             f"orbitSFH_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
 

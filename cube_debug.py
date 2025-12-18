@@ -294,6 +294,12 @@ def nnls_seed_diagnostics(
     fits_png = base / "nnls_seed_fits.png"
     sfh_png = base / "nnls_seed_sfh.png"
 
+    render_sfh_from_x(
+        h5_path,
+        x_flat,
+        sfh_png,
+    )
+    
     if ap_idx:
         render_aperture_fits_with_x(
             h5_path,
@@ -304,11 +310,6 @@ def nnls_seed_diagnostics(
             title="NNLS seed treated as final solution",
         )
 
-    render_sfh_from_x(
-        h5_path,
-        x_flat,
-        sfh_png,
-    )
 
     return {
         "seed_path": str(seed_path),
