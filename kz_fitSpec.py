@@ -558,7 +558,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         use=True           # actually enable the ratio term
     )
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=3,
+        epochs=2,
         lr=1.0,
         project_nonneg=True,
         orbit_weights=None, # or None for “free” fit
@@ -569,7 +569,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         blas_threads=12, # 12 BLAS threads each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
-        warm_start='resume',  # 'zeros', 'resume', 'jacobi', 'nnls'
+        warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
