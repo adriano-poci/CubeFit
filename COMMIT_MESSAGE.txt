@@ -1,2 +1,0 @@
-* Implemented mtime-based decision for sidecar vs main file loading in
-            `pipeline_runner.solve_all*` resume logic

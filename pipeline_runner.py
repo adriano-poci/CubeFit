@@ -443,74 +443,74 @@ class PipelineRunner:
 
         return None, None
 
-@staticmethod
-def _read_latest_from_main(h5_path: str, N_expected: int):
-    """
-    Read the best available solution vector from the *main* HDF5.
+    @staticmethod
+    def _read_latest_from_main(h5_path: str, N_expected: int):
+        """
+        Read the best available solution vector from the *main* HDF5.
 
-    Priority is "most resume-correct" first:
-      1) /Fit/x_last
-      2) /Fit/x_epoch_last
-      3) /X_global
-      4) /Fit/x_best
-      5) legacy fallbacks
+        Priority is "most resume-correct" first:
+        1) /Fit/x_last
+        2) /Fit/x_epoch_last
+        3) /X_global
+        4) /Fit/x_best
+        5) legacy fallbacks
 
-    Returns
-    -------
-    x : ndarray[float64] or None
-        Flattened solution vector (length N_expected), if found.
-    src : str or None
-        Dataset label used to load x (for logging).
-    """
-    if (h5_path is None) or (not os.path.exists(h5_path)):
-        return None, None
+        Returns
+        -------
+        x : ndarray[float64] or None
+            Flattened solution vector (length N_expected), if found.
+        src : str or None
+            Dataset label used to load x (for logging).
+        """
+        if (h5_path is None) or (not os.path.exists(h5_path)):
+            return None, None
 
-    def _read_flat(f, name: str):
-        if name not in f:
-            return None
-        ds = f[name]
-        try:
-            if ds.ndim == 2 and ds.shape[0] > 0:
-                v = np.asarray(ds[-1, :], np.float64, order="C")
-            else:
-                v = np.asarray(ds[...], np.float64, order="C")
-        except Exception:
-            return None
+        def _read_flat(f, name: str):
+            if name not in f:
+                return None
+            ds = f[name]
+            try:
+                if ds.ndim == 2 and ds.shape[0] > 0:
+                    v = np.asarray(ds[-1, :], np.float64, order="C")
+                else:
+                    v = np.asarray(ds[...], np.float64, order="C")
+            except Exception:
+                return None
 
-        v = np.asarray(v, np.float64).ravel(order="C")
-        if v.size != int(N_expected):
-            return None
-        if not np.all(np.isfinite(v)):
-            v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
-        return v
+            v = np.asarray(v, np.float64).ravel(order="C")
+            if v.size != int(N_expected):
+                return None
+            if not np.all(np.isfinite(v)):
+                v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+            return v
 
-    with open_h5(h5_path, role="reader", swmr=True) as f:
-        # Resume-correct (if present)
-        v = _read_flat(f, "/Fit/x_last")
-        if v is not None:
-            return v, "/Fit/x_last"
-
-        v = _read_flat(f, "/Fit/x_epoch_last")
-        if v is not None:
-            return v, "/Fit/x_epoch_last"
-
-        # Canonical committed solution
-        v = _read_flat(f, "/X_global")
-        if v is not None:
-            return v, "/X_global"
-
-        # Best-so-far fallback (if you keep it in main)
-        v = _read_flat(f, "/Fit/x_best")
-        if v is not None:
-            return v, "/Fit/x_best"
-
-        # Legacy candidates (only if they exist in your file)
-        for name in ("/X_best", "/X_last", "/Fit/x_hist"):
-            v = _read_flat(f, name)
+        with open_h5(h5_path, role="reader", swmr=True) as f:
+            # Resume-correct (if present)
+            v = _read_flat(f, "/Fit/x_last")
             if v is not None:
-                return v, name
+                return v, "/Fit/x_last"
 
-    return None, None
+            v = _read_flat(f, "/Fit/x_epoch_last")
+            if v is not None:
+                return v, "/Fit/x_epoch_last"
+
+            # Canonical committed solution
+            v = _read_flat(f, "/X_global")
+            if v is not None:
+                return v, "/X_global"
+
+            # Best-so-far fallback (if you keep it in main)
+            v = _read_flat(f, "/Fit/x_best")
+            if v is not None:
+                return v, "/Fit/x_best"
+
+            # Legacy candidates (only if they exist in your file)
+            for name in ("/X_best", "/X_last", "/Fit/x_hist"):
+                v = _read_flat(f, name)
+                if v is not None:
+                    return v, name
+
+        return None, None
 
     def _read_seed_from_h5(self,
                         h5_path: str,
