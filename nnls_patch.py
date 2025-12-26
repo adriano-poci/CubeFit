@@ -1,3 +1,63 @@
+# -*- coding: utf-8 -*-
+r"""
+    nnls_patch.py
+    Adriano Poci
+    University of Oxford
+    2025
+
+    Platforms
+    ---------
+    Unix, Windows
+
+    Synopsis
+    --------
+    Patch-scale non-negative least-squares (NNLS) utilities for CubeFit.
+
+    This module solves a *reduced* NNLS problem on a representative subset of
+    spaxels and a restricted set of populations per component, producing a
+    compact seed solution ``x_CP`` (shape ``(C, P)``) that can be:
+
+    - written to the main HDF5 file (typically ``/Seeds/x0_nnls_patch``), and
+    - used as a warm-start for global solvers (e.g. Kaczmarz-based fits).
+
+    The patch fit can optionally:
+    - apply the global wavelength mask (``/Mask``),
+    - apply λ-weights (typically ``/HyperCube/lambda_weights``),
+    - normalize model columns consistently with the HyperCube normalization,
+    - compare population “usage” against an optional orbit-weight prior, and
+    - generate quick-look diagnostics (per-spaxel overlays, RMSE/χ² summaries,
+      and usage-vs-prior plots).
+
+    The main entry point is :func:`run_patch`, and a small CLI wrapper is
+    provided for interactive use and debugging.
+
+    Inputs
+    ------
+    The HDF5 file is expected to contain, at minimum:
+    - ``/DataCube`` (S, L)
+    - ``/HyperCube/models`` (S, C, P, L)
+
+    Optional datasets used when enabled:
+    - ``/Mask`` (L,)
+    - ``/HyperCube/lambda_weights`` (L,)
+    - ``/HyperCube/col_energy`` or equivalent global column-energy storage
+
+    Outputs
+    -------
+    - ``x_CP``: seed weights (C, P) in float64
+    - optional HDF5 seed write (e.g. ``/Seeds/x0_nnls_patch``)
+    - optional diagnostic PNGs in ``out_dir``
+
+    Authors
+    -------
+    Adriano Poci <adriano.poci@physics.ox.ac.uk>
+
+History
+-------
+v1.0:   19 December 2025
+"""
+
+
 from __future__ import annotations
 import os, math, pathlib as plp
 from typing import Optional, List, Tuple
@@ -12,6 +72,134 @@ from CubeFit.cube_utils import read_lambda_weights, ensure_lambda_weights,\
     compare_usage_to_orbit_weights
 
 # ----------------------------- helpers ---------------------------------
+
+def _predict_spaxel_sparse_from_models(M,
+                                      s_idx,
+                                      x_cp,
+                                      picks,
+                                      keep_idx=None):
+    """
+    Predict one spaxel spectrum by streaming /HyperCube/models in chunk-aligned
+    slabs, avoiding eager materialization of (C, P, L).
+
+    This is intended for diagnostics/plotting (e.g. the NNLS seed patch plots),
+    where we only need y_fit for a small number of spaxels and want to avoid:
+
+        np.asarray(M[s, :, :, :])  # huge (C,P,L) read per spaxel.
+
+    The implementation respects the dataset chunking: it reads blocks
+    (1, C_chunk, P_block, L) and accumulates contributions in float64.
+
+    Notes
+    -----
+    - If the dataset is chunked with L_chunk == L (common in our files),
+      masking wavelengths (keep_idx) reduces compute but may not reduce I/O
+      much, because HDF5 still has to decompress whole L-chunks.
+    - We still avoid the large temporary (C,P,Lk) allocation and instead
+      stream blocks and accumulate into y_fit.
+
+    Parameters
+    ----------
+    M : h5py.Dataset
+        The /HyperCube/models dataset of shape (S, C, P, L).
+    s_idx : int
+        Spaxel index.
+    x_cp : ndarray
+        Weights shaped (C, P), float64 recommended.
+    picks : list[list[int]]
+        For each component c, a list of population indices to include.
+        This is the same structure already used in nnls_patch.py.
+    keep_idx : ndarray[int] or None
+        Optional wavelength indices (length Lk) to evaluate on. If None,
+        predicts the full L grid.
+
+    Returns
+    -------
+    y_fit : ndarray
+        Predicted spectrum for spaxel s_idx with shape (Lk,) if keep_idx is
+        not None, else (L,). dtype float64.
+
+    Raises
+    ------
+    ValueError
+        If shapes are inconsistent with (C, P).
+
+    Examples
+    --------
+    >>> with open_h5(h5_path, role="reader") as f:
+    ...     M = f["/HyperCube/models"]
+    ...     y_fit = _predict_spaxel_sparse_from_models(
+    ...         M, s_idx=0, x_cp=x_CP, picks=picks, keep_idx=keep_idx
+    ...     )
+    """
+    s_idx = int(s_idx)
+    C = int(M.shape[1])
+    P = int(M.shape[2])
+    L = int(M.shape[3])
+
+    x_cp = np.asarray(x_cp, dtype=np.float64, order="C")
+    if x_cp.shape != (C, P):
+        raise ValueError(f"x_cp shape {x_cp.shape} != (C,P)=({C},{P})")
+
+    if keep_idx is None:
+        Lk = L
+        keep_idx_local = None
+    else:
+        keep_idx_local = np.asarray(keep_idx, dtype=np.int64).ravel()
+        Lk = int(keep_idx_local.size)
+
+    # Use storage chunking to align reads
+    chunks = M.chunks or (1, 1, P, L)
+    C_chunk = int(max(1, chunks[1]))
+    P_chunk = int(max(1, chunks[2]))
+
+    # Work in float64 accumulator; multiply in float32 for speed.
+    y_fit = np.zeros(Lk, dtype=np.float64)
+
+    # Iterate in storage order: components in C_chunk blocks
+    for c0 in range(0, C, C_chunk):
+        c1 = min(C, c0 + C_chunk)
+
+        # Most of our files are C_chunk == 1, so this is one component.
+        for c in range(c0, c1):
+            plist = picks[c]
+            if not plist:
+                continue
+
+            # Determine which P-chunks contain any of the picked populations.
+            plist_arr = np.asarray(plist, dtype=np.int64)
+            pj = np.unique((plist_arr // P_chunk) * P_chunk)
+
+            for p0 in pj:
+                p0 = int(p0)
+                p1 = int(min(P, p0 + P_chunk))
+
+                # Select only the picked populations that lie in [p0, p1)
+                in_block = (plist_arr >= p0) & (plist_arr < p1)
+                if not np.any(in_block):
+                    continue
+                local_idx = (plist_arr[in_block] - p0).astype(np.int64, copy=False)
+
+                # Read one storage-aligned block: (1, 1, Pb, L) float32
+                # (This avoids the full (C,P,L) slab.)
+                A32 = M[s_idx:s_idx + 1, c:c + 1, p0:p1, :][...]
+                A32 = np.asarray(A32, dtype=np.float32, order="C")[0, 0, :, :]  # (Pb, L)
+
+                # Slice to selected populations in this P-block
+                A32 = A32[local_idx, :]  # (Kb, L)
+
+                # Optional wavelength masking (compute reduction; I/O depends on L-chunk)
+                if keep_idx_local is not None:
+                    A32 = A32[:, keep_idx_local]  # (Kb, Lk)
+
+                # Weights for this block
+                w64 = x_cp[c, p0:p1][local_idx]                 # (Kb,) float64
+                w32 = w64.astype(np.float32, copy=False)        # float32 GEMV
+
+                # Accumulate: y += A^T w
+                y_fit += (A32.T @ w32).astype(np.float64, copy=False)
+
+    return y_fit
 
 def _get_mask_local(f) -> np.ndarray:
     """Return a 1D boolean λ-mask (L,), True = keep."""
@@ -666,16 +854,13 @@ def run_patch(h5_path: str,
         for i, s in enumerate(tqdm(s_idx, desc="[patch] plots", mininterval=0.5, dynamic_ncols=True)):
             y_fit = np.zeros(Lk, dtype=np.float64)
             # weighted least-squares sense: compare on masked/log grid unweighted
-            A_sp = np.asarray(M[s, :, :, :], dtype=np.float32) # (C,P,L)
-            if keep_idx is not None:
-                A_sp = A_sp[:, :, keep_idx] # (C,P,Lk)
-            # only chosen pops contribute
-            for c, plist in enumerate(picks):
-                if len(plist) == 0:
-                    continue
-                coeff = x_CP[c, plist] # (|plist|,)
-                if coeff.sum() != 0.0:
-                    y_fit += coeff @ A_sp[c, plist, :]
+            y_fit = _predict_spaxel_sparse_from_models(
+                M=M,
+                s_idx=int(s),
+                x_cp=x_CP,
+                picks=picks,
+                keep_idx=keep_idx,
+            )
             y_obs = y[pos:pos+Lk]
             wrow  = sqrt_w_rows[pos:pos+Lk]
             pos += Lk
@@ -687,15 +872,16 @@ def run_patch(h5_path: str,
             chi2[i] = float(np.sum((r * wrow)**2) / den)
 
             if out_dir:
-                fig = plt.figure(figsize=(9.5, 3.2)); ax = fig.add_subplot(111)
+                fig = plt.figure(figsize=(9.5, 3.2))
+                ax = fig.add_subplot(111)
                 ax.plot(lam_plot, y_obs, lw=1.0, label="data")
                 ax.plot(lam_plot, y_fit, lw=1.0, label="model")
                 ax.set_title(f"spaxel {int(s)}  rmse={rmse[i]:.3f}")
                 ax.set_xlabel("λ (ObsPix)")
                 ax.set_ylabel("flux")
                 ax.legend(loc="best", fontsize=8)
-                fig.tight_layout()
-                fig.savefig(os.path.join(out_dir, f"patch_spax{int(s):05d}.png"), dpi=120)
+                fig.savefig(os.path.join(out_dir,
+                    f"patch_spax{int(s):05d}.png"), dpi=120)
                 plt.close(fig)
 
     if out_dir:
@@ -711,14 +897,16 @@ def run_patch(h5_path: str,
             ax.bar(np.arange(order.size), flat[order])
             ax.set_title("x_CP top coefficients (sorted)")
             ax.set_xlabel("rank"); ax.set_ylabel("weight")
-            fig.tight_layout(); fig.savefig(os.path.join(out_dir, "xcp_bar.png"), dpi=120)
+            fig.savefig(os.path.join(out_dir, "xcp_bar.png"), dpi=120)
             plt.close(fig)
 
     if write_seed:
         with open_h5(h5_path, role="writer") as f:
             g = f.require_group("/Seeds")
-            if seed_path in f: del f[seed_path]
-            ds = f.create_dataset(seed_path, data=x_CP.astype(np.float64), dtype="f8", compression="gzip")
+            if seed_path in f:
+                del f[seed_path]
+            ds = f.create_dataset(seed_path, data=x_CP.astype(np.float64),
+                dtype="f8")
             ds.attrs["origin"] = "nnls_patch"
             ds.attrs["s_idx"]  = s_idx
             ds.attrs["k_per_comp"] = int(k_per_comp)
@@ -736,11 +924,11 @@ def run_patch(h5_path: str,
             metrics = compare_usage_to_orbit_weights(
                 h5_path,
                 sidecar=None,
-                x_dset=seed_path,           # e.g. "/Seeds/x0_nnls_patch"
+                x_dset=seed_path, # e.g. "/Seeds/x0_nnls_patch"
                 normalize="unit_sum",
                 out_png=usage_png,
-                usage_metric="energy",      # use energy–weighted usage
-                E_cp=E,                     # (C,P) from read_global_column_energy
+                usage_metric="energy", # use energy–weighted usage
+                E_cp=E, # (C,P) from read_global_column_energy
             )
         except Exception as e:
             print(f"[nnls_patch] usage-vs-prior (seed) failed: {e}")
@@ -759,7 +947,7 @@ def run_patch(h5_path: str,
             import h5py
             with h5py.File(tmp_sidecar, "w") as G:
                 G.create_dataset("/Fit/x_best", data=x_CP.astype("f8"),
-                                 dtype="f8", compression="gzip")
+                                 dtype="f8",)
 
             metrics = compare_usage_to_orbit_weights(
                 h5_path,

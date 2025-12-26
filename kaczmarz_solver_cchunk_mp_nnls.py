@@ -39,6 +39,9 @@ v2.0:   Implemented global Kaczmarz gradient instead of per-tile updates; added
             `solve_global_kaczmarz_global_step_mp`. 16 December 2025
 v2.1:   Added tiny-column freeze inside `_worker_tile_global_grad_band`. 18
             December 2025
+v2.2:   Consolidated two tiny-column freeze env var names into one;
+        Added fairer max-tile rather than bias to brighter spaxels. 25 December
+            2025
 """
 
 from __future__ import annotations, print_function
@@ -152,6 +155,57 @@ def _xcorr_int_shift(a: np.ndarray, b: np.ndarray) -> int:
     if j > n:
         j -= 2*n
     return j
+
+# ------------------------------------------------------------------------------
+
+def _choose_tiles_fair_spread(
+    s_ranges: list[tuple[int, int]],
+    k: int,
+    seed: int = 12345,
+) -> list[tuple[int, int]]:
+    """
+    Pick k tile ranges with a roughly uniform spread over the spatial index.
+
+    This avoids brightness bias: it sorts by s0 and stratifies the list into k bins,
+    selecting one tile per bin (random within each bin).
+
+    Parameters
+    ----------
+    s_ranges
+        List of (s0, s1) tile ranges.
+    k
+        Number of tiles to select.
+    seed
+        RNG seed.
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        Selected tile ranges (k or fewer if s_ranges is smaller).
+    """
+    if k <= 0 or not s_ranges:
+        return []
+    if k >= len(s_ranges):
+        return list(s_ranges)
+
+    s_sorted = sorted(s_ranges, key=lambda t: int(t[0]))
+    n = len(s_sorted)
+    k = min(k, n)
+
+    rng = np.random.default_rng(seed)
+    edges = np.linspace(0, n, k + 1, dtype=int)
+
+    out: list[tuple[int, int]] = []
+    for i in range(k):
+        a = int(edges[i])
+        b = int(edges[i + 1])
+        if b <= a:
+            idx = a
+        else:
+            idx = int(rng.integers(a, b))
+        out.append(s_sorted[idx])
+
+    return out
 
 # ------------------------------------------------------------------------------
 
@@ -444,7 +498,7 @@ def _worker_tile_global_grad_band(args):
 
     Control knobs (env)
     -------------------
-    CUBEFIT_ZERO_FREEZE_ENABLE : {0,1} (default 1)
+    CUBEFIT_ZERO_COL_FREEZE : {0,1} (default 1)
         Enable/disable tile-local freeze.
     CUBEFIT_ZERO_COL_REL : float (default 1e-12)
     CUBEFIT_ZERO_COL_ABS : float (default 1e-24)
@@ -465,7 +519,7 @@ def _worker_tile_global_grad_band(args):
     eps = float(os.environ.get("CUBEFIT_EPS", "1e-12"))
 
     freeze_enable = os.environ.get(
-        "CUBEFIT_ZERO_FREEZE_ENABLE", "1"
+        "CUBEFIT_ZERO_COL_FREEZE", "1"
     ).lower() not in ("0", "false", "no", "off")
     rel_zero = float(os.environ.get("CUBEFIT_ZERO_COL_REL", "1e-12"))
     abs_zero = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-24"))
@@ -2387,13 +2441,7 @@ def solve_global_kaczmarz_global_step_mp(
                 ).reshape(C, P)
                 print(
                     "[Kaczmarz-GLOBAL] cp_flux_ref: "
-                    "min={:.3e}, max={:.3e}, median={:.3e}".format(
-                        float(np.min(cp_flux_ref)),
-                        float(np.max(cp_flux_ref)),
-                        float(
-                            np.median(cp_flux_ref[cp_flux_ref > 0.0])
-                        ),
-                    ),
+                    f"min={np.min(cp_flux_ref):.3e}, max={np.max(cp_flux_ref):.3e}, median={np.median(cp_flux_ref[cp_flux_ref > 0.0]):.3e}",
                     flush=True,
                 )
                 inv_cp_flux_ref = 1.0 / np.maximum(
@@ -2438,11 +2486,7 @@ def solve_global_kaczmarz_global_step_mp(
                     )
                 print(
                     "[Kaczmarz-GLOBAL] λ-weights "
-                    "min={:.3e}, max={:.3e}, mean={:.3e}".format(
-                        float(np.min(w_full)),
-                        float(np.max(w_full)),
-                        float(np.mean(w_full)),
-                    ),
+                    f"min={np.min(w_full):.3e}, max={np.max(w_full):.3e}, mean={np.mean(w_full):.3e}",
                     flush=True,
                 )
                 w_lam = w_full[keep_idx] if keep_idx is not None else w_full
@@ -2471,60 +2515,85 @@ def solve_global_kaczmarz_global_step_mp(
                 Y_glob_norm2 += float(np.sum(Yt * Yt))
 
         print(
-            "[Kaczmarz-GLOBAL] DataCube S={}, L={} (kept Lk={}), "
-            "Hypercube C={}, P={}, s_tile={}, epochs={}, lr={}, "
-            "processes={}, blas_threads={}".format(
-                S, L, Lk, C, P, s_tile,
-                cfg.epochs, cfg.lr,
-                cfg.processes, cfg.blas_threads,
-            ),
+            f"[Kaczmarz-GLOBAL] DataCube S={S}, L={L} (kept Lk={Lk}), "
+            f"Hypercube C={C}, P={P}, s_tile={s_tile}, epochs={cfg.epochs}, lr={cfg.lr}, "
+            f"processes={cfg.processes}, blas_threads={cfg.blas_threads}",
             flush=True,
         )
 
-        # Sort tiles by descending norm (brightest first)
-        paired = sorted(
-            zip(norms, s_ranges), key=lambda t: -t[0]
-        )
-        norms_sorted = [t[0] for t in paired]
-        s_ranges_sorted = [t[1] for t in paired]
+        # # Sort tiles by descending norm (brightest first)
+        # paired = sorted(
+        #     zip(norms, s_ranges), key=lambda t: -t[0]
+        # )
+        # norms_sorted = [t[0] for t in paired]
+        # s_ranges_sorted = [t[1] for t in paired]
 
-        # Optional tile budget (max_tiles)
+        # # Optional tile budget (max_tiles)
+        # max_tiles = cfg.max_tiles
+        # print("[Kaczmarz-GLOBAL] Applying max_tiles constraint...",
+        #       flush=True)
+        # if max_tiles is not None:
+        #     max_tiles = int(max_tiles)
+        #     if 0 < max_tiles < len(s_ranges_sorted):
+        #         import math
+        #         rng_sel = np.random.default_rng(
+        #             int(os.environ.get(
+        #                 "CUBEFIT_POLISH_SEED", "12345"
+        #             ))
+        #         )
+
+        #         k_bright = max(1, int(math.ceil(0.7 * max_tiles)))
+        #         k_rand = max(0, max_tiles - k_bright)
+
+        #         bright_idx = np.arange(k_bright, dtype=int)
+        #         tail_idx = np.arange(
+        #             k_bright, len(s_ranges_sorted), dtype=int
+        #         )
+        #         if k_rand > 0 and tail_idx.size > 0:
+        #             rng_sel.shuffle(tail_idx)
+        #             rand_idx = tail_idx[:k_rand]
+        #             keep_idx_tiles = np.concatenate(
+        #                 [bright_idx, rand_idx]
+        #             )
+        #         else:
+        #             keep_idx_tiles = bright_idx
+
+        #         keep_idx_tiles = np.sort(keep_idx_tiles)
+        #         s_ranges = [s_ranges_sorted[i] for i in keep_idx_tiles]
+        #         norms_sorted = [norms_sorted[i] for i in keep_idx_tiles]
+        #     else:
+        #         s_ranges = s_ranges_sorted
+        # else:
+        #     s_ranges = s_ranges_sorted
+
+        print("[Kaczmarz-MP] Applying max_tiles constraint...", flush=True)
         max_tiles = cfg.max_tiles
-        print("[Kaczmarz-GLOBAL] Applying max_tiles constraint...",
-              flush=True)
-        if max_tiles is not None:
-            max_tiles = int(max_tiles)
-            if 0 < max_tiles < len(s_ranges_sorted):
-                import math
-                rng_sel = np.random.default_rng(
-                    int(os.environ.get(
-                        "CUBEFIT_POLISH_SEED", "12345"
-                    ))
-                )
+        # ---- Build tile list ----
+        s_ranges_all = list(s_ranges)  # keep the full list for fairness
 
-                k_bright = max(1, int(math.ceil(0.7 * max_tiles)))
-                k_rand = max(0, max_tiles - k_bright)
+        tile_norms: list[tuple[float, tuple[int, int]]] = []
+        with open_h5(h5_path, "reader") as f:
+            DC = f["/DataCube"]              # (S, L)
+            for (s0, s1) in s_ranges_all:
+                Y = np.asarray(DC[s0:s1, :], np.float64, order="C")
+                if keep_idx is not None:
+                    Y = Y[:, keep_idx]       # (Sblk, Lk)
+                tile_norms.append((float(np.linalg.norm(Y)), (s0, s1)))
 
-                bright_idx = np.arange(k_bright, dtype=int)
-                tail_idx = np.arange(
-                    k_bright, len(s_ranges_sorted), dtype=int
-                )
-                if k_rand > 0 and tail_idx.size > 0:
-                    rng_sel.shuffle(tail_idx)
-                    rand_idx = tail_idx[:k_rand]
-                    keep_idx_tiles = np.concatenate(
-                        [bright_idx, rand_idx]
-                    )
-                else:
-                    keep_idx_tiles = bright_idx
+        # Brightness ordering (optional, but fine as an iteration order)
+        tile_norms.sort(key=lambda t: t[0], reverse=True)
 
-                keep_idx_tiles = np.sort(keep_idx_tiles)
-                s_ranges = [s_ranges_sorted[i] for i in keep_idx_tiles]
-                norms_sorted = [norms_sorted[i] for i in keep_idx_tiles]
-            else:
-                s_ranges = s_ranges_sorted
+        if max_tiles is not None and max_tiles < len(s_ranges_all):
+            # Fair subset in space, then keep brightness ordering within that subset.
+            fair_keep = _choose_tiles_fair_spread(
+                s_ranges_all,
+                int(max_tiles),
+                seed=int(os.environ.get("CUBEFIT_GLOBAL_TILE_SEED", "12345")),
+            )
+            fair_keep_set = set(fair_keep)
+            s_ranges = [t for _, t in tile_norms if t in fair_keep_set]
         else:
-            s_ranges = s_ranges_sorted
+            s_ranges = [t for _, t in tile_norms]
 
         print(
             f"[Kaczmarz-GLOBAL] Using {len(s_ranges)} tiles for fitting.",
@@ -2535,7 +2604,7 @@ def solve_global_kaczmarz_global_step_mp(
 
         # Global column energy (for trust-region scaling)
         print("[Kaczmarz-GLOBAL] Reading global column energy...",
-              flush=True)
+            flush=True)
         E_global = read_global_column_energy(h5_path)  # (C, P) float64
         print("[Kaczmarz-GLOBAL] done.", flush=True)
 
@@ -2780,9 +2849,6 @@ def solve_global_kaczmarz_global_step_mp(
                 )
                 pbar.refresh()
 
-                # Use a fixed LR per epoch for now
-                lr_epoch = float(cfg.lr)
-
                 for tile_idx, (s0, s1) in enumerate(s_ranges):
                     Sblk = s1 - s0
 
@@ -2845,11 +2911,9 @@ def solve_global_kaczmarz_global_step_mp(
                             sh = _xcorr_int_shift(y_obs, y_fit)
                             if sh != 0:
                                 print(
-                                    "[diag] spaxel {}: "
+                                    f"[diag] spaxel {s_pick}: "
                                     "data↔model integer shift "
-                                    "= {} px".format(
-                                        s_pick, int(sh)
-                                    ),
+                                    f"= {int(sh)} px",
                                     flush=True,
                                 )
                         except Exception:
@@ -2944,7 +3008,7 @@ def solve_global_kaczmarz_global_step_mp(
                         g_tot[c_start:c_stop, :] += g_band
                         D_tot[c_start:c_stop, :] += D_band
 
-                    if tracker is not None:
+                    if tracker is not None and False:
                         tracker.on_progress(
                             epoch=ep + 1,
                             spax_done=tile_idx + 1,
@@ -2953,7 +3017,7 @@ def solve_global_kaczmarz_global_step_mp(
                         )
 
                     pbar.update(1)
-                    pbar.refresh()
+                    # pbar.refresh()
 
                 pbar.close()
 
@@ -2975,8 +3039,8 @@ def solve_global_kaczmarz_global_step_mp(
                     rmse_epoch_proxy = float(np.sqrt(mean_sq))
 
                 print(
-                    "[Kaczmarz-GLOBAL] epoch {} RMSE(proxy) = "
-                    "{:.6e}".format(ep + 1, rmse_epoch_proxy),
+                    f"[Kaczmarz-GLOBAL] epoch {ep + 1} RMSE(proxy) = "
+                    f"{rmse_epoch_proxy:.6e}",
                     flush=True,
                 )
 
@@ -3066,53 +3130,20 @@ def solve_global_kaczmarz_global_step_mp(
                 # Build the step with the per-epoch effective lr
                 dx = lr_eff * dx_base
 
-                # Optional debug print
-                print(
-                    "[Kaczmarz-GLOBAL] epoch {}: lr_eff={:.3e}, "
-                    "step_norm_base={:.3e}, "
-                    "Y_glob_norm={:.3e}".format(
-                        ep + 1,
-                        lr_eff,
-                        float(np.sqrt(max(upd_energy_sq_base, 0.0))),
-                        Y_glob_norm,
-                    ),
-                    flush=True,
-                )
-
-                # --------------- Global trust-region cap (safety) ---------------
-                alpha_glob = 1.0
-                if (E_global is not None) and (Y_glob_norm > 0.0):
-                    Eg = np.asarray(E_global, np.float64)
-                    upd_energy_sq = float(
-                        np.sum((dx.astype(np.float64) ** 2) * Eg)
-                    )
+                # ------------------------------------------------------------
+                # frac_clipped diagnostic ONLY
+                # ------------------------------------------------------------
+                if cfg.project_nonneg:
+                    frac_clipped = float(np.mean(dx < -x_CP))
                 else:
-                    upd_energy_sq = float(
-                        np.sum(dx.astype(np.float64) ** 2)
-                    )
-
-                if (upd_energy_sq > 0.0) and (Y_glob_norm > 0.0):
-                    global_step_norm = float(
-                        np.sqrt(upd_energy_sq)
-                    )
-                    cap = float(tau_global * Y_glob_norm)
-                    if global_step_norm > cap:
-                        alpha_glob = float(
-                            cap / np.maximum(global_step_norm, 1.0e-12)
-                        )
-                        dx *= alpha_glob
+                    frac_clipped = 0.0
 
                 print(
-                    "[Kaczmarz-GLOBAL] epoch {}: "
-                    "global_step_norm={:.3e}, cap={:.3e}, alpha_glob={:.3e}"
-                    .format(
-                        ep + 1,
-                        float(np.sqrt(max(upd_energy_sq, 0.0))),
-                        float(tau_global * Y_glob_norm),
-                        float(alpha_glob),
-                    ),
-                    flush=True,
-                )
+                    f"[Kaczmarz-GLOBAL] epoch {ep + 1}: lr_eff={lr_eff:.3e}, "
+                    f"step_norm_base="
+                    f"{float(np.sqrt(np.max((upd_energy_sq_base, 0.0)))):.3e}, "
+                    f"Y_glob_norm={Y_glob_norm:.3e}",
+                    flush=True)
 
                 # Apply update with nonnegativity projection
                 if not np.all(np.isfinite(dx)):
@@ -3124,9 +3155,59 @@ def solve_global_kaczmarz_global_step_mp(
                         copy=False,
                     )
 
-                x_CP += dx
+                x_before = x_CP.copy(order="C")
+                x_trial = x_before + dx
                 if cfg.project_nonneg:
-                    np.maximum(x_CP, 0.0, out=x_CP)
+                    np.maximum(x_trial, 0.0, out=x_trial)
+
+                dx_applied = x_trial - x_before
+
+                # ------------------------------------------------------------
+                # Global trust-region cap — MUST use dx_applied (NOT dx)
+                # ------------------------------------------------------------
+                alpha_glob = 1.0
+
+                if (E_global is not None) and (Y_glob_norm > 0.0):
+                    Eg = np.asarray(E_global, np.float64)
+                    upd_energy_sq = float(
+                        np.sum((dx_applied.astype(np.float64) ** 2) * Eg)
+                    )
+                else:
+                    upd_energy_sq = float(
+                        np.sum(dx_applied.astype(np.float64) ** 2)
+                    )
+
+                if (upd_energy_sq > 0.0) and (Y_glob_norm > 0.0):
+                    global_step_norm = float(np.sqrt(upd_energy_sq))
+                    cap = float(tau_global * Y_glob_norm)
+
+                    if global_step_norm > cap:
+                        alpha_glob = float(
+                            cap / np.maximum(global_step_norm, 1.0e-12)
+                        )
+
+                        # Scale RAW dx, then re-apply NNLS projection
+                        dx *= alpha_glob
+
+                        x_trial = x_before + dx
+                        if cfg.project_nonneg:
+                            np.maximum(x_trial, 0.0, out=x_trial)
+
+                        dx_applied = x_trial - x_before
+
+                print(
+                    f"[Kaczmarz-GLOBAL] frac_clipped={frac_clipped:.3f}, "
+                    f"||dx_raw||={np.linalg.norm(dx):.3e}, "
+                    f"||dx_applied||={np.linalg.norm(dx_applied):.3e}",
+                    flush=True,
+                )
+                print(
+                    f"[Kaczmarz-GLOBAL] cap="
+                    f"{float(tau_global * Y_glob_norm):.3e}, "
+                    f"alpha_glob={float(alpha_glob):.3e}, "
+                    f"global_step_norm="
+                    f"{float(np.sqrt(np.max((upd_energy_sq, 0.0)))):.3e}, ",
+                    flush=True)
 
                 if not np.all(np.isfinite(x_CP)):
                     bad = ~np.isfinite(x_CP)
@@ -3173,9 +3254,7 @@ def solve_global_kaczmarz_global_step_mp(
                         pass
 
                 print(
-                    "[Kaczmarz-GLOBAL] epoch {}/{} done.".format(
-                        ep + 1, cfg.epochs
-                    ),
+                    f"[Kaczmarz-GLOBAL] epoch {ep + 1}/{cfg.epochs} done.",
                     flush=True,
                 )
 

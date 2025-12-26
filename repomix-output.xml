@@ -2525,329 +2525,6 @@ docs_dir: docs
 ```
 </file>
 
-<file path="cube_debug.py">
-# -*- coding: utf-8 -*-
-r"""
-    cube_debug.py
-    Adriano Poci
-    University of Oxford
-    2025
-
-    Platforms
-    ---------
-    Unix, Windows
-
-    Synopsis
-    --------
-    A collection of helpful functionality to assist in debugging aspects of the CubeFit pipeline.
-
-    Authors
-    -------
-    Adriano Poci <adriano.poci@physics.ox.ac.uk>
-
-History
--------
-v1.0:   Added `nnls_seed_diagnostics` to investigate how the NNLS seed behaves
-            as a full solution. 13 December 2025
-"""
-import time, os
-import numpy as np
-from pathlib import Path
-from typing import Optional, Sequence
-
-from CubeFit.hdf5_manager import open_h5
-from CubeFit.hypercube_builder import read_global_column_energy
-from CubeFit.cube_utils import (
-    project_to_component_weights,
-    # project_to_component_weights_strict,
-)
-from CubeFit.live_fit_dashboard import (
-    render_aperture_fits_with_x,
-    render_sfh_from_x,
-)
-
-# ------------------------------------------------------------------------------
-
-def _read_C_P(f) -> tuple[int, int]:
-    M = f["/HyperCube/models"]
-    _, C, P, _ = map(int, M.shape)
-    return C, P
-
-def _row_or_vec_to_CP(arr: np.ndarray, C: int, P: int) -> np.ndarray:
-    """Map various X layouts to a (C,P) array."""
-    X = np.asarray(arr, np.float64)
-    if X.ndim == 2 and X.shape == (C, P):
-        return X.copy()
-    if X.ndim == 2 and X.shape == (P, C):
-        return X.T.copy()
-    v = X.ravel(order="C")
-    if v.size != C * P:
-        raise ValueError(
-            f"Cannot reshape X of size {v.size} to (C,P)=({C},{P})."
-        )
-    return v.reshape(C, P, order="C").copy()
-
-def _read_orbit_weights(f) -> np.ndarray:
-    # Same preference order you use elsewhere
-    if "/Fit/orbit_weights" in f:
-        w = np.asarray(f["/Fit/orbit_weights"][...], np.float64)
-    elif "/CompWeights" in f:
-        w = np.asarray(f["/CompWeights"][...], np.float64)
-    else:
-        raise RuntimeError("No orbital weights found (/Fit/orbit_weights or /CompWeights).")
-    return np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
-
-def _read_X(h5_path: str,
-            x_dset: str | None,
-            C: int,
-            P: int) -> np.ndarray:
-    """
-    Read a real solution / seed vector and return it as (C,P).
-
-    x_dset=None → use your usual preference order.
-    """
-    with open_h5(h5_path, role="reader", swmr=True) as f:
-        if x_dset is not None:
-            if x_dset not in f:
-                raise RuntimeError(f"Requested x_dset '{x_dset}' not found.")
-            X_raw = np.asarray(f[x_dset][...], np.float64)
-        else:
-            # same search order as compare_usage_to_orbit_weights, but main-file only
-            for name in ("/X_global",
-                         "/Fit/x_latest",
-                         "/Seeds/x0_nnls_patch",
-                         "/Fit/x_best",
-                         "/Fit/x_last",
-                         "/Fit/x_epoch_last"):
-                if name in f:
-                    X_raw = np.asarray(f[name][...], np.float64)
-                    break
-            else:
-                raise RuntimeError("No X dataset found in main HDF5.")
-    return _row_or_vec_to_CP(X_raw, C, P)
-
-def _usage(X: np.ndarray,
-           E: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Return (raw_usage, normalized_usage) per component.
-    If E is provided, usage is energy-weighted: s_c = sum_p X[c,p]*E[c,p].
-    """
-    X64 = np.asarray(X, np.float64)
-    if E is None:
-        s = X64.sum(axis=1)
-    else:
-        E64 = np.asarray(E, np.float64)
-        s = (X64 * E64).sum(axis=1)
-    s = np.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
-    s = np.maximum(s, 0.0)
-    S = float(s.sum() or 1.0)
-    return s, s / S
-
-def debug_test_projectors_on_h5(
-    h5_path: str,
-    x_dset: str | None = None,
-    *,
-    use_energy_metric: bool = True,
-) -> None:
-    """
-    Test project_to_component_weights and project_to_component_weights_strict
-    on *real* data from an HDF5, as close to runtime as possible.
-    """
-    with open_h5(h5_path, role="reader", swmr=True) as f:
-        C, P = _read_C_P(f)
-        w_raw = _read_orbit_weights(f)
-
-    # Reduce orbit_weights to (C,) if needed (C*P -> sum over P)
-    w_vec = np.asarray(w_raw, np.float64).ravel(order="C")
-    if w_vec.size == C:
-        w_c = w_vec.copy()
-    elif w_vec.size == C * P:
-        w_c = w_vec.reshape(C, P, order="C").sum(axis=1)
-    else:
-        raise ValueError(
-            f"orbit_weights length {w_vec.size} incompatible with C={C}, C*P={C*P}."
-        )
-    w_c = np.maximum(np.nan_to_num(w_c, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
-    Wsum = float(w_c.sum() or 1.0)
-    w_fracs = w_c / Wsum
-
-    # Real X_cp from file
-    X0 = _read_X(h5_path, x_dset=x_dset, C=C, P=P)
-    # Real global column energy (same as softbox/usage)
-    E_cp = read_global_column_energy(h5_path)
-
-    print(f"[debug] h5={h5_path}")
-    print(f"[debug] shapes: X0={X0.shape}, E_cp={E_cp.shape}, w_c={w_c.shape}")
-
-    # Baseline usage
-    s_plain0, u_plain0 = _usage(X0, E=None)
-    s_energy0, u_energy0 = _usage(X0, E_cp if use_energy_metric else None)
-
-    def _report(label: str, u: np.ndarray) -> None:
-        diff = u - w_fracs
-        l1 = float(np.sum(np.abs(diff)))
-        linf = float(np.max(np.abs(diff)))
-        print(f"[{label}] L1={l1:.3e}  L∞={linf:.3e}")
-
-    print("\n[baseline] before any projection:")
-    _report("plain-usage", u_plain0)
-    _report("energy-usage", u_energy0)
-    print("  mass_plain =", float(s_plain0.sum()))
-    print("  mass_energy =", float(s_energy0.sum()))
-
-    # ---------- inter-epoch projector (gentle) ----------
-    X1 = X0.copy()
-    t0 = time.perf_counter()
-    project_to_component_weights(
-        X1,
-        t_vec=w_c,                # same target as runtime
-        E_cp=(E_cp if use_energy_metric else None),
-        minw=1e-12,
-    )
-    dt1 = time.perf_counter() - t0
-
-    s_plain1, u_plain1 = _usage(X1, E=None)
-    s_energy1, u_energy1 = _usage(X1, E_cp if use_energy_metric else None)
-
-    print("\n[proj] after project_to_component_weights:")
-    print(f"  runtime = {dt1:.4e} s")
-    print("  finite X1? ", np.isfinite(X1).all(),
-          "  min(X1) =", float(np.nanmin(X1)))
-    print("  mass_plain  (before/after) =",
-          float(s_plain0.sum()), "→", float(s_plain1.sum()))
-    print("  mass_energy (before/after) =",
-          float(s_energy0.sum()), "→", float(s_energy1.sum()))
-    _report("plain-usage", u_plain1)
-    _report("energy-usage", u_energy1)
-
-    # # ---------- strict projector (hard constraint, post-epoch) ----------
-    # X2 = X0.copy()
-    # t0 = time.perf_counter()
-    # project_to_component_weights_strict(
-    #     X2,
-    #     orbit_weights=w_c,        # or full (C*P,) if you want; fn should handle both
-    #     E_cp=(E_cp if use_energy_metric else None),
-    #     min_target=1e-12,
-    # )
-    # dt2 = time.perf_counter() - t0
-
-    # s_plain2, u_plain2 = _usage(X2, E=None)
-    # s_energy2, u_energy2 = _usage(X2, E_cp if use_energy_metric else None)
-
-    # print("\n[strict] after project_to_component_weights_strict:")
-    # print(f"  runtime = {dt2:.4e} s")
-    # print("  finite X2? ", np.isfinite(X2).all(),
-    #       "  min(X2) =", float(np.nanmin(X2)))
-    # print("  mass_plain  (before/after) =",
-    #       float(s_plain0.sum()), "→", float(s_plain2.sum()))
-    # print("  mass_energy (before/after) =",
-    #       float(s_energy0.sum()), "→", float(s_energy2.sum()))
-    # _report("plain-usage", u_plain2)
-    # _report("energy-usage", u_energy2)
-
-    print("\n[debug] done.\n")
-
-# ------------------------------------------------------------------------------
-
-def nnls_seed_diagnostics(
-    h5_path: str,
-    *,
-    seed_path: Optional[str] = None,
-    n_apertures: int = 6,
-    apertures: Optional[Sequence[int]] = None,
-    show_residual: bool = True,
-) -> dict:
-    """
-    Treat the NNLS seed as the final solution and render standard diagnostics.
-
-    This is a convenience wrapper around `render_aperture_fits_with_x` and
-    `render_sfh_from_x` that:
-      - reads the seed vector X from the main HDF5 file,
-      - flattens it to (C*P,) in the runtime layout,
-      - renders a small set of representative aperture fits, and
-      - renders the orbital SFH panel.
-
-    Parameters
-    ----------
-    h5_path : str
-        Path to the main CubeFit HDF5 file.
-    seed_path : str, optional
-        Dataset to use for the seed X. Defaults to the environment
-        variable CUBEFIT_SEED_PATH if set, otherwise "/Seeds/x0_nnls_patch".
-    n_apertures : int, optional
-        Number of apertures to sample uniformly across the field if
-        `apertures` is not provided. Default is 6.
-    apertures : sequence of int, optional
-        Explicit list of aperture indices to plot. If provided, this
-        overrides `n_apertures`.
-    show_residual : bool, optional
-        Whether to overlay residuals in the aperture-fit panel.
-
-    Returns
-    -------
-    info : dict
-        Dictionary with keys:
-          - "seed_path" : str
-          - "apertures" : list[int]
-          - "fits_png" : str
-          - "sfh_png" : str
-    """
-
-    if seed_path is None:
-        seed_path = os.environ.get(
-            "CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch"
-        )
-
-    # Read geometry and seed vector as (C,P)
-    with open_h5(h5_path, role="reader", swmr=True) as f:
-        C, P = _read_C_P(f)
-        S = int(f["/DataCube"].shape[0])
-
-    X_cp = _read_X(h5_path, x_dset=seed_path, C=C, P=P)
-    x_flat = np.asarray(X_cp, dtype=np.float64).ravel(order="C")
-    x_flat = np.nan_to_num(
-        x_flat, copy=False, nan=0.0, posinf=0.0, neginf=0.0
-    )
-
-    # Choose apertures to plot
-    if apertures is not None:
-        ap_idx = [int(i) for i in apertures if 0 <= int(i) < S]
-    else:
-        n_plot = int(min(max(1, n_apertures), S))
-        ap_idx = np.linspace(0, S - 1, n_plot, dtype=int).tolist()
-
-    base = Path(h5_path).parent / "figures"
-    base.mkdir(parents=True, exist_ok=True)
-
-    fits_png = base / "nnls_seed_fits.png"
-    sfh_png = base / "nnls_seed_sfh.png"
-
-    if ap_idx:
-        render_aperture_fits_with_x(
-            h5_path,
-            x_flat,
-            fits_png,
-            apertures=ap_idx,
-            show_residual=show_residual,
-            title="NNLS seed treated as final solution",
-        )
-
-    render_sfh_from_x(
-        h5_path,
-        x_flat,
-        sfh_png,
-    )
-
-    return {
-        "seed_path": str(seed_path),
-        "apertures": ap_idx,
-        "fits_png": str(fits_png),
-        "sfh_png": str(sfh_png),
-    }
-
-# ------------------------------------------------------------------------------
-</file>
-
 <file path="hypercube_reader.py">
 # -*- coding: utf-8 -*-
 r"""
@@ -3474,6 +3151,330 @@ MkDocs config (`mkdocs.yml`) already points navigation to `docs/CubeFit.md`.
 See `LICENSE` (if present). If you plan to publish results, please cite the repository and any underlying data/model libraries you use (e.g., MILES/eMILES).
 </file>
 
+<file path="cube_debug.py">
+# -*- coding: utf-8 -*-
+r"""
+    cube_debug.py
+    Adriano Poci
+    University of Oxford
+    2025
+
+    Platforms
+    ---------
+    Unix, Windows
+
+    Synopsis
+    --------
+    A collection of helpful functionality to assist in debugging aspects of the CubeFit pipeline.
+
+    Authors
+    -------
+    Adriano Poci <adriano.poci@physics.ox.ac.uk>
+
+History
+-------
+v1.0:   Added `nnls_seed_diagnostics` to investigate how the NNLS seed behaves
+            as a full solution. 13 December 2025
+"""
+import time, os
+import numpy as np
+from pathlib import Path
+from typing import Optional, Sequence
+
+from CubeFit.hdf5_manager import open_h5
+from CubeFit.hypercube_builder import read_global_column_energy
+from CubeFit.cube_utils import (
+    project_to_component_weights,
+    # project_to_component_weights_strict,
+)
+from CubeFit.live_fit_dashboard import (
+    render_aperture_fits_with_x,
+    render_sfh_from_x,
+)
+
+# ------------------------------------------------------------------------------
+
+def _read_C_P(f) -> tuple[int, int]:
+    M = f["/HyperCube/models"]
+    _, C, P, _ = map(int, M.shape)
+    return C, P
+
+def _row_or_vec_to_CP(arr: np.ndarray, C: int, P: int) -> np.ndarray:
+    """Map various X layouts to a (C,P) array."""
+    X = np.asarray(arr, np.float64)
+    if X.ndim == 2 and X.shape == (C, P):
+        return X.copy()
+    if X.ndim == 2 and X.shape == (P, C):
+        return X.T.copy()
+    v = X.ravel(order="C")
+    if v.size != C * P:
+        raise ValueError(
+            f"Cannot reshape X of size {v.size} to (C,P)=({C},{P})."
+        )
+    return v.reshape(C, P, order="C").copy()
+
+def _read_orbit_weights(f) -> np.ndarray:
+    # Same preference order you use elsewhere
+    if "/Fit/orbit_weights" in f:
+        w = np.asarray(f["/Fit/orbit_weights"][...], np.float64)
+    elif "/CompWeights" in f:
+        w = np.asarray(f["/CompWeights"][...], np.float64)
+    else:
+        raise RuntimeError("No orbital weights found (/Fit/orbit_weights or /CompWeights).")
+    return np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+
+def _read_X(h5_path: str,
+            x_dset: str | None,
+            C: int,
+            P: int) -> np.ndarray:
+    """
+    Read a real solution / seed vector and return it as (C,P).
+
+    x_dset=None → use your usual preference order.
+    """
+    with open_h5(h5_path, role="reader", swmr=True) as f:
+        if x_dset is not None:
+            if x_dset not in f:
+                raise RuntimeError(f"Requested x_dset '{x_dset}' not found.")
+            X_raw = np.asarray(f[x_dset][...], np.float64)
+        else:
+            # same search order as compare_usage_to_orbit_weights, but main-file only
+            for name in ("/X_global",
+                         "/Fit/x_latest",
+                         "/Seeds/x0_nnls_patch",
+                         "/Fit/x_best",
+                         "/Fit/x_last",
+                         "/Fit/x_epoch_last"):
+                if name in f:
+                    X_raw = np.asarray(f[name][...], np.float64)
+                    break
+            else:
+                raise RuntimeError("No X dataset found in main HDF5.")
+    return _row_or_vec_to_CP(X_raw, C, P)
+
+def _usage(X: np.ndarray,
+           E: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return (raw_usage, normalized_usage) per component.
+    If E is provided, usage is energy-weighted: s_c = sum_p X[c,p]*E[c,p].
+    """
+    X64 = np.asarray(X, np.float64)
+    if E is None:
+        s = X64.sum(axis=1)
+    else:
+        E64 = np.asarray(E, np.float64)
+        s = (X64 * E64).sum(axis=1)
+    s = np.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+    s = np.maximum(s, 0.0)
+    S = float(s.sum() or 1.0)
+    return s, s / S
+
+def debug_test_projectors_on_h5(
+    h5_path: str,
+    x_dset: str | None = None,
+    *,
+    use_energy_metric: bool = True,
+) -> None:
+    """
+    Test project_to_component_weights and project_to_component_weights_strict
+    on *real* data from an HDF5, as close to runtime as possible.
+    """
+    with open_h5(h5_path, role="reader", swmr=True) as f:
+        C, P = _read_C_P(f)
+        w_raw = _read_orbit_weights(f)
+
+    # Reduce orbit_weights to (C,) if needed (C*P -> sum over P)
+    w_vec = np.asarray(w_raw, np.float64).ravel(order="C")
+    if w_vec.size == C:
+        w_c = w_vec.copy()
+    elif w_vec.size == C * P:
+        w_c = w_vec.reshape(C, P, order="C").sum(axis=1)
+    else:
+        raise ValueError(
+            f"orbit_weights length {w_vec.size} incompatible with C={C}, C*P={C*P}."
+        )
+    w_c = np.maximum(np.nan_to_num(w_c, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
+    Wsum = float(w_c.sum() or 1.0)
+    w_fracs = w_c / Wsum
+
+    # Real X_cp from file
+    X0 = _read_X(h5_path, x_dset=x_dset, C=C, P=P)
+    # Real global column energy (same as softbox/usage)
+    E_cp = read_global_column_energy(h5_path)
+
+    print(f"[debug] h5={h5_path}")
+    print(f"[debug] shapes: X0={X0.shape}, E_cp={E_cp.shape}, w_c={w_c.shape}")
+
+    # Baseline usage
+    s_plain0, u_plain0 = _usage(X0, E=None)
+    s_energy0, u_energy0 = _usage(X0, E_cp if use_energy_metric else None)
+
+    def _report(label: str, u: np.ndarray) -> None:
+        diff = u - w_fracs
+        l1 = float(np.sum(np.abs(diff)))
+        linf = float(np.max(np.abs(diff)))
+        print(f"[{label}] L1={l1:.3e}  L∞={linf:.3e}")
+
+    print("\n[baseline] before any projection:")
+    _report("plain-usage", u_plain0)
+    _report("energy-usage", u_energy0)
+    print("  mass_plain =", float(s_plain0.sum()))
+    print("  mass_energy =", float(s_energy0.sum()))
+
+    # ---------- inter-epoch projector (gentle) ----------
+    X1 = X0.copy()
+    t0 = time.perf_counter()
+    project_to_component_weights(
+        X1,
+        t_vec=w_c,                # same target as runtime
+        E_cp=(E_cp if use_energy_metric else None),
+        minw=1e-12,
+    )
+    dt1 = time.perf_counter() - t0
+
+    s_plain1, u_plain1 = _usage(X1, E=None)
+    s_energy1, u_energy1 = _usage(X1, E_cp if use_energy_metric else None)
+
+    print("\n[proj] after project_to_component_weights:")
+    print(f"  runtime = {dt1:.4e} s")
+    print("  finite X1? ", np.isfinite(X1).all(),
+          "  min(X1) =", float(np.nanmin(X1)))
+    print("  mass_plain  (before/after) =",
+          float(s_plain0.sum()), "→", float(s_plain1.sum()))
+    print("  mass_energy (before/after) =",
+          float(s_energy0.sum()), "→", float(s_energy1.sum()))
+    _report("plain-usage", u_plain1)
+    _report("energy-usage", u_energy1)
+
+    # # ---------- strict projector (hard constraint, post-epoch) ----------
+    # X2 = X0.copy()
+    # t0 = time.perf_counter()
+    # project_to_component_weights_strict(
+    #     X2,
+    #     orbit_weights=w_c,        # or full (C*P,) if you want; fn should handle both
+    #     E_cp=(E_cp if use_energy_metric else None),
+    #     min_target=1e-12,
+    # )
+    # dt2 = time.perf_counter() - t0
+
+    # s_plain2, u_plain2 = _usage(X2, E=None)
+    # s_energy2, u_energy2 = _usage(X2, E_cp if use_energy_metric else None)
+
+    # print("\n[strict] after project_to_component_weights_strict:")
+    # print(f"  runtime = {dt2:.4e} s")
+    # print("  finite X2? ", np.isfinite(X2).all(),
+    #       "  min(X2) =", float(np.nanmin(X2)))
+    # print("  mass_plain  (before/after) =",
+    #       float(s_plain0.sum()), "→", float(s_plain2.sum()))
+    # print("  mass_energy (before/after) =",
+    #       float(s_energy0.sum()), "→", float(s_energy2.sum()))
+    # _report("plain-usage", u_plain2)
+    # _report("energy-usage", u_energy2)
+
+    print("\n[debug] done.\n")
+
+# ------------------------------------------------------------------------------
+
+def nnls_seed_diagnostics(
+    h5_path: str,
+    *,
+    seed_path: Optional[str] = None,
+    n_apertures: int = 6,
+    apertures: Optional[Sequence[int]] = None,
+    show_residual: bool = True,
+) -> dict:
+    """
+    Treat the NNLS seed as the final solution and render standard diagnostics.
+
+    This is a convenience wrapper around `render_aperture_fits_with_x` and
+    `render_sfh_from_x` that:
+      - reads the seed vector X from the main HDF5 file,
+      - flattens it to (C*P,) in the runtime layout,
+      - renders a small set of representative aperture fits, and
+      - renders the orbital SFH panel.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the main CubeFit HDF5 file.
+    seed_path : str, optional
+        Dataset to use for the seed X. Defaults to the environment
+        variable CUBEFIT_SEED_PATH if set, otherwise "/Seeds/x0_nnls_patch".
+    n_apertures : int, optional
+        Number of apertures to sample uniformly across the field if
+        `apertures` is not provided. Default is 6.
+    apertures : sequence of int, optional
+        Explicit list of aperture indices to plot. If provided, this
+        overrides `n_apertures`.
+    show_residual : bool, optional
+        Whether to overlay residuals in the aperture-fit panel.
+
+    Returns
+    -------
+    info : dict
+        Dictionary with keys:
+          - "seed_path" : str
+          - "apertures" : list[int]
+          - "fits_png" : str
+          - "sfh_png" : str
+    """
+
+    if seed_path is None:
+        seed_path = os.environ.get(
+            "CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch"
+        )
+
+    # Read geometry and seed vector as (C,P)
+    with open_h5(h5_path, role="reader", swmr=True) as f:
+        C, P = _read_C_P(f)
+        S = int(f["/DataCube"].shape[0])
+
+    X_cp = _read_X(h5_path, x_dset=seed_path, C=C, P=P)
+    x_flat = np.asarray(X_cp, dtype=np.float64).ravel(order="C")
+    x_flat = np.nan_to_num(
+        x_flat, copy=False, nan=0.0, posinf=0.0, neginf=0.0
+    )
+
+    # Choose apertures to plot
+    if apertures is not None:
+        ap_idx = [int(i) for i in apertures if 0 <= int(i) < S]
+    else:
+        n_plot = int(min(max(1, n_apertures), S))
+        ap_idx = np.linspace(0, S - 1, n_plot, dtype=int).tolist()
+
+    base = Path(h5_path).parent / "figures"
+    base.mkdir(parents=True, exist_ok=True)
+
+    fits_png = base / "nnls_seed_fits.png"
+    sfh_png = base / "nnls_seed_sfh.png"
+
+    render_sfh_from_x(
+        h5_path,
+        x_flat,
+        sfh_png,
+    )
+    
+    if ap_idx:
+        render_aperture_fits_with_x(
+            h5_path,
+            x_flat,
+            fits_png,
+            apertures=ap_idx,
+            show_residual=show_residual,
+            title="NNLS seed treated as final solution",
+        )
+
+
+    return {
+        "seed_path": str(seed_path),
+        "apertures": ap_idx,
+        "fits_png": str(fits_png),
+        "sfh_png": str(sfh_png),
+    }
+
+# ------------------------------------------------------------------------------
+</file>
+
 <file path="kz_initNGC4365.py">
 """
 #!/apps/skylake/software/core/anaconda3/5.1.0/bin/python3
@@ -4073,93 +4074,6 @@ class NullTracker:
     def on_epoch_end(self, *a, **k): pass
     def maybe_save(self, *a, **k): pass
     def close(self, *a, **k): pass
-</file>
-
-<file path="kz_run.py">
-"""
-History
--------
-v1.0:	Capture exceptions around `genCubeFit` call. 4 December 2025
-"""
-
-import numpy as np
-import os, re, sys
-import pathlib as plp
-import argparse
-
-# Custom modules
-from CubeFit.kz_fitSpec import genCubeFit
-from CubeFit.kz_initNGC4365 import props
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Thin wrapper around genCubeFit")
-    ap.add_argument(
-        "--run-switch",
-        type=str,
-        default=None,
-        help="Single string passed directly as runSwitch to genCubeFit"
-    )
-    # boolean redraw with explicit on/off flags
-    group = ap.add_mutually_exclusive_group()
-    group.add_argument("--redraw", dest="redraw", action="store_true",
-                       help="Enable redraw mode")
-    group.add_argument("--no-redraw", dest="redraw", action="store_false",
-                       help="Disable redraw mode")
-    ap.set_defaults(redraw=False)
-
-    args = ap.parse_args()
-
-    # Detect CPUs
-    slurm_cpu = os.environ.get('SLURM_CPUS_PER_TASK')
-    if slurm_cpu is not None:
-        nCPU = int(slurm_cpu)
-    else:
-        curdir = plp.Path(__file__).parent
-        try:
-            with open(curdir/'kz_addqueue.sh') as f:
-                content = f.read()
-            m = re.search(r'^\s*nCPU\s*=\s*(\d+)', content, re.MULTILINE)
-            nCPU = int(m.group(1)) if m else 20
-        except FileNotFoundError:
-            nCPU = 20
-
-    print(f"Setting nCPU to {nCPU} from SLURM_CPUS_PER_TASK or kz_addqueue.sh")
-    props['nProcs'] = nCPU
-
-    # Pass-through args
-    if args.run_switch is not None:
-        props['runSwitch'] = args.run_switch
-        print(f"runSwitch = {props['runSwitch']}")
-    props['redraw'] = bool(args.redraw)
-    print(f"redraw = {props['redraw']}")
-
-    os.environ['CUBEFIT_NNLS_ENABLE']=str(0)
-    os.environ['CUBEFIT_NNLS_EVERY']=str(5)
-    os.environ['CUBEFIT_NNLS_MIN_IMPROVE']=str(0.9995)
-    os.environ['CUBEFIT_NNLS_MAX_COLS']=str(64)
-    os.environ['CUBEFIT_NNLS_SUB_L']=str(512)
-    os.environ['CUBEFIT_NNLS_SOLVER']='nnls'
-    os.environ["CUBEFIT_USE_NNLS_PRIOR"] = "0"
-    os.environ['CUBEFIT_NNLS_L2']=str(0)
-
-    print(props)
-
-    try:
-        genCubeFit(**props)
-    except SystemExit:
-        # Let explicit sys.exit()s behave normally
-        raise
-    except BaseException as e:
-        # Log + print the traceback explicitly
-        import traceback
-        print("[kz_run] FATAL: unhandled exception in genCubeFit", file=sys.__stderr__, flush=True)
-        traceback.print_exc()
-        # This *forces* the interpreter to exit, even under IPython
-        sys.exit(1)
-
-if __name__ == "__main__":
-    main()
 </file>
 
 <file path="hdf5_manager.py">
@@ -7888,80 +7802,164 @@ def assert_preflight_ok(
 # ------------------------------------------------------------------------------
 </file>
 
-<file path="kz_2Fit.sh">
-#!/bin/bash -l
-# #SBATCH -A durham
-# #SBATCH -D "/cosma5/data/durham/dc-poci1/muse"
-# #SBATCH --output="/cosma5/data/durham/dc-poci1/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-# #SBATCH --error="/cosma5/data/durham/dc-poci1/muse/slurm_tri_losvdDecomp.log" --open-mode=append
+<file path="kz_run.py">
+"""
+History
+-------
+v1.0:	Capture exceptions around `genCubeFit` call. 4 December 2025
+"""
 
-# #SBATCH -A oz059
-# #SBATCH -D "/fred/oz059/poci/muse"
-# #SBATCH --output="/fred/oz059/poci/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-# #SBATCH --error="/fred/oz059/poci/muse/slurm_tri_losvdDecomp.log" --open-mode=append
+import numpy as np
+import os, re, sys
+import pathlib as plp
+import argparse
 
-#SBATCH -D "/data/phys-gal-dynamics/phys2603/muse"
-#SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
-#SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
-#SBATCH -p medium
+# Custom modules
+from CubeFit.kz_fitSpec import genCubeFit
+from CubeFit.kz_initNGC4365 import props
 
-#SBATCH --job-name="CubeFit_2Fit"
-#SBATCH --time=0-48:00
-#SBATCH -N 1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=48
-#SBATCH --mem=200G
-#SBATCH --hint=nomultithread
-#SBATCH --exclusive
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=adriano.poci@physics.ox.ac.uk
 
-module purge
-module load foss/2023a
-module load Python/3.11.3-GCCcore-12.3.0
+def main():
+    ap = argparse.ArgumentParser(description="Thin wrapper around genCubeFit")
+    ap.add_argument(
+        "--run-switch",
+        type=str,
+        default=None,
+        help="Single string passed directly as runSwitch to genCubeFit"
+    )
+    # boolean redraw with explicit on/off flags
+    group = ap.add_mutually_exclusive_group()
+    group.add_argument("--redraw", dest="redraw", action="store_true",
+                       help="Enable redraw mode")
+    group.add_argument("--no-redraw", dest="redraw", action="store_false",
+                       help="Disable redraw mode")
+    ap.set_defaults(redraw=False)
 
-# --- BLAS / OpenMP threading (per worker) ---
-export OMP_NUM_THREADS=12
-export OPENBLAS_NUM_THREADS=12
-export MKL_NUM_THREADS=12
-export NUMEXPR_NUM_THREADS=12
-export OMP_PROC_BIND=spread
-export OMP_PLACES=cores
-export OMP_DYNAMIC=FALSE
-export MKL_DYNAMIC=FALSE
-# For OpenBLAS, avoid accidental main-thread reuse:
-export OPENBLAS_VERBOSE=0
+    args = ap.parse_args()
 
-# --- HDF5 raw-data chunk cache (reader side) ---
-export CUBEFIT_RDCC_NBYTES=$((16*1024*1024*1024))  # 16 GiB
-export CUBEFIT_RDCC_NSLOTS=400003                   # large-ish prime
-export CUBEFIT_RDCC_W0=0.9
+    # Detect CPUs
+    slurm_cpu = os.environ.get('SLURM_CPUS_PER_TASK')
+    if slurm_cpu is not None:
+        nCPU = int(slurm_cpu)
+    else:
+        curdir = plp.Path(__file__).parent
+        try:
+            with open(curdir/'kz_addqueue.sh') as f:
+                content = f.read()
+            m = re.search(r'^\s*nCPU\s*=\s*(\d+)', content, re.MULTILINE)
+            nCPU = int(m.group(1)) if m else 20
+        except FileNotFoundError:
+            nCPU = 20
 
-export HDF5_USE_FILE_LOCKING=FALSE
+    print(f"Setting nCPU to {nCPU} from SLURM_CPUS_PER_TASK or kz_addqueue.sh")
+    props['nProcs'] = nCPU
 
-# File descriptors
-ulimit -n 8192
+    # Pass-through args
+    if args.run_switch is not None:
+        props['runSwitch'] = args.run_switch
+        print(f"runSwitch = {props['runSwitch']}")
+    props['redraw'] = bool(args.redraw)
+    print(f"redraw = {props['redraw']}")
 
-cd /data/phys-gal-dynamics/phys2603/CubeFit
+    os.environ['CUBEFIT_NNLS_ENABLE']=str(0)
+    os.environ['CUBEFIT_NNLS_EVERY']=str(5)
+    os.environ['CUBEFIT_NNLS_MIN_IMPROVE']=str(0.9995)
+    os.environ['CUBEFIT_NNLS_MAX_COLS']=str(64)
+    os.environ['CUBEFIT_NNLS_SUB_L']=str(512)
+    os.environ['CUBEFIT_NNLS_SOLVER']='nnls'
+    os.environ["CUBEFIT_USE_NNLS_PRIOR"] = "0"
+    os.environ['CUBEFIT_NNLS_L2']=str(0)
+    os.environ["CUBEFIT_LAMBDA_WEIGHTS_ENABLE"] = "1"
+    os.environ["CUBEFIT_KACZ_L2"] = "0.0"
+    os.environ["CUBEFIT_RMSE_PROXY_GUARD"] = "0"
+    os.environ["CUBEFIT_NNLS_PROP_PER_BAND"] = "0"
+    os.environ["CUBEFIT_NNLS_ENABLE"] = "0"
+    os.environ["CUBEFIT_ORBIT_BETA"] = "0.0"
+    os.environ["CUBEFIT_GLOBAL_STEP_FRAC"] = "1.0"
+    os.environ["CUBEFIT_GLOBAL_TAU"] = "1.5"
+    os.environ["CUBEFIT_GLOBAL_ENERGY_BLEND"] = "0.0"
+    os.environ["CUBEFIT_ZERO_COL_FREEZE"] = str(1)
+    os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-4)
+    print(props)
 
-# sanity print (once) to confirm cpuset and BLAS threads
-srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python - <<'PY'
-import os, json
-print(f"[sanity] cpuset cores: {len(os.sched_getaffinity(0))}")
-try:
-    from threadpoolctl import threadpool_info
-    print("[sanity] BLAS pools:", json.dumps(threadpool_info(), indent=2)[:600], "...")
-except Exception as e:
-    print("[sanity] threadpoolctl not available:", e)
-PY
+    try:
+        genCubeFit(**props)
+    except SystemExit:
+        # Let explicit sys.exit()s behave normally
+        raise
+    except BaseException as e:
+        # Log + print the traceback explicitly
+        import traceback
+        print("[kz_run] FATAL: unhandled exception in genCubeFit", file=sys.__stderr__, flush=True)
+        traceback.print_exc()
+        # This *forces* the interpreter to exit, even under IPython
+        sys.exit(1)
 
-# run your job as a Slurm step (gives you the full cpuset)
-srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python -m IPython kz_run.py -- --run-switch fit
+if __name__ == "__main__":
+    main()
 </file>
 
 <file path="nnls_patch.py">
+# -*- coding: utf-8 -*-
+r"""
+    nnls_patch.py
+    Adriano Poci
+    University of Oxford
+    2025
+
+    Platforms
+    ---------
+    Unix, Windows
+
+    Synopsis
+    --------
+    Patch-scale non-negative least-squares (NNLS) utilities for CubeFit.
+
+    This module solves a *reduced* NNLS problem on a representative subset of
+    spaxels and a restricted set of populations per component, producing a
+    compact seed solution ``x_CP`` (shape ``(C, P)``) that can be:
+
+    - written to the main HDF5 file (typically ``/Seeds/x0_nnls_patch``), and
+    - used as a warm-start for global solvers (e.g. Kaczmarz-based fits).
+
+    The patch fit can optionally:
+    - apply the global wavelength mask (``/Mask``),
+    - apply λ-weights (typically ``/HyperCube/lambda_weights``),
+    - normalize model columns consistently with the HyperCube normalization,
+    - compare population “usage” against an optional orbit-weight prior, and
+    - generate quick-look diagnostics (per-spaxel overlays, RMSE/χ² summaries,
+      and usage-vs-prior plots).
+
+    The main entry point is :func:`run_patch`, and a small CLI wrapper is
+    provided for interactive use and debugging.
+
+    Inputs
+    ------
+    The HDF5 file is expected to contain, at minimum:
+    - ``/DataCube`` (S, L)
+    - ``/HyperCube/models`` (S, C, P, L)
+
+    Optional datasets used when enabled:
+    - ``/Mask`` (L,)
+    - ``/HyperCube/lambda_weights`` (L,)
+    - ``/HyperCube/col_energy`` or equivalent global column-energy storage
+
+    Outputs
+    -------
+    - ``x_CP``: seed weights (C, P) in float64
+    - optional HDF5 seed write (e.g. ``/Seeds/x0_nnls_patch``)
+    - optional diagnostic PNGs in ``out_dir``
+
+    Authors
+    -------
+    Adriano Poci <adriano.poci@physics.ox.ac.uk>
+
+History
+-------
+v1.0:   19 December 2025
+"""
+
+
 from __future__ import annotations
 import os, math, pathlib as plp
 from typing import Optional, List, Tuple
@@ -7976,6 +7974,134 @@ from CubeFit.cube_utils import read_lambda_weights, ensure_lambda_weights,\
     compare_usage_to_orbit_weights
 
 # ----------------------------- helpers ---------------------------------
+
+def _predict_spaxel_sparse_from_models(M,
+                                      s_idx,
+                                      x_cp,
+                                      picks,
+                                      keep_idx=None):
+    """
+    Predict one spaxel spectrum by streaming /HyperCube/models in chunk-aligned
+    slabs, avoiding eager materialization of (C, P, L).
+
+    This is intended for diagnostics/plotting (e.g. the NNLS seed patch plots),
+    where we only need y_fit for a small number of spaxels and want to avoid:
+
+        np.asarray(M[s, :, :, :])  # huge (C,P,L) read per spaxel.
+
+    The implementation respects the dataset chunking: it reads blocks
+    (1, C_chunk, P_block, L) and accumulates contributions in float64.
+
+    Notes
+    -----
+    - If the dataset is chunked with L_chunk == L (common in our files),
+      masking wavelengths (keep_idx) reduces compute but may not reduce I/O
+      much, because HDF5 still has to decompress whole L-chunks.
+    - We still avoid the large temporary (C,P,Lk) allocation and instead
+      stream blocks and accumulate into y_fit.
+
+    Parameters
+    ----------
+    M : h5py.Dataset
+        The /HyperCube/models dataset of shape (S, C, P, L).
+    s_idx : int
+        Spaxel index.
+    x_cp : ndarray
+        Weights shaped (C, P), float64 recommended.
+    picks : list[list[int]]
+        For each component c, a list of population indices to include.
+        This is the same structure already used in nnls_patch.py.
+    keep_idx : ndarray[int] or None
+        Optional wavelength indices (length Lk) to evaluate on. If None,
+        predicts the full L grid.
+
+    Returns
+    -------
+    y_fit : ndarray
+        Predicted spectrum for spaxel s_idx with shape (Lk,) if keep_idx is
+        not None, else (L,). dtype float64.
+
+    Raises
+    ------
+    ValueError
+        If shapes are inconsistent with (C, P).
+
+    Examples
+    --------
+    >>> with open_h5(h5_path, role="reader") as f:
+    ...     M = f["/HyperCube/models"]
+    ...     y_fit = _predict_spaxel_sparse_from_models(
+    ...         M, s_idx=0, x_cp=x_CP, picks=picks, keep_idx=keep_idx
+    ...     )
+    """
+    s_idx = int(s_idx)
+    C = int(M.shape[1])
+    P = int(M.shape[2])
+    L = int(M.shape[3])
+
+    x_cp = np.asarray(x_cp, dtype=np.float64, order="C")
+    if x_cp.shape != (C, P):
+        raise ValueError(f"x_cp shape {x_cp.shape} != (C,P)=({C},{P})")
+
+    if keep_idx is None:
+        Lk = L
+        keep_idx_local = None
+    else:
+        keep_idx_local = np.asarray(keep_idx, dtype=np.int64).ravel()
+        Lk = int(keep_idx_local.size)
+
+    # Use storage chunking to align reads
+    chunks = M.chunks or (1, 1, P, L)
+    C_chunk = int(max(1, chunks[1]))
+    P_chunk = int(max(1, chunks[2]))
+
+    # Work in float64 accumulator; multiply in float32 for speed.
+    y_fit = np.zeros(Lk, dtype=np.float64)
+
+    # Iterate in storage order: components in C_chunk blocks
+    for c0 in range(0, C, C_chunk):
+        c1 = min(C, c0 + C_chunk)
+
+        # Most of our files are C_chunk == 1, so this is one component.
+        for c in range(c0, c1):
+            plist = picks[c]
+            if not plist:
+                continue
+
+            # Determine which P-chunks contain any of the picked populations.
+            plist_arr = np.asarray(plist, dtype=np.int64)
+            pj = np.unique((plist_arr // P_chunk) * P_chunk)
+
+            for p0 in pj:
+                p0 = int(p0)
+                p1 = int(min(P, p0 + P_chunk))
+
+                # Select only the picked populations that lie in [p0, p1)
+                in_block = (plist_arr >= p0) & (plist_arr < p1)
+                if not np.any(in_block):
+                    continue
+                local_idx = (plist_arr[in_block] - p0).astype(np.int64, copy=False)
+
+                # Read one storage-aligned block: (1, 1, Pb, L) float32
+                # (This avoids the full (C,P,L) slab.)
+                A32 = M[s_idx:s_idx + 1, c:c + 1, p0:p1, :][...]
+                A32 = np.asarray(A32, dtype=np.float32, order="C")[0, 0, :, :]  # (Pb, L)
+
+                # Slice to selected populations in this P-block
+                A32 = A32[local_idx, :]  # (Kb, L)
+
+                # Optional wavelength masking (compute reduction; I/O depends on L-chunk)
+                if keep_idx_local is not None:
+                    A32 = A32[:, keep_idx_local]  # (Kb, Lk)
+
+                # Weights for this block
+                w64 = x_cp[c, p0:p1][local_idx]                 # (Kb,) float64
+                w32 = w64.astype(np.float32, copy=False)        # float32 GEMV
+
+                # Accumulate: y += A^T w
+                y_fit += (A32.T @ w32).astype(np.float64, copy=False)
+
+    return y_fit
 
 def _get_mask_local(f) -> np.ndarray:
     """Return a 1D boolean λ-mask (L,), True = keep."""
@@ -8630,16 +8756,13 @@ def run_patch(h5_path: str,
         for i, s in enumerate(tqdm(s_idx, desc="[patch] plots", mininterval=0.5, dynamic_ncols=True)):
             y_fit = np.zeros(Lk, dtype=np.float64)
             # weighted least-squares sense: compare on masked/log grid unweighted
-            A_sp = np.asarray(M[s, :, :, :], dtype=np.float32) # (C,P,L)
-            if keep_idx is not None:
-                A_sp = A_sp[:, :, keep_idx] # (C,P,Lk)
-            # only chosen pops contribute
-            for c, plist in enumerate(picks):
-                if len(plist) == 0:
-                    continue
-                coeff = x_CP[c, plist] # (|plist|,)
-                if coeff.sum() != 0.0:
-                    y_fit += coeff @ A_sp[c, plist, :]
+            y_fit = _predict_spaxel_sparse_from_models(
+                M=M,
+                s_idx=int(s),
+                x_cp=x_CP,
+                picks=picks,
+                keep_idx=keep_idx,
+            )
             y_obs = y[pos:pos+Lk]
             wrow  = sqrt_w_rows[pos:pos+Lk]
             pos += Lk
@@ -8651,15 +8774,16 @@ def run_patch(h5_path: str,
             chi2[i] = float(np.sum((r * wrow)**2) / den)
 
             if out_dir:
-                fig = plt.figure(figsize=(9.5, 3.2)); ax = fig.add_subplot(111)
+                fig = plt.figure(figsize=(9.5, 3.2))
+                ax = fig.add_subplot(111)
                 ax.plot(lam_plot, y_obs, lw=1.0, label="data")
                 ax.plot(lam_plot, y_fit, lw=1.0, label="model")
                 ax.set_title(f"spaxel {int(s)}  rmse={rmse[i]:.3f}")
                 ax.set_xlabel("λ (ObsPix)")
                 ax.set_ylabel("flux")
                 ax.legend(loc="best", fontsize=8)
-                fig.tight_layout()
-                fig.savefig(os.path.join(out_dir, f"patch_spax{int(s):05d}.png"), dpi=120)
+                fig.savefig(os.path.join(out_dir,
+                    f"patch_spax{int(s):05d}.png"), dpi=120)
                 plt.close(fig)
 
     if out_dir:
@@ -8675,14 +8799,16 @@ def run_patch(h5_path: str,
             ax.bar(np.arange(order.size), flat[order])
             ax.set_title("x_CP top coefficients (sorted)")
             ax.set_xlabel("rank"); ax.set_ylabel("weight")
-            fig.tight_layout(); fig.savefig(os.path.join(out_dir, "xcp_bar.png"), dpi=120)
+            fig.savefig(os.path.join(out_dir, "xcp_bar.png"), dpi=120)
             plt.close(fig)
 
     if write_seed:
         with open_h5(h5_path, role="writer") as f:
             g = f.require_group("/Seeds")
-            if seed_path in f: del f[seed_path]
-            ds = f.create_dataset(seed_path, data=x_CP.astype(np.float64), dtype="f8", compression="gzip")
+            if seed_path in f:
+                del f[seed_path]
+            ds = f.create_dataset(seed_path, data=x_CP.astype(np.float64),
+                dtype="f8")
             ds.attrs["origin"] = "nnls_patch"
             ds.attrs["s_idx"]  = s_idx
             ds.attrs["k_per_comp"] = int(k_per_comp)
@@ -8700,11 +8826,11 @@ def run_patch(h5_path: str,
             metrics = compare_usage_to_orbit_weights(
                 h5_path,
                 sidecar=None,
-                x_dset=seed_path,           # e.g. "/Seeds/x0_nnls_patch"
+                x_dset=seed_path, # e.g. "/Seeds/x0_nnls_patch"
                 normalize="unit_sum",
                 out_png=usage_png,
-                usage_metric="energy",      # use energy–weighted usage
-                E_cp=E,                     # (C,P) from read_global_column_energy
+                usage_metric="energy", # use energy–weighted usage
+                E_cp=E, # (C,P) from read_global_column_energy
             )
         except Exception as e:
             print(f"[nnls_patch] usage-vs-prior (seed) failed: {e}")
@@ -8723,7 +8849,7 @@ def run_patch(h5_path: str,
             import h5py
             with h5py.File(tmp_sidecar, "w") as G:
                 G.create_dataset("/Fit/x_best", data=x_CP.astype("f8"),
-                                 dtype="f8", compression="gzip")
+                                 dtype="f8",)
 
             metrics = compare_usage_to_orbit_weights(
                 h5_path,
@@ -8818,6 +8944,10 @@ from CubeFit.hdf5_manager import open_h5
 from CubeFit.logger import get_logger
 
 logger = get_logger()
+
+divcmap = 'GECKOSdr'
+moncmap = 'inferno'
+moncmapr = 'inferno_r'
 
 # ------------------------------------------------------------------------------
 
@@ -8942,32 +9072,97 @@ def alpha_star_stats(h5_path, x_vec, n_spax=32, tile=None, swmr_main: bool | Non
                 return _compute(f)
         raise
 
-def render_aperture_fits_with_x(h5_path, x_vec, out_png, apertures, show_residual=True, title=None):
+def render_aperture_fits_with_x(
+    h5_path,
+    x_vec,
+    out_png,
+    apertures,
+    show_residual=True,
+    title=None,
+):
+    """
+    Render fits for selected spaxels using a global solution x_vec, but
+    stream the HyperCube per-component to avoid a large (C, P, L) slab
+    in memory.
+    """
     with open_h5(h5_path, role="reader") as f:
-        M = f["/HyperCube/models"]; Y = f["/DataCube"]
-        Mask = np.asarray(f["/Mask"][...], bool).ravel() if "/Mask" in f else None
-        C, P = int(M.shape[1]), int(M.shape[2])
-        X = np.asarray(x_vec, float).reshape(C, P)
+        M = f["/HyperCube/models"]   # (S, C, P, L)
+        Y = f["/DataCube"]           # (S, L)
 
-        fig, axes = plt.subplots(len(apertures), 1, figsize=(12, 2.7*len(apertures)))
-        if len(apertures) == 1: axes = [axes]
+        Mask = (
+            np.asarray(f["/Mask"][...], bool).ravel()
+            if "/Mask" in f
+            else None
+        )
+
+        S, C, P, L = map(int, M.shape)
+
+        X = np.asarray(x_vec, float).reshape(C, P)   # same basis as x_vec
+
+        # Precompute λ indices once
+        if Mask is not None:
+            keep = np.flatnonzero(Mask)
+        else:
+            keep = None
+
+        fig, axes = plt.subplots(
+            len(apertures),
+            1,
+            figsize=(12, 2.7 * len(apertures)),
+        )
+        if len(apertures) == 1:
+            axes = [axes]
+
         for ax, s in zip(axes, apertures):
-            slab = np.asarray(M[s, :, :, :], float)
-            yhat = np.tensordot(slab, X, axes=([0,1],[0,1]))
-            y    = np.asarray(Y[s, :], float)
-            if Mask is not None:
-                keep = np.flatnonzero(Mask)
-                yhat = yhat[keep]; y = y[keep]
-                good = np.isfinite(y)
-                ax.plot(np.flatnonzero(good), y[good],    label="data")
-                ax.plot(np.flatnonzero(good), yhat[good], label="model")
+            if not (0 <= s < S):
+                raise IndexError(f"spaxel index {s} out of range [0, {S})")
+
+            # Observed spectrum
+            y = np.asarray(Y[s, :], float)   # (L,)
+
+            # Model spectrum: stream over components c
+            yhat = np.zeros(L, float)
+            for c in range(C):
+                # A_c has shape (P, L) for this spaxel / component
+                A_c = np.asarray(M[s, c, :, :], float)  # (P, L)
+                # dot over P: (P,) @ (P, L) -> (L,)
+                yhat += X[c, :].astype(float, copy=False) @ A_c
+
+            if keep is not None:
+                y_plot = y[keep]
+                yhat_plot = yhat[keep]
+                good = np.isfinite(y_plot)
+                lam_idx = np.flatnonzero(good)
+                ax.plot(lam_idx, y_plot[good], label="data")
+                ax.plot(lam_idx, yhat_plot[good], label="model")
                 if show_residual:
-                    ax.plot(np.flatnonzero(good), y[good] - yhat[good], label="residual")
+                    ax.plot(
+                        lam_idx,
+                        (y_plot - yhat_plot)[good],
+                        label="residual",
+                    )
+            else:
+                good = np.isfinite(y)
+                lam_idx = np.flatnonzero(good)
+                ax.plot(lam_idx, y[good], label="data")
+                ax.plot(lam_idx, yhat[good], label="model")
+                if show_residual:
+                    ax.plot(
+                        lam_idx,
+                        (y - yhat)[good],
+                        label="residual",
+                    )
+
             ax.set_title(f"spaxel {s}")
-            ax.set_xlabel("λ (log space)"); ax.set_ylabel("flux")
+            ax.set_xlabel("λ (log space)")
+            ax.set_ylabel("flux")
             ax.legend(loc="upper right")
-        if title: fig.suptitle(title)
-        fig.savefig(out_png, dpi=130); plt.close(fig)
+
+        if title:
+            fig.suptitle(title)
+        fig.tight_layout(rect=(0, 0, 1, 0.96) if title else None)
+        fig.savefig(out_png, dpi=130)
+        plt.close(fig)
 
 def render_sfh_from_x(h5_path: str,
                       x_flat: np.ndarray,
@@ -9002,19 +9197,21 @@ def render_sfh_from_x(h5_path: str,
 
         # assume (nZ, nT, nA) order
         nZ, nT, nA = pop_shape
-        W = X.sum(axis=0)                   # (nZ, nT, nA)
-        vmax = float(np.max(W)) if np.isfinite(W).any() else 1.0
+        W = X.sum(axis=0) # (nZ, nT, nA)
+        vmax = float(np.max(np.log10(W))) if np.isfinite(W).any() else 1.0
 
         fig, axes = plt.subplots(1, nA, figsize=(3.0*nA, 3.4), squeeze=False)
         axes = axes[0]
         for a in range(nA):
             ax = axes[a]
-            im = ax.imshow(W[:, :, a], origin="lower", aspect="auto",
-                           norm=Normalize(vmin=0.0, vmax=vmax))
+            im = ax.imshow(np.log10(W[:, :, a]), origin="lower", aspect="auto",
+                cmap=moncmapr, norm=Normalize(vmin=0.0, vmax=vmax))
             ax.set_title(f"α index {a}")
             ax.set_xlabel("Age index")
             if a == 0:
                 ax.set_ylabel("Metal index")
+            if not ax.get_subplotspec().is_first_col():
+                ax.set_yticklabels([])
         fig.colorbar(im, ax=axes.tolist(), shrink=0.8, pad=0.02)
         fig.savefig(out_png, dpi=130); plt.close(fig)
 
@@ -9387,6 +9584,84 @@ if __name__ == "__main__":
 # ipython -- /data/phys-gal-dynamics/phys2603/CubeFit/live_fit_dashboard.py /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/NGC4365_12.h5 --out /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/figures/fit_live.png --apertures 0,2000,1400,740 --apertures-separate-dir /data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/figures/apertures/
 </file>
 
+<file path="kz_2Fit.sh">
+#!/bin/bash -l
+# #SBATCH -A durham
+# #SBATCH -D "/cosma5/data/durham/dc-poci1/muse"
+# #SBATCH --output="/cosma5/data/durham/dc-poci1/muse/slurm_tri_losvdDecomp.log" --open-mode=append
+# #SBATCH --error="/cosma5/data/durham/dc-poci1/muse/slurm_tri_losvdDecomp.log" --open-mode=append
+
+# #SBATCH -A oz059
+# #SBATCH -D "/fred/oz059/poci/muse"
+# #SBATCH --output="/fred/oz059/poci/muse/slurm_tri_losvdDecomp.log" --open-mode=append
+# #SBATCH --error="/fred/oz059/poci/muse/slurm_tri_losvdDecomp.log" --open-mode=append
+
+#SBATCH -D "/data/phys-gal-dynamics/phys2603/muse"
+#SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
+#SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
+#SBATCH -p short
+
+#SBATCH --job-name="CubeFit_2Fit"
+#SBATCH --time=0-12:00
+#SBATCH -N 1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=48
+#SBATCH --mem=200G
+#SBATCH --hint=nomultithread
+#SBATCH --exclusive
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=adriano.poci@physics.ox.ac.uk
+
+module purge
+module load foss/2023a
+module load Python/3.11.3-GCCcore-12.3.0
+
+# --- BLAS / OpenMP threading (per worker) ---
+export OMP_NUM_THREADS=12
+export OPENBLAS_NUM_THREADS=12
+export MKL_NUM_THREADS=12
+export NUMEXPR_NUM_THREADS=12
+export OMP_PROC_BIND=spread
+export OMP_PLACES=cores
+export OMP_DYNAMIC=FALSE
+export MKL_DYNAMIC=FALSE
+# For OpenBLAS, avoid accidental main-thread reuse:
+export OPENBLAS_VERBOSE=0
+
+# --- HDF5 raw-data chunk cache (reader side) ---
+export CUBEFIT_RDCC_NBYTES=$((16*1024*1024*1024))  # 16 GiB
+export CUBEFIT_RDCC_NSLOTS=400003                   # large-ish prime
+export CUBEFIT_RDCC_W0=0.9
+
+export HDF5_USE_FILE_LOCKING=FALSE
+
+# File descriptors
+ulimit -n 8192
+
+cd /data/phys-gal-dynamics/phys2603/CubeFit
+
+# sanity print (once) to confirm cpuset and BLAS threads
+srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
+  python - <<'PY'
+import os, json
+print(f"[sanity] cpuset cores: {len(os.sched_getaffinity(0))}")
+try:
+    from threadpoolctl import threadpool_info
+    print("[sanity] BLAS pools:", json.dumps(threadpool_info(), indent=2)[:600], "...")
+except Exception as e:
+    print("[sanity] threadpoolctl not available:", e)
+PY
+
+# run your job as a Slurm step (gives you the full cpuset)
+srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
+  python -m IPython kz_run.py -- --run-switch fit
+</file>
+
+<file path="COMMIT_MESSAGE.txt">
+* Consolidated two tiny-column freeze env var names into one in `kaczmarz_solver_cchunk_mp_nnls`
+* Added extra diagnostic output concerning step sizes in `kaczmarz_solver_cchunk_mp_nnls`
+</file>
+
 <file path="cube_utils.py">
 # thread_utils.py
 from __future__ import annotations
@@ -9400,6 +9675,7 @@ import matplotlib.pyplot as plt
 
 from dynamics.IFU.Constants import Constants
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
+from CubeFit.hypercube_builder import read_global_column_energy
 from CubeFit.hdf5_manager import open_h5
 
 CTS = Constants()
@@ -10978,6 +11254,240 @@ def project_to_component_weights(
     x_cp[:] = X_new
 
 # ------------------------------------------------------------------------------
+
+def diagnose_zero_column_threshold(
+    h5_path: str,
+    rel_zero_candidates=None,
+    abs_zero: float = 1.0e-24,
+) -> None:
+    """
+    Diagnose the impact of the zero-column freeze threshold on this
+    HyperCube.
+
+    This inspects the global column energy array E_global(c,p) and reports
+    how many columns would be considered "tiny" for various choices of
+    rel_zero, using the same logic as the solver:
+
+        tiny_col = max(abs_zero, rel_zero * median(E_global[E_global>0])),
+        freeze_mask = (E_global <= tiny_col).
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the HDF5 file with /HyperCube and /HyperCube/col_energy.
+    rel_zero_candidates : sequence of float, optional
+        List of rel_zero values to test. If None, a default grid
+        [1e-12, 1e-11, ..., 1e-6] is used.
+    abs_zero : float, optional
+        Absolute floor for tiny_col, same meaning as in the solver.
+    """
+
+    if rel_zero_candidates is None:
+        rel_zero_candidates = np.logspace(-20, -2, num=int(19*2),
+            dtype=np.float64)
+
+    E_global = read_global_column_energy(h5_path)  # (C, P)
+    E = np.asarray(E_global, dtype=np.float64).ravel()
+
+    # Keep only positive, finite energies
+    mask_good = np.isfinite(E) & (E > 0.0)
+    E = E[mask_good]
+
+    if E.size == 0:
+        print(
+            "[diagnose_zero_column_threshold] No positive finite column "
+            "energies found."
+        )
+        return
+
+    med_energy = float(np.median(E))
+    q05 = float(np.quantile(E, 0.05))
+    q25 = float(np.quantile(E, 0.25))
+    q75 = float(np.quantile(E, 0.75))
+    q95 = float(np.quantile(E, 0.95))
+
+    print("[diagnose_zero_column_threshold] Global column energy stats:")
+    print(f"  N_cols   = {E.size}")
+    print(f"  min      = {float(E.min()):.3e}")
+    print(f"  5%       = {q05:.3e}")
+    print(f"  25%      = {q25:.3e}")
+    print(f"  median   = {med_energy:.3e}")
+    print(f"  75%      = {q75:.3e}")
+    print(f"  95%      = {q95:.3e}")
+    print(f"  max      = {float(E.max()):.3e}")
+    print()
+
+    for r in rel_zero_candidates:
+        if not np.isfinite(r) or r <= 0.0:
+            continue
+        tiny_col = float(max(abs_zero, r * med_energy))
+        frozen = int(np.count_nonzero(E <= tiny_col))
+        frac = frozen / float(E.size)
+        print(
+            f"  rel_zero = {r:9.1e} -> "
+            f"tiny_col = {tiny_col:.3e}, "
+            f"freeze {frozen:6d}/{E.size:6d} "
+            f"({100.0 * frac:6.3f} %)"
+        )
+
+# ------------------------------------------------------------------------------
+
+def diagnose_tile_col_denom_threshold(
+    h5_path: str,
+    *,
+    n_tiles: int = 8,
+    n_comps: int = 8,
+    seed: int = 12345,
+    rel_zero_grid: np.ndarray | None = None,
+    abs_zero: float | None = None,
+    mask_dset: str = "/Mask",
+    models_dset: str = "/HyperCube/models",
+    lamw_dset: str = "/HyperCube/lambda_weights",
+) -> dict:
+    """
+    Diagnose a reasonable ZERO_COL_REL based on tile-local denominators.
+
+    This samples a subset of spatial tiles and components, computes the
+    tile-local per-population denominator:
+
+        col_denom[p] = sum_{s,λ} ( (sqrt(w_λ) * A[s,p,λ])^2 )
+
+    and then evaluates freeze fractions for a grid of rel_zero values using:
+
+        tiny_col = max(abs_zero, rel_zero * median(col_denom[col_denom>0]))
+
+    Parameters
+    ----------
+    h5_path
+        Path to the CubeFit HDF5 file.
+    n_tiles
+        Number of spatial tiles to sample (uniform random).
+    n_comps
+        Number of components to sample (uniform random).
+    seed
+        RNG seed for reproducibility.
+    rel_zero_grid
+        Grid of rel_zero values to test. If None, uses a log grid.
+    abs_zero
+        Absolute floor. If None, read from env default (1e-24 behavior).
+    mask_dset
+        Mask dataset path, if present.
+    models_dset
+        HyperCube models dataset path.
+    lamw_dset
+        Lambda-weights dataset path (optional). If missing, weights=1.
+
+    Returns
+    -------
+    out : dict
+        Contains sampled denom statistics and freeze fractions.
+
+    Notes
+    -----
+    This is intended for choosing rel_zero. It does not run the solver.
+    """
+    if rel_zero_grid is None:
+        rel_zero_grid = np.logspace(-15, -2, 25)
+    rel_zero_grid = np.asarray(rel_zero_grid, dtype=np.float64)
+
+    if abs_zero is None:
+        abs_zero = 1.0e-24
+
+    rng = np.random.default_rng(int(seed))
+
+    with open_h5(h5_path, role="reader") as f:
+        M = f[models_dset]
+        S, C, P, L = map(int, M.shape)
+
+        # Mask -> keep_idx
+        keep_idx = None
+        if mask_dset in f:
+            mask = np.asarray(f[mask_dset][...], bool).ravel()
+            keep_idx = np.flatnonzero(mask)
+            Lk = int(keep_idx.size)
+        else:
+            Lk = L
+
+        # Lambda weights -> sqrt weights on kept grid
+        w_lam_sqrt = None
+        if lamw_dset in f:
+            w_full = np.asarray(f[lamw_dset][...], np.float64).ravel()
+            if w_full.size == L:
+                w = w_full[keep_idx] if keep_idx is not None else w_full
+                w_lam_sqrt = np.sqrt(np.clip(w, 1e-12, None)).astype(np.float64)
+
+        # Tile ranges from chunking (fallback 128)
+        s_tile = int(M.chunks[0]) if (M.chunks and M.chunks[0] > 0) else 128
+        s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
+
+        # Sample tiles/components
+        tile_idx = rng.choice(len(s_ranges),
+                              size=min(n_tiles, len(s_ranges)),
+                              replace=False)
+        comp_idx = rng.choice(C, size=min(n_comps, C), replace=False)
+
+        denoms = []
+
+        for ti in tile_idx:
+            s0, s1 = s_ranges[int(ti)]
+            for c in comp_idx:
+                A = np.asarray(M[s0:s1, int(c), :, :], np.float32, order="C")
+                if keep_idx is not None:
+                    A = A[:, :, keep_idx]  # (Sblk, P, Lk)
+
+                if w_lam_sqrt is not None:
+                    Aw = A * w_lam_sqrt[None, None, :]
+                else:
+                    Aw = A
+
+                # col_denom over (s,λ)
+                col_denom = np.sum(np.square(Aw, dtype=np.float64), axis=(0, 2))
+                denoms.append(col_denom.astype(np.float64, copy=False))
+
+        den = np.concatenate(denoms, axis=0) if denoms else np.zeros((0,))
+        den_pos = den[den > 0.0]
+
+        if den_pos.size == 0:
+            med = 0.0
+            q = {}
+        else:
+            med = float(np.median(den_pos))
+            q = {
+                "min": float(np.min(den_pos)),
+                "p05": float(np.percentile(den_pos, 5)),
+                "p25": float(np.percentile(den_pos, 25)),
+                "median": float(np.median(den_pos)),
+                "p75": float(np.percentile(den_pos, 75)),
+                "p95": float(np.percentile(den_pos, 95)),
+                "max": float(np.max(den_pos)),
+            }
+
+        rows = []
+        for rz in rel_zero_grid:
+            tiny_col = float(max(abs_zero, float(rz) * med))
+            frz = int(np.count_nonzero(den <= tiny_col))
+            tot = int(den.size)
+            pct = 0.0 if tot == 0 else 100.0 * frz / tot
+            rows.append((float(rz), tiny_col, frz, tot, pct))
+
+    out = {
+        "sampled_tiles": int(len(tile_idx)),
+        "sampled_components": int(len(comp_idx)),
+        "stats_pos": q,
+        "rows": rows,
+    }
+
+    print("[diagnose_tile_col_denom_threshold] denom stats (positive only):")
+    for k, v in q.items():
+        print(f"  {k:>7s} = {v:.3e}")
+    print("")
+    for rz, tiny, frz, tot, pct in rows:
+        print(f"  rel_zero={rz:9.2e} -> tiny_col={tiny:9.3e}, "
+              f"freeze {frz:6d}/{tot:6d} ({pct:6.3f} %)")
+
+    return out
+
+# ------------------------------------------------------------------------------
 </file>
 
 <file path="pipeline_runner.py">
@@ -11021,6 +11531,8 @@ v1.6:   Updated `solve_all_mp_batched` `warm_start` options to match `solve_all`
             12 December 2025
 v1.7:   Read in NNLs `L2` ridge from environment variable in
             `solve_all_mp_batched`. 13 December 2025
+v1.8:   Implemented mtime-based decision for sidecar vs main file loading in
+            `solve_all*` resume logic. 18 December 2025
 """
 
 from __future__ import annotations
@@ -11035,7 +11547,8 @@ from CubeFit.hypercube_builder import build_hypercube, read_global_column_energy
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
 from CubeFit.kaczmarz_solver import solve_global_kaczmarz, SolverCfg
 from CubeFit.kaczmarz_solver_cchunk_mp_nnls import (
-    MPConfig, solve_global_kaczmarz_cchunk_mp)
+    MPConfig, solve_global_kaczmarz_global_step_mp)
+    # solve_global_kaczmarz_cchunk_mp)
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
 )
@@ -11339,37 +11852,157 @@ class PipelineRunner:
 
     @staticmethod
     def _read_latest_from_sidecar(sidecar_path: str, N_expected: int):
-        with open_h5(sidecar_path, role="reader") as g:
-            def _try(name):
-                if name in g:
-                    v = np.asarray(g[name][...], np.float64, order="C")
-                    return v if v.size == N_expected else None
+        """
+        Read the most recent solution vector from a FitTracker sidecar file.
+
+        For *resume semantics* we prefer the latest checkpoint, not the
+        best-so-far checkpoint. So we try, in order:
+
+        1) /Fit/x_last
+        2) /Fit/x_epoch_last
+        3) /Fit/x_snapshots[-1]
+        4) /Fit/x_best
+        5) /Fit/x_hist[-1] (legacy)
+
+        Parameters
+        ----------
+        sidecar_path : str
+            Path to the sidecar HDF5 file: <main>.fit.<pid>.<ts>.h5
+        N_expected : int
+            Expected flattened size (C*P).
+
+        Returns
+        -------
+        x : ndarray[float64] or None
+            Flattened solution vector of length N_expected, if found.
+        src : str or None
+            Dataset label used to load x (for logging).
+        """
+        if (sidecar_path is None) or (not os.path.exists(sidecar_path)):
+            return None, None
+
+        def _read_flat(g, name: str):
+            if name not in g:
                 return None
-            x = _try("/Fit/x_best")
-            src = "/Fit/x_best" if x is not None else None
-            if x is None:
-                x = _try("/Fit/x_last")
-                src = "/Fit/x_last" if x is not None else None
-            if x is None and "/Fit/x_hist" in g and g["/Fit/x_hist"].shape[0] > 0:
-                v = np.asarray(g["/Fit/x_hist"][-1, ...], np.float64,
-                               order="C")
-                if v.size == N_expected:
-                    x, src = v, "/Fit/x_hist[-1]"
-            return x, src
+            ds = g[name]
+            try:
+                if ds.ndim == 2 and ds.shape[0] > 0:
+                    v = np.asarray(ds[-1, :], np.float64, order="C")
+                else:
+                    v = np.asarray(ds[...], np.float64, order="C")
+            except Exception:
+                return None
+
+            v = np.asarray(v, np.float64).ravel(order="C")
+            if v.size != int(N_expected):
+                return None
+            return v
+
+        with open_h5(sidecar_path, role="reader", swmr=True) as g:
+            # Prefer latest progress for resume.
+            v = _read_flat(g, "/Fit/x_last")
+            if v is not None:
+                return v, "/Fit/x_last"
+
+            v = _read_flat(g, "/Fit/x_epoch_last")
+            if v is not None:
+                return v, "/Fit/x_epoch_last"
+
+            if "/Fit/x_snapshots" in g and g["/Fit/x_snapshots"].shape[0] > 0:
+                ds = g["/Fit/x_snapshots"]
+                try:
+                    v = np.asarray(ds[-1, :], np.float64, order="C")
+                    v = v.ravel(order="C")
+                    if v.size == int(N_expected):
+                        return v, "/Fit/x_snapshots[-1]"
+                except Exception:
+                    pass
+
+            # Fallback to best-so-far.
+            v = _read_flat(g, "/Fit/x_best")
+            if v is not None:
+                return v, "/Fit/x_best"
+
+            # Legacy fallback.
+            if "/Fit/x_hist" in g and g["/Fit/x_hist"].shape[0] > 0:
+                ds = g["/Fit/x_hist"]
+                try:
+                    v = np.asarray(ds[-1, :], np.float64, order="C")
+                    v = v.ravel(order="C")
+                    if v.size == int(N_expected):
+                        return v, "/Fit/x_hist[-1]"
+                except Exception:
+                    pass
+
+        return None, None
 
     @staticmethod
-    def _read_latest_from_main(main_path: str, N_expected: int):
-        xb = xl = None
-        with open_h5(main_path, role="reader") as f_ro:
-            if "/Fit/x_best" in f_ro:
-                v = np.asarray(f_ro["/Fit/x_best"][...], np.float64,
-                               order="C")
-                if v.size == N_expected: xb = v
-            if "/X_global" in f_ro and xb is None:
-                v = np.asarray(f_ro["/X_global"][...], np.float64, order="C")
-                if v.size == N_expected: xl = v
-        if xb is not None: return xb, "/Fit/x_best"
-        if xl is not None: return xl, "/X_global"
+    def _read_latest_from_main(h5_path: str, N_expected: int):
+        """
+        Read the best available solution vector from the *main* HDF5.
+
+        Priority is "most resume-correct" first:
+        1) /Fit/x_last
+        2) /Fit/x_epoch_last
+        3) /X_global
+        4) /Fit/x_best
+        5) legacy fallbacks
+
+        Returns
+        -------
+        x : ndarray[float64] or None
+            Flattened solution vector (length N_expected), if found.
+        src : str or None
+            Dataset label used to load x (for logging).
+        """
+        if (h5_path is None) or (not os.path.exists(h5_path)):
+            return None, None
+
+        def _read_flat(f, name: str):
+            if name not in f:
+                return None
+            ds = f[name]
+            try:
+                if ds.ndim == 2 and ds.shape[0] > 0:
+                    v = np.asarray(ds[-1, :], np.float64, order="C")
+                else:
+                    v = np.asarray(ds[...], np.float64, order="C")
+            except Exception:
+                return None
+
+            v = np.asarray(v, np.float64).ravel(order="C")
+            if v.size != int(N_expected):
+                return None
+            if not np.all(np.isfinite(v)):
+                v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+            return v
+
+        with open_h5(h5_path, role="reader", swmr=True) as f:
+            # Resume-correct (if present)
+            v = _read_flat(f, "/Fit/x_last")
+            if v is not None:
+                return v, "/Fit/x_last"
+
+            v = _read_flat(f, "/Fit/x_epoch_last")
+            if v is not None:
+                return v, "/Fit/x_epoch_last"
+
+            # Canonical committed solution
+            v = _read_flat(f, "/X_global")
+            if v is not None:
+                return v, "/X_global"
+
+            # Best-so-far fallback (if you keep it in main)
+            v = _read_flat(f, "/Fit/x_best")
+            if v is not None:
+                return v, "/Fit/x_best"
+
+            # Legacy candidates (only if they exist in your file)
+            for name in ("/X_best", "/X_last", "/Fit/x_hist"):
+                v = _read_flat(f, name)
+                if v is not None:
+                    return v, name
+
         return None, None
 
     def _read_seed_from_h5(self,
@@ -11498,45 +12131,95 @@ class PipelineRunner:
 
         elif warm_start == "resume":
             sidecar = cu._find_latest_sidecar(self.h5_path)
+
+            # Always define these (avoids UnboundLocalError patterns).
             x_side, src_side = (None, None)
-            if sidecar is not None:
+            x_main, src_main = (None, None)
+            x_seed, src_seed = (None, None)
+
+            # Candidate 1: newest sidecar (by filename/mtime), but may not exist.
+            if sidecar is not None and os.path.exists(sidecar):
                 x_side, src_side = self._read_latest_from_sidecar(
                     sidecar, N_expected
                 )
-            x_main, src_main = self._read_latest_from_main(self.h5_path,
-                                                           N_expected)
 
+            # Candidate 2: main file (committed solution).
+            x_main, src_main = self._read_latest_from_main(
+                self.h5_path, N_expected
+            )
+
+            def _safe_mtime(path: str | None) -> float:
+                if not path:
+                    return -np.inf
+                try:
+                    return float(os.path.getmtime(path))
+                except Exception:
+                    return -np.inf
+
+            def _try_epoch(path: str | None, dset: str | None) -> float | None:
+                if (path is None) or (dset is None):
+                    return None
+                try:
+                    with open_h5(path, role="reader", swmr=True) as f:
+                        if dset in f:
+                            e = f[dset].attrs.get("epoch", None)
+                            if e is None:
+                                return None
+                            e = float(e)
+                            return e if np.isfinite(e) else None
+                except Exception:
+                    return None
+                return None
+
+            # Decide: newest progress (prefer higher epoch if both have it;
+            # otherwise prefer newer file mtime).
             choose_side = False
             if x_side is not None and x_main is None:
-                choose_side = True  # prefer main unless missing
+                choose_side = True
+            elif x_side is None and x_main is not None:
+                choose_side = False
+            elif x_side is not None and x_main is not None:
+                e_side = _try_epoch(sidecar, src_side)
+                e_main = _try_epoch(self.h5_path, src_main)
+
+                if (e_side is not None) and (e_main is not None) and (e_side != e_main):
+                    choose_side = (e_side > e_main)
+                else:
+                    choose_side = (_safe_mtime(sidecar) > _safe_mtime(self.h5_path))
 
             x0_effective, src_label, src_file = (
                 (x_side, src_side, sidecar) if choose_side
                 else (x_main, src_main, self.h5_path)
             )
 
-            # Fallback: /Seeds/x0_nnls_patch
+            # Fallback: seed (optional but robust).
+            seed_used = False
             if x0_effective is None:
-                seed_path = os.environ.get("CUBEFIT_SEED_PATH",
-                                           "/Seeds/x0_nnls_patch")
-                x_seed, src_seed = self._read_seed_from_h5(self.h5_path,
-                                                           N_expected,
-                                                           dset=seed_path)
+                seed_path = os.environ.get("CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch")
+                x_seed, src_seed = self._read_seed_from_h5(
+                    self.h5_path, N_expected, dset=seed_path
+                )
                 if x_seed is not None:
                     x0_effective = x_seed
+                    src_label = src_seed
+                    src_file = self.h5_path
+                    choose_side = False
+                    seed_used = True
                     if verbose:
-                        logger.log("[Pipeline] Warm-start fallback from seed "
-                                   f"{src_seed} (n={x0_effective.size}).")
+                        logger.log(
+                            "[Pipeline] Warm-start fallback from seed "
+                            f"{src_seed} (n={x0_effective.size})."
+                        )
 
-            if x0_effective is not None and verbose:
-                if x0_effective is x_seed:
-                    pass
-                else:
-                    logger.log(
-                        f"[Pipeline] Warm-start from {src_label} "
-                        f"({'sidecar' if choose_side else 'main'}: "
-                        f"{src_file}) (n={x0_effective.size})."
-                    )
+            if x0_effective is not None and verbose and (not seed_used):
+                t_side = _safe_mtime(sidecar) if sidecar else -np.inf
+                t_main = _safe_mtime(self.h5_path)
+                logger.log(
+                    f"[Pipeline] Warm-start from {src_label} "
+                    f"({'sidecar' if choose_side else 'main'}: {src_file}) "
+                    f"(n={x0_effective.size}); "
+                    f"mtime(sidecar)={t_side:.0f}, mtime(main)={t_main:.0f}."
+                )
 
         elif warm_start == "nnls":
             if verbose:
@@ -11554,7 +12237,7 @@ class PipelineRunner:
                 use_lambda=True,
                 lam_dset="/HyperCube/lambda_weights",
                 out_dir=plp.Path(self.h5_path).parent/'figures',
-                write_seed=False,
+                write_seed=True,
                 seed_path="/Seeds/x0_nnls_patch",
                 normalize_columns=True,
                 orbit_weights=orbit_weights,
@@ -11738,7 +12421,7 @@ class PipelineRunner:
         seed_cfg=None,
         tracker_mode="on",
         verbose=True,
-        ratio_cfg: RatioCfg | None = None,  
+        ratio_cfg: RatioCfg | None = None,
     ):
 
         # --------------- Warm-start (same policy as SP path) -----------
@@ -11764,44 +12447,95 @@ class PipelineRunner:
 
         elif warm_start == "resume":
             sidecar = cu._find_latest_sidecar(self.h5_path)
+
+            # Always define these (avoids UnboundLocalError patterns).
             x_side, src_side = (None, None)
-            if sidecar is not None:
+            x_main, src_main = (None, None)
+            x_seed, src_seed = (None, None)
+
+            # Candidate 1: newest sidecar (by filename/mtime), but may not exist.
+            if sidecar is not None and os.path.exists(sidecar):
                 x_side, src_side = self._read_latest_from_sidecar(
                     sidecar, N_expected
                 )
-            x_main, src_main = self._read_latest_from_main(self.h5_path,
-                                                           N_expected)
 
+            # Candidate 2: main file (committed solution).
+            x_main, src_main = self._read_latest_from_main(
+                self.h5_path, N_expected
+            )
+
+            def _safe_mtime(path: str | None) -> float:
+                if not path:
+                    return -np.inf
+                try:
+                    return float(os.path.getmtime(path))
+                except Exception:
+                    return -np.inf
+
+            def _try_epoch(path: str | None, dset: str | None) -> float | None:
+                if (path is None) or (dset is None):
+                    return None
+                try:
+                    with open_h5(path, role="reader", swmr=True) as f:
+                        if dset in f:
+                            e = f[dset].attrs.get("epoch", None)
+                            if e is None:
+                                return None
+                            e = float(e)
+                            return e if np.isfinite(e) else None
+                except Exception:
+                    return None
+                return None
+
+            # Decide: newest progress (prefer higher epoch if both have it;
+            # otherwise prefer newer file mtime).
             choose_side = False
             if x_side is not None and x_main is None:
-                choose_side = True  # prefer main unless missing
+                choose_side = True
+            elif x_side is None and x_main is not None:
+                choose_side = False
+            elif x_side is not None and x_main is not None:
+                e_side = _try_epoch(sidecar, src_side)
+                e_main = _try_epoch(self.h5_path, src_main)
+
+                if (e_side is not None) and (e_main is not None) and (e_side != e_main):
+                    choose_side = (e_side > e_main)
+                else:
+                    choose_side = (_safe_mtime(sidecar) > _safe_mtime(self.h5_path))
 
             x0_effective, src_label, src_file = (
                 (x_side, src_side, sidecar) if choose_side
                 else (x_main, src_main, self.h5_path)
             )
 
-            # Fallback: /Seeds/x0_nnls_patch
+            # Fallback: seed (optional but robust).
+            seed_used = False
             if x0_effective is None:
-                seed_path = os.environ.get("CUBEFIT_SEED_PATH",
-                                           "/Seeds/x0_nnls_patch")
-                x_seed, src_seed = self._read_seed_from_h5(self.h5_path,
-                    N_expected, dset=seed_path)
+                seed_path = os.environ.get("CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch")
+                x_seed, src_seed = self._read_seed_from_h5(
+                    self.h5_path, N_expected, dset=seed_path
+                )
                 if x_seed is not None:
                     x0_effective = x_seed
+                    src_label = src_seed
+                    src_file = self.h5_path
+                    choose_side = False
+                    seed_used = True
                     if verbose:
-                        logger.log("[Pipeline] Warm-start fallback from seed "
-                                   f"{src_seed} (n={x0_effective.size}).")
+                        logger.log(
+                            "[Pipeline] Warm-start fallback from seed "
+                            f"{src_seed} (n={x0_effective.size})."
+                        )
 
-            if x0_effective is not None and verbose:
-                if x0_effective is x_seed:
-                    pass
-                else:
-                    logger.log(
-                        f"[Pipeline] Warm-start from {src_label} "
-                        f"({'sidecar' if choose_side else 'main'}: "
-                        f"{src_file}) (n={x0_effective.size})."
-                    )
+            if x0_effective is not None and verbose and (not seed_used):
+                t_side = _safe_mtime(sidecar) if sidecar else -np.inf
+                t_main = _safe_mtime(self.h5_path)
+                logger.log(
+                    f"[Pipeline] Warm-start from {src_label} "
+                    f"({'sidecar' if choose_side else 'main'}: {src_file}) "
+                    f"(n={x0_effective.size}); "
+                    f"mtime(sidecar)={t_side:.0f}, mtime(main)={t_main:.0f}."
+                )
 
         elif warm_start == "nnls":
             if verbose:
@@ -11937,7 +12671,7 @@ class PipelineRunner:
 
         try:
             with logger.capture_all_output():
-                x_global, stats = solve_global_kaczmarz_cchunk_mp(
+                x_global, stats = solve_global_kaczmarz_global_step_mp(
                     self.h5_path,
                     cfg,
                     orbit_weights=orbit_weights,
@@ -12578,18 +13312,18 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         use=True           # actually enable the ratio term
     )
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=2,
-        lr=0.0001,
+        epochs=3,
+        lr=1.0,
         project_nonneg=True,
         orbit_weights=None, # or None for “free” fit
         ratio_cfg=None,
-        # orbit_weights=cWeights,
+        # orbit_weights=cWeights, # Make sure to enable `CUBEFIT_ORBIT_BETA`
         # ratio_cfg=RC,
         processes=4, # 4 workers
         blas_threads=12, # 12 BLAS threads each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
-        warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
+        warm_start='resume',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
@@ -13855,7 +14589,13 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     minT, maxT = np.min(uages), np.max(uages)
     minZ, maxZ = np.min(umetals), np.max(umetals)
 
-    wmax = np.max(np.array([coSFH, laSFH, boSFH]))
+    wmax = np.max(np.log10(np.array([coSFH, laSFH, boSFH])))
+    sfhMin = np.min(np.log10((
+        np.min(coSFH[coSFH>0]),
+        np.min(laSFH[laSFH>0]),
+        np.min(boSFH[boSFH>0]))))
+    wmin = np.max((sfhMin, -12))
+    print(f"SFH plot limits: {wmin:.2f} ({sfhMin:.2f}) to {wmax:.2f}")
 
     if 'sfh' in pplots:
         fig = plt.figure(figsize=plt.figaspect(3./4.))
@@ -13864,9 +14604,10 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         print(nAlphas, ualphas)
         for ali in range(nAlphas):
             ax = fig.add_subplot(gs[0, ali])
-            ax.imshow(coSFH[:, :, ali], extent=[minT, maxT, minZ, maxZ],
-                aspect='auto', interpolation='bicubic', origin='lower',
-                cmap=moncmapr, norm=Normalize(vmin=0, vmax=wmax))
+            cnt = ax.imshow(np.log10(coSFH[:, :, ali]),
+                extent=[minT, maxT, minZ, maxZ],
+                aspect='auto', interpolation='none', origin='lower',
+                cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
             if not ax.get_subplotspec().is_last_row():
                 ax.set_xticklabels([])
             if not ax.get_subplotspec().is_first_col():
@@ -13883,9 +14624,10 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 lT.set_path_effects(
                     [PathEffects.withStroke(linewidth=1.5, foreground='k')])
             ax = fig.add_subplot(gs[1, ali])
-            ax.imshow(laSFH[:, :, ali], extent=[minT, maxT, minZ, maxZ],
-                aspect='auto', interpolation='bicubic', origin='lower',
-                cmap=moncmapr, norm=Normalize(vmin=0, vmax=wmax))
+            ax.imshow(np.log10(laSFH[:, :, ali]),
+                extent=[minT, maxT, minZ, maxZ],
+                aspect='auto', interpolation='none', origin='lower',
+                cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
             if not ax.get_subplotspec().is_last_row():
                 ax.set_xticklabels([])
             if not ax.get_subplotspec().is_first_col():
@@ -13896,9 +14638,10 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                     foreground='k')])
             ax = fig.add_subplot(gs[2, ali])
-            ax.imshow(boSFH[:, :, ali], extent=[minT, maxT, minZ, maxZ],
-                aspect='auto', interpolation='bicubic', origin='lower',
-                cmap=moncmapr, norm=Normalize(vmin=0, vmax=wmax))
+            ax.imshow(np.log10(boSFH[:, :, ali]),
+                extent=[minT, maxT, minZ, maxZ],
+                aspect='auto', interpolation='none', origin='lower',
+                cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
             if not ax.get_subplotspec().is_last_row():
                 ax.set_xticklabels([])
             if not ax.get_subplotspec().is_first_col():
@@ -13915,6 +14658,18 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         BIG.set_yticks([])
         BIG.set_xlabel(r'$t\ [{\rm Gyr}]$', labelpad=20)
         BIG.set_ylabel(r'$[Z/H]$', labelpad=35)
+        cax = POT.attachAxis(BIG, 'right', 0.05)
+        cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
+        lT = cax.text(0.5, 0.5, r'$\log_{10}($Mass Weight$)$',
+            va='center', ha='center', color=POT.pgreen,
+            transform=cax.transAxes, rotation=270)
+        lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+            foreground='k')])
+        cax.text(0.45, 1.0-1e-3, f"{wmax:.2f}", va='top', ha='center',
+            color='w', transform=cax.transAxes, rotation=270)
+        cax.text(0.45, 1e-3, f"{wmin:.2f}", va='bottom', ha='center',
+            color='k', transform=cax.transAxes, rotation=270)
+        cb.set_ticks([])
         plt.savefig(figDir/\
             f"orbitSFH_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
 
@@ -14251,6 +15006,15 @@ v1.3:   Introduced L2 into Kaczmarz solving to be consistent with NNLS
 v1.4:   Use the seed vector as a numerical prior during the Kaczmarz solving;
         Implement global RMSE evaluation, and keep only globally-best solution;
         Optionally disable seed prior. 13 December 2025
+v1.5:   Use RMSE proxy as guard for epoch solution. 15 December 2025
+v2.0:   Implemented global Kaczmarz gradient instead of per-tile updates; added
+            `_worker_tile_global_grad_band` and
+            `solve_global_kaczmarz_global_step_mp`. 16 December 2025
+v2.1:   Added tiny-column freeze inside `_worker_tile_global_grad_band`. 18
+            December 2025
+v2.2:   Consolidated two tiny-column freeze env var names into one. 19 December
+            2025
+v2.3:   Added extra diagnostic output concerning step sizes. 22 December 2025
 """
 
 from __future__ import annotations, print_function
@@ -14594,6 +15358,187 @@ def _compute_global_rmse(
         return float("inf")
 
     return float(math.sqrt(num / float(den)))
+
+# ------------------------------------------------------------------------------
+
+def _tiny_col_freeze_inplace(col_denom, grad, rel_zero, abs_zero):
+    """
+    Freeze numerically tiny / unsupported columns for a given tile-band.
+
+    Parameters
+    ----------
+    col_denom : (P,) float array
+        Per-column denominator computed on the SAME weighted/scaled A used for
+        the gradient (e.g. after cp_flux_ref scaling and λ-weighting).
+    grad : (P,) float array
+        Per-column gradient/numerator (same space as col_denom).
+    rel_zero : float
+        Relative threshold multiplier applied to median positive denom.
+    abs_zero : float
+        Absolute floor threshold.
+    """
+    # robust median on strictly-positive finite entries
+    good = np.isfinite(col_denom) & (col_denom > 0.0)
+    if np.any(good):
+        med_energy = float(np.median(col_denom[good]))
+    else:
+        med_energy = 0.0
+
+    tiny_col = float(max(abs_zero, rel_zero * med_energy))
+
+    # freeze non-finite or tiny denom
+    freeze = (~np.isfinite(col_denom)) | (col_denom <= tiny_col)
+    if np.any(freeze):
+        grad[freeze] = 0.0
+        col_denom[freeze] = np.inf
+
+    return freeze, tiny_col, med_energy
+
+# ---------------------------- Worker ---------------------------------
+
+def _worker_tile_global_grad_band(args):
+    r"""
+    Compute global Kaczmarz-style gradient contributions for one spatial
+    tile and one contiguous band of components.
+
+    This worker does **not** update x or R. It only returns the
+    band-local contributions to the global gradient and diagonal
+    preconditioner:
+
+        g_band[c,p]  = sum_{s,λ} (√w_λ A_{s,c,p,λ}) * (√w_λ R_{s,λ})
+        D_band[c,p]  = sum_{s,λ} (√w_λ A_{s,c,p,λ})^2,
+
+    where R = Y - ŷ is the residual for the current epoch's global x_CP,
+    and A already includes any column-flux normalization in the "model"
+    basis.
+
+    Additionally, this worker can apply a tile-local "tiny-column freeze"
+    safety guard: columns with numerically tiny denom are zeroed in the
+    numerator and excluded from the denom accumulator for this tile. This
+    prevents large/noisy updates later when the coordinator forms
+    invD = 1/max(D, eps).
+
+    Control knobs (env)
+    -------------------
+    CUBEFIT_ZERO_COL_FREEZE : {0,1} (default 1)
+        Enable/disable tile-local freeze.
+    CUBEFIT_ZERO_COL_REL : float (default 1e-12)
+    CUBEFIT_ZERO_COL_ABS : float (default 1e-24)
+
+    Returns
+    -------
+    g_band : ndarray, shape (band_size, P), float64
+    D_band : ndarray, shape (band_size, P), float64
+    """
+    (h5_path, s0, s1, keep_idx,
+     c_start, c_stop,
+     x_band,
+     R_tile,
+     w_lam_sqrt,
+     inv_ref_band,
+     dset_slots, dset_bytes, dset_w0) = args
+
+    eps = float(os.environ.get("CUBEFIT_EPS", "1e-12"))
+
+    freeze_enable = os.environ.get(
+        "CUBEFIT_ZERO_COL_FREEZE", "1"
+    ).lower() not in ("0", "false", "no", "off")
+    rel_zero = float(os.environ.get("CUBEFIT_ZERO_COL_REL", "1e-12"))
+    abs_zero = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-24"))
+
+    # Shapes
+    R_tile = np.asarray(R_tile, dtype=np.float64, order="C")
+    Sblk, Lk = R_tile.shape
+
+    # λ-weights (optional)
+    if w_lam_sqrt is not None:
+        wvec = np.asarray(w_lam_sqrt, np.float64).ravel()
+        if wvec.size != Lk:
+            raise RuntimeError(
+                f"_worker_tile_global_grad_band: w_lam_sqrt length "
+                f"{wvec.size} != Lk={Lk}"
+            )
+        Rw = R_tile * wvec[None, :]
+    else:
+        wvec = None
+        Rw = R_tile
+
+    band_size, P = x_band.shape
+
+    g_band = np.zeros((band_size, P), dtype=np.float64)
+    D_band = np.zeros((band_size, P), dtype=np.float64)
+
+    with open_h5(h5_path, role="reader") as f:
+        M = f["/HyperCube/models"]  # (S, C, P, L)
+        try:
+            M.id.set_chunk_cache(dset_slots, dset_bytes, dset_w0)
+        except Exception:
+            pass
+
+        for bi, c in enumerate(range(c_start, c_stop)):
+            A = np.asarray(
+                M[s0:s1, c, :, :], dtype=np.float32, order="C"
+            )  # (Sblk, P, L_full)
+            if keep_idx is not None:
+                A = A[:, :, keep_idx]  # (Sblk, P, Lk)
+
+            # Apply column-flux normalization if present
+            if inv_ref_band is not None:
+                inv_ref = np.asarray(
+                    inv_ref_band[bi, :], dtype=np.float64, copy=False
+                )  # (P,)
+                A = A * inv_ref[None, :, None]
+
+            # Promote to float64 for safe dot products
+            A = A.astype(np.float64, copy=False)
+
+            if wvec is not None:
+                A_w = A * wvec[None, None, :]  # (Sblk, P, Lk)
+            else:
+                A_w = A
+
+            # g_row[p] = Σ_{s,λ} A_w[s,p,λ] * Rw[s,λ]
+            g_row = np.tensordot(A_w, Rw, axes=([0, 2], [0, 1]))
+
+            # D_row[p] = Σ_{s,λ} (A_w[s,p,λ])^2
+            D_row = np.sum(np.square(A_w, dtype=np.float64), axis=(0, 2))
+
+            # ---- Tiny-column freeze (tile-local) -------------------------
+            # Use the existing helper. It sets denom[frozen]=inf; for a
+            # global accumulator we instead want to *exclude* this tile’s
+            # contribution, so we revert denom[frozen] -> 0 before storing.
+            if freeze_enable:
+                freeze, _, _ = _tiny_col_freeze_inplace(
+                    D_row, g_row, rel_zero, abs_zero
+                )
+                if np.any(freeze):
+                    D_row[freeze] = 0.0
+
+            g_band[bi, :] = g_row
+            D_band[bi, :] = D_row
+
+    # Numerical guards
+    if not np.all(np.isfinite(g_band)):
+        g_band = np.nan_to_num(
+            g_band, nan=0.0, posinf=0.0, neginf=0.0, copy=False
+        )
+
+    # For D: keep zeros (they are meaningful), but sanitize NaN/Inf.
+    if not np.all(np.isfinite(D_band)):
+        D_band = np.nan_to_num(
+            D_band, nan=0.0, posinf=0.0, neginf=0.0, copy=False
+        )
+
+    # Ensure no negative denom from numerical noise
+    np.maximum(D_band, 0.0, out=D_band)
+
+    # Optional hard floor (only if you later invert without g-masking);
+    # here we do NOT force a floor, because g has been frozen where denom
+    # is tiny/invalid.
+    if not np.isfinite(eps) or eps <= 0.0:
+        eps = 1e-12
+
+    return g_band, D_band
 
 # ---------------------------- Worker ---------------------------------
 
@@ -16279,6 +17224,1026 @@ def solve_global_kaczmarz_cchunk_mp(
         )
         print(traceback.format_exc(), flush=True)
         # re-raise so the pipeline still fails loudly
+        raise
+
+# ------------------------------------------------------------------------------
+
+def solve_global_kaczmarz_global_step_mp(
+    h5_path: str,
+    cfg: MPConfig,
+    *,
+    orbit_weights: Optional[np.ndarray] = None,
+    x0: Optional[np.ndarray] = None,
+    tracker: Optional[object] = None,
+    ratio_cfg: cu.RatioCfg | None = None,
+) -> tuple[np.ndarray, dict]:
+    """
+    Global-step Kaczmarz/gradient solver over the full HyperCube.
+
+    This variant treats the whole cube as a single least-squares problem
+    with objective
+
+        J(x) = 0.5 * sum_{s,λ} w_λ (Y_{s,λ} - yhat_{s,λ}(x))^2
+               + 0.5 * λ * ||x||^2,
+
+    where x is the component–population weight matrix in the solver's
+    normalized basis (x_CP). Each epoch does:
+
+    1. Sweep over all spatial tiles, using the current x_CP to build the
+       residual R_tile = Y_tile - yhat_tile(x_CP).
+    2. For each tile and band of components, accumulate local contributions
+       to the global gradient g_CP and diagonal preconditioner D_CP using
+       `_worker_tile_global_grad_band`.
+    3. After all tiles, take a single global projected step
+
+           dx = lr * (g_eff / D_eff),
+           x_CP <- max(0, x_CP + dx),
+
+       with an optional global trust-region cap based on E_global and
+       ||Y||.
+
+    There are **no per-tile Kaczmarz updates** in this solver, no tile-level
+    line search, and no tile-local NNLS polish. The only objective it
+    optimizes is the global LS (plus optional L2), making its behaviour
+    much easier to interpret relative to the NNLS seed.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the HDF5 cube with /DataCube and /HyperCube/models.
+    cfg : MPConfig
+        Configuration for tiling, multiprocessing, epochs, LR, etc.
+    orbit_weights : ndarray or None, optional
+        Ignored in the pure-LS global step, but kept for API parity.
+        Global orbit/ratio regularization is not applied here.
+    x0 : ndarray or None, optional
+        Initial weights in the **physical** basis, shape (C*P,). If None,
+        start from zeros in the solver's normalized basis.
+    tracker : object or None, optional
+        Optional FitTracker-like object with methods:
+            - on_batch_rmse(rmse: float)
+            - on_progress(epoch, spax_done, spax_total, rmse_ewma=None)
+            - on_epoch_end(epoch, stats_dict, block=True/False)
+            - maybe_snapshot_x(x_CP, epoch, rmse, force=False)
+    ratio_cfg : cu.RatioCfg or None, optional
+        Ignored in this pure-LS solver. Present only for API compatibility.
+
+    Returns
+    -------
+    x_out : ndarray, shape (C*P,), float64
+        Final physical component–population weights, flattened in C-major
+        order.
+    info : dict
+        Dictionary with basic run metadata, currently:
+            - epochs : int
+            - elapsed_sec : float
+
+    Notes
+    -----
+    • This solver assumes `mode='model'` normalization on the HyperCube.
+    • Column-flux normalization (`cp_flux_ref`) is allowed but disabled in
+      your current runs; when present it is handled in the "normalized"
+      basis internally and decoded back to physical at the end.
+    • All global orbit/ratio/softbox regularization is intentionally
+      disabled here to focus purely on the LS objective. You can layer it
+      back later if this behaves well.
+    """
+    try:
+        t0 = time.perf_counter()
+
+        def _set_chunk_cache(dset, cfg_obj):
+            try:
+                dset.id.set_chunk_cache(
+                    cfg_obj.dset_slots, cfg_obj.dset_bytes, cfg_obj.dset_w0
+                )
+            except Exception:
+                pass
+
+        # Normalization mode sanity check
+        mode = _assert_norm_mode(h5_path, expect=None)
+        print(f"[Kaczmarz-GLOBAL] HyperCube norm.mode = '{mode}'",
+              flush=True)
+
+        # ------------------- read dims, mask, cp_flux_ref -------------------
+        with open_h5(h5_path, role="reader") as f:
+            DC = f["/DataCube"]           # (S, L) float64
+            M  = f["/HyperCube/models"]   # (S, C, P, L) float32
+            _set_chunk_cache(M, cfg)
+
+            S, L = map(int, DC.shape)
+            _, C, P, Lm = map(int, M.shape)
+            if Lm != L:
+                raise RuntimeError(
+                    f"L mismatch: models L={Lm} vs data L={L}."
+                )
+
+            mask = cu._get_mask(f) if cfg.apply_mask else None
+            keep_idx = np.flatnonzero(mask) if mask is not None else None
+            Lk = int(keep_idx.size) if keep_idx is not None else L
+
+            # Column-flux scaling (model basis), explicitly gated by env
+            cp_enable = os.environ.get(
+                "CUBEFIT_CP_FLUX_ENABLE", "0"
+            ).lower() not in ("0", "false", "no", "off")
+
+            if cp_enable:
+                cp_flux_ref = cu._ensure_cp_flux_ref(
+                    h5_path, keep_idx=keep_idx
+                )  # shape (C, P) or None
+            else:
+                cp_flux_ref = None
+
+            if cp_flux_ref is not None:
+                print(
+                    "[Kaczmarz-GLOBAL] Using column-flux scaling.",
+                    flush=True,
+                )
+                cp_flux_ref = np.asarray(
+                    cp_flux_ref, np.float64
+                ).reshape(C, P)
+                print(
+                    "[Kaczmarz-GLOBAL] cp_flux_ref: "
+                    "min={:.3e}, max={:.3e}, median={:.3e}".format(
+                        float(np.min(cp_flux_ref)),
+                        float(np.max(cp_flux_ref)),
+                        float(
+                            np.median(cp_flux_ref[cp_flux_ref > 0.0])
+                        ),
+                    ),
+                    flush=True,
+                )
+                inv_cp_flux_ref = 1.0 / np.maximum(
+                    cp_flux_ref, 1.0e-30
+                )
+            else:
+                cp_flux_ref = None
+                inv_cp_flux_ref = None
+
+            # λ-weights (feature emphasis)
+            lamw_enable = os.environ.get(
+                "CUBEFIT_LAMBDA_WEIGHTS_ENABLE", "1"
+            ).lower() not in ("0", "false", "no", "off")
+            lamw_dset = os.environ.get(
+                "CUBEFIT_LAMBDA_WEIGHTS_DSET",
+                "/HyperCube/lambda_weights",
+            )
+            lamw_floor = float(
+                os.environ.get("CUBEFIT_LAMBDA_MIN_W", "1e-6")
+            )
+            lamw_auto = os.environ.get(
+                "CUBEFIT_LAMBDA_WEIGHTS_AUTO", "1"
+            ).lower() not in ("0", "false", "no", "off")
+
+            if lamw_enable:
+                print(
+                    "[Kaczmarz-GLOBAL] Reading λ-weights from "
+                    f"'{lamw_dset}' (floor={lamw_floor}, auto={lamw_auto})",
+                    flush=True,
+                )
+                try:
+                    w_full = cu.read_lambda_weights(
+                        h5_path, dset_name=lamw_dset, floor=lamw_floor
+                    )
+                except Exception:
+                    w_full = (
+                        cu.ensure_lambda_weights(
+                            h5_path, dset_name=lamw_dset
+                        )
+                        if lamw_auto
+                        else np.ones(L, dtype=np.float64)
+                    )
+                print(
+                    "[Kaczmarz-GLOBAL] λ-weights "
+                    "min={:.3e}, max={:.3e}, mean={:.3e}".format(
+                        float(np.min(w_full)),
+                        float(np.max(w_full)),
+                        float(np.mean(w_full)),
+                    ),
+                    flush=True,
+                )
+                w_lam = w_full[keep_idx] if keep_idx is not None else w_full
+                w_lam_sqrt = np.sqrt(
+                    np.clip(w_lam, lamw_floor, None)
+                ).astype(np.float64, order="C")
+            else:
+                w_lam_sqrt = None
+
+            # Spaxel tiling from HyperCube chunking
+            s_tile = int(M.chunks[0]) if (M.chunks and M.chunks[0] > 0) \
+                else 128
+            s_ranges = [
+                (s0, int(np.min((S, s0 + s_tile))))
+                for s0 in range(0, S, s_tile)
+            ]
+
+            # Tile norms and global ||Y||
+            norms = []
+            Y_glob_norm2 = 0.0
+            for (ss0, ss1) in s_ranges:
+                Yt = np.asarray(DC[ss0:ss1, :], np.float64)
+                if keep_idx is not None:
+                    Yt = Yt[:, keep_idx]
+                norms.append(float(np.linalg.norm(Yt)))
+                Y_glob_norm2 += float(np.sum(Yt * Yt))
+
+        print(
+            "[Kaczmarz-GLOBAL] DataCube S={}, L={} (kept Lk={}), "
+            "Hypercube C={}, P={}, s_tile={}, epochs={}, lr={}, "
+            "processes={}, blas_threads={}".format(
+                S, L, Lk, C, P, s_tile,
+                cfg.epochs, cfg.lr,
+                cfg.processes, cfg.blas_threads,
+            ),
+            flush=True,
+        )
+
+        # Sort tiles by descending norm (brightest first)
+        paired = sorted(
+            zip(norms, s_ranges), key=lambda t: -t[0]
+        )
+        norms_sorted = [t[0] for t in paired]
+        s_ranges_sorted = [t[1] for t in paired]
+
+        # Optional tile budget (max_tiles)
+        max_tiles = cfg.max_tiles
+        print("[Kaczmarz-GLOBAL] Applying max_tiles constraint...",
+              flush=True)
+        if max_tiles is not None:
+            max_tiles = int(max_tiles)
+            if 0 < max_tiles < len(s_ranges_sorted):
+                import math
+                rng_sel = np.random.default_rng(
+                    int(os.environ.get(
+                        "CUBEFIT_POLISH_SEED", "12345"
+                    ))
+                )
+
+                k_bright = max(1, int(math.ceil(0.7 * max_tiles)))
+                k_rand = max(0, max_tiles - k_bright)
+
+                bright_idx = np.arange(k_bright, dtype=int)
+                tail_idx = np.arange(
+                    k_bright, len(s_ranges_sorted), dtype=int
+                )
+                if k_rand > 0 and tail_idx.size > 0:
+                    rng_sel.shuffle(tail_idx)
+                    rand_idx = tail_idx[:k_rand]
+                    keep_idx_tiles = np.concatenate(
+                        [bright_idx, rand_idx]
+                    )
+                else:
+                    keep_idx_tiles = bright_idx
+
+                keep_idx_tiles = np.sort(keep_idx_tiles)
+                s_ranges = [s_ranges_sorted[i] for i in keep_idx_tiles]
+                norms_sorted = [norms_sorted[i] for i in keep_idx_tiles]
+            else:
+                s_ranges = s_ranges_sorted
+        else:
+            s_ranges = s_ranges_sorted
+
+        print(
+            f"[Kaczmarz-GLOBAL] Using {len(s_ranges)} tiles for fitting.",
+            flush=True,
+        )
+
+        Y_glob_norm = float(np.sqrt(Y_glob_norm2))
+
+        # Global column energy (for trust-region scaling)
+        print("[Kaczmarz-GLOBAL] Reading global column energy...",
+              flush=True)
+        E_global = read_global_column_energy(h5_path)  # (C, P) float64
+        print("[Kaczmarz-GLOBAL] done.", flush=True)
+
+        # ------------------- optional orbit_weights prior -------------------
+        # Here we only prepare the target mix; the actual use is an optional
+        # projection after each global step (see below).
+        w_prior = None
+        orbit_weights_arr = None
+        if orbit_weights is not None:
+            orbit_weights_arr = np.asarray(
+                orbit_weights, np.float64
+            ).ravel(order="C")
+            if orbit_weights_arr.size != C:
+                raise ValueError(
+                    f"orbit_weights length {orbit_weights_arr.size} != C={C}."
+                )
+            w_prior = orbit_weights_arr.copy()
+
+            if tracker is not None and hasattr(
+                tracker, "set_orbit_weights"
+            ):
+                try:
+                    tracker.set_orbit_weights(w_prior)
+                except Exception:
+                    pass
+
+        tau_global = float(
+            os.environ.get("CUBEFIT_GLOBAL_TAU", "0.5")
+        )
+        beta_blend = float(
+            os.environ.get("CUBEFIT_GLOBAL_ENERGY_BLEND", "1e-2")
+        )
+
+        # ------------------- x initialization -------------------
+        if x0 is None:
+            x_CP = np.zeros((C, P), dtype=np.float64, order="C")
+        else:
+            x0 = np.asarray(x0, np.float64).ravel(order="C")
+            if x0.size != C * P:
+                raise ValueError(
+                    f"x0 length {x0.size} != C*P={C*P}."
+                )
+            X_phys = x0.reshape(C, P)  # physical basis
+            if cp_flux_ref is not None:
+                x_CP = X_phys * cp_flux_ref
+            else:
+                x_CP = X_phys.copy(order="C")
+
+        # Small symmetry breaking if starting from exact zero
+        sym_eps = float(
+            os.environ.get("CUBEFIT_SYMBREAK_EPS", "1e-6")
+        )
+        sym_mode = os.environ.get(
+            "CUBEFIT_SYMBREAK_MODE", "qr"
+        ).lower()
+        if (
+            sym_eps > 0.0
+            and sym_mode != "off"
+            and (x0 is None or np.count_nonzero(x_CP) == 0)
+        ):
+            print("[Kaczmarz-GLOBAL] Applying symmetry breaking...",
+                  flush=True)
+            rng_sb = np.random.default_rng(
+                int(os.environ.get("CUBEFIT_SEED", "12345"))
+            )
+            if sym_mode == "qr":
+                Rmat = rng_sb.standard_normal((C, P))
+                Q, _ = np.linalg.qr(Rmat.T, mode="reduced")
+                Q = Q[:, :C].T  # (C, P)
+                x_CP += sym_eps * np.abs(Q)
+            else:
+                x_CP += sym_eps * rng_sb.random((C, P))
+            if cfg.project_nonneg:
+                np.maximum(x_CP, 0.0, out=x_CP)
+            print("[Kaczmarz-GLOBAL] done.", flush=True)
+
+        # This global-step solver ignores orbit_weights / ratio_cfg for now
+        have_ratio = False
+        w_prior = None
+
+        # ------------------- multiprocessing setup -------------------
+        print(
+            f"[Kaczmarz-GLOBAL] Spinning up workers with "
+            f"{cfg.processes} processes...",
+            flush=True,
+        )
+
+        nprocs_req = max(1, int(cfg.processes))
+        band_size = int(np.ceil(C / nprocs_req))
+        bands: list[tuple[int, int]] = []
+        c0 = 0
+        for _i in range(nprocs_req):
+            c1 = int(np.min((C, c0 + band_size)))
+            if c1 > c0:
+                bands.append((c0, c1))
+            c0 = c1
+        nprocs = len(bands)
+        print(
+            f"[Kaczmarz-GLOBAL] Using {nprocs} processes, "
+            f"band_size={band_size}.",
+            flush=True,
+        )
+
+        use_pool = nprocs > 1
+        if not use_pool:
+            print(
+                "[Kaczmarz-GLOBAL] Single-process mode "
+                "(no multiprocessing pool).",
+                flush=True,
+            )
+            pool = None
+        else:
+            ctx_name = os.environ.get(
+                "CUBEFIT_MP_CTX", "forkserver"
+            )
+            print(
+                f"[Kaczmarz-GLOBAL] Using multiprocessing context "
+                f"'{ctx_name}'",
+                flush=True,
+            )
+            try:
+                ctx = mp.get_context(ctx_name)
+            except ValueError:
+                print(
+                    "[Kaczmarz-GLOBAL] Context '{ctx_name}' unavailable; "
+                    "falling back to 'spawn'.",
+                    flush=True,
+                )
+                ctx = mp.get_context("spawn")
+
+            os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
+            os.environ.setdefault(
+                "OMP_NUM_THREADS", str(cfg.blas_threads)
+            )
+            os.environ.setdefault(
+                "OPENBLAS_NUM_THREADS", str(cfg.blas_threads)
+            )
+            os.environ.setdefault(
+                "MKL_NUM_THREADS", str(cfg.blas_threads)
+            )
+
+            max_tasks = int(
+                os.environ.get("CUBEFIT_WORKER_MAXTASKS", "0")
+            )
+            ping_timeout = float(
+                os.environ.get(
+                    "CUBEFIT_POOL_PING_TIMEOUT", "5.0"
+                )
+            )
+            renew_each_epoch = os.environ.get(
+                "CUBEFIT_POOL_RENEW_EVERY_EPOCH", "0"
+            ).lower() not in ("0", "false", "no", "off")
+
+            def _make_pool():
+                print(
+                    f"[Kaczmarz-GLOBAL] Creating pool with {nprocs} "
+                    f"workers...",
+                    flush=True,
+                )
+                ppool = ctx.Pool(
+                    processes=nprocs,
+                    initializer=_worker_init,
+                    initargs=(int(cfg.blas_threads),),
+                    maxtasksperchild=(
+                        None if max_tasks <= 0 else max_tasks
+                    ),
+                )
+                print("[Kaczmarz-GLOBAL] Pool created.", flush=True)
+                return ppool
+
+            pool = _make_pool()
+
+        want_shift_diag = os.environ.get(
+            "CUBEFIT_SHIFT_DIAG", "0"
+        ).lower() not in ("0", "false", "no", "off")
+
+        # Kacz-style global step hyperparameters
+        eps      = float(os.environ.get("CUBEFIT_EPS", "1e-12"))
+        rel_zero = float(os.environ.get("CUBEFIT_ZERO_COL_REL", "1e-12"))
+        abs_zero = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-24"))
+
+        # Allow disabling the tiny-column freeze for diagnostics.
+        # If CUBEFIT_ZERO_COL_FREEZE in {0, false, no, off}, no columns are
+        # frozen based on (rel_zero, abs_zero).
+        zero_col_freeze = os.environ.get(
+            "CUBEFIT_ZERO_COL_FREEZE", "1"
+        ).lower() not in ("0", "false", "no", "off")
+
+        kacz_l2 = float(os.environ.get("CUBEFIT_KACZ_L2", "0.0"))
+        if not np.isfinite(kacz_l2) or kacz_l2 < 0.0:
+            kacz_l2 = 0.0
+
+        # Optional orbit-mix projection strength (0 = off)
+        orbit_beta = float(
+            os.environ.get("CUBEFIT_ORBIT_BETA", "0.0")
+        )
+        if not np.isfinite(orbit_beta) or orbit_beta < 0.0:
+            orbit_beta = 0.0
+
+        rmse_cap = float(
+            os.environ.get("CUBEFIT_RMSE_ABORT", "0.0")
+        )
+
+        def _pool_ok(ppool, timeout=5.0) -> bool:
+            if ppool is None:
+                return True
+            try:
+                ppool.apply_async(lambda: None).get(timeout=timeout)
+                return True
+            except Exception:
+                return False
+
+        try:
+            for ep in range(cfg.epochs):
+                if use_pool:
+                    if (not _pool_ok(pool, timeout=ping_timeout)) or \
+                       renew_each_epoch:
+                        try:
+                            pool.close()
+                            pool.join()
+                        except Exception:
+                            try:
+                                pool.terminate()
+                            except Exception:
+                                pass
+                        pool = _make_pool()
+
+                # Global accumulators for this epoch
+                g_tot = np.zeros((C, P), dtype=np.float64)
+                D_tot = np.zeros((C, P), dtype=np.float64)
+                rmse_sum_sq = 0.0
+                rmse_count = 0
+
+                pbar = tqdm(
+                    total=len(s_ranges),
+                    desc=(
+                        f"[Kaczmarz-GLOBAL] epoch "
+                        f"{ep+1}/{cfg.epochs}"
+                    ),
+                    mininterval=2.0,
+                    dynamic_ncols=True,
+                )
+                pbar.refresh()
+
+                # Use a fixed LR per epoch for now
+                lr_epoch = float(cfg.lr)
+
+                for tile_idx, (s0, s1) in enumerate(s_ranges):
+                    Sblk = s1 - s0
+
+                    # ---------- Build residual R = Y - yhat ----------
+                    with open_h5(h5_path, role="reader") as f:
+                        DC = f["/DataCube"]
+                        M  = f["/HyperCube/models"]
+                        try:
+                            M.id.set_chunk_cache(
+                                cfg.dset_slots,
+                                cfg.dset_bytes,
+                                cfg.dset_w0,
+                            )
+                        except Exception:
+                            pass
+
+                        Y = np.asarray(
+                            DC[s0:s1, :], np.float64, order="C"
+                        )
+                        if keep_idx is not None:
+                            Y = Y[:, keep_idx]
+
+                        # Model prediction with current global x_CP
+                        yhat = np.zeros((Sblk, Lk), np.float64)
+                        for c in range(C):
+                            A = np.asarray(
+                                M[s0:s1, c, :, :],
+                                np.float32,
+                                order="C",
+                            )
+                            if keep_idx is not None:
+                                A = A[:, :, keep_idx]
+                            if cp_flux_ref is not None:
+                                A = (
+                                    A
+                                    * inv_cp_flux_ref[c, :][
+                                        None, :, None
+                                    ]
+                                )
+                            xc_norm = x_CP[c, :].astype(
+                                np.float64, copy=False
+                            )
+                            # yhat[s, :] += xc_norm @ A[s, :, :]
+                            yhat += np.tensordot(
+                                xc_norm, A, axes=(0, 1)
+                            )
+
+                        R = Y - yhat
+
+                    # Optional per-tile shift diagnostic
+                    if want_shift_diag and Sblk > 0:
+                        s_pick = s0
+                        try:
+                            y_obs = np.asarray(
+                                DC[s_pick, :], np.float64
+                            )
+                            if keep_idx is not None:
+                                y_obs = y_obs[keep_idx]
+                            y_fit = yhat[s_pick - s0, :]
+                            sh = _xcorr_int_shift(y_obs, y_fit)
+                            if sh != 0:
+                                print(
+                                    "[diag] spaxel {}: "
+                                    "data↔model integer shift "
+                                    "= {} px".format(
+                                        s_pick, int(sh)
+                                    ),
+                                    flush=True,
+                                )
+                        except Exception:
+                            pass
+
+                    # NaN/Inf guard on R
+                    if not np.all(np.isfinite(R)):
+                        bad = ~np.isfinite(R)
+                        n_bad = int(bad.sum())
+                        print(
+                            "[Kaczmarz-GLOBAL] WARNING: non-finite "
+                            f"residuals on tile {tile_idx} "
+                            f"(bad={n_bad}); zeroing.",
+                            flush=True,
+                        )
+                        R = np.nan_to_num(
+                            R,
+                            nan=0.0,
+                            posinf=0.0,
+                            neginf=0.0,
+                            copy=False,
+                        )
+
+                    # Per-tile RMSE (unweighted) before this global step
+                    rmse_before = float(
+                        np.sqrt(np.mean(R * R))
+                    )
+
+                    if (rmse_cap > 0.0) and (rmse_before > rmse_cap):
+                        if tracker is not None:
+                            tracker.on_batch_rmse(rmse_cap)
+                        # Skip this tile in gradient accumulation
+                        pbar.update(1)
+                        pbar.refresh()
+                        continue
+
+                    if tracker is not None:
+                        tracker.on_batch_rmse(rmse_before)
+
+                    # Accumulate into the epoch-level global RMSE proxy
+                    rmse_sum_sq += float(np.sum(R * R))
+                    rmse_count += int(R.size)
+
+                    # ---------- Gradient jobs for this tile ----------
+                    jobs = []
+                    inv_ref_band_full = (
+                        inv_cp_flux_ref
+                        if cp_flux_ref is not None
+                        else None
+                    )
+                    for (c_start, c_stop) in bands:
+                        x_band = x_CP[c_start:c_stop, :].copy(order="C")
+                        inv_ref_band = (
+                            inv_ref_band_full[c_start:c_stop, :]
+                            if inv_ref_band_full is not None
+                            else None
+                        )
+                        jobs.append(
+                            (
+                                h5_path,
+                                int(s0),
+                                int(s1),
+                                keep_idx,
+                                int(c_start),
+                                int(c_stop),
+                                x_band,
+                                R.copy(order="C"),
+                                w_lam_sqrt,
+                                inv_ref_band,
+                                cfg.dset_slots,
+                                cfg.dset_bytes,
+                                cfg.dset_w0,
+                            )
+                        )
+
+                    if use_pool:
+                        results = pool.map(
+                            _worker_tile_global_grad_band, jobs
+                        )
+                    else:
+                        results = [
+                            _worker_tile_global_grad_band(job)
+                            for job in jobs
+                        ]
+
+                    # Aggregate band contributions into global g_tot, D_tot
+                    for (c_start, c_stop), (g_band, D_band) in zip(
+                        bands, results
+                    ):
+                        c_start = int(c_start)
+                        c_stop = int(c_stop)
+                        g_tot[c_start:c_stop, :] += g_band
+                        D_tot[c_start:c_stop, :] += D_band
+
+                    if tracker is not None:
+                        tracker.on_progress(
+                            epoch=ep + 1,
+                            spax_done=tile_idx + 1,
+                            spax_total=len(s_ranges),
+                            rmse_ewma=None,
+                        )
+
+                    pbar.update(1)
+                    pbar.refresh()
+
+                pbar.close()
+
+                # --------- finalize epoch-level RMSE proxy ----------
+                if rmse_count > 0:
+                    mean_sq = rmse_sum_sq / float(rmse_count)
+                else:
+                    mean_sq = 0.0
+
+                if (not np.isfinite(mean_sq)) or (mean_sq < 0.0):
+                    print(
+                        "[Kaczmarz-GLOBAL] WARNING: epoch "
+                        f"{ep+1} RMSE(proxy) mean_sq={mean_sq!r} "
+                        "non-finite or negative; setting +inf.",
+                        flush=True,
+                    )
+                    rmse_epoch_proxy = float("inf")
+                else:
+                    rmse_epoch_proxy = float(np.sqrt(mean_sq))
+
+                print(
+                    "[Kaczmarz-GLOBAL] epoch {} RMSE(proxy) = "
+                    "{:.6e}".format(ep + 1, rmse_epoch_proxy),
+                    flush=True,
+                )
+
+                if tracker is not None:
+                    try:
+                        tracker.on_epoch_end(
+                            ep + 1,
+                            {"rmse_epoch_proxy": rmse_epoch_proxy},
+                            block=False,
+                        )
+                    except TypeError:
+                        tracker.on_epoch_end(
+                            ep + 1,
+                            {"rmse_epoch_proxy": rmse_epoch_proxy},
+                        )
+
+                # --------- global Kaczmarz-style update in x_CP -----
+                # Freeze numerically tiny columns based on global D_tot
+                D = np.asarray(D_tot, dtype=np.float64, order="C")
+                g = np.asarray(g_tot, dtype=np.float64, order="C")
+
+                # Freeze numerically tiny columns globally (optional)
+                if zero_col_freeze and np.any(D > 0):
+                    med_energy = float(np.median(D[D > 0]))
+                    tiny_col = np.max((abs_zero, rel_zero * med_energy))
+                    freeze = D <= tiny_col
+                    if freeze.any():
+                        g[freeze] = 0.0
+                        D = np.where(freeze, np.inf, D)
+                else:
+                    tiny_col = 0.0  # not used, kept for potential logging
+
+                # Blend with global column energy to stabilize empty tiles
+                if E_global is not None:
+                    Eg = np.asarray(E_global, np.float64)
+                    if Eg.shape == D.shape:
+                        D = np.maximum(D, beta_blend * Eg)
+
+                # Optional L2 term in the normalized basis
+                if kacz_l2 > 0.0:
+                    g -= kacz_l2 * x_CP
+
+                invD = 1.0 / np.maximum(D, eps)
+
+                # ---- Adaptive effective learning rate for this epoch ----
+                # Base step for lr=1.0
+                dx_base = g * invD
+
+                # --- Project the *direction* for NNLS before sizing/capping ---
+                if cfg.project_nonneg:
+                    # At x=0, do not step negative (it will be clipped anyway).
+                    mask = (x_CP > 0.0) | (dx_base > 0.0)
+                    dx_base[~mask] = 0.0
+                    # Never propose dx < -x (keeps feasibility without relying on later clip).
+                    np.maximum(dx_base, -x_CP, out=dx_base)
+
+                # Compute its energy in the same metric as the trust region
+                if E_global is not None:
+                    Eg = np.asarray(E_global, np.float64)
+                    upd_energy_sq_base = float(
+                        np.sum((dx_base.astype(np.float64) ** 2) * Eg)
+                    )
+                else:
+                    upd_energy_sq_base = np.sum((dx_base**2) * D)
+                    # D is already λ-weighted
+                    upd_energy_sq      = np.sum((dx**2) * D)
+
+                # Decide how aggressively we want to move relative to the
+                # global trust cap. target_frac <= 1.0 means "aim for this
+                # fraction of the cap when lr=effective_lr".
+                target_frac = float(
+                    os.environ.get("CUBEFIT_GLOBAL_STEP_FRAC", "0.3")
+                )
+                if (not np.isfinite(target_frac)) or (target_frac <= 0.0):
+                    target_frac = 0.3
+                if target_frac > 1.0:
+                    target_frac = 1.0
+
+                # Compute an effective lr that would give
+                # global_step_norm ≈ target_frac * tau_global * ||Y||
+                if (upd_energy_sq_base > 0.0) and (Y_glob_norm > 0.0):
+                    global_step_norm_base = float(
+                        np.sqrt(upd_energy_sq_base)
+                    )
+                    cap = float(tau_global * Y_glob_norm)
+                    lr_auto = (
+                        target_frac * cap
+                        / max(global_step_norm_base, 1.0e-12)
+                    )
+                    # Respect cfg.lr as a ceiling
+                    lr_eff = float(min(cfg.lr, lr_auto))
+                else:
+                    lr_eff = float(cfg.lr)
+
+                # Build the step with the per-epoch effective lr
+                dx = lr_eff * dx_base
+
+                # Apply update with nonnegativity projection (trial), then cap on APPLIED step
+                if not np.all(np.isfinite(dx)):
+                    dx = np.nan_to_num(
+                        dx,
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                        copy=False,
+                    )
+
+                x_before = x_CP.copy(order="C")
+
+                # First trial (un-capped)
+                x_trial = x_before + dx
+                if cfg.project_nonneg:
+                    np.maximum(x_trial, 0.0, out=x_trial)
+                dx_applied = x_trial - x_before
+
+                # --------------- Global trust-region cap (APPLIED step) ---------------
+                cap = float(tau_global * Y_glob_norm)
+                alpha_glob = 1.0
+
+                if (Y_glob_norm > 0.0) and (cap > 0.0):
+                    if E_global is not None:
+                        Eg = np.asarray(E_global, np.float64)
+                        upd_energy_sq_applied = float(
+                            np.sum((dx_applied.astype(np.float64) ** 2) * Eg)
+                        )
+                    else:
+                        upd_energy_sq_applied = float(
+                            np.sum(dx_applied.astype(np.float64) ** 2)
+                        )
+
+                    global_step_norm_applied = float(
+                        np.sqrt(max(upd_energy_sq_applied, 0.0))
+                    )
+
+                    if global_step_norm_applied > cap:
+                        alpha_glob = float(
+                            cap / max(global_step_norm_applied, 1.0e-12)
+                        )
+
+                        # Scale the raw step, then re-project (projection is nonlinear)
+                        dx *= alpha_glob
+
+                        x_trial = x_before + dx
+                        if cfg.project_nonneg:
+                            np.maximum(x_trial, 0.0, out=x_trial)
+                        dx_applied = x_trial - x_before
+
+                        # Recompute applied norm for logging (optional but useful)
+                        if E_global is not None:
+                            upd_energy_sq_applied = float(
+                                np.sum((dx_applied.astype(np.float64) ** 2) * Eg)
+                            )
+                        else:
+                            upd_energy_sq_applied = float(
+                                np.sum(dx_applied.astype(np.float64) ** 2)
+                            )
+                        global_step_norm_applied = float(
+                            np.sqrt(max(upd_energy_sq_applied, 0.0))
+                        )
+                else:
+                    global_step_norm_applied = 0.0
+
+                # Diagnostics (now valid: dx_applied is defined)
+                frac_clipped = (
+                    float(np.mean((x_before + dx) < 0.0))
+                    if cfg.project_nonneg
+                    else 0.0
+                )
+
+                print(
+                    f"[Kaczmarz-GLOBAL] epoch {ep + 1}: lr_eff={lr_eff:.3e}, "
+                    f"step_norm_base={float(np.sqrt(max(upd_energy_sq_base, 0.0))):.3e}, "
+                    f"Y_glob_norm={Y_glob_norm:.3e}",
+                    flush=True,
+                )
+                print(
+                    f"[Kaczmarz-GLOBAL] epoch {ep + 1}: "
+                    f"global_step_norm(applied)={global_step_norm_applied:.3e}, "
+                    f"cap={cap:.3e}, alpha_glob={alpha_glob:.3e}",
+                    flush=True,
+                )
+                print(
+                    f"[Kaczmarz-GLOBAL] dx_min={dx.min():.3e}, "
+                    f"dx_max={dx.max():.3e}, "
+                    f"dx_l2={np.linalg.norm(dx):.3e}, "
+                    f"dx_applied_l2={np.linalg.norm(dx_applied):.3e}",
+                    flush=True,
+                )
+                print(
+                    f"[Kaczmarz-GLOBAL] frac_clipped={frac_clipped:.3f}, "
+                    f"||dx_raw||={np.linalg.norm(dx):.3e}, "
+                    f"||dx_applied||={np.linalg.norm(dx_applied):.3e}",
+                    flush=True,
+                )
+
+                # Commit projected trial
+                x_CP[:, :] = x_trial
+
+                # Final guard
+                if not np.all(np.isfinite(x_CP)):
+                    bad = ~np.isfinite(x_CP)
+                    print(
+                        "[Kaczmarz-GLOBAL] WARNING: non-finite entries "
+                        f"in x_CP after update (bad={int(bad.sum())}); zeroing.",
+                        flush=True,
+                    )
+                    x_CP[bad] = 0.0
+
+                # Optional global projection toward orbit_weights
+                if (
+                    orbit_beta > 0.0
+                    and orbit_weights_arr is not None
+                    and E_global is not None
+                ):
+                    try:
+                        cu.project_to_component_weights(
+                            x_CP,
+                            orbit_weights_arr,
+                            E_cp=E_global,
+                            minw=1.0e-10,
+                            beta=float(orbit_beta),
+                        )
+                    except Exception as e:
+                        print(
+                            "[Kaczmarz-GLOBAL] WARNING: "
+                            "orbit_weights projection failed: "
+                            f"{e!r}",
+                            flush=True,
+                        )
+
+                # Snapshot after the global step
+                if tracker is not None:
+                    try:
+                        tracker.maybe_snapshot_x(
+                            x_CP,
+                            epoch=ep + 1,
+                            rmse=rmse_epoch_proxy,
+                            force=True,
+                        )
+                    except Exception:
+                        pass
+
+                print(
+                    "[Kaczmarz-GLOBAL] epoch {}/{} done.".format(
+                        ep + 1, cfg.epochs
+                    ),
+                    flush=True,
+                )
+
+            elapsed = time.perf_counter() - t0
+
+            # Convert back to physical basis
+            np.nan_to_num(
+                x_CP,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+                copy=False,
+            )
+
+            if cp_flux_ref is not None:
+                X_norm = x_CP
+                X_phys = X_norm * inv_cp_flux_ref
+            else:
+                X_phys = x_CP
+
+            x_out = np.asarray(
+                X_phys, np.float64, order="C"
+            ).ravel(order="C")
+
+            return x_out, dict(
+                epochs=cfg.epochs,
+                elapsed_sec=elapsed,
+            )
+        finally:
+            if use_pool and (pool is not None):
+                try:
+                    pool.close()
+                    pool.join()
+                except Exception:
+                    try:
+                        pool.terminate()
+                    except Exception:
+                        pass
+    except Exception:
+        print(
+            "[Kaczmarz-GLOBAL] FATAL exception in "
+            "solve_global_kaczmarz_global_step_mp:",
+            flush=True,
+        )
+        print(traceback.format_exc(), flush=True)
         raise
 
 # ------------------------------------------------------------------------------
