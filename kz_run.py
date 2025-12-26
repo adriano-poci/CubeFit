@@ -68,12 +68,12 @@ def main():
     os.environ["CUBEFIT_KACZ_L2"] = "0.0"
     os.environ["CUBEFIT_RMSE_PROXY_GUARD"] = "0"
     os.environ["CUBEFIT_NNLS_PROP_PER_BAND"] = "0"
-    os.environ["CUBEFIT_NNLS_ENABLE"]        = "0"
+    os.environ["CUBEFIT_NNLS_ENABLE"] = "0"
     os.environ["CUBEFIT_ORBIT_BETA"] = "0.0"
-    os.environ["CUBEFIT_ZERO_COL_FREEZE"] = "0"
     os.environ["CUBEFIT_GLOBAL_STEP_FRAC"] = "1.0"
-    os.environ["CUBEFIT_GLOBAL_TAU"] = "1.1"
-    os.environ["CUBEFIT_ZERO_FREEZE_ENABLE"] = str(1)
+    os.environ["CUBEFIT_GLOBAL_TAU"] = "1.5"
+    os.environ["CUBEFIT_GLOBAL_ENERGY_BLEND"] = "0.0"
+    os.environ["CUBEFIT_ZERO_COL_FREEZE"] = str(1)
     os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-4)
     print(props)
 

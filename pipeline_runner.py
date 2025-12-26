@@ -744,7 +744,7 @@ class PipelineRunner:
                 use_lambda=True,
                 lam_dset="/HyperCube/lambda_weights",
                 out_dir=plp.Path(self.h5_path).parent/'figures',
-                write_seed=False,
+                write_seed=True,
                 seed_path="/Seeds/x0_nnls_patch",
                 normalize_columns=True,
                 orbit_weights=orbit_weights,

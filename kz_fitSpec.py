@@ -558,7 +558,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         use=True           # actually enable the ratio term
     )
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=2,
+        epochs=3,
         lr=1.0,
         project_nonneg=True,
         orbit_weights=None, # or None for “free” fit
@@ -569,7 +569,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         blas_threads=12, # 12 BLAS threads each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
-        warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
+        warm_start='resume',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
@@ -1836,6 +1836,12 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     minZ, maxZ = np.min(umetals), np.max(umetals)
 
     wmax = np.max(np.log10(np.array([coSFH, laSFH, boSFH])))
+    sfhMin = np.min(np.log10((
+        np.min(coSFH[coSFH>0]),
+        np.min(laSFH[laSFH>0]),
+        np.min(boSFH[boSFH>0]))))
+    wmin = np.max((sfhMin, -12))
+    print(f"SFH plot limits: {wmin:.2f} ({sfhMin:.2f}) to {wmax:.2f}")
 
     if 'sfh' in pplots:
         fig = plt.figure(figsize=plt.figaspect(3./4.))
@@ -1847,7 +1853,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             cnt = ax.imshow(np.log10(coSFH[:, :, ali]),
                 extent=[minT, maxT, minZ, maxZ],
                 aspect='auto', interpolation='none', origin='lower',
-                cmap=moncmapr, norm=Normalize(vmin=0, vmax=wmax))
+                cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
             if not ax.get_subplotspec().is_last_row():
                 ax.set_xticklabels([])
             if not ax.get_subplotspec().is_first_col():
@@ -1867,7 +1873,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             ax.imshow(np.log10(laSFH[:, :, ali]),
                 extent=[minT, maxT, minZ, maxZ],
                 aspect='auto', interpolation='none', origin='lower',
-                cmap=moncmapr, norm=Normalize(vmin=0, vmax=wmax))
+                cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
             if not ax.get_subplotspec().is_last_row():
                 ax.set_xticklabels([])
             if not ax.get_subplotspec().is_first_col():
@@ -1881,7 +1887,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             ax.imshow(np.log10(boSFH[:, :, ali]),
                 extent=[minT, maxT, minZ, maxZ],
                 aspect='auto', interpolation='none', origin='lower',
-                cmap=moncmapr, norm=Normalize(vmin=0, vmax=wmax))
+                cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
             if not ax.get_subplotspec().is_last_row():
                 ax.set_xticklabels([])
             if not ax.get_subplotspec().is_first_col():
@@ -1907,7 +1913,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             foreground='k')])
         cax.text(0.45, 1.0-1e-3, f"{wmax:.2f}", va='top', ha='center',
             color='w', transform=cax.transAxes, rotation=270)
-        cax.text(0.45, 1e-3, f"0", va='bottom', ha='center',
+        cax.text(0.45, 1e-3, f"{wmin:.2f}", va='bottom', ha='center',
             color='k', transform=cax.transAxes, rotation=270)
         cb.set_ticks([])
         plt.savefig(figDir/\
