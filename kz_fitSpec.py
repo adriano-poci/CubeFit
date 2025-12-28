@@ -128,6 +128,61 @@ def _worker_compute_tile(h5_path, s0, s1, x_cp64):
 
 # ------------------------------------------------------------------------------
 
+def load_xring_best(sidecar_path: str, ring_idx: int = 95, as_physical: bool = True,
+                    cp_flux_ref: np.ndarray | None = None) -> np.ndarray:
+    """
+    Load x_ring[ring_idx] from sidecar /Fit/x_ring and return a 1-D float64
+    vector suitable as x0 for genCubeFit. If as_physical=True and a
+    cp_flux_ref array is provided, convert from solver-normalized (x_CP)
+    -> physical (X_phys) before returning.
+    """
+    with open_h5(sidecar_path, role="reader") as f:
+        fit = f.get("/Fit")
+        if fit is None:
+            raise KeyError(f"no /Fit group in {sidecar_path!r}")
+        if "x_ring" not in fit:
+            raise KeyError(f"/Fit/x_ring not found in {sidecar_path!r}")
+
+        x_ring = np.asarray(fit["x_ring"])  # shape (Nring, C*P) or (Nring, C, P)
+
+    # Accept both flattened and (C,P) forms
+    if x_ring.ndim == 1:
+        # single-vector stored (no ring axis) — treat as the vector
+        vec = x_ring.astype(np.float64).ravel(order="C")
+    elif x_ring.ndim == 2:
+        if ring_idx < 0 or ring_idx >= x_ring.shape[0]:
+            raise IndexError(f"ring_idx {ring_idx} out of range (0..{x_ring.shape[0]-1})")
+        vec = x_ring[ring_idx].astype(np.float64).ravel(order="C")
+    elif x_ring.ndim == 3:
+        # stored as (Nring, C, P) — flatten afterwards
+        if ring_idx < 0 or ring_idx >= x_ring.shape[0]:
+            raise IndexError(f"ring_idx {ring_idx} out of range (0..{x_ring.shape[0]-1})")
+        vec = x_ring[ring_idx].astype(np.float64).ravel(order="C")
+    else:
+        raise RuntimeError(f"unexpected /Fit/x_ring shape {x_ring.shape}")
+
+    # Optional conversion from normalized basis x_CP -> physical X_phys:
+    if as_physical and (cp_flux_ref is not None):
+        # cp_flux_ref expected shape (C, P)
+        CtimesP = vec.size
+        cp = np.asarray(cp_flux_ref, np.float64).ravel(order="C")
+        if cp.size != CtimesP:
+            # allow cp provided as (C,P) array
+            cp = np.asarray(cp_flux_ref, np.float64).ravel(order="C")
+            if cp.size != CtimesP:
+                raise ValueError("cp_flux_ref size does not match x_ring length")
+        inv_cp = 1.0 / np.maximum(cp, 1e-30)
+        vec = (vec * inv_cp).astype(np.float64, order="C")
+
+    return vec
+
+# --- example use in genCubeFit ---
+# sidecar_path = "/path/to/your/sidecar.h5"
+# x0 = load_xring_best(sidecar_path, ring_idx=95, as_physical=True, cp_flux_ref=maybe_cp_flux)
+# pass x0 into the routine that accepts initial x0 (shape (C*P,))
+
+# ------------------------------------------------------------------------------
+
 def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     full=False, slope=1.30, IMF='KB', iso='pad', weighting='luminosity',
     lOrder=4, rescale=False, specRange=None, lsf=False, band='r', smask=None,
@@ -538,6 +593,16 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # # progress_interval_sec=60,  # if you want periodic on_progress ticks
     # )
 
+    sidecar = cu._find_latest_sidecar(hdf5Path)
+    ridx = 95
+    x0 = load_xring_best(
+        sidecar,
+        ring_idx=ridx,
+        as_physical=True,
+        cp_flux_ref=None,
+    )
+    logger.log(f"[CubeFit] Loaded `x0` from sidecar {sidecar} at ring {ridx}.")
+    
     #####################################
     # Multi-processing Batched Kaczmarz #
     #####################################
@@ -559,6 +624,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     )
     x_global, stats = runner.solve_all_mp_batched(
         epochs=3,
+        x0=x0,
         lr=1.0,
         project_nonneg=True,
         orbit_weights=None, # or None for “free” fit
@@ -569,7 +635,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         blas_threads=12, # 12 BLAS threads each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
-        warm_start='resume',  # 'zeros', 'resume', 'jacobi', 'nnls'
+        warm_start='seed',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 

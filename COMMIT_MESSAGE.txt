@@ -1,3 +1,3 @@
-* Consolidated two tiny-column freeze env var names into one in `kaczmarz_solver_cchunk_mp_nnls`
-* Added extra diagnostic output concerning step sizes in `kaczmarz_solver_cchunk_mp_nnls`
-* Commit before major revision
+* Stripped global Kaczmarz solver diagnostics to single gradient and NNLS constraint in `kaczmarz_solver_cchunk_mp_nnls`
+* Pre-check gradient before each epoch in `kaczmarz_solver_cchunk_mp_nnls`
+* Pre-check RMSE proxy before each epoch to allow for early exit in `kaczmarz_solver_cchunk_mp_nnls`

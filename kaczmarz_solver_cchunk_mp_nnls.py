@@ -42,6 +42,11 @@ v2.1:   Added tiny-column freeze inside `_worker_tile_global_grad_band`. 18
 v2.2:   Consolidated two tiny-column freeze env var names into one;
         Added fairer max-tile rather than bias to brighter spaxels. 25 December
             2025
+v2.3:   Stripped global Kaczmarz solver diagnostics to single gradient and NNLS
+            constraint. 26 December 2025
+v2.4:   Pre-check gradient before each epoch;
+        Pre-check RMSE proxy before each epoch to allow for early exit. 28
+            December 2025
 """
 
 from __future__ import annotations, print_function
@@ -436,6 +441,47 @@ def _compute_global_rmse(
         return float("inf")
 
     return float(math.sqrt(num / float(den)))
+
+# ------------------------------------------------------------------------------
+
+def rmse_proxy_subset(
+    h5_path,
+    x_CP,
+    tile_ranges,
+    keep_idx,
+    inv_cp_flux_ref,
+    w_lam_sqrt,
+):
+    ssq = 0.0
+    n = 0
+
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M  = f["/HyperCube/models"]
+
+        for (s0, s1) in tile_ranges:
+            Y = np.asarray(DC[s0:s1, :], np.float64)
+            if keep_idx is not None:
+                Y = Y[:, keep_idx]
+
+            yhat = np.zeros_like(Y)
+            for c in range(x_CP.shape[0]):
+                A = np.asarray(M[s0:s1, c, :, :], np.float32)
+                if keep_idx is not None:
+                    A = A[:, :, keep_idx]
+                if inv_cp_flux_ref is not None:
+                    A = A * inv_cp_flux_ref[c, :][None, :, None]
+
+                yhat += np.tensordot(x_CP[c, :], A, axes=(0, 1))
+
+            R = Y - yhat
+            if w_lam_sqrt is not None:
+                R = R * w_lam_sqrt
+
+            ssq += float(np.sum(R * R))
+            n   += int(R.size)
+
+    return np.sqrt(ssq / max(n, 1))
 
 # ------------------------------------------------------------------------------
 
@@ -2817,6 +2863,9 @@ def solve_global_kaczmarz_global_step_mp(
             except Exception:
                 return False
 
+        frac_bad_prev = None
+        dx_base_norm_prev = None
+
         try:
             for ep in range(cfg.epochs):
                 if use_pool:
@@ -3089,72 +3138,73 @@ def solve_global_kaczmarz_global_step_mp(
                 # Base step for lr=1.0
                 dx_base = g * invD
 
-                # Compute its energy in the same metric as the trust region
-                if E_global is not None:
-                    Eg = np.asarray(E_global, np.float64)
-                    upd_energy_sq_base = float(
-                        np.sum((dx_base.astype(np.float64) ** 2) * Eg)
-                    )
-                else:
-                    upd_energy_sq_base = float(
-                        np.sum(dx_base.astype(np.float64) ** 2)
-                    )
-
-                # Decide how aggressively we want to move relative to the
-                # global trust cap. target_frac <= 1.0 means "aim for this
-                # fraction of the cap when lr=effective_lr".
-                target_frac = float(
-                    os.environ.get("CUBEFIT_GLOBAL_STEP_FRAC", "0.3")
-                )
-                if (not np.isfinite(target_frac)) or (target_frac <= 0.0):
-                    target_frac = 0.3
-                if target_frac > 1.0:
-                    target_frac = 1.0
-
-                # Compute an effective lr that would give
-                # global_step_norm ≈ target_frac * tau_global * ||Y||
-                if (upd_energy_sq_base > 0.0) and (Y_glob_norm > 0.0):
-                    global_step_norm_base = float(
-                        np.sqrt(upd_energy_sq_base)
-                    )
-                    cap = float(tau_global * Y_glob_norm)
-                    lr_auto = (
-                        target_frac * cap
-                        / max(global_step_norm_base, 1.0e-12)
-                    )
-                    # Respect cfg.lr as a ceiling
-                    lr_eff = float(min(cfg.lr, lr_auto))
-                else:
-                    lr_eff = float(cfg.lr)
-
-                # Build the step with the per-epoch effective lr
-                dx = lr_eff * dx_base
-
                 # ------------------------------------------------------------
-                # frac_clipped diagnostic ONLY
+                # Guard A: gradient geometry sanity check (pre-epoch)
                 # ------------------------------------------------------------
                 if cfg.project_nonneg:
-                    frac_clipped = float(np.mean(dx < -x_CP))
+                    frac_bad = float(np.mean(dx_base < -x_CP))
                 else:
-                    frac_clipped = 0.0
+                    frac_bad = 0.0
 
-                print(
-                    f"[Kaczmarz-GLOBAL] epoch {ep + 1}: lr_eff={lr_eff:.3e}, "
-                    f"step_norm_base="
-                    f"{float(np.sqrt(np.max((upd_energy_sq_base, 0.0)))):.3e}, "
-                    f"Y_glob_norm={Y_glob_norm:.3e}",
-                    flush=True)
+                dx_base_norm = float(np.linalg.norm(dx_base))
 
-                # Apply update with nonnegativity projection
-                if not np.all(np.isfinite(dx)):
-                    dx = np.nan_to_num(
-                        dx,
-                        nan=0.0,
-                        posinf=0.0,
-                        neginf=0.0,
-                        copy=False,
+                if frac_bad_prev is not None and dx_base_norm_prev is not None:
+                    if (frac_bad > frac_bad_prev * 1.2) and (dx_base_norm > dx_base_norm_prev * 10.0):
+                        print(
+                            f"[Kaczmarz-GLOBAL] epoch {ep+1} ABORTED EARLY: "
+                            f"active-set shock "
+                            f"(frac_bad {frac_bad:.2f}, "
+                            f"dx_norm {dx_base_norm:.2e})",
+                            flush=True,
+                        )
+                        break
+
+                frac_bad_prev = frac_bad
+                dx_base_norm_prev = dx_base_norm
+
+                # ------------------------------------------------------------
+                # Guard B: cheap pre-epoch RMSE probe on a few tiles
+                # ------------------------------------------------------------
+                tiles_probe = _choose_tiles_fair_spread(
+                    s_ranges_all,
+                    k=min(4, len(s_ranges_all)),
+                    seed=ep + 1000,
+                )
+
+                # simulate a single global step (cheap)
+                x_probe = x_CP + (cfg.lr * dx_base)
+                if cfg.project_nonneg:
+                    np.maximum(x_probe, 0.0, out=x_probe)
+
+                rmse_probe = rmse_proxy_subset(
+                    h5_path,
+                    x_probe,
+                    tiles_probe,
+                    keep_idx,
+                    inv_cp_flux_ref,
+                    w_lam_sqrt,
+                )
+
+                if (not np.isfinite(rmse_probe)) or (rmse_probe > rmse_epoch_proxy * 2.0):
+                    print(
+                        f"[Kaczmarz-GLOBAL] epoch {ep+1} ABORTED EARLY: "
+                        f"probe RMSE explosion "
+                        f"(before {rmse_epoch_proxy:.3e}, probe {rmse_probe:.3e})",
+                        flush=True,
                     )
+                    break
 
+                # ------------------------------------------------------------
+                # Minimal projected-gradient global step (NNLS-consistent)
+                # ------------------------------------------------------------
+
+                # Fixed global learning rate (no auto-scaling)
+                lr = float(cfg.lr)
+
+                # Raw gradient step
+                dx = lr * dx_base
+
+                # Trial update + NNLS projection
                 x_before = x_CP.copy(order="C")
                 x_trial = x_before + dx
                 if cfg.project_nonneg:
@@ -3162,52 +3212,70 @@ def solve_global_kaczmarz_global_step_mp(
 
                 dx_applied = x_trial - x_before
 
-                # ------------------------------------------------------------
-                # Global trust-region cap — MUST use dx_applied (NOT dx)
-                # ------------------------------------------------------------
-                alpha_glob = 1.0
+                # Diagnostic only: fraction clipped
+                if cfg.project_nonneg:
+                    frac_clipped = float(np.mean(dx < -x_before))
+                else:
+                    frac_clipped = 0.0
 
+                # ------------------------------------------------------------
+                # Applied-step trust cap (single, physical control)
+                # ------------------------------------------------------------
                 if (E_global is not None) and (Y_glob_norm > 0.0):
                     Eg = np.asarray(E_global, np.float64)
-                    upd_energy_sq = float(
-                        np.sum((dx_applied.astype(np.float64) ** 2) * Eg)
-                    )
+                    step_energy = float(np.sum((dx_applied.astype(np.float64) ** 2) * Eg))
                 else:
-                    upd_energy_sq = float(
-                        np.sum(dx_applied.astype(np.float64) ** 2)
-                    )
+                    step_energy = float(np.sum(dx_applied.astype(np.float64) ** 2))
 
-                if (upd_energy_sq > 0.0) and (Y_glob_norm > 0.0):
-                    global_step_norm = float(np.sqrt(upd_energy_sq))
-                    cap = float(tau_global * Y_glob_norm)
+                cap = float(tau_global * Y_glob_norm)
 
-                    if global_step_norm > cap:
-                        alpha_glob = float(
-                            cap / np.maximum(global_step_norm, 1.0e-12)
-                        )
+                if (step_energy > 0.0) and (cap > 0.0):
+                    step_norm = float(np.sqrt(step_energy))
+                    if step_norm > cap:
+                        scale = cap / max(step_norm, 1.0e-12)
 
-                        # Scale RAW dx, then re-apply NNLS projection
-                        dx *= alpha_glob
-
+                        dx *= scale
                         x_trial = x_before + dx
                         if cfg.project_nonneg:
                             np.maximum(x_trial, 0.0, out=x_trial)
 
                         dx_applied = x_trial - x_before
 
+                # Commit
+                x_CP[:, :] = x_trial
+
+                # ------------------- Global-step diagnostics ------------------
+                dx_norm      = float(np.linalg.norm(dx))
+                dx_app_norm  = float(np.linalg.norm(dx_applied))
+                x_norm       = float(np.linalg.norm(x_CP))
+                x_min        = float(np.min(x_CP))
+                x_max        = float(np.max(x_CP))
+
+                # Energy-weighted norms (if available)
+                if E_global is not None:
+                    Eg = np.asarray(E_global, np.float64)
+                    dx_E_norm     = float(np.sqrt(np.sum((dx.astype(np.float64) ** 2) * Eg)))
+                    dx_app_E_norm = float(np.sqrt(np.sum((dx_applied.astype(np.float64) ** 2) * Eg)))
+                else:
+                    dx_E_norm     = float("nan")
+                    dx_app_E_norm = float("nan")
+
+                # Step scaling actually applied
+                step_scale = dx_app_norm / max(dx_norm, 1.0e-30)
+
                 print(
-                    f"[Kaczmarz-GLOBAL] frac_clipped={frac_clipped:.3f}, "
-                    f"||dx_raw||={np.linalg.norm(dx):.3e}, "
-                    f"||dx_applied||={np.linalg.norm(dx_applied):.3e}",
+                    "[Kaczmarz-GLOBAL] "
+                    f"frac_clipped={frac_clipped:.3f} | "
+                    f"dx_norm={dx_norm:.3e} "
+                    f"dx_applied_norm={dx_app_norm:.3e} "
+                    f"step_scale={step_scale:.3e} | "
+                    f"dx_E_norm={dx_E_norm:.3e} "
+                    f"dx_app_E_norm={dx_app_E_norm:.3e} | "
+                    f"x_norm={x_norm:.3e} "
+                    f"x_min={x_min:.3e} "
+                    f"x_max={x_max:.3e}",
                     flush=True,
                 )
-                print(
-                    f"[Kaczmarz-GLOBAL] cap="
-                    f"{float(tau_global * Y_glob_norm):.3e}, "
-                    f"alpha_glob={float(alpha_glob):.3e}, "
-                    f"global_step_norm="
-                    f"{float(np.sqrt(np.max((upd_energy_sq, 0.0)))):.3e}, ",
-                    flush=True)
 
                 if not np.all(np.isfinite(x_CP)):
                     bad = ~np.isfinite(x_CP)
