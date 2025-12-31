@@ -469,7 +469,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
-    hdf5Path = (hdf5Dir/f"{galaxy}_{lOrder:02d}").with_suffix('.h5')
+    hdf5Path = (hdf5Dir/f"{galaxy}_{nComp}_{lOrder:02d}").with_suffix('.h5')
 
     # --- Initialize and load data ---
     # mgr = H5Manager(hdf5Path, tem_pix=copy(teLL), obs_pix=copy(spLL))
@@ -593,15 +593,15 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # # progress_interval_sec=60,  # if you want periodic on_progress ticks
     # )
 
-    sidecar = cu._find_latest_sidecar(hdf5Path)
-    ridx = 95
-    x0 = load_xring_best(
-        sidecar,
-        ring_idx=ridx,
-        as_physical=True,
-        cp_flux_ref=None,
-    )
-    logger.log(f"[CubeFit] Loaded `x0` from sidecar {sidecar} at ring {ridx}.")
+    # sidecar = cu._find_latest_sidecar(hdf5Path)
+    # ridx = 95
+    # x0 = load_xring_best(
+    #     sidecar,
+    #     ring_idx=ridx,
+    #     as_physical=True,
+    #     cp_flux_ref=None,
+    # )
+    # logger.log(f"[CubeFit] Loaded `x0` from sidecar {sidecar} at ring {ridx}.")
     
     #####################################
     # Multi-processing Batched Kaczmarz #
@@ -623,9 +623,9 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         use=True           # actually enable the ratio term
     )
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=3,
-        x0=x0,
-        lr=1.0,
+        epochs=6,
+        # x0=x0,
+        lr=0.01,
         project_nonneg=True,
         orbit_weights=None, # or None for “free” fit
         ratio_cfg=None,
@@ -635,7 +635,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         blas_threads=12, # 12 BLAS threads each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
-        warm_start='seed',  # 'zeros', 'resume', 'jacobi', 'nnls'
+        warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
@@ -1719,7 +1719,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
-    hdf5Path = (hdf5Dir/f"{galaxy}_{lOrder:02d}").with_suffix('.h5')
+    hdf5Path = (hdf5Dir/f"{galaxy}_{nComp}_{lOrder:02d}").with_suffix('.h5')
     
     # Read dims & X_global using robust reader
     with open_h5(hdf5Path, role="reader") as f:
@@ -1890,26 +1890,26 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     else:
         otypes = copy(nzComp)
 
-    satube = (otypes == 0) # group short-axis tubes
-    latube = (otypes == 1)
-    boxess = (otypes == 2)
-    arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
-    coSFH = arSOL[satube, :, :, :].sum(axis=0)
-    laSFH = arSOL[latube, :, :, :].sum(axis=0)
-    boSFH = arSOL[boxess, :, :, :].sum(axis=0)
-
-    minT, maxT = np.min(uages), np.max(uages)
-    minZ, maxZ = np.min(umetals), np.max(umetals)
-
-    wmax = np.max(np.log10(np.array([coSFH, laSFH, boSFH])))
-    sfhMin = np.min(np.log10((
-        np.min(coSFH[coSFH>0]),
-        np.min(laSFH[laSFH>0]),
-        np.min(boSFH[boSFH>0]))))
-    wmin = np.max((sfhMin, -12))
-    print(f"SFH plot limits: {wmin:.2f} ({sfhMin:.2f}) to {wmax:.2f}")
-
     if 'sfh' in pplots:
+        satube = (otypes == 0) # group short-axis tubes
+        latube = (otypes == 1)
+        boxess = (otypes == 2)
+        arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
+        coSFH = arSOL[satube, :, :, :].sum(axis=0)
+        laSFH = arSOL[latube, :, :, :].sum(axis=0)
+        boSFH = arSOL[boxess, :, :, :].sum(axis=0)
+
+        minT, maxT = np.min(uages), np.max(uages)
+        minZ, maxZ = np.min(umetals), np.max(umetals)
+
+        wmax = np.max(np.log10(np.array([coSFH, laSFH, boSFH])))
+        sfhMin = np.min(np.log10((
+            np.min(coSFH[coSFH>0]),
+            np.min(laSFH[laSFH>0]),
+            np.min(boSFH[boSFH>0]))))
+        wmin = np.max((sfhMin, -12))
+        print(f"SFH plot limits: {wmin:.2f} ({sfhMin:.2f}) to {wmax:.2f}")
+
         fig = plt.figure(figsize=plt.figaspect(3./4.))
         gs = gridspec.GridSpec(3, nAlphas, hspace=0., wspace=0.)
         # one column per alpha, 3 orbit types

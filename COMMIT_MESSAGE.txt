@@ -1,3 +1,1 @@
-* Stripped global Kaczmarz solver diagnostics to single gradient and NNLS constraint in `kaczmarz_solver_cchunk_mp_nnls`
-* Pre-check gradient before each epoch in `kaczmarz_solver_cchunk_mp_nnls`
-* Pre-check RMSE proxy before each epoch to allow for early exit in `kaczmarz_solver_cchunk_mp_nnls`
+* Switched to diagonal-preconditioned Spectral Projected Gradient method to replace Kaczmarz updates in `kaczmarz_solver_cchunk_mp_nnls.solve_global_kaczmarz_global_step_mp`

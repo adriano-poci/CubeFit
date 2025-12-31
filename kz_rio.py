@@ -95,7 +95,7 @@ def main():
     print(f"redraw = {props['redraw']}")
 
     try:
-        loadCubeFit(**props)
+        loadCubeFit(**props, pplots=['spec', 'mw'])
     except SystemExit:
         # Let explicit sys.exit()s behave normally
         raise
