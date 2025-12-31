@@ -1182,9 +1182,9 @@ class PipelineRunner:
                     self.h5_path,
                     cfg,
                     orbit_weights=orbit_weights,
+                    # ratio_cfg=ratio_cfg,
                     x0=x0_effective,
                     tracker=tracker,
-                    ratio_cfg=ratio_cfg,
                 )
 
             # Do we need to project + polish?
@@ -1226,14 +1226,14 @@ class PipelineRunner:
                     max_tiles=int(small_tile_budget)
                 )
 
-                x_global, _ = solve_global_kaczmarz_cchunk_mp(
+                x_global, _ = solve_global_kaczmarz_global_step_mp(
                     self.h5_path,
                     cfg_polish,
                     orbit_weights=None,
                     # keep the enforced mixture; no projector here
                     x0=np.asarray(x_global, np.float64, order="C"),
                     tracker=NullTracker(), # silent + cheap
-                    ratio_cfg=None, # disable ratio projector
+                    # ratio_cfg=None, # disable ratio projector
                 )
                 logger.log("[Pipeline] Quick polish done.")
 

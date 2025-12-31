@@ -71,7 +71,7 @@ def main():
     os.environ["CUBEFIT_NNLS_ENABLE"] = "0"
     os.environ["CUBEFIT_ORBIT_BETA"] = "0.0"
     os.environ["CUBEFIT_GLOBAL_STEP_FRAC"] = "1.0"
-    os.environ["CUBEFIT_GLOBAL_TAU"] = "1.5"
+    os.environ["CUBEFIT_GLOBAL_TAU"] = "0.3"
     os.environ["CUBEFIT_GLOBAL_ENERGY_BLEND"] = "0.0"
     os.environ["CUBEFIT_ZERO_COL_FREEZE"] = str(1)
     os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-4)

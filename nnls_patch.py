@@ -163,7 +163,8 @@ def _predict_spaxel_sparse_from_models(M,
         # Most of our files are C_chunk == 1, so this is one component.
         for c in range(c0, c1):
             plist = picks[c]
-            if not plist:
+            # Avoid ambiguous truth-value for numpy arrays: check emptiness explicitly
+            if (plist is None) or (np.size(plist) == 0):
                 continue
 
             # Determine which P-chunks contain any of the picked populations.
@@ -284,7 +285,7 @@ def _topk_by_corr_per_comp(Bw, yw, col_map, k_per_comp_init=32):
         by_c[c].append((score[j], j))
     keep = []
     for c, items in enumerate(by_c):
-        if not items: 
+        if (items is None) or (len(items) == 0):
             continue
         items.sort(key=lambda t: t[0], reverse=True)
         k_c = int(np.minimum(k_per_comp_init, len(items)))
@@ -407,7 +408,7 @@ def _global_nnls_workingset(Bw, yw, col_map,
                 k_c = int(np.minimum(kincr_per_comp, j_c.size))
                 add.extend(j_c[:k_c].tolist())
 
-        if not add:
+        if len(add) == 0:
             break
         keep = np.array(sorted(set(keep.tolist() + add)), dtype=np.int64)
         if keep.size >= K:
