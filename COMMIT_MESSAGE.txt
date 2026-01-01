@@ -1,1 +1,0 @@
-* Added orbit-weight projection step inside SPG loop in `kaczmarz_solver_cchunk_mp_nnls.solve_global_kaczmarz_global_step_mp`
