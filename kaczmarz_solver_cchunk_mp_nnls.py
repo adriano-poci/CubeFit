@@ -53,6 +53,8 @@ v2.6:   Replaced expensive backtracking RMSE evaluations with O(1) quadratic
             coefficients. 30 December 2025
 v3.0:   Switched to diagonal-preconditioned Spectral Projected Gradient method
             to replace Kaczmarz updates. 31 December 2025
+v3.1:   Added orbit-weight projection step inside SPG loop in 
+            `solve_global_kaczmarz_global_step_mp`. 1 January 2026
 """
 
 from __future__ import annotations, print_function
@@ -774,7 +776,7 @@ def solve_global_kaczmarz_global_step_mp(
             D_floor = max(abs_zero, denom_floor_frac * D_scale)
             D = np.maximum(D_tot, D_floor)
 
-            g = g_tot
+            g = -g_tot  # gradient is negative residual correlation
 
             # BB spectral step length
             if x_prev is not None and g_prev is not None:
@@ -786,12 +788,98 @@ def solve_global_kaczmarz_global_step_mp(
                     lr = np.clip(lr, 1e-6, cfg.lr)
                 else:
                     lr = cfg.lr
+            
+            # after computing D
+            D_min = np.min(D)
+            lr_eff_max = 0.1 * D_min    # conservative, safe
+            lr = np.min([lr, lr_eff_max])
 
             # gradient descent step
             x_prev = x.copy()
             g_prev = g.copy()
 
             dx = -lr * (g / D)
+            step_dot_grad = float(np.vdot(dx, g))
+            quad_pred = float(
+                np.vdot(g, dx) + 0.5 * np.vdot(dx, D * dx)
+            )
+            D_flat = D.ravel()
+            print("[SPG] Step diagnostics:", flush=True)
+            print(
+                f"  lr={lr:.3e}, step·grad={step_dot_grad:.3e}, "
+                f"quad_pred={quad_pred:.3e}"
+            )
+            Dpercs = np.percentile(D_flat, [0.1, 1.0, 10.0, 50.0, 90.0, 99.0, 99.9])
+            print(f"  D percentiles: 0.1%={Dpercs[0]:.3e}, 1%={Dpercs[1]:.3e}, "
+                  f"10%={Dpercs[2]:.3e}, 50%={Dpercs[3]:.3e}, "
+                  f"90%={Dpercs[4]:.3e}, 99%={Dpercs[5]:.3e}, "
+                  f"99.9%={Dpercs[6]:.3e}")
+            print(
+                f"  minD={np.min(D_flat):.3e}, medianD={np.median(D_flat):.3e},"
+                f" maxD={np.max(D_flat):.3e}")
+
+            if np.vdot(dx, g) > 0.0: # prevent gradient ascent
+                dx = -dx
+
+            # ==================================================================
+            # Safeguards on step size
+            # ==================================================================
+
+            # Safeguard against huge steps
+            x_norm  = np.linalg.norm(x)
+
+            # --- adaptive max_frac computed from solver diagnostics ---
+            # Inputs available cheaply in your loop:
+            #   lr        : current learning rate / step multiplier (scalar)
+            #   D         : preconditioner array or small-sample percentiles (you already compute percentiles)
+            #   grad      : gradient array (you already have it to compute dx)
+            #   x         : current solution vector
+            #   dx        : proposed update (already computed, sign-corrected)
+
+            # Parameters (tunable but safe defaults)
+            beta = 3.0 # headroom multiplier (>=1). 3 is conservative but responsive.
+            min_frac = 1e-8 # absolute lower bound to avoid exact zero cap
+            max_frac_cap = 0.5 # absolute upper bound on fractional change per epoch
+            eps_x = 1e-12 # prevents division by zero for median(x)
+
+            # VERY cheap, O(1) scalar computations:
+            # Prefer using median statistics over mean for robustness on heavy-tailed data.
+            medianD = Dpercs[3]
+            median_abs_grad = np.median(np.abs(g))
+            median_abs_x = np.median(np.abs(x))
+
+            # Estimate typical per-element step magnitude (based on lr * D * grad)
+            typical_step = lr * medianD * median_abs_grad
+
+            # Convert to a typical fractional change relative to median(|x|)
+            typical_frac = typical_step / max(median_abs_x, eps_x)
+
+            # Proposed adaptive max_frac
+            adaptive_max_frac = beta * typical_frac
+
+            # Clip to safe bounds
+            adaptive_max_frac = float(np.clip(adaptive_max_frac, min_frac, max_frac_cap))
+
+            # --- Now enforce trust region on dx (L2 or linf variant, choose one) ---
+            # Option A (L2 norm)
+            dx_norm = np.linalg.norm(dx)      # one scalar
+            x_scale = np.max([x_norm, eps_x * np.sqrt(x.size)])  # keep same scaling style if used elsewhere
+            if dx_norm > adaptive_max_frac * x_scale:
+                dx *= (adaptive_max_frac * x_scale / dx_norm)
+
+            # Option B (Linfty / elementwise) - cheaper if x is huge (avoid full L2)
+            # dx_max = np.max(np.abs(dx))
+            # x_max  = max(np.max(np.abs(x)), eps_x)
+            # if dx_max > adaptive_max_frac * x_max:
+            #     dx *= (adaptive_max_frac * x_max / dx_max)
+
+            print(f"  adaptive_max_frac={adaptive_max_frac:.3e}", flush=True)
+            print(f"  ||x||={x_norm:.3e}", flush=True)
+            print(f"  medianD={medianD:.3e}, median|grad|={median_abs_grad:.3e}, "
+                  f"median|x|={median_abs_x:.3e}", flush=True)
+            print(f"  ||dx|| before cap={dx_norm:.3e}", flush=True)
+            print(f"  ||dx|| after cap={np.linalg.norm(dx):.3e}", flush=True)
+
             # ---- GLOBAL TRUST REGION ----
             tau_global = float(os.environ.get("CUBEFIT_GLOBAL_TAU", "0.5"))
             if E_global is not None and Y_glob_norm > 0.0:
