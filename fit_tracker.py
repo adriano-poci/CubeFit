@@ -1,12 +1,28 @@
-# -*- coding: utf-8 -*-
-"""
-fit_tracker.py
+r"""
+    fit_tracker.py
+    Adriano Poci
+    University of Oxford
+    2025
 
-Sidecar-based, non-blocking fit tracker for live Kaczmarz runs.
+    Platforms
+    ---------
+    Unix, Windows
 
-- Writes ONLY to <main>.fit.<pid>.<ts>.h5 (a sidecar), never the main HDF5.
-- Uses a bounded mp.Queue so the solver never blocks on I/O.
-- No SWMR; no file locking on the main file.
+    Synopsis
+    --------
+    Sidecar-based, non-blocking fit tracker for live Kaczmarz runs.
+
+    - Writes ONLY to <main>.fit.<pid>.<ts>.h5 (a sidecar), never the main HDF5.
+    - Uses a bounded mp.Queue so the solver never blocks on I/O.
+    - No SWMR; no file locking on the main file.
+
+    Authors
+    -------
+    Adriano Poci <adriano.poci@physics.ox.ac.uk>
+
+History
+-------
+v1.0:   Added `maybe_snapshot_x` to `NullTracker` for consistency. 1 January 2026
 """
 
 from __future__ import annotations
@@ -352,10 +368,11 @@ class FitTracker:
 
     def maybe_save(self, x_final: np.ndarray, stats: dict) -> None:
         self._try_put({"op": "save_x",
-                    "x": np.asarray(x_final, np.float32).ravel(order="C"),
-                    "epoch": int(stats.get("epochs", -1)),
-                    "rmse": float(stats.get("rmse_epoch_last",
-                                            stats.get("rmse_final", math.nan)))}, block=False)
+            "x": np.asarray(x_final, np.float32).ravel(order="C"),
+            "epoch": int(stats.get("epochs", -1)),
+            "rmse": float(stats.get("rmse_epoch_last",
+                stats.get("rmse_final", math.nan)))},
+            block=False)
 
     def maybe_snapshot_x(self, x: np.ndarray, *, epoch: int | None = None,
                         rmse: float | None = None, force: bool = False) -> bool:
@@ -375,11 +392,10 @@ class FitTracker:
         except Exception:
             return False
 
-        return self._try_put({"op": "x_snapshot",
-                            "x": x32,
-                            "epoch": int(epoch) if epoch is not None else None,
-                            "rmse": float(rmse) if (rmse is not None and np.isfinite(rmse)) else None},
-                            block=False)
+        return self._try_put({"op": "x_snapshot", "x": x32,
+            "epoch": int(epoch) if epoch is not None else None,
+            "rmse": float(rmse) if (rmse is not None and np.isfinite(rmse)) else None},
+            block=False)
 
 
     def close(self, timeout: float = 2.0) -> None:
@@ -425,4 +441,5 @@ class NullTracker:
     def on_batch_rmse(self, *a, **k): pass
     def on_epoch_end(self, *a, **k): pass
     def maybe_save(self, *a, **k): pass
+    def maybe_snapshot_x(self, *a, **k): pass
     def close(self, *a, **k): pass

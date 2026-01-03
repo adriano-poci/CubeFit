@@ -606,36 +606,18 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     #####################################
     # Multi-processing Batched Kaczmarz #
     #####################################
-    RC = cu.RatioCfg(
-        anchor="target",   # pull toward /CompWeights
-        eta=0.8,           # per-tile multiplicative strength
-        gamma=2.0,         # clamp for multiplicative factors
-        prob=1.0,          # apply every tile
-        batch=0,           # consider all active components
-        minw=1e-5,         # ignore ~zero-weight targets
-        # epoch-level projection (gentle, blended)
-        epoch_project=True,
-        epoch_eta=0.6,     # how hard the epoch projection pushes
-        epoch_gamma=3.0,   # clamp at epoch projection
-        epoch_beta=0.35,   # 0..1 blend toward the projected state
-        epoch_renorm=True, # keep target sum=1
-        tile_every=1,      # apply per tile
-        use=True           # actually enable the ratio term
-    )
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=8,
+        epochs=3,
         # x0=x0,
         lr=0.1,
         project_nonneg=True,
         orbit_weights=None, # or None for “free” fit
-        ratio_cfg=None,
-        # orbit_weights=cWeights, # Make sure to enable `CUBEFIT_ORBIT_BETA`
-        # ratio_cfg=RC,
-        processes=4, # 4 workers
-        blas_threads=12, # 12 BLAS threads each → 48 total
+        # orbit_weights=cWeights,
+        processes=48, # 48 workers
+        blas_threads=1, # 1 BLAS thread each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
-        warm_start='zeros',  # 'zeros', 'resume', 'jacobi', 'nnls'
+        warm_start='resume',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
