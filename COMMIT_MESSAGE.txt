@@ -1,0 +1,4 @@
+* Added `maybe_snapshot_x` to `fit_tracker.NullTracker` for consistency
+* Added final elapsed time logging in `pipeline_runner.solve_all_mp_batched`
+* Added `build_component_support_from_losvd_amp` and `build_component_support_energy_from_models` to efficiently determine spatial support of components based on LOSVD amplitude or model energy in `cube_utils`
+* Properly account for active orbits using component support masks during orbit-weight projection in `kaczmarz_solver_cchunk_mp_nnls.solve_global_kaczmarz_global_step_mp`

@@ -55,6 +55,8 @@ v3.0:   Switched to diagonal-preconditioned Spectral Projected Gradient method
             to replace Kaczmarz updates. 31 December 2025
 v3.1:   Added orbit-weight projection step inside SPG loop in 
             `solve_global_kaczmarz_global_step_mp`. 1 January 2026
+v3.2:   Properly account for active orbits using component support masks during
+            orbit-weight projection. 3 January 2026
 """
 
 from __future__ import annotations, print_function
@@ -570,6 +572,43 @@ def solve_global_kaczmarz_global_step_mp(
     )
 
     # ------------------------------------------------------------
+    # Load spatial component support masks (LOSVD + ENERGY)
+    # ------------------------------------------------------------
+    with open_h5(h5_path, role="reader") as f:
+        supp_losvd = None
+        supp_energy = None
+
+        if "/HyperCube/component_support" in f:
+            ds = f["/HyperCube/component_support"]
+            supp_losvd = np.asarray(ds[...], dtype=bool)
+            if int(ds.attrs.get("S_chunk", s_tile)) != s_tile:
+                raise RuntimeError(
+                    "component_support S_chunk mismatch with solver tile size"
+                )
+            print("[SPG] Using LOSVD-based component support.", flush=True)
+
+        if "/HyperCube/component_support_energy" in f:
+            ds = f["/HyperCube/component_support_energy"]
+            supp_energy = np.asarray(ds[...], dtype=bool)
+            if int(ds.attrs.get("S_chunk", s_tile)) != s_tile:
+                raise RuntimeError(
+                    "component_support_energy S_chunk mismatch with solver tile size"
+                )
+            print("[SPG] Using ENERGY-based component support.", flush=True)
+
+        if supp_losvd is not None and supp_energy is not None:
+            component_support = supp_losvd & supp_energy
+            print("[SPG] Combined LOSVD ∧ ENERGY component support.", flush=True)
+        elif supp_losvd is not None:
+            component_support = supp_losvd
+        elif supp_energy is not None:
+            component_support = supp_energy
+        else:
+            component_support = None
+            print("[SPG] No component support masks found; using all components.",
+                  flush=True)
+
+    # ------------------------------------------------------------
     # Global ||Y|| for trust region (compute once)
     # ------------------------------------------------------------
     Y_glob_norm2 = 0.0
@@ -688,6 +727,15 @@ def solve_global_kaczmarz_global_step_mp(
             ssq = 0.0
             nres = 0
 
+            # Precompute spatially active components per tile
+            if component_support is not None:
+                active_c_per_tile = [
+                    np.nonzero(component_support[it])[0]
+                    for it in range(len(s_ranges))
+                ]
+            else:
+                active_c_per_tile = None
+
             pbar = tqdm(
                 total=len(s_ranges),
                 desc=f"[SPG] epoch {ep+1}/{cfg.epochs}",
@@ -708,36 +756,59 @@ def solve_global_kaczmarz_global_step_mp(
                     M  = f["/HyperCube/models"]
 
                     Y = np.asarray(DC[s0:s1, :], np.float64)
+                if keep_idx is not None:
+                    Y = Y[:, keep_idx]
+
+                # exact model prediction (ACTIVE ORBITS ∧ SPATIAL SUPPORT)
+                yhat = np.zeros_like(Y)
+
+                if active_c_per_tile is not None:
+                    tile_idx = s0 // s_tile
+                    spatial_active = active_c_per_tile[tile_idx]
+                    c_iter = np.intersect1d(
+                        active_orbits,
+                        spatial_active,
+                        assume_unique=True
+                    )
+                else:
+                    c_iter = active_orbits
+
+                for c in c_iter:
+                    A = np.asarray(M[s0:s1, c, :, :], np.float32)
                     if keep_idx is not None:
-                        Y = Y[:, keep_idx]
+                        A = A[:, :, keep_idx]
+                    yhat += np.tensordot(x_eff[c], A, axes=(0, 1))
 
-                    # exact model prediction (ACTIVE ORBITS ONLY)
-                    yhat = np.zeros_like(Y)
-                    for c in active_orbits:
-                        A = np.asarray(M[s0:s1, c, :, :], np.float32)
-                        if keep_idx is not None:
-                            A = A[:, :, keep_idx]
-                        yhat += np.tensordot(x_eff[c], A, axes=(0, 1))
-
-                    R = Y - yhat
-                    if not np.all(np.isfinite(R)):
-                        R = np.nan_to_num(R, copy=False)
+                R = Y - yhat
+                if not np.all(np.isfinite(R)):
+                    R = np.nan_to_num(R, copy=False)
 
                 ssq += float(np.sum(R * R))
                 nres += int(R.size)
 
                 # ---- Worker jobs: FULL CONTIGUOUS BANDS (unchanged) ----
                 jobs = []
+                band_map = []
                 for (c_start, c_stop) in bands:
+                    if spatial_active is not None:
+                        mask = (spatial_active >= c_start) & (spatial_active < c_stop)
+                        if not np.any(mask):
+                            continue
+                        c_sel = spatial_active[mask]
+                        c0 = int(c_sel.min())
+                        c1 = int(c_sel.max()) + 1
+                    else:
+                        c0, c1 = c_start, c_stop
+
                     jobs.append(
                         (
                             h5_path,
                             int(s0),
                             int(s1),
                             keep_idx,
-                            int(c_start),
-                            int(c_stop),
-                            x_eff[c_start:c_stop].copy(order="C"),
+                            c0,
+                            c1,
+                            x_eff[c0:c1].copy(order="C"),
                             R.copy(order="C"),
                             w_lam_sqrt,
                             None,
@@ -746,16 +817,17 @@ def solve_global_kaczmarz_global_step_mp(
                             cfg.dset_w0,
                         )
                     )
+                    band_map.append((c0, c1))
 
                 if use_pool:
                     results = pool.map(_worker_tile_global_grad_band, jobs)
                 else:
                     results = [_worker_tile_global_grad_band(j) for j in jobs]
 
-                # ---- Aggregate results (UNCHANGED, SAFE) ----
-                for (c_start, c_stop), (g_band, D_band) in zip(bands, results):
-                    g_tot[c_start:c_stop] += g_band
-                    D_tot[c_start:c_stop] += D_band
+                # ---- Aggregate results ----
+                for (c0, c1), (g_band, D_band) in zip(band_map, results):
+                    g_tot[c0:c1] += g_band
+                    D_tot[c0:c1] += D_band
 
                 pbar.update(1)
 
@@ -778,21 +850,109 @@ def solve_global_kaczmarz_global_step_mp(
 
             g = -g_tot  # gradient is negative residual correlation
 
-            # BB spectral step length
+            # ------------------------------------------------------------
+            # Safeguarded SPG step length (large -> decay -> adapt)
+            # ------------------------------------------------------------
+
+            # --- parameters ---
+            lr_min = 1e-8
+            lr_max = 1e-2           # safe ceiling (trust region still protects)
+            lr_init = 1e-3          # start large
+            lr_decay = 0.99         # gentle decay per epoch
+            bt_tol = 1e-4           # relative proxy RMSE improvement
+            bt_max = 2              # max backtracking attempts
+            dx_cap = np.inf   # default: no cap unless set below
+
+            # --- choose lr (BB when valid) ---
             if x_prev is not None and g_prev is not None:
                 s = x - x_prev
                 y = g - g_prev
-                sy = float(np.sum(s * y))
+                sy = float(np.vdot(s, y))
                 if sy > 0.0:
-                    lr = float(np.sum(s * s) / sy)
-                    lr = np.clip(lr, 1e-6, cfg.lr)
+                    lr_bb = float(np.vdot(s, s) / sy)
+                    lr = np.clip(lr_bb, lr_min, lr_max)
                 else:
-                    lr = cfg.lr
+                    lr = lr_init
+            else:
+                lr = lr_init
+
+            # epoch-wise decay
+            lr = np.max([lr * (lr_decay ** ep), lr_min])
+
+            # ------------------------------------------------------------
+            # Compute proposed step (SIGN CORRECTED: g is the gradient)
+            # ------------------------------------------------------------
+            # For descent we want dx = - lr * (g / D)
+            dx = -lr * (g / D)
+
+            # ------------------------------------------------------------
+            # Monotonicity guard (never remove)
+            # If dx·g > 0 then flip — with dx = -lr*(g/D) this should be <= 0
+            # but keep the check to be defensive against sign inconsistencies.
+            # ------------------------------------------------------------
+            if np.vdot(dx, g) > 0.0:
+                dx = -dx
+
+            # ------------------------------------------------------------
+            # Trust region (your blended dx_cap logic already computed)
+            # ------------------------------------------------------------
+            dx_norm = np.linalg.norm(dx)
+            if dx_norm > dx_cap and dx_cap > 0.0:
+                dx *= (dx_cap / dx_norm)
+
+            # ------------------------------------------------------------
+            # Cheap proxy-based acceptance (VERY LIGHT)
+            # ------------------------------------------------------------
+            x_trial = x + dx
+            if cfg.project_nonneg:
+                np.maximum(x_trial, 0.0, out=x_trial)
+
+            rmse_here = rmse_proxy
+
+            accepted = False
+            for _ in range(bt_max + 1):
+                rmse_new = rmse_proxy_subset(
+                    h5_path,
+                    x_trial,
+                    tile_ranges=_choose_tiles_fair_spread(s_ranges, 2),
+                    keep_idx=keep_idx,
+                    inv_cp_flux_ref=None,
+                    w_lam_sqrt=w_lam_sqrt,
+                )
+
+                if rmse_new <= rmse_here * (1.0 - bt_tol):
+                    # accept
+                    x = x_trial
+                    lr = min(lr * 1.05, lr_max)   # small reward for successful step
+                    accepted = True
+                    break
+
+                # reject: shrink lr and retry
+                lr *= 0.5
+                if lr < lr_min:
+                    break
+
+                dx = -lr * (g / D)
+                if np.vdot(dx, g) > 0.0:
+                    dx = -dx
+                dx_norm = np.linalg.norm(dx)
+                if dx_norm > dx_cap and dx_cap > 0.0:
+                    dx *= (dx_cap / dx_norm)
+                x_trial = x + dx
+                if cfg.project_nonneg:
+                    np.maximum(x_trial, 0.0, out=x_trial)
+
+            # if never accepted, keep x unchanged (explicit copy to avoid aliasing)
+            if not accepted:
+                x = x.copy()
             
             # after computing D
-            D_min = np.min(D)
-            lr_eff_max = 0.1 * D_min    # conservative, safe
-            lr = np.min([lr, lr_eff_max])
+            D_flat = D.ravel()
+            Dpercs = np.percentile(D_flat, [5.0, 50.0, 95.0])
+            D_floor = np.max((Dpercs[1] * 1e-6, 1e-20))   # floor relative to median
+            D = np.maximum(D, D_floor)
+            # optionally adjust lr so that lr/D has reasonable scale
+            lr = np.min([lr, 1e-2 * Dpercs[1]])   # tweak factor as you like
 
             # gradient descent step
             x_prev = x.copy()
@@ -803,20 +963,16 @@ def solve_global_kaczmarz_global_step_mp(
             quad_pred = float(
                 np.vdot(g, dx) + 0.5 * np.vdot(dx, D * dx)
             )
-            D_flat = D.ravel()
             print("[SPG] Step diagnostics:", flush=True)
             print(
                 f"  lr={lr:.3e}, step·grad={step_dot_grad:.3e}, "
                 f"quad_pred={quad_pred:.3e}"
             )
-            Dpercs = np.percentile(D_flat, [0.1, 1.0, 10.0, 50.0, 90.0, 99.0, 99.9])
-            print(f"  D percentiles: 0.1%={Dpercs[0]:.3e}, 1%={Dpercs[1]:.3e}, "
-                  f"10%={Dpercs[2]:.3e}, 50%={Dpercs[3]:.3e}, "
-                  f"90%={Dpercs[4]:.3e}, 99%={Dpercs[5]:.3e}, "
-                  f"99.9%={Dpercs[6]:.3e}")
-            print(
-                f"  minD={np.min(D_flat):.3e}, medianD={np.median(D_flat):.3e},"
-                f" maxD={np.max(D_flat):.3e}")
+            print(f"  D percentiles: 5%={Dpercs[0]:.3e}, 50%={Dpercs[1]:.3e}, "
+                  f"95%={Dpercs[2]:.3e}")
+            print(f"  D_floor={D_floor:.3e}", flush=True)
+            print(f"  meanD={np.mean(D_flat):.3e}, medD={np.median(D_flat):.3e}")
+            print(f"  minD={np.min(D_flat):.3e}, maxD={np.max(D_flat):.3e}")
 
             if np.vdot(dx, g) > 0.0: # prevent gradient ascent
                 dx = -dx
@@ -825,58 +981,42 @@ def solve_global_kaczmarz_global_step_mp(
             # Safeguards on step size
             # ==================================================================
 
-            # Safeguard against huge steps
-            x_norm  = np.linalg.norm(x)
+            # --- inputs you already have cheaply available ---
+            # dx         : proposed step vector (numpy array or view)
+            # x          : current solution vector
+            # g          : gradient vector
+            # D          : diagonal preconditioner (1D array)
+            # max_frac   : fractional cap for late stage (e.g. 0.05)
+            # beta       : model headroom factor (e.g. 1.0)
+            # eps        : tiny value to avoid div-by-zero
 
-            # --- adaptive max_frac computed from solver diagnostics ---
-            # Inputs available cheaply in your loop:
-            #   lr        : current learning rate / step multiplier (scalar)
-            #   D         : preconditioner array or small-sample percentiles (you already compute percentiles)
-            #   grad      : gradient array (you already have it to compute dx)
-            #   x         : current solution vector
-            #   dx        : proposed update (already computed, sign-corrected)
+            eps = 1e-30
+            beta = 3.0
+            max_frac = 0.075
+            D_scale = Dpercs[1] + eps
 
-            # Parameters (tunable but safe defaults)
-            beta = 3.0 # headroom multiplier (>=1). 3 is conservative but responsive.
-            min_frac = 1e-8 # absolute lower bound to avoid exact zero cap
-            max_frac_cap = 0.5 # absolute upper bound on fractional change per epoch
-            eps_x = 1e-12 # prevents division by zero for median(x)
+            # robust/cheap norms: use medians if full norms are expensive
+            g_norm = np.linalg.norm(g)          # or: median_abs_grad * sqrt(n)
+            x_norm = np.linalg.norm(x)
+            dx_norm = np.linalg.norm(dx)
 
-            # VERY cheap, O(1) scalar computations:
-            # Prefer using median statistics over mean for robustness on heavy-tailed data.
-            medianD = Dpercs[3]
-            median_abs_grad = np.median(np.abs(g))
-            median_abs_x = np.median(np.abs(x))
+            # natural model scale where x and model steps match
+            s = g_norm / D_scale
 
-            # Estimate typical per-element step magnitude (based on lr * D * grad)
-            typical_step = lr * medianD * median_abs_grad
+            # smooth weight 0..1, bias toward grad-scale when x << s
+            w = x_norm / (x_norm + s + eps)
 
-            # Convert to a typical fractional change relative to median(|x|)
-            typical_frac = typical_step / max(median_abs_x, eps_x)
+            # blended cap (||dx||)
+            grad_cap = beta * g_norm / D_scale
+            x_cap = max_frac * x_norm
+            dx_cap = (1.0 - w) * grad_cap + w * x_cap
 
-            # Proposed adaptive max_frac
-            adaptive_max_frac = beta * typical_frac
+            # enforce cap
+            if dx_norm > dx_cap and dx_cap > 0.0:
+                dx *= (dx_cap / dx_norm)
 
-            # Clip to safe bounds
-            adaptive_max_frac = float(np.clip(adaptive_max_frac, min_frac, max_frac_cap))
-
-            # --- Now enforce trust region on dx (L2 or linf variant, choose one) ---
-            # Option A (L2 norm)
-            dx_norm = np.linalg.norm(dx)      # one scalar
-            x_scale = np.max([x_norm, eps_x * np.sqrt(x.size)])  # keep same scaling style if used elsewhere
-            if dx_norm > adaptive_max_frac * x_scale:
-                dx *= (adaptive_max_frac * x_scale / dx_norm)
-
-            # Option B (Linfty / elementwise) - cheaper if x is huge (avoid full L2)
-            # dx_max = np.max(np.abs(dx))
-            # x_max  = max(np.max(np.abs(x)), eps_x)
-            # if dx_max > adaptive_max_frac * x_max:
-            #     dx *= (adaptive_max_frac * x_max / dx_max)
-
-            print(f"  adaptive_max_frac={adaptive_max_frac:.3e}", flush=True)
             print(f"  ||x||={x_norm:.3e}", flush=True)
-            print(f"  medianD={medianD:.3e}, median|grad|={median_abs_grad:.3e}, "
-                  f"median|x|={median_abs_x:.3e}", flush=True)
+            print(f"  dx_cap={dx_cap:.3e}", flush=True)
             print(f"  ||dx|| before cap={dx_norm:.3e}", flush=True)
             print(f"  ||dx|| after cap={np.linalg.norm(dx):.3e}", flush=True)
 
@@ -911,8 +1051,8 @@ def solve_global_kaczmarz_global_step_mp(
             x_row_l1 = np.sum(x, axis=1)
             g_row_inf = np.max(np.abs(g), axis=1)
 
-            x_scale = max(float(np.sum(x_row_l1)), 1.0)
-            g_scale = max(float(np.max(g_row_inf)), 1.0)
+            x_scale = np.max([float(np.sum(x_row_l1)), 1.0])
+            g_scale = np.max([float(np.max(g_row_inf)), 1.0])
 
             eps_mass = 1e-12 * x_scale
             eps_grad = 1e-10 * g_scale
@@ -939,8 +1079,8 @@ def solve_global_kaczmarz_global_step_mp(
                 )
 
             print(
-                f"[SPG] epoch {ep+1} RMSE(proxy)={rmse_proxy:.4e} "
-                f"lr={lr:.3e} ||x||={np.linalg.norm(x):.3e}",
+                f"[SPG] epoch {ep+1} RMSE(proxy)={rmse_proxy:.4e}, "
+                f"final ||x||={np.linalg.norm(x):.3e}",
                 flush=True,
             )
 

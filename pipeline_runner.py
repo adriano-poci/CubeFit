@@ -40,6 +40,8 @@ v1.7:   Read in NNLs `L2` ridge from environment variable in
             `solve_all_mp_batched`. 13 December 2025
 v1.8:   Implemented mtime-based decision for sidecar vs main file loading in
             `solve_all*` resume logic. 18 December 2025
+v1.9:   Added final elapsed time logging in `solve_all_mp_batched`. 1 January
+            2026
 """
 
 from __future__ import annotations
@@ -928,7 +930,6 @@ class PipelineRunner:
         seed_cfg=None,
         tracker_mode="on",
         verbose=True,
-        ratio_cfg: RatioCfg | None = None,
     ):
 
         # --------------- Warm-start (same policy as SP path) -----------
@@ -1182,7 +1183,6 @@ class PipelineRunner:
                     self.h5_path,
                     cfg,
                     orbit_weights=orbit_weights,
-                    # ratio_cfg=ratio_cfg,
                     x0=x0_effective,
                     tracker=tracker,
                 )
@@ -1195,10 +1195,16 @@ class PipelineRunner:
                 # --- STRICT projection (mass preserving, exact per-component)
                 logger.log('[Pipeline] Enforcing orbit weights via strict '\
                     'projection.')
+                # x_global is flat (C*P,) → reshape to (C,P)
+                C = self.nComp
+                P = self.nPop
+                Xcp = x_global.reshape(C, P)
                 cu.project_to_component_weights(
-                    x_global, orbit_weights, E_cp=E_global, minw=1e-10,
+                    Xcp, orbit_weights, E_cp=E_global, minw=1e-10,
                     beta=1.0
                 )
+                # flatten back to 1-D for downstream consistency
+                x_global = Xcp.ravel(order="C")
                 logger.log('[Pipeline] Post-projection total mass: '\
                     f'{float(np.sum(x_global)):.6e}')
                 total_tiles = (
@@ -1226,14 +1232,13 @@ class PipelineRunner:
                     max_tiles=int(small_tile_budget)
                 )
 
-                x_global, _ = solve_global_kaczmarz_global_step_mp(
+                x_global, stats = solve_global_kaczmarz_global_step_mp(
                     self.h5_path,
                     cfg_polish,
                     orbit_weights=None,
                     # keep the enforced mixture; no projector here
                     x0=np.asarray(x_global, np.float64, order="C"),
                     tracker=NullTracker(), # silent + cheap
-                    # ratio_cfg=None, # disable ratio projector
                 )
                 logger.log("[Pipeline] Quick polish done.")
 
@@ -1254,5 +1259,18 @@ class PipelineRunner:
         if tracker is not None:
             try: tracker.close()
             except Exception: pass
+        
+        logger.log(
+            "[Pipeline] ===================================================")
+        logger.log(
+            f"[Pipeline] Multi-process solve complete: epochs={epochs}, "
+            f"processes={processes}, blas_threads={blas_threads}."
+        )
+        logger.log(
+            '[Pipeline] ---------------------------------------------------')
+        logger.log("[Pipeline] Final elapsed time: "
+            f"{stats.get('elapsed_sec', np.nan):.2f} sec.")
+        logger.log(
+            "[Pipeline] ===================================================")
 
         return x_global, stats

@@ -1006,6 +1006,62 @@ def build_hypercube(
         A = f[A_path] # (S,C) float64
         A_sum = f[A_sum_path] # (S,)  float64
 
+        # ------------------------------------------------------------
+        # Build spatial component support mask (tile-based)
+        # Uses LOSVD amplitudes: if A[s,c] == 0 then models[s,c,:,:] == 0
+        # ------------------------------------------------------------
+
+        # Number of spatial tiles (must match solver tiling)
+        n_tiles = math.ceil(S / S_chunk)
+
+        # Create /HyperCube/component_support : (n_tiles, C) uint8
+        if "/HyperCube/component_support" in f:
+            del f["/HyperCube/component_support"]
+
+        support_ds = g.create_dataset(
+            "component_support",
+            shape=(n_tiles, C),
+            dtype="u1",
+            chunks=(1, min(C, 256)),
+            compression="gzip",
+            compression_opts=1,
+        )
+
+        support_ds.attrs["definition"] = (
+            "component_support[t,c]=1 if any spaxel s in tile t has "
+            "losvd_amp[s,c] > eps_support; else 0"
+        )
+        support_ds.attrs["source"] = "losvd_amp"
+        support_ds.attrs["S_chunk"] = int(S_chunk)
+        support_ds.attrs["eps_mode"] = "relative_to_component_max"
+        support_ds.attrs["eps_factor"] = 1e-12
+
+        # Compute per-component max amplitude (C,)
+        # This is cheap: losvd_amp already exists
+        A_max = np.max(np.asarray(A[...], dtype=np.float64), axis=0)
+
+        # Conservative threshold per component
+        eps_support = 1e-12 * A_max
+
+        # Build mask tile-by-tile to keep memory bounded
+        for t in range(n_tiles):
+            s0 = t * S_chunk
+            s1 = min(S, s0 + S_chunk)
+
+            # Slice losvd amplitudes for this tile: (ΔS, C)
+            A_tile = np.asarray(A[s0:s1, :], dtype=np.float64, order="C")
+
+            # Component is active in tile if any spaxel exceeds threshold
+            active = np.any(A_tile > eps_support[None, :], axis=0)
+
+            support_ds[t, :] = active.astype(np.uint8)
+
+        try:
+            support_ds.id.flush()
+            f.flush()
+        except Exception:
+            pass
+
         # record attributes once
         g.attrs["norm.mode"] = norm_mode
         g.attrs["losvd_amplitude_mode"] = amp_mode
@@ -1072,6 +1128,14 @@ def build_hypercube(
 
         # Initialize global column energy accumulator E[c,p] float64
         E_acc = np.zeros((C, P), dtype=np.float64)
+        # ------------------------------------------------------------
+        # Tile-wise component energy for spatial support (ENERGY-based)
+        # ------------------------------------------------------------
+        n_tiles = math.ceil(S / S_chunk)
+
+        # Accumulate energy per (tile, component)
+        # float64 but very small: (n_tiles, C)
+        E_tile_comp = np.zeros((n_tiles, C), dtype=np.float64)
 
         # --- iterate tiles; skip ones marked done
         def _iter_all_tiles():
@@ -1152,6 +1216,9 @@ def build_hypercube(
                         )  # (ΔP,)
 
                     E_acc[c_idx, p0:p1] += e_local
+                    # --- accumulate tile-wise component energy ---
+                    tile_idx = s_idx // S_chunk
+                    E_tile_comp[tile_idx, c_idx] += float(np.sum(e_local))
 
                     # --- cp_flux_ref: per-(c,p) masked λ-sum, one sample per spaxel
                     if do_ref:
@@ -1192,6 +1259,49 @@ def build_hypercube(
         pbar.close()
 
         E_ds[...] = E_acc
+
+        # ------------------------------------------------------------
+        # Build ENERGY-based component support mask
+        # ------------------------------------------------------------
+        if "/HyperCube/component_support_energy" in f:
+            del f["/HyperCube/component_support_energy"]
+
+        eps_energy = 1e-6   # conservative
+
+        suppE = g.create_dataset(
+            "component_support_energy",
+            shape=(n_tiles, C),
+            dtype="u1",
+            chunks=(1, min(C, 256)),
+            compression="gzip",
+            compression_opts=1,
+        )
+
+        suppE.attrs["definition"] = (
+            "component_support_energy[t,c]=1 iff "
+            "tile_energy[t,c] > eps_energy * median_c(tile_energy[t,:])"
+        )
+        suppE.attrs["eps_energy"] = float(eps_energy)
+        suppE.attrs["S_chunk"] = int(S_chunk)
+        suppE.attrs["source"] = "models energy"
+        suppE.attrs["shape"] = (int(n_tiles), int(C))
+
+        for t in range(n_tiles):
+            row = E_tile_comp[t, :]
+            pos = row[row > 0.0]
+            if pos.size == 0:
+                suppE[t, :] = 0
+                continue
+
+            med = float(np.median(pos))
+            thresh = eps_energy * med
+            suppE[t, :] = (row > thresh).astype(np.uint8)
+
+        try:
+            suppE.id.flush()
+            f.flush()
+        except Exception:
+            pass
 
         # --- finalize cp_flux_ref
         if do_ref:

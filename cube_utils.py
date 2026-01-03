@@ -1,9 +1,17 @@
-# thread_utils.py
+"""
+
+History
+--------
+v1.0:   Added `build_component_support_from_losvd_amp` and
+            `build_component_support_energy_from_models` to efficiently determine
+            spatial support of components based on LOSVD amplitude or model
+            energy. 3 January 2025
+"""
 from __future__ import annotations
 from contextlib import contextmanager
 from typing import Optional, Sequence
 import numpy as np
-import os, glob, time, re
+import os, glob, time, re, math
 import pathlib as plp
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
@@ -1821,5 +1829,267 @@ def diagnose_tile_col_denom_threshold(
               f"freeze {frz:6d}/{tot:6d} ({pct:6.3f} %)")
 
     return out
+
+# ------------------------------------------------------------------------------
+
+def build_component_support_from_losvd_amp(
+    h5_path: str,
+    *,
+    eps_factor: float = 1e-12,
+    overwrite: bool = False,
+) -> None:
+    """
+    Build /HyperCube/component_support for an existing HyperCube using
+    LOSVD amplitudes.
+
+    The support mask is tile-aligned:
+        component_support[t, c] = 1
+        iff there exists a spaxel s in spatial tile t such that
+        losvd_amp[s, c] > eps_factor * max_s losvd_amp[s, c].
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the CubeFit HDF5 file.
+    eps_factor : float, optional
+        Relative threshold factor (default 1e-12). Must be conservative:
+        false positives are OK, false negatives are not.
+    overwrite : bool, optional
+        If True, overwrite existing /HyperCube/component_support.
+        If False (default), raise if it already exists.
+    """
+
+    with open_h5(h5_path, role="writer") as f:
+        if "/HyperCube" not in f:
+            raise RuntimeError("Missing /HyperCube group.")
+
+        g = f["/HyperCube"]
+
+        # --- existence checks ---
+        if "/HyperCube/norm/losvd_amp" not in f:
+            raise RuntimeError(
+                "Missing /HyperCube/norm/losvd_amp. "
+                "Run _compute_and_store_losvd_amplitudes first."
+            )
+
+        if "models" not in g:
+            raise RuntimeError("Missing /HyperCube/models.")
+
+        if "component_support" in g:
+            if not overwrite:
+                raise RuntimeError(
+                    "/HyperCube/component_support already exists. "
+                    "Use overwrite=True to rebuild."
+                )
+            del g["component_support"]
+
+        # --- read shapes ---
+        models = g["models"]
+        S, C, P, L = map(int, models.shape)
+
+        # Infer spatial chunking from models dataset
+        chunks = models.chunks
+        if chunks is None or chunks[0] is None:
+            raise RuntimeError("models dataset has no spatial chunking.")
+        S_chunk = int(chunks[0])
+
+        n_tiles = int(math.ceil(S / S_chunk))
+
+        print(
+            f"[component_support] Building support mask: "
+            f"S={S}, C={C}, S_chunk={S_chunk}, n_tiles={n_tiles}"
+        )
+
+        # --- read losvd_amp ---
+        A = f["/HyperCube/norm/losvd_amp"]  # shape (S, C), float64
+
+        if A.shape != (S, C):
+            raise RuntimeError(
+                f"/HyperCube/norm/losvd_amp has shape {A.shape}, "
+                f"expected {(S, C)}."
+            )
+
+        # --- compute per-component max amplitude (C,) ---
+        # This is cheap: A is already stored
+        A_max = np.max(np.asarray(A[...], dtype=np.float64), axis=0)
+
+        # Conservative per-component threshold
+        eps_support = eps_factor * A_max
+
+        # --- create dataset ---
+        supp = g.create_dataset(
+            "component_support",
+            shape=(n_tiles, C),
+            dtype="u1",
+            chunks=(1, min(C, 256)),
+            compression="gzip",
+            compression_opts=1,
+        )
+
+        # Metadata
+        supp.attrs["definition"] = (
+            "component_support[t,c]=1 iff any spaxel s in tile t has "
+            "losvd_amp[s,c] > eps_factor * max_s losvd_amp[s,c]"
+        )
+        supp.attrs["source"] = "losvd_amp"
+        supp.attrs["eps_factor"] = float(eps_factor)
+        supp.attrs["S_chunk"] = int(S_chunk)
+        supp.attrs["shape"] = (int(n_tiles), int(C))
+
+        # --- build support tile-by-tile ---
+        for t in range(n_tiles):
+            s0 = t * S_chunk
+            s1 = min(S, s0 + S_chunk)
+
+            # Slice (ΔS, C)
+            A_tile = np.asarray(A[s0:s1, :], dtype=np.float64, order="C")
+
+            # Active if any spaxel in tile exceeds threshold
+            active = np.any(A_tile > eps_support[None, :], axis=0)
+
+            supp[t, :] = active.astype(np.uint8)
+
+        # Flush for SWMR readers
+        try:
+            supp.id.flush()
+            f.flush()
+        except Exception:
+            pass
+
+        # --- optional summary ---
+        mean_active = float(np.mean(np.sum(supp[...], axis=1)))
+        print(
+            f"[component_support] Done. "
+            f"Mean active components per tile: {mean_active:.1f} / {C}"
+        )
+
+# ------------------------------------------------------------------------------
+
+def build_component_support_energy_from_models(
+    h5_path: str,
+    *,
+    eps_energy: float = 1e-6,
+    overwrite: bool = False,
+) -> None:
+    """
+    Build /HyperCube/component_support_energy by streaming over
+    /HyperCube/models and accumulating tile-wise component energy.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to CubeFit HDF5 file.
+    eps_energy : float
+        Relative threshold vs per-tile median component energy.
+        Must be conservative (default 1e-6).
+    overwrite : bool
+        Overwrite existing dataset if present.
+    """
+
+    with open_h5(h5_path, role="writer") as f:
+        g = f["/HyperCube"]
+
+        if "models" not in g:
+            raise RuntimeError("Missing /HyperCube/models")
+
+        if "component_support_energy" in g:
+            if not overwrite:
+                raise RuntimeError(
+                    "/HyperCube/component_support_energy exists. "
+                    "Use overwrite=True."
+                )
+            del g["component_support_energy"]
+
+        M = g["models"]
+        S, C, P, L = map(int, M.shape)
+
+        # Infer chunking (this is critical)
+        chunks = M.chunks
+        if chunks is None:
+            raise RuntimeError("models dataset is not chunked")
+
+        S_chunk, C_chunk, P_chunk, L_chunk = map(int, chunks)
+        if C_chunk != 1:
+            raise RuntimeError("Expected C_chunk == 1 for efficient streaming")
+
+        n_tiles = math.ceil(S / S_chunk)
+
+        print(
+            f"[support_energy] Streaming build: "
+            f"S={S}, C={C}, P={P}, L={L}, "
+            f"S_chunk={S_chunk}, P_chunk={P_chunk}"
+        )
+
+        # Accumulator: (tile, component)
+        E_tile_comp = np.zeros((n_tiles, C), dtype=np.float64)
+
+        # Stream in EXACT chunk order
+        for s0 in range(0, S, S_chunk):
+            s1 = min(S, s0 + S_chunk)
+            tile_idx = s0 // S_chunk
+
+            for c in range(C):
+                acc = 0.0
+
+                for p0 in range(0, P, P_chunk):
+                    p1 = min(P, p0 + P_chunk)
+
+                    # Read one on-disk chunk:
+                    # shape = (ΔS, 1, ΔP, L)
+                    slab = np.asarray(
+                        M[s0:s1, c:c+1, p0:p1, :],
+                        dtype=np.float32,
+                        order="C"
+                    )
+
+                    # Sum of squares over s, p, λ
+                    acc += float(np.sum(
+                        np.square(slab, dtype=np.float64)
+                    ))
+
+                E_tile_comp[tile_idx, c] += acc
+
+        # Create dataset
+        suppE = g.create_dataset(
+            "component_support_energy",
+            shape=(n_tiles, C),
+            dtype="u1",
+            chunks=(1, min(C, 256)),
+            compression="gzip",
+            compression_opts=1,
+        )
+
+        suppE.attrs["definition"] = (
+            "component_support_energy[t,c]=1 iff "
+            "tile_energy[t,c] > eps_energy * median_c(tile_energy[t,:])"
+        )
+        suppE.attrs["eps_energy"] = float(eps_energy)
+        suppE.attrs["S_chunk"] = int(S_chunk)
+        suppE.attrs["source"] = "models energy (chunk-streamed)"
+        suppE.attrs["shape"] = (int(n_tiles), int(C))
+
+        # Threshold per tile
+        for t in range(n_tiles):
+            row = E_tile_comp[t, :]
+            pos = row[row > 0.0]
+            if pos.size == 0:
+                suppE[t, :] = 0
+                continue
+
+            med = float(np.median(pos))
+            thresh = eps_energy * med
+            suppE[t, :] = (row > thresh).astype(np.uint8)
+
+        try:
+            suppE.id.flush()
+            f.flush()
+        except Exception:
+            pass
+
+        mean_active = float(np.mean(np.sum(suppE[...], axis=1)))
+        print(
+            f"[support_energy] Done. "
+            f"Mean active components per tile: {mean_active:.1f} / {C}"
+        )
 
 # ------------------------------------------------------------------------------
