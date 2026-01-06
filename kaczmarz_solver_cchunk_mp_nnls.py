@@ -62,7 +62,9 @@ v3.2:   Properly account for active orbits using component support masks during
 v3.3:   Correctly capped `dx` during SPG step in
             `solve_global_kaczmarz_global_step_mp`;
         Implement Armijo backtracking with cheap RMSE proxy in
-            `solve_global_kaczmarz_global_step_mp`. 5 January 2026
+            `solve_global_kaczmarz_global_step_mp`;
+        Force small `D` to `np.inf` in `solve_global_kaczmarz_global_step_mp`. 5
+            January 2026
 """
 
 from __future__ import annotations, print_function
@@ -864,24 +866,50 @@ def solve_global_kaczmarz_global_step_mp(
             g = -g_tot  # gradient is negative residual correlation
 
             # ------------------------------------------------------------
-            # GLOBAL freeze of ill-conditioned columns
+            # GLOBAL freeze of ill-conditioned columns (FIXED)
             # ------------------------------------------------------------
-            D_flat = D.ravel()
-            Dpercs = np.percentile(D_flat, [5.0, 50.0, 95.0])
-            D_med = Dpercs[1] if Dpercs.size >= 2 else float(np.median(D_flat))
+            # Determine freeze threshold from finite, positive denominators only
+            finite_pos = D[pos]
+            if finite_pos.size:
+                D_med = np.median(finite_pos)
+            else:
+                D_med = D_floor
 
             freeze_mul = float(os.environ.get("CUBEFIT_GLOBAL_FREEZE_MUL", "1e-4"))
-            D_freeze = max(D_med * freeze_mul, 1e-20)
+            D_freeze = np.max([D_med * freeze_mul, 1e-20])
 
-            freeze = D < D_freeze
+            freeze = (D <= D_freeze) | (~np.isfinite(D))
+
             if np.any(freeze):
-                # remove numerator influence and mark denom as zero (no update)
+                # Remove any influence from unconstrained columns
                 g = g.copy()
                 g[freeze] = 0.0
+
                 D = D.copy()
-                D[freeze] = 0.0
-                print(f"[SPG] GLOBAL freeze applied: {int(np.count_nonzero(freeze))} cols (<{D_freeze:.3e})",
-                    flush=True)
+                D[freeze] = np.inf
+
+                # Enforce exact zeros in x so nothing leaks back later
+                try:
+                    x[freeze, :] = 0.0
+                except Exception:
+                    pass
+
+                print(
+                    f"[SPG] GLOBAL freeze applied: {int(np.count_nonzero(freeze))} cols "
+                    f"(<{D_freeze:.3e})",
+                    flush=True,
+                )
+
+            # ------------------------------------------------------------
+            # Compute percentiles ONLY on finite denominators (diagnostics)
+            # ------------------------------------------------------------
+            finite = np.isfinite(D)
+            if np.any(finite):
+                D_flat = D[finite].ravel()
+            else:
+                D_flat = np.array([D_floor], dtype=np.float64)
+
+            Dpercs = np.percentile(D_flat, [5.0, 50.0, 95.0])
 
             # ------------------------------------------------------------
             # Safeguarded SPG step length (large -> decay -> adapt)
