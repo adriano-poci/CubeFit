@@ -56,7 +56,13 @@ v3.0:   Switched to diagonal-preconditioned Spectral Projected Gradient method
 v3.1:   Added orbit-weight projection step inside SPG loop in 
             `solve_global_kaczmarz_global_step_mp`. 1 January 2026
 v3.2:   Properly account for active orbits using component support masks during
-            orbit-weight projection. 3 January 2026
+            orbit-weight projection;
+        Fixed indentation bug in tile loop in
+            `solve_global_kaczmarz_global_step_mp`. 3 January 2026
+v3.3:   Correctly capped `dx` during SPG step in
+            `solve_global_kaczmarz_global_step_mp`;
+        Implement Armijo backtracking with cheap RMSE proxy in
+            `solve_global_kaczmarz_global_step_mp`. 5 January 2026
 """
 
 from __future__ import annotations, print_function
@@ -547,11 +553,8 @@ def solve_global_kaczmarz_global_step_mp(
     # Load cube metadata
     # ------------------------------------------------------------
     with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
-        M  = f["/HyperCube/models"]
-
-        S, L = map(int, DC.shape)
-        _, C, P, Lm = map(int, M.shape)
+        S, L = map(int, f["/DataCube"].shape)
+        _, C, P, Lm = map(int, f["/HyperCube/models"].shape)
         if Lm != L:
             raise RuntimeError("Model / data wavelength mismatch")
 
@@ -559,7 +562,9 @@ def solve_global_kaczmarz_global_step_mp(
         keep_idx = np.flatnonzero(mask) if mask is not None else None
         Lk = int(keep_idx.size) if keep_idx is not None else L
 
-        s_tile = int(M.chunks[0]) if (M.chunks and M.chunks[0] > 0) else 128
+        # read chunking info (but don't keep the dataset handle)
+        chunks = f["/HyperCube/models"].chunks
+        s_tile = int(chunks[0]) if (chunks and chunks[0]) else 128
         if cfg.s_tile_override is not None:
             s_tile = int(cfg.s_tile_override)
 
@@ -756,28 +761,28 @@ def solve_global_kaczmarz_global_step_mp(
                     M  = f["/HyperCube/models"]
 
                     Y = np.asarray(DC[s0:s1, :], np.float64)
-                if keep_idx is not None:
-                    Y = Y[:, keep_idx]
-
-                # exact model prediction (ACTIVE ORBITS ∧ SPATIAL SUPPORT)
-                yhat = np.zeros_like(Y)
-
-                if active_c_per_tile is not None:
-                    tile_idx = s0 // s_tile
-                    spatial_active = active_c_per_tile[tile_idx]
-                    c_iter = np.intersect1d(
-                        active_orbits,
-                        spatial_active,
-                        assume_unique=True
-                    )
-                else:
-                    c_iter = active_orbits
-
-                for c in c_iter:
-                    A = np.asarray(M[s0:s1, c, :, :], np.float32)
                     if keep_idx is not None:
-                        A = A[:, :, keep_idx]
-                    yhat += np.tensordot(x_eff[c], A, axes=(0, 1))
+                        Y = Y[:, keep_idx]
+
+                    # exact model prediction (ACTIVE ORBITS ∧ SPATIAL SUPPORT)
+                    yhat = np.zeros_like(Y)
+
+                    if active_c_per_tile is not None:
+                        tile_idx = s0 // s_tile
+                        spatial_active = active_c_per_tile[tile_idx]
+                        c_iter = np.intersect1d(
+                            active_orbits,
+                            spatial_active,
+                            assume_unique=True
+                        )
+                    else:
+                        c_iter = active_orbits
+
+                    for c in c_iter:
+                        A = np.asarray(M[s0:s1, c, :, :], np.float32)
+                        if keep_idx is not None:
+                            A = A[:, :, keep_idx]
+                        yhat += np.tensordot(x_eff[c], A, axes=(0, 1))
 
                 R = Y - yhat
                 if not np.all(np.isfinite(R)):
@@ -839,16 +844,44 @@ def solve_global_kaczmarz_global_step_mp(
                 best_proxy = rmse_proxy
                 best_x = x.copy()
 
-            # diagonal preconditioner
+            # ------------------------------------------------------------
+            # Diagonal preconditioner (finite entries only)
+            # ------------------------------------------------------------
             abs_zero = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-24"))
-            denom_floor_frac = float(os.environ.get("CUBEFIT_DENOM_FLOOR_FRAC",
-                "1e-6"))
+            denom_floor_frac = float(os.environ.get("CUBEFIT_DENOM_FLOOR_FRAC", "1e-4"))
+
             D_pos = D_tot[D_tot > 0.0]
             D_scale = np.percentile(D_pos, 90.0) if D_pos.size else 1.0
             D_floor = max(abs_zero, denom_floor_frac * D_scale)
-            D = np.maximum(D_tot, D_floor)
+
+            # Start from raw D
+            D = D_tot.copy()
+
+            # Apply floor to positive entries only (do NOT touch zeros yet)
+            pos = D > 0.0
+            D[pos] = np.maximum(D[pos], D_floor)
 
             g = -g_tot  # gradient is negative residual correlation
+
+            # ------------------------------------------------------------
+            # GLOBAL freeze of ill-conditioned columns
+            # ------------------------------------------------------------
+            D_flat = D.ravel()
+            Dpercs = np.percentile(D_flat, [5.0, 50.0, 95.0])
+            D_med = Dpercs[1] if Dpercs.size >= 2 else float(np.median(D_flat))
+
+            freeze_mul = float(os.environ.get("CUBEFIT_GLOBAL_FREEZE_MUL", "1e-4"))
+            D_freeze = max(D_med * freeze_mul, 1e-20)
+
+            freeze = D < D_freeze
+            if np.any(freeze):
+                # remove numerator influence and mark denom as zero (no update)
+                g = g.copy()
+                g[freeze] = 0.0
+                D = D.copy()
+                D[freeze] = 0.0
+                print(f"[SPG] GLOBAL freeze applied: {int(np.count_nonzero(freeze))} cols (<{D_freeze:.3e})",
+                    flush=True)
 
             # ------------------------------------------------------------
             # Safeguarded SPG step length (large -> decay -> adapt)
@@ -856,11 +889,13 @@ def solve_global_kaczmarz_global_step_mp(
 
             # --- parameters ---
             lr_min = 1e-8
-            lr_max = 1e-2           # safe ceiling (trust region still protects)
-            lr_init = 1e-3          # start large
+            lr_max = float(os.environ.get("CUBEFIT_LR_MAX",
+                "1e-3"))   # default 1e-3
+            lr_init = float(os.environ.get("CUBEFIT_LR_INIT",
+                "1e-4")) # default 1e-4
             lr_decay = 0.99         # gentle decay per epoch
             bt_tol = 1e-4           # relative proxy RMSE improvement
-            bt_max = 2              # max backtracking attempts
+            bt_max = 5              # max backtracking attempts
             dx_cap = np.inf   # default: no cap unless set below
 
             # --- choose lr (BB when valid) ---
@@ -886,7 +921,7 @@ def solve_global_kaczmarz_global_step_mp(
             dx = -lr * (g / D)
 
             # ------------------------------------------------------------
-            # Monotonicity guard (never remove)
+            # Monotonicity guard
             # If dx·g > 0 then flip — with dx = -lr*(g/D) this should be <= 0
             # but keep the check to be defensive against sign inconsistencies.
             # ------------------------------------------------------------
@@ -894,20 +929,83 @@ def solve_global_kaczmarz_global_step_mp(
                 dx = -dx
 
             # ------------------------------------------------------------
-            # Trust region (your blended dx_cap logic already computed)
+            # Trust region
             # ------------------------------------------------------------
             dx_norm = np.linalg.norm(dx)
             if dx_norm > dx_cap and dx_cap > 0.0:
                 dx *= (dx_cap / dx_norm)
 
             # ------------------------------------------------------------
-            # Cheap proxy-based acceptance (VERY LIGHT)
+            # Quadratic-prediction gating
+            # ------------------------------------------------------------
+            # If the quadratic model predicts an unrealistically large decrease
+            # relative to gradient scale, the diagonal Hessian is unreliable here.
+            # Shrink lr BEFORE doing any expensive proxy RMSE evaluation.
+
+            quad_pred = float(np.vdot(g, dx) + 0.5 * np.vdot(dx, D * dx))
+            step_dot_grad = float(np.vdot(dx, g))
+
+            # Safety parameters (tunable, conservative defaults)
+            quad_frac = float(os.environ.get("CUBEFIT_QUAD_FRAC", "0.2"))
+
+            # Gradient-based scale for comparison
+            g_norm = np.linalg.norm(g)
+            dx_norm = np.linalg.norm(dx)
+
+            # Predicted decrease magnitude
+            pred_decrease = -step_dot_grad
+
+            # If predicted decrease is wildly large compared to gradient scale,
+            # the quadratic model is not trustworthy at this step size.
+            if pred_decrease > quad_frac * g_norm * dx_norm:
+                lr *= 0.3
+                if lr < lr_min:
+                    lr = lr_min
+                # Recompute step with reduced lr
+                dx = -lr * (g / D)
+                if np.vdot(dx, g) > 0.0:
+                    dx = -dx
+                dx_norm = np.linalg.norm(dx)
+                if dx_norm > dx_cap and dx_cap > 0.0:
+                    dx *= (dx_cap / dx_norm)
+
+            # ------------------------------------------------------------
+            # Cheap proxy-based acceptance
             # ------------------------------------------------------------
             x_trial = x + dx
             if cfg.project_nonneg:
                 np.maximum(x_trial, 0.0, out=x_trial)
 
             rmse_here = rmse_proxy
+
+            # ------------------------------------------------------------
+            # EARLY-ABORT HOOK
+            # ------------------------------------------------------------
+            early_tiles = _choose_tiles_fair_spread(s_ranges, 1)
+            early_tol = float(os.environ.get("CUBEFIT_EARLY_ABORT_TOL", "1.02"))
+            rmse_early = rmse_proxy_subset(
+                h5_path,
+                x_trial,
+                tile_ranges=early_tiles,
+                keep_idx=keep_idx,
+                inv_cp_flux_ref=None,
+                w_lam_sqrt=w_lam_sqrt,
+            )
+
+            if rmse_early > rmse_here * early_tol:
+                # Abort immediately: this step is clearly bad
+                lr *= 0.5
+                if lr < lr_min:
+                    lr = lr_min
+
+                x = best_x.copy()
+                continue
+
+            # ------------------------------------------------------------
+            # Armijo backtracking with RMSE proxy
+            # ------------------------------------------------------------
+            f0 = rmse_here * rmse_here
+            c1 = float(os.environ.get("CUBEFIT_ARMIJO_C1", "1e-4"))
 
             accepted = False
             for _ in range(bt_max + 1):
@@ -920,14 +1018,16 @@ def solve_global_kaczmarz_global_step_mp(
                     w_lam_sqrt=w_lam_sqrt,
                 )
 
-                if rmse_new <= rmse_here * (1.0 - bt_tol):
-                    # accept
+                f1 = rmse_new * rmse_new
+
+                # Armijo sufficient decrease
+                if f1 <= f0 + c1 * step_dot_grad:
                     x = x_trial
-                    lr = min(lr * 1.05, lr_max)   # small reward for successful step
+                    lr = np.min([lr * 1.05, lr_max])
                     accepted = True
                     break
 
-                # reject: shrink lr and retry
+                # backtrack
                 lr *= 0.5
                 if lr < lr_min:
                     break
@@ -935,24 +1035,20 @@ def solve_global_kaczmarz_global_step_mp(
                 dx = -lr * (g / D)
                 if np.vdot(dx, g) > 0.0:
                     dx = -dx
+
+                # recompute capped step
                 dx_norm = np.linalg.norm(dx)
                 if dx_norm > dx_cap and dx_cap > 0.0:
                     dx *= (dx_cap / dx_norm)
+
                 x_trial = x + dx
                 if cfg.project_nonneg:
                     np.maximum(x_trial, 0.0, out=x_trial)
 
-            # if never accepted, keep x unchanged (explicit copy to avoid aliasing)
+            # GLOBAL rollback if Armijo never satisfied
             if not accepted:
-                x = x.copy()
-            
-            # after computing D
-            D_flat = D.ravel()
-            Dpercs = np.percentile(D_flat, [5.0, 50.0, 95.0])
-            D_floor = np.max((Dpercs[1] * 1e-6, 1e-20))   # floor relative to median
-            D = np.maximum(D, D_floor)
-            # optionally adjust lr so that lr/D has reasonable scale
-            lr = np.min([lr, 1e-2 * Dpercs[1]])   # tweak factor as you like
+                x = best_x.copy()
+                lr = np.max([lr * 0.5, lr_min])
 
             # gradient descent step
             x_prev = x.copy()
@@ -992,7 +1088,7 @@ def solve_global_kaczmarz_global_step_mp(
 
             eps = 1e-30
             beta = 3.0
-            max_frac = 0.075
+            max_frac = float(os.environ.get("CUBEFIT_MAX_FRAC", "0.02"))
             D_scale = Dpercs[1] + eps
 
             # robust/cheap norms: use medians if full norms are expensive
@@ -1009,7 +1105,7 @@ def solve_global_kaczmarz_global_step_mp(
             # blended cap (||dx||)
             grad_cap = beta * g_norm / D_scale
             x_cap = max_frac * x_norm
-            dx_cap = (1.0 - w) * grad_cap + w * x_cap
+            dx_cap = np.min([grad_cap, x_cap])
 
             # enforce cap
             if dx_norm > dx_cap and dx_cap > 0.0:
