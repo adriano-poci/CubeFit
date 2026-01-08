@@ -23,6 +23,8 @@ v1.0:   2025
 v1.1:   Read `zarrDir` from `kwargs` instead of hardcoding it. 12 August 2025
 v1.2:   Removed `cp_flux_ref` from `reconstruct_modelcube_fast`, since now all
             public `x` API is scaled to physical units. 5 December 2025
+v1.3:   Read in and un-scale `x_global` by stored Hypercube scale in
+            `loadCubeFit`. 8 January 2026
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -1159,9 +1161,18 @@ def reconstruct_modelcube_fast(
         x_cp = np.ascontiguousarray(x_in.reshape(C, P), dtype=np.float64)
 
         # Optional sparse speedup: precompute nonzeros per component
-        nz_per_c = None
+        nz_per_c = [None] * C
         if use_sparse:
-            nz_per_c = [np.flatnonzero(x_cp[c, :] != 0.0) for c in range(C)]
+            for c in range(C):
+                nz = np.flatnonzero(x_cp[c, :] != 0.0)
+                if nz.size < 0.2 * P:
+                    nz_per_c[c] = nz
+                else:
+                    nz_per_c.append(None)  # fall back to dense
+        if use_sparse:
+            n_sparse = sum(nz is not None for nz in nz_per_c)
+            if n_sparse == 0:
+                nz_per_c = [None] * C
 
         # Progress
         n_tiles = math.ceil(S / S_blk) * math.ceil(L / L_band)
@@ -1183,24 +1194,18 @@ def reconstruct_modelcube_fast(
                 band = np.zeros((dS, l1 - l0), dtype=np.float64, order="C")
 
                 for c in range(C):
-                    if use_sparse:
-                        nz = nz_per_c[c]
-                        if nz.size == 0:
-                            continue
-                        w = x_cp[c, nz]  # (P_sub,)
-                        A_c = np.asarray(
-                            M[s0:s1, c, nz, l0:l1], dtype=np.float32, order="C"
-                        )
+                    if nz_per_c[c] is None:
+                        w = x_cp[c, :]
+                        A_c = M[s0:s1, c, :, l0:l1]
                     else:
-                        w = x_cp[c, :]    # (P,)
-                        A_c = np.asarray(
-                            M[s0:s1, c, :, l0:l1], dtype=np.float32, order="C"
-                        )
+                        nz = nz_per_c[c]
+                        w = x_cp[c, nz]
+                        A_c = M[s0:s1, c, nz, l0:l1]
 
                     # y += sum_p w[p] * A[:, p, :]
                     band += np.tensordot(
-                        w.astype(np.float64, copy=False),
-                        A_c.astype(np.float64, copy=False),
+                        w,
+                        A_c,
                         axes=(0, 1),
                     )
 
@@ -1708,6 +1713,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         if "/X_global" not in f:
             raise RuntimeError("No /X_global found — run the fit first.")
         x_global = f["/X_global"][...]
+        scale = float(f["/HyperCube"].attrs["global_scale"])
 
         if "/HyperCube/models" not in f:
             raise RuntimeError("No /HyperCube/models found — build the HyperCube first.")
@@ -1727,6 +1733,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         has_mask = ("/Mask" in f)
         mask_arr = f["/Mask"][...] if has_mask else None
         obs = f["/ObsPix"][...] if "/ObsPix" in f else np.arange(nLSpec)
+    
+    x_global /= scale  # undo scaling for ModelCube reconstruction
 
     spat_tile, nTiles = choose_spat_tile_fast(nSpat, nProcs, s_chunk, k=2)
     nProcs = min(nProcs, nTiles, 12)  # don’t spawn more processes than tiles
@@ -1738,12 +1746,18 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     else:
         logger.log("[ModelCube] Reconstructing…")
         # reconstruct_model_cube_single(  # or your parallel version
-        reconstruct_modelcube_fast(
-            h5_path=str(hdf5Path),
-            x_cp=x_global,
-            # array_name="ModelCube",
-            # blas_threads=nProcs,
-        )
+        try:
+            reconstruct_modelcube_fast(
+                h5_path=str(hdf5Path),
+                x_cp=x_global,
+                use_sparse=False,
+                # array_name="ModelCube",
+                # blas_threads=nProcs,
+            )
+        except Exception as e:
+            logger.log(
+                f"[ModelCube] Error: Could not reconstruct ModelCube")
+            raise e
         # Stamp digest so future runs can skip confidently
         try:
             with open_h5(str(hdf5Path), role="writer") as f:

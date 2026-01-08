@@ -5,12 +5,16 @@ History
 v1.0:   Added `build_component_support_from_losvd_amp` and
             `build_component_support_energy_from_models` to efficiently determine
             spatial support of components based on LOSVD amplitude or model
-            energy. 3 January 2025
+            energy. 3 January 2026
+v1.1:   Added `apply_global_hypercube_scale_inplace` to compute and store a
+            global scale for the Hypercube model to improve numerical stability
+            during fitting. 8 January 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Tuple, Sequence
 import numpy as np
+from tqdm import tqdm
 import os, glob, time, re, math
 import pathlib as plp
 from dataclasses import dataclass
@@ -2091,5 +2095,98 @@ def build_component_support_energy_from_models(
             f"[support_energy] Done. "
             f"Mean active components per tile: {mean_active:.1f} / {C}"
         )
+
+# ------------------------------------------------------------------------------
+
+def apply_global_hypercube_scale_inplace(
+    h5_path: str,
+    *,
+    apply_mask: bool = True,
+    use_lambda_weights: bool = True,
+    rdcc_slots: int = 1_000_003,
+    rdcc_bytes: int = 256 * 1024**2,
+    rdcc_w0: float = 0.90,
+) -> dict:
+    """
+    Compute and apply the exact global HyperCube normalization in-place,
+    using full-cube L2 energies. Semantics are identical to HyperCube build.
+
+    Returns
+    -------
+    dict with keys:
+        scale
+        data_energy
+        model_energy
+    """
+
+    # ----------------------------
+    # 1. Compute data energy
+    # ----------------------------
+    data_energy = 0.0
+
+    with open_h5(h5_path, "reader") as f:
+        DC = f["/DataCube"]
+        S, L = DC.shape
+
+        keep_idx = None
+        if apply_mask and "/Mask" in f:
+            m = np.asarray(f["/Mask"][...], bool).ravel()
+            if m.size == L and np.any(m):
+                keep_idx = np.flatnonzero(m)
+
+        for s0 in range(0, S, 128):
+            s1 = min(S, s0 + 128)
+            Y = np.asarray(DC[s0:s1, :], np.float64, order="C")
+            if keep_idx is not None:
+                Y = Y[:, keep_idx]
+            data_energy += float(np.sum(Y * Y))
+
+    # ----------------------------
+    # 2. Read model energy (exact)
+    # ----------------------------
+    with open_h5(h5_path, "reader") as f:
+        if "/HyperCube/col_energy" not in f:
+            raise RuntimeError("Missing /HyperCube/col_energy")
+        E = np.asarray(f["/HyperCube/col_energy"][...], np.float64)
+        model_energy = float(np.sum(E))
+
+    if model_energy <= 0.0 or not np.isfinite(model_energy):
+        raise RuntimeError("Invalid model energy")
+
+    scale = np.sqrt(data_energy / model_energy)
+
+    # ----------------------------
+    # 3. Apply in-place
+    # ----------------------------
+    with open_h5(h5_path, "writer") as f:
+        M = f["/HyperCube/models"]
+        try:
+            M.id.set_chunk_cache(rdcc_slots, rdcc_bytes, rdcc_w0)
+        except Exception:
+            pass
+
+        S, C, P, L = M.shape
+        S_chunk = M.chunks[0] if M.chunks else 128
+
+        for s0 in tqdm(range(0, S, S_chunk),
+                        desc="[HyperCube] applying global scale",
+                        mininterval=2.0):
+            s1 = min(S, s0 + S_chunk)
+            M[s0:s1, :, :, :] *= scale
+
+        # scale col_energy consistently
+        f["/HyperCube/col_energy"][...] *= scale * scale
+
+        g = f["/HyperCube"]
+        g.attrs["global_scale"] = float(scale)
+        g.attrs["global_scale_definition"] = (
+            "argmin || DataCube - α * sum_{c,p} models ||_2"
+        )
+
+    return dict(
+        scale=float(scale),
+        data_energy=float(data_energy),
+        model_energy=float(model_energy),
+    )
 
 # ------------------------------------------------------------------------------

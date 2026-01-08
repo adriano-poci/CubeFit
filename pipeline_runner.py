@@ -42,6 +42,7 @@ v1.8:   Implemented mtime-based decision for sidecar vs main file loading in
             `solve_all*` resume logic. 18 December 2025
 v1.9:   Added final elapsed time logging in `solve_all_mp_batched`. 1 January
             2026
+v1.10:  Implemented SPG to Kaczmarz workflow. 7 January 2026
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ from CubeFit.hypercube_builder import build_hypercube, read_global_column_energy
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
 from CubeFit.kaczmarz_solver import solve_global_kaczmarz, SolverCfg
 from CubeFit.kaczmarz_solver_cchunk_mp_nnls import (
-    MPConfig, solve_global_kaczmarz_global_step_mp)
+    MPConfig, solve_global_kaczmarz_global_step_mp, solve_kaczmarz_nnls)
     # solve_global_kaczmarz_cchunk_mp)
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
@@ -1187,60 +1188,35 @@ class PipelineRunner:
                     tracker=tracker,
                 )
 
-            # Do we need to project + polish?
-            if orbit_weights is not None:
-                logger.log("[Pipeline] Initial MP solve done; starting quick polish...")
-                E_global = read_global_column_energy(self.h5_path)   # (C,P) or None
-                # Tile budget for quick polish (no extra I/O; use the reader’s known shapes)
-                # --- STRICT projection (mass preserving, exact per-component)
-                logger.log('[Pipeline] Enforcing orbit weights via strict '\
-                    'projection.')
-                # x_global is flat (C*P,) → reshape to (C,P)
+                # ------------------------------------------------------------
+                # Final Kaczmarz NNLS polish (true row-action)
+                # ------------------------------------------------------------
+                logger.log("[Pipeline] Starting Kaczmarz NNLS polish...")
+
                 C = self.nComp
                 P = self.nPop
                 Xcp = x_global.reshape(C, P)
-                cu.project_to_component_weights(
-                    Xcp, orbit_weights, E_cp=E_global, minw=1e-10,
-                    beta=1.0
-                )
-                # flatten back to 1-D for downstream consistency
-                x_global = Xcp.ravel(order="C")
-                logger.log('[Pipeline] Post-projection total mass: '\
-                    f'{float(np.sum(x_global)):.6e}')
-                total_tiles = (
-                    math.ceil(reader.nSpat / reader_s_tile)
-                    * math.ceil(reader.nComp / reader_c_tile)
-                    * math.ceil(reader.nPop  / reader_p_tile)
-                )
-                # --- QUICK POLISH (cheap 1-epoch touch-up, no projector/softbox)
-                # Use the solver's own API; seed it with the just-projected x_global.
-                # Keep it lightweight: a small fraction of tiles, no ratio projector, no softbox.
-                try:
-                    small_tile_budget = np.max((1, int(0.1 * total_tiles)))# ~10%
-                except Exception:
-                    small_tile_budget = 0  # fall back to solver default if your solver ignores max_tiles
-                logger.log(f"[Pipeline] Running quick polish with tile budget: "
-                    f"{small_tile_budget} tiles (~10% of total {total_tiles}).")
 
-                cfg_polish = MPConfig(
-                    epochs=1,
-                    lr=float(lr),
-                    project_nonneg=bool(project_nonneg),
-                    processes=int(processes),
-                    blas_threads=int(blas_threads),
-                    apply_mask=bool(reader_apply_mask),
-                    max_tiles=int(small_tile_budget)
-                )
+                # Use active set from SPG (rows only)
+                active_orbits = stats.get("active_orbits", None)
 
-                x_global, stats = solve_global_kaczmarz_global_step_mp(
+                Xcp = solve_kaczmarz_nnls(
                     self.h5_path,
-                    cfg_polish,
-                    orbit_weights=None,
-                    # keep the enforced mixture; no projector here
-                    x0=np.asarray(x_global, np.float64, order="C"),
-                    tracker=NullTracker(), # silent + cheap
+                    Xcp,
+                    active_orbits=active_orbits,
+                    orbit_weights=orbit_weights,
+                    orbit_beta=float(os.environ.get("CUBEFIT_ORBIT_BETA", "0.2")),
+                    max_epochs=int(os.environ.get("CUBEFIT_KACZMARZ_EPOCHS", "2")),
+                    tol_kkt=float(os.environ.get("CUBEFIT_KACZMARZ_KKT", "1e-6")),
+                    shuffle_spaxels=True,
+                    apply_mask=bool(reader_apply_mask),
+                    use_lambda_weights=True,
+                    tracker=tracker,
                 )
-                logger.log("[Pipeline] Quick polish done.")
+
+                x_global = Xcp.ravel(order="C")
+
+                logger.log("[Pipeline] Kaczmarz NNLS polish complete.")
 
         finally:
             try:

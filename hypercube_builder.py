@@ -26,6 +26,8 @@ v1.1:   Added Zarr v3 sharding support and safe-direct writes. 5 September 2025
 v1.2:   Complete re-write to use HDF5. 7 September 2025
 v1.3:   Improved speed of `col_energy` computation, switching from `einsum` to
             `square`. 4 December 2025
+v1.4:   Compute and apply a global scale to the Hypercube model to improve
+            numerical stability during fitting. 8 January 2026
 
 
 Hypercube builder (LOSVD convolution in log-λ, then rebin to observed grid)
@@ -130,7 +132,6 @@ class _P2Median:
         if n <= 5:
             return float(np.median(self._q[:n]))
         return float(self._q[2])
-
 
 def _ensure_mask_indices(f, L: int) -> Optional[np.ndarray]:
     """
@@ -882,15 +883,17 @@ def _frac_shift_last_axis(X: np.ndarray, shift: float) -> np.ndarray:
 def build_hypercube(
     base_h5: str,
     *,
-    norm_mode: str = "data",        # "model" or "data"
-    amp_mode: str = "sum",           # "sum" or "trapz" for LOSVD amplitude
-    cp_flux_ref_mode: str = "median",   # "median" | "mean" | "off"
+    norm_mode: str = "data",
+    amp_mode: str = "sum",
+    cp_flux_ref_mode: str = "median",
     floor: float = 1e-12,
     S_chunk: int = 128,
     C_chunk: int = 1,
     P_chunk: int = 360,
-    compression: str | None = None,  # keep None for speed; compress later
+    compression: str | None = None,
     vel_bias_kms: float = 0.0,
+    global_scale: float | None = None,
+    global_scale_auto: bool = True,
 ) -> None:
     """
     Build /HyperCube/models with LOSVD convolution on the template grid,
@@ -1151,6 +1154,11 @@ def build_hypercube(
                         yield (p0, p1, s0, s1, c0, c1, (is_s, ic, ip))
 
         total_tiles = rem
+
+        # --- global scale accumulators ---
+        scale_num = 0.0   # Σ data * model
+        scale_den = 0.0   # Σ model^2
+
         pbar = tqdm(total=total_tiles, desc="[HyperCube] tiles",
                     mininterval=2.0)
 
@@ -1164,6 +1172,24 @@ def build_hypercube(
 
             # For each (s,c) in this tile:
             for s_idx in range(s0, s1):
+
+                # --------------------------------------------
+                # GLOBAL SCALE: per-spaxel model accumulator
+                # --------------------------------------------
+                if norm_mode == "model":
+                    if masked_flag:
+                        model_sum = np.zeros((keep_idx.size,), dtype=np.float64)
+                        data_vec = np.asarray(
+                            f["/DataCube"][s_idx, keep_idx],
+                            dtype=np.float64
+                        )
+                    else:
+                        model_sum = np.zeros((L,), dtype=np.float64)
+                        data_vec = np.asarray(
+                            f["/DataCube"][s_idx, :],
+                            dtype=np.float64
+                        )
+
                 a_sum = float(A_sum[s_idx])  # scalar
                 for c_idx in range(c0, c1):
                     # 1) build unit-area kernel for (s,c)
@@ -1201,6 +1227,10 @@ def build_hypercube(
                     else:
                         Yv = Ycp               # (ΔP, L or Lk)
 
+                    if norm_mode == "model":
+                        # Sum over populations for this component
+                        model_sum += np.sum(Yv, axis=0)
+
                     # Compute per-population contribution for this (s_idx, c_idx, P-block)
                     if w_lam_sqrt is not None:
                         # weighted: sum_λ (√w·Y)^2 = sum_λ (w * Y^2)
@@ -1214,6 +1244,10 @@ def build_hypercube(
                             np.square(Yv, dtype=np.float64),
                             axis=1
                         )  # (ΔP,)
+                    # --------------------------------------------
+                    # GLOBAL SCALE: denominator accumulation
+                    # --------------------------------------------
+                    scale_den += float(np.sum(e_local))
 
                     E_acc[c_idx, p0:p1] += e_local
                     # --- accumulate tile-wise component energy ---
@@ -1236,6 +1270,12 @@ def build_hypercube(
 
                     # 7) write
                     models[s_idx, c_idx, p0:p1, 0:L] = Ycp
+
+                # --------------------------------------------
+                # GLOBAL SCALE: numerator accumulation
+                # --------------------------------------------
+                if norm_mode == "model":
+                    scale_num += float(np.dot(model_sum, data_vec))
 
 
             _done_set(done, idx3)
@@ -1330,7 +1370,41 @@ def build_hypercube(
                 "mask applied to λ if present"
             )
 
+        # ------------------------------------------------------------
+        # FINALIZE GLOBAL HYPERCUBE SCALE
+        # ------------------------------------------------------------
+        if norm_mode == "model":
+            if scale_den > 0.0:
+                global_scale = scale_num / scale_den
+            else:
+                global_scale = 1.0
 
+            g_norm = f.require_group("/HyperCube/norm")
+            g_norm.attrs["global_scale"] = float(global_scale)
+            g_norm.attrs["global_scale_definition"] = (
+                "argmin || DataCube - α * sum_{c,p} models ||_2"
+            )
+            g_norm.attrs["global_scale_masked"] = bool(masked_flag)
+            g_norm.attrs["global_scale_lambda_weighted"] = bool(w_lam_sqrt
+                is not None)
+
+            for s0 in tqdm(range(0, S, S_chunk),
+                          desc="[HyperCube] applying global scale",
+                          mininterval=2.0):
+                s1 = min(S, s0 + S_chunk)
+                models[s0:s1, :, :, :] *= np.float32(global_scale)
+                try:
+                    models.id.flush()
+                    f.flush()
+                except Exception:
+                    pass
+
+            # Also rescale col_energy consistently
+            if "col_energy" in g:
+                g["col_energy"][...] *= (global_scale ** 2)
+
+            print(f"[HyperCube] Applied global scale α={global_scale:.6e}")
+        
         g.attrs["complete"] = True
         if vel_bias_kms is not None:
             g.attrs["vel_bias_kms"] = float(vel_bias_kms)

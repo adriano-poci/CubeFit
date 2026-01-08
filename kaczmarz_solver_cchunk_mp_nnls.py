@@ -65,6 +65,9 @@ v3.3:   Correctly capped `dx` during SPG step in
             `solve_global_kaczmarz_global_step_mp`;
         Force small `D` to `np.inf` in `solve_global_kaczmarz_global_step_mp`. 5
             January 2026
+v3.4:   Implemented SPG to Kaczmarz workflow. 7 January 2026
+v3.5:   Fixed indentation bug for Kaczmarz update in
+            `solve_global_kaczmarz_global_step_mp`. 8 January 2026
 """
 
 from __future__ import annotations, print_function
@@ -888,17 +891,32 @@ def solve_global_kaczmarz_global_step_mp(
                 D = D.copy()
                 D[freeze] = np.inf
 
-                # Enforce exact zeros in x so nothing leaks back later
-                try:
-                    x[freeze, :] = 0.0
-                except Exception:
-                    pass
-
                 print(
                     f"[SPG] GLOBAL freeze applied: {int(np.count_nonzero(freeze))} cols "
                     f"(<{D_freeze:.3e})",
                     flush=True,
                 )
+
+            # ------------------------------------------------------------
+            # NNLS KKT residual (optimality diagnostic)
+            # ------------------------------------------------------------
+            viol = np.zeros_like(g)
+            pos_mask = x > 0.0
+            viol[pos_mask] = np.abs(g[pos_mask])
+            viol[~pos_mask] = np.maximum(-g[~pos_mask], 0.0)
+
+            kkt_norm = np.linalg.norm(viol, ord=np.inf)
+
+            # ------------------------------------------------------------
+            # Primal gap estimate (upper bound on remaining improvement)
+            # ------------------------------------------------------------
+            finite = np.isfinite(D)
+            gap_est = 0.5 * np.sum((g[finite] ** 2) / D[finite])
+
+            gap_tol = float(os.environ.get("CUBEFIT_GAP_TOL", "1e-6"))
+            if gap_est < gap_tol:
+                logger.log("[SPG] Dual gap tolerance reached; stopping SPG.")
+                break
 
             # ------------------------------------------------------------
             # Compute percentiles ONLY on finite denominators (diagnostics)
@@ -970,7 +988,11 @@ def solve_global_kaczmarz_global_step_mp(
             # relative to gradient scale, the diagonal Hessian is unreliable here.
             # Shrink lr BEFORE doing any expensive proxy RMSE evaluation.
 
-            quad_pred = float(np.vdot(g, dx) + 0.5 * np.vdot(dx, D * dx))
+            finite = np.isfinite(D)
+            quad_pred = float(
+                np.vdot(g[finite], dx[finite]) +
+                0.5 * np.vdot(dx[finite], D[finite] * dx[finite])
+            )
             step_dot_grad = float(np.vdot(dx, g))
 
             # Safety parameters (tunable, conservative defaults)
@@ -1085,13 +1107,15 @@ def solve_global_kaczmarz_global_step_mp(
             dx = -lr * (g / D)
             step_dot_grad = float(np.vdot(dx, g))
             quad_pred = float(
-                np.vdot(g, dx) + 0.5 * np.vdot(dx, D * dx)
+                np.vdot(g[finite], dx[finite]) +
+                0.5 * np.vdot(dx[finite], D[finite] * dx[finite])
             )
             print("[SPG] Step diagnostics:", flush=True)
             print(
                 f"  lr={lr:.3e}, step·grad={step_dot_grad:.3e}, "
                 f"quad_pred={quad_pred:.3e}"
             )
+            print(f"  KKT_inf={kkt_norm:.3e}, gap_est={gap_est:.3e}", flush=True)
             print(f"  D percentiles: 5%={Dpercs[0]:.3e}, 50%={Dpercs[1]:.3e}, "
                   f"95%={Dpercs[2]:.3e}")
             print(f"  D_floor={D_floor:.3e}", flush=True)
@@ -1192,6 +1216,54 @@ def solve_global_kaczmarz_global_step_mp(
 
             active_orbits = new_active.astype(np.int32)
 
+            # ------------------------------------------------------------
+            # SPG → Kaczmarz switch criterion
+            # ------------------------------------------------------------
+
+            # --- (A) Active set stability ---
+            if ep == 0:
+                active_overlap = 0.0
+            else:
+                inter = np.intersect1d(prev_active_orbits, active_orbits)
+                active_overlap = inter.size / max(1, active_orbits.size)
+
+            prev_active_orbits = active_orbits.copy()
+
+            # --- (B) Projected gradient (KKT residual) ---
+            # g_plus: projected gradient for NNLS
+            g_plus = np.zeros_like(g)
+            pos_mask = x > 0.0
+            g_plus[pos_mask] = g[pos_mask]
+            g_plus[~pos_mask] = np.minimum(g[~pos_mask], 0.0)
+
+            pg_norm = np.linalg.norm(g_plus)
+            pg_rel = pg_norm / (1.0 + np.linalg.norm(x))
+
+            # --- (C) Objective stagnation ---
+            if ep == 0:
+                rmse_prev = rmse_proxy
+            rmse_rel_change = abs(rmse_prev - rmse_proxy) / max(rmse_prev, 1.0)
+            rmse_prev = rmse_proxy
+
+            # --- thresholds ---
+            overlap_tol = float(os.environ.get("CUBEFIT_ACTIVE_OVERLAP_TOL", "0.98"))
+            pg_tol      = float(os.environ.get("CUBEFIT_PG_TOL", "1e-6"))
+            rmse_tol    = float(os.environ.get("CUBEFIT_RMSE_REL_TOL", "1e-6"))
+
+            if (active_overlap > overlap_tol and
+                pg_rel < pg_tol and
+                rmse_rel_change < rmse_tol):
+
+                print(
+                    "[SPG] Convergence reached: switching to Kaczmarz\n"
+                    f"      active_overlap={active_overlap:.3f}, "
+                    f"pg_rel={pg_rel:.3e}, rmse_rel_change={rmse_rel_change:.3e}",
+                    flush=True,
+                )
+
+                # Exit SPG early
+                break
+
             print(
                 f"[SPG] active orbits: {active_orbits.size}/{C}",
                 flush=True,
@@ -1208,17 +1280,192 @@ def solve_global_kaczmarz_global_step_mp(
                 flush=True,
             )
 
+        # Active columns after SPG
+        active_mask = np.zeros((C, P), dtype=bool)
+        active_mask[active_orbits, :] = True
+
+        # Also exclude globally frozen columns if you want
+        if 'freeze' in locals():
+            active_mask &= ~freeze
+        active_cols = np.flatnonzero(active_mask.ravel())
+
         elapsed = time.perf_counter() - t0
         return best_x.ravel(order="C"), dict(
             epochs=cfg.epochs,
             elapsed_sec=elapsed,
             rmse_proxy_best=float(best_proxy),
+            kkt_norm_best=float(kkt_norm),
+            active_orbits=active_orbits.copy(),
         )
 
     finally:
         if pool is not None:
             pool.close()
             pool.join()
+
+# ------------------------------------------------------------------------------
+
+def _kaczmarz_update_row(
+    x_row,            # (P,) current coefficients for component c
+    A_row,            # (P, Lk) model row for spaxel s, component c
+    r_row,            # (Lk,) residual at spaxel s
+    w_lam_sqrt=None,  # (Lk,) or None
+):
+    """
+    One projected Kaczmarz update for a single spaxel row.
+    """
+
+    if w_lam_sqrt is not None:
+        A = A_row * w_lam_sqrt[None, :]
+        r = r_row * w_lam_sqrt
+    else:
+        A = A_row
+        r = r_row
+
+    # numerator: <A, r>
+    num = A @ r
+
+    # denominator: ||A||^2
+    denom = np.sum(A * A)
+
+    if denom <= 0.0:
+        return x_row
+
+    alpha = num / denom
+
+    # update + projection
+    x_new = x_row + alpha * A @ np.ones(A.shape[1])
+    np.maximum(x_new, 0.0, out=x_new)
+
+    return x_new
+
+# ------------------------------------------------------------------------------
+
+def solve_kaczmarz_nnls(
+    h5_path: str,
+    x0: np.ndarray,                    # (C,P)
+    *,
+    active_orbits: np.ndarray | None = None,
+    orbit_weights: np.ndarray | None = None,
+    orbit_beta: float | None = None,
+    max_epochs: int = 10,
+    tol_kkt: float = 1e-6,
+    shuffle_spaxels: bool = True,
+    apply_mask: bool = True,
+    use_lambda_weights: bool = True,
+    tracker=None,
+):
+    """
+    Row-action (Kaczmarz) NNLS solver for CubeFit.
+    Supports orbit-weight projection (global, per epoch).
+    """
+
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M  = f["/HyperCube/models"]
+
+        S, L = DC.shape
+        _, C, P, _ = M.shape
+
+        mask = cu._get_mask(f) if apply_mask else None
+        keep_idx = np.flatnonzero(mask) if mask is not None else None
+
+        if use_lambda_weights and "/HyperCube/lambda_weights" in f:
+            w_full = np.asarray(f["/HyperCube/lambda_weights"], np.float64)
+            w_lam_sqrt = np.sqrt(np.maximum(
+                w_full[keep_idx] if keep_idx is not None else w_full,
+                1e-6
+            ))
+        else:
+            w_lam_sqrt = None
+
+    x = x0.copy()
+
+    if active_orbits is None:
+        active_orbits = np.arange(C)
+
+    # Canonical orbit-weight target
+    if orbit_weights is not None:
+        w_target = _canon_orbit_weights(
+            h5_path,
+            orbit_weights,
+            C=C,
+            P=P,
+        )
+        if orbit_beta is None:
+            orbit_beta = float(os.environ.get("CUBEFIT_ORBIT_BETA", "0.2"))
+    else:
+        w_target = None
+
+    spaxel_order = np.arange(S)
+
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M  = f["/HyperCube/models"]
+
+        for epoch in range(max_epochs):
+
+            if shuffle_spaxels:
+                np.random.shuffle(spaxel_order)
+
+            max_kkt = 0.0
+
+            for s in spaxel_order:
+                y = np.asarray(DC[s], np.float64)
+                if keep_idx is not None:
+                    y = y[keep_idx]
+
+                yhat = np.zeros_like(y)
+
+                for c in active_orbits:
+                    A = np.asarray(M[s, c], np.float32)
+                    if keep_idx is not None:
+                        A = A[:, keep_idx]
+                    yhat += x[c] @ A
+
+                r = y - yhat
+
+                for c in active_orbits:
+                    A = np.asarray(M[s, c], np.float32)
+                    if keep_idx is not None:
+                        A = A[:, keep_idx]
+
+                    x[c] = _kaczmarz_update_row(
+                        x[c], A, r, w_lam_sqrt
+                    )
+
+                    g_c = -(A @ r)
+                    viol = np.where(x[c] > 0.0,
+                                    np.abs(g_c),
+                                    np.maximum(-g_c, 0.0))
+                    max_kkt = max(max_kkt, np.max(viol))
+
+            # Global orbit-weight projection (once per epoch)
+            if w_target is not None and orbit_beta > 0.0:
+                cu.project_to_component_weights(
+                    x,
+                    w_target,
+                    E_cp=None,
+                    beta=orbit_beta,
+                    minw=1e-12,
+                )
+
+            if tracker is not None:
+                tracker.maybe_snapshot_x(
+                    x, epoch=epoch + 1, rmse=None, force=True
+                )
+
+            print(
+                f"[Kaczmarz] epoch {epoch+1}/{max_epochs}, "
+                f"KKT_inf={max_kkt:.3e}",
+                flush=True,
+            )
+
+            if max_kkt < tol_kkt:
+                print("[Kaczmarz] Converged (KKT residual small).", flush=True)
+                break
+
+    return x
 
 # ------------------------------------------------------------------------------
 
