@@ -1,4 +1,4 @@
-This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
+This file is a merged representation of a subset of the codebase, containing specifically included files and files not matching ignore patterns, combined into a single document by Repomix.
 
 <file_summary>
 This section contains a summary of this file.
@@ -32,6 +32,7 @@ The content is organized as follows:
 <notes>
 - Some files may have been excluded based on .gitignore rules and Repomix's configuration
 - Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: *.py
 - Files matching these patterns are excluded: *.bak, *.old.*, *.tar.xz, *.xz, *.zip, *.tar, *.tar.gz, *.patch, *.txt, *.png, *.log, *.pdf
 - Files matching patterns in .gitignore are excluded
 - Files matching default ignore patterns are excluded
@@ -41,163 +42,25 @@ The content is organized as follows:
 </file_summary>
 
 <directory_structure>
-docs/
-  CubeFit.html
-  CubeFit.md
-  CubeFit.pdf
-NGC4365/
-  figures/
-    best_C0207_spax00039.png
-    best_C0207_spax00042.png
-    best_C0207_spax00051.png
-    best_C0207_spax00055.png
-    best_C0207_spax01032.png
-    best_C0207_spax01058.png
-    best_C0207_spax01079.png
-    best_C0207_spax01171.png
-    best_C0207_spax01259.png
-    best_C0207_spax01310.png
-    chi2_hist.png
-    fit_live_fits.png
-    fit_live.png
-    modelCube_207_ii_SN100_BaSTI_KB1.30_LW_12.png
-    nnlsPatchUsage.png
-    orbitSFH_207_ii_SN100_BaSTI_KB1.30_LW_12.png
-    patch_spax00000.png
-    patch_spax00001.png
-    patch_spax00002.png
-    patch_spax00003.png
-    patch_spax00004.png
-    patch_spax00005.png
-    patch_spax00006.png
-    patch_spax00007.png
-    patch_spax00008.png
-    patch_spax00009.png
-    patch_spax00010.png
-    patch_spax00011.png
-    patch_spax00012.png
-    patch_spax00013.png
-    patch_spax00014.png
-    patch_spax00015.png
-    patch_spax00016.png
-    patch_spax00017.png
-    patch_spax00018.png
-    patch_spax00019.png
-    patch_spax00020.png
-    patch_spax00021.png
-    patch_spax00022.png
-    patch_spax00023.png
-    patch_spax00024.png
-    patch_spax00025.png
-    patch_spax00026.png
-    patch_spax00027.png
-    patch_spax00028.png
-    patch_spax00029.png
-    patch_spax00030.png
-    patch_spax00031.png
-    patch_spax00045.png
-    patch_spax00090.png
-    patch_spax00135.png
-    patch_spax00181.png
-    patch_spax00226.png
-    patch_spax00271.png
-    patch_spax00317.png
-    patch_spax00362.png
-    patch_spax00407.png
-    patch_spax00452.png
-    patch_spax00498.png
-    patch_spax00543.png
-    patch_spax00588.png
-    patch_spax00634.png
-    patch_spax00679.png
-    patch_spax00724.png
-    patch_spax00769.png
-    patch_spax00815.png
-    patch_spax00860.png
-    patch_spax00905.png
-    patch_spax00951.png
-    patch_spax00996.png
-    patch_spax01041.png
-    patch_spax01086.png
-    patch_spax01132.png
-    patch_spax01177.png
-    patch_spax01222.png
-    patch_spax01268.png
-    patch_spax01313.png
-    patch_spax01358.png
-    patch_spax01403.png
-    patch_spax01449.png
-    patch_spax01494.png
-    patch_spax01539.png
-    patch_spax01585.png
-    patch_spax01630.png
-    patch_spax01675.png
-    patch_spax01720.png
-    patch_spax01766.png
-    patch_spax01811.png
-    patch_spax01856.png
-    patch_spax01902.png
-    patch_spax01947.png
-    patch_spax01992.png
-    patch_spax02037.png
-    patch_spax02083.png
-    patch_spax02128.png
-    patch_spax02173.png
-    patch_spax02219.png
-    patch_spax02264.png
-    patch_spax02309.png
-    patch_spax02354.png
-    patch_spax02400.png
-    patch_spax02445.png
-    patch_spax02490.png
-    patch_spax02536.png
-    patch_spax02581.png
-    patch_spax02626.png
-    patch_spax02671.png
-    patch_spax02717.png
-    patch_spax02762.png
-    patch_spax02807.png
-    patch_spax02853.png
-    prefit_overlay_from_models_C207.png
-    worst_C0207_spax00759.png
-    worst_C0207_spax00802.png
-    worst_C0207_spax00806.png
-    worst_C0207_spax02830.png
-    worst_C0207_spax02840.png
-    worst_C0207_spax02848.png
-    worst_C0207_spax02850.png
-    worst_C0207_spax02851.png
-    worst_C0207_spax02852.png
-    worst_C0207_spax02853.png
-    xcp_bar.png
 __init__.py
 cube_debug.py
 cube_utils.py
 diag_losvd_models.py
-environment.yml
 fit_tracker.py
 hdf5_manager.py
 hypercube_builder.py
 hypercube_reader.py
 kaczmarz_solver_cchunk_mp_nnls.py
-kz_0All.sh
-kz_1Gen.sh
-kz_2Fit.sh
-kz_3Rio.sh
-kz_addqueue.sh
 kz_fitSpec.py
 kz_initNGC4365.py
 kz_rio.py
 kz_run.py
 live_fit_dashboard.py
 logger.py
-Makefile
-mkdocs.yml
 nnls_patch.py
 pipeline_runner.py
 plotting.py
 pre_solve_check.py
-README.md
 </directory_structure>
 
 <files>
@@ -439,54 +302,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-</file>
-
-<file path="environment.yml">
-name: cubefit-env
-channels:
-  - conda-forge
-dependencies:
-  - python>=3.8
-  - numpy
-  - matplotlib
-  - zarr
-  - numcodecs
-  - tqdm
-</file>
-
-<file path="kz_addqueue.sh">
-#!/bin/bash
-
-while getopts ":g:" arg; do
-  case $arg in
-    g) galax=$OPTARG;;
-  esac
-done
-
-curdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QUEUE="cmb"
-NodeMem=273
-nCPU=32
-
-memPerCPU=$(echo "scale=2; $NodeMem*0.99 / $nCPU" | bc)
-#memPerCPU=$(echo "scale=2; 110.0 / $nCPU" | bc)
-# memPerCPU=10
-printf "Running ${nCPU} cores on ${QUEUE},\n using ${memPerCPU} GB per core.\n\n"
-
-addqueue --sbatch --requeue --serial -n "${nCPU}" -q "${QUEUE}" \
-    -m "${memPerCPU}" -c "genAper_${galax}" -g "CubeFit${galax}" \
-    -o "${curdir}/log.log" "${curdir}/kz_rio.sh"
-    # -o "${curdir}/log.log" "${curdir}/kz_run.sh"
-</file>
-
-<file path="mkdocs.yml">
-site_name: CubeFit
-theme:
-  name: material
-nav:
-  - Home: index.md
-  - CubeFit: CubeFit.md
-docs_dir: docs
 </file>
 
 <file path="plotting.py">
@@ -1077,1393 +892,6 @@ if __name__ == "__main__":
     main()
 </file>
 
-<file path="docs/CubeFit.html">
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
-<head>
-  <meta charset="utf-8" />
-  <meta name="generator" content="pandoc" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
-  <title>CubeFit</title>
-  <style>
-    html {
-      color: #1a1a1a;
-      background-color: #fdfdfd;
-    }
-    body {
-      margin: 0 auto;
-      max-width: 36em;
-      padding-left: 50px;
-      padding-right: 50px;
-      padding-top: 50px;
-      padding-bottom: 50px;
-      hyphens: auto;
-      overflow-wrap: break-word;
-      text-rendering: optimizeLegibility;
-      font-kerning: normal;
-    }
-    @media (max-width: 600px) {
-      body {
-        font-size: 0.9em;
-        padding: 12px;
-      }
-      h1 {
-        font-size: 1.8em;
-      }
-    }
-    @media print {
-      html {
-        background-color: white;
-      }
-      body {
-        background-color: transparent;
-        color: black;
-        font-size: 12pt;
-      }
-      p, h2, h3 {
-        orphans: 3;
-        widows: 3;
-      }
-      h2, h3, h4 {
-        page-break-after: avoid;
-      }
-    }
-    p {
-      margin: 1em 0;
-    }
-    a {
-      color: #1a1a1a;
-    }
-    a:visited {
-      color: #1a1a1a;
-    }
-    img {
-      max-width: 100%;
-    }
-    svg {
-      height: auto;
-      max-width: 100%;
-    }
-    h1, h2, h3, h4, h5, h6 {
-      margin-top: 1.4em;
-    }
-    h5, h6 {
-      font-size: 1em;
-      font-style: italic;
-    }
-    h6 {
-      font-weight: normal;
-    }
-    ol, ul {
-      padding-left: 1.7em;
-      margin-top: 1em;
-    }
-    li > ol, li > ul {
-      margin-top: 0;
-    }
-    blockquote {
-      margin: 1em 0 1em 1.7em;
-      padding-left: 1em;
-      border-left: 2px solid #e6e6e6;
-      color: #606060;
-    }
-    code {
-      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
-      font-size: 85%;
-      margin: 0;
-      hyphens: manual;
-    }
-    pre {
-      margin: 1em 0;
-      overflow: auto;
-    }
-    pre code {
-      padding: 0;
-      overflow: visible;
-      overflow-wrap: normal;
-    }
-    .sourceCode {
-     background-color: transparent;
-     overflow: visible;
-    }
-    hr {
-      background-color: #1a1a1a;
-      border: none;
-      height: 1px;
-      margin: 1em 0;
-    }
-    table {
-      margin: 1em 0;
-      border-collapse: collapse;
-      width: 100%;
-      overflow-x: auto;
-      display: block;
-      font-variant-numeric: lining-nums tabular-nums;
-    }
-    table caption {
-      margin-bottom: 0.75em;
-    }
-    tbody {
-      margin-top: 0.5em;
-      border-top: 1px solid #1a1a1a;
-      border-bottom: 1px solid #1a1a1a;
-    }
-    th {
-      border-top: 1px solid #1a1a1a;
-      padding: 0.25em 0.5em 0.25em 0.5em;
-    }
-    td {
-      padding: 0.125em 0.5em 0.25em 0.5em;
-    }
-    header {
-      margin-bottom: 4em;
-      text-align: center;
-    }
-    #TOC li {
-      list-style: none;
-    }
-    #TOC ul {
-      padding-left: 1.3em;
-    }
-    #TOC > ul {
-      padding-left: 0;
-    }
-    #TOC a:not(:hover) {
-      text-decoration: none;
-    }
-    code{white-space: pre-wrap;}
-    span.smallcaps{font-variant: small-caps;}
-    div.columns{display: flex; gap: min(4vw, 1.5em);}
-    div.column{flex: auto; overflow-x: auto;}
-    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
-    /* The extra [class] is a hack that increases specificity enough to
-       override a similar rule in reveal.js */
-    ul.task-list[class]{list-style: none;}
-    ul.task-list li input[type="checkbox"] {
-      font-size: inherit;
-      width: 0.8em;
-      margin: 0 0.8em 0.2em -1.6em;
-      vertical-align: middle;
-    }
-    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
-    /* CSS for syntax highlighting */
-    pre > code.sourceCode { white-space: pre; position: relative; }
-    pre > code.sourceCode > span { line-height: 1.25; }
-    pre > code.sourceCode > span:empty { height: 1.2em; }
-    .sourceCode { overflow: visible; }
-    code.sourceCode > span { color: inherit; text-decoration: inherit; }
-    div.sourceCode { margin: 1em 0; }
-    pre.sourceCode { margin: 0; }
-    @media screen {
-    div.sourceCode { overflow: auto; }
-    }
-    @media print {
-    pre > code.sourceCode { white-space: pre-wrap; }
-    pre > code.sourceCode > span { display: inline-block; text-indent: -5em; padding-left: 5em; }
-    }
-    pre.numberSource code
-      { counter-reset: source-line 0; }
-    pre.numberSource code > span
-      { position: relative; left: -4em; counter-increment: source-line; }
-    pre.numberSource code > span > a:first-child::before
-      { content: counter(source-line);
-        position: relative; left: -1em; text-align: right; vertical-align: baseline;
-        border: none; display: inline-block;
-        -webkit-touch-callout: none; -webkit-user-select: none;
-        -khtml-user-select: none; -moz-user-select: none;
-        -ms-user-select: none; user-select: none;
-        padding: 0 4px; width: 4em;
-        color: #aaaaaa;
-      }
-    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
-    div.sourceCode
-      {   }
-    @media screen {
-    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
-    }
-    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
-    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
-    code span.at { color: #7d9029; } /* Attribute */
-    code span.bn { color: #40a070; } /* BaseN */
-    code span.bu { color: #008000; } /* BuiltIn */
-    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
-    code span.ch { color: #4070a0; } /* Char */
-    code span.cn { color: #880000; } /* Constant */
-    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
-    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
-    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
-    code span.dt { color: #902000; } /* DataType */
-    code span.dv { color: #40a070; } /* DecVal */
-    code span.er { color: #ff0000; font-weight: bold; } /* Error */
-    code span.ex { } /* Extension */
-    code span.fl { color: #40a070; } /* Float */
-    code span.fu { color: #06287e; } /* Function */
-    code span.im { color: #008000; font-weight: bold; } /* Import */
-    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
-    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
-    code span.op { color: #666666; } /* Operator */
-    code span.ot { color: #007020; } /* Other */
-    code span.pp { color: #bc7a00; } /* Preprocessor */
-    code span.sc { color: #4070a0; } /* SpecialChar */
-    code span.ss { color: #bb6688; } /* SpecialString */
-    code span.st { color: #4070a0; } /* String */
-    code span.va { color: #19177c; } /* Variable */
-    code span.vs { color: #4070a0; } /* VerbatimString */
-    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
-  </style>
-</head>
-<body>
-<header id="title-block-header">
-<h1 class="title">CubeFit</h1>
-</header>
-<nav id="TOC" role="doc-toc">
-<ul>
-<li><a
-href="#cubefit--losvd-convolved-stellar-population-fitting-for-ifu-cubes"
-id="toc-cubefit--losvd-convolved-stellar-population-fitting-for-ifu-cubes">CubeFit
-— LOSVD-convolved stellar population fitting for IFU cubes</a>
-<ul>
-<li><a href="#hdf5-layout-what-lives-where"
-id="toc-hdf5-layout-what-lives-where">HDF5 layout (what lives
-where)</a></li>
-<li><a href="#manager-creating-and-populating-the-hdf5-backbone"
-id="toc-manager-creating-and-populating-the-hdf5-backbone">Manager:
-creating and populating the HDF5 backbone</a></li>
-<li><a href="#hypercube-builder" id="toc-hypercube-builder">Hypercube
-builder</a></li>
-<li><a href="#normalization-conversion-post-hoc"
-id="toc-normalization-conversion-post-hoc">Normalization conversion
-(post-hoc)</a></li>
-<li><a href="#λ-feature-emphasis-line-weights"
-id="toc-λ-feature-emphasis-line-weights">λ-feature emphasis (line
-weights)</a></li>
-<li><a
-href="#solver-multiprocess-batched-kaczmarz--weighted-nnls-polish"
-id="toc-solver-multiprocess-batched-kaczmarz--weighted-nnls-polish">Solver:
-multiprocess batched Kaczmarz (+ weighted NNLS polish)</a></li>
-<li><a href="#reconstruction--plots-without-storing-a-full-modelcube"
-id="toc-reconstruction--plots-without-storing-a-full-modelcube">Reconstruction
-&amp; plots (without storing a full ModelCube)</a></li>
-<li><a href="#fit-tracking--snapshots"
-id="toc-fit-tracking--snapshots">Fit tracking &amp; snapshots</a></li>
-<li><a href="#utilities" id="toc-utilities">Utilities</a></li>
-<li><a href="#environment-variables-knobs"
-id="toc-environment-variables-knobs">Environment variables (knobs)</a>
-<ul>
-<li><a href="#hdf5--dataset-caching" id="toc-hdf5--dataset-caching">HDF5
-&amp; dataset caching</a></li>
-<li><a href="#multiprocessing--blasopenmp"
-id="toc-multiprocessing--blasopenmp">Multiprocessing &amp;
-BLAS/OpenMP</a></li>
-<li><a
-href="#solver-worker-level-stability--steps-in-kaczmarz_solver_cchunk_mppy"
-id="toc-solver-worker-level-stability--steps-in-kaczmarz_solver_cchunk_mppy">Solver:
-worker-level stability &amp; steps (in
-<code>kaczmarz_solver_cchunk_mp.py</code>)</a></li>
-<li><a
-href="#solver-aggregation--nnls-polish-in-kaczmarz_solver_cchunk_mppy"
-id="toc-solver-aggregation--nnls-polish-in-kaczmarz_solver_cchunk_mppy">Solver:
-aggregation &amp; NNLS polish (in
-<code>kaczmarz_solver_cchunk_mp.py</code>)</a></li>
-<li><a
-href="#solver-λ-weights-in-kaczmarz_solver_cchunk_mppy--cube_utilspy"
-id="toc-solver-λ-weights-in-kaczmarz_solver_cchunk_mppy--cube_utilspy">Solver:
-λ-weights (in <code>kaczmarz_solver_cchunk_mp.py</code> /
-<code>cube_utils.py</code>)</a></li>
-<li><a href="#fit-tracking-in-fit_trackerpy"
-id="toc-fit-tracking-in-fit_trackerpy">Fit tracking (in
-<code>fit_tracker.py</code>)</a></li>
-</ul></li>
-<li><a href="#typical-end-to-end-workflow"
-id="toc-typical-end-to-end-workflow">Typical end-to-end
-workflow</a></li>
-<li><a href="#notes-on-normalization--physics"
-id="toc-notes-on-normalization--physics">Notes on normalization &amp;
-physics</a></li>
-<li><a href="#troubleshooting--sanity-checks"
-id="toc-troubleshooting--sanity-checks">Troubleshooting &amp; sanity
-checks</a></li>
-<li><a href="#where-to-look-in-the-code"
-id="toc-where-to-look-in-the-code">Where to look in the code</a></li>
-<li><a href="#building-the-docs" id="toc-building-the-docs">Building the
-docs</a></li>
-</ul></li>
-</ul>
-</nav>
-<h1
-id="cubefit--losvd-convolved-stellar-population-fitting-for-ifu-cubes">CubeFit
-— LOSVD-convolved stellar population fitting for IFU cubes</h1>
-<p>CubeFit builds a <strong>hypercube of convolved template
-spectra</strong> for every
-<code>(spaxel S, component C, population P)</code> and solves for a
-global, non-negative mixture that best explains the observed IFU data
-cube. It is designed for large datasets (10^3–10^5 spaxels, 10^2–10^3
-populations), is robust to restarts, and uses HDF5 end-to-end with
-streaming, tile-aligned I/O.</p>
-<ul>
-<li><strong>Hypercube builder:</strong> FFT-based LOSVD convolution on
-the template grid, followed by flux-conserving rebin to the observed
-grid.</li>
-<li><strong>Normalization:</strong> choose “model” (LOSVD amplitude) or
-“data” (per-spaxel observed flux with LOSVD-proportional splits).
-Convert between modes later without a rebuild.</li>
-<li><strong>Line emphasis:</strong> optional λ-weights so absorption
-features drive the fit.</li>
-<li><strong>Solver:</strong> multiprocess Kaczmarz with diagonal
-preconditioning, trust region, backtracking, global step caps, near-zero
-column freezing, optional de-correlation nudge, and a tile-local
-<strong>weighted NNLS polish</strong>.</li>
-<li><strong>Tracking:</strong> streaming fit metrics and optional
-snapshots to a SWMR-friendly sidecar.</li>
-<li><strong>Utilities:</strong> chunk-aware normalization conversion;
-global column energy; reconstruction and plotting helpers that never
-touch the giant <code>/HyperCube/models</code> unless needed.</li>
-</ul>
-<hr />
-<h2 id="hdf5-layout-what-lives-where">HDF5 layout (what lives
-where)</h2>
-<p>Core inputs:</p>
-<ul>
-<li><code>/Templates</code> — <code>(P, T)</code> template spectra on
-the template grid (time domain).</li>
-<li><code>/TemPix</code> — <code>(T,)</code> template grid in log-λ
-(natural log).</li>
-<li><code>/ObsPix</code> — <code>(L,)</code> observed wavelength grid
-(log-λ).</li>
-<li><code>/R_T</code> — <code>(T, L)</code> (or <code>(L, T)</code>)
-<strong>flux-conserving</strong> linear rebin operator mapping the
-template grid to the observed grid.</li>
-<li><code>/LOSVD</code> — <code>(S, V, C)</code> LOSVD histograms (per
-spaxel and component).</li>
-<li><code>/VelPix</code> — <code>(V,)</code> velocity grid in km/s (for
-LOSVD).</li>
-</ul>
-<p>Optional inputs:</p>
-<ul>
-<li><code>/Mask</code> — <code>(L,)</code> boolean wavelength mask; used
-consistently by builder and solver.</li>
-<li><code>/HyperCube/data_flux</code> — <code>(S,)</code> masked mean
-data flux per spaxel (required for <code>norm="data"</code>).</li>
-</ul>
-<p>Built artifacts:</p>
-<ul>
-<li><code>/HyperCube/models</code> — <code>(S, C, P, L)</code> float32
-convolved+rebinned spectra, chunked for streaming and resumable via a
-<code>_done</code> bitmap.</li>
-<li><code>/HyperCube/col_energy</code> — <code>(C, P)</code> float64
-global column energy <code>E[c,p] = Σ_{s,λ in mask} A^2</code>, for
-step-size control.</li>
-<li><code>/HyperCube/norm/losvd_amp</code> — <code>(S, C)</code> LOSVD
-amplitude (sum or trapz).</li>
-<li><code>/HyperCube/norm/losvd_amp_sum</code> — <code>(S,)</code>
-per-spaxel sum of amplitudes.</li>
-<li><code>/HyperCube/lambda_weights</code> — <code>(L,)</code> optional
-λ-weights in <code>[floor, 1]</code> (generated by a median-DoG
-heuristic).</li>
-</ul>
-<p>Fit outputs:</p>
-<ul>
-<li><code>/X_global</code> — <code>(C*P,)</code> solution vector,
-row-major <code>(C, P)</code> flattened.</li>
-</ul>
-<hr />
-<h2 id="manager-creating-and-populating-the-hdf5-backbone">Manager:
-creating and populating the HDF5 backbone</h2>
-<p><code>hdf5_manager.py</code> provides:</p>
-<ul>
-<li><strong>Safe file open</strong> with retries, optional SWMR, and
-lock-handling (<code>open_h5</code>).</li>
-<li><strong>Dataset creation</strong> for the core arrays and dimensions
-(<code>H5Manager</code> + <code>H5Dims</code>).</li>
-<li><strong>Population</strong> from NumPy arrays
-(<code>populate_from_arrays</code>), including grid checks.</li>
-<li><strong>Flux-conserving rebin</strong> operator construction
-(<code>ensure_rebin_and_resample</code>).</li>
-</ul>
-<p>Typical setup:</p>
-<div class="sourceCode" id="cb1"><pre
-class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.hdf5_manager <span class="im">import</span> H5Manager, H5Dims</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>mgr <span class="op">=</span> H5Manager(<span class="st">&quot;galaxy.h5&quot;</span>, tem_pix<span class="op">=</span>tem_loglam, obs_pix<span class="op">=</span>obs_loglam)</span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>mgr.init_base(H5Dims(nSpat<span class="op">=</span>S, nLSpec<span class="op">=</span>L, nTSpec<span class="op">=</span>T, nVel<span class="op">=</span>V, nComp<span class="op">=</span>C, nPop<span class="op">=</span>P))</span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>mgr.populate_from_arrays(losvd<span class="op">=</span>H_SVC, datacube<span class="op">=</span>Y_SL, templates<span class="op">=</span>T_PT)</span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>mgr.ensure_rebin_and_resample()  <span class="co"># builds /R_T (and validates shapes)</span></span></code></pre></div>
-<p>Notes:</p>
-<ul>
-<li><code>/R_T</code> is built by exact bin overlap in log-λ, preserving
-flux.</li>
-<li><code>/Mask</code> (if present) is used later by both builder and
-solver.</li>
-<li>Manager helpers centralize chunk-cache setup so downstream is
-fast.</li>
-</ul>
-<hr />
-<h2 id="hypercube-builder">Hypercube builder</h2>
-<p><code>hypercube_builder.py</code> constructs
-<code>/HyperCube/models</code> in streaming, tile-aligned passes:</p>
-<ol type="1">
-<li><strong>Kernel from LOSVD:</strong> each <code>(s,c)</code> LOSVD
-row → <strong>unit-area</strong> kernel on the template grid (linear
-interpolation to integer pixel shifts). A separate scalar
-<strong>amplitude</strong> is computed per <code>(s,c)</code> (either
-sum or trapezoidal integral).</li>
-<li><strong>Convolution (per p):</strong> FFT-multiply template by
-kernel and crop the linear convolution back to the template length.</li>
-<li><strong>Rebin to observed grid:</strong> multiply by
-<code>/R_T</code> to get <code>(P, L)</code> for each
-<code>(s,c)</code>.</li>
-<li><strong>Normalization:</strong>
-<ul>
-<li><code>norm="model"</code>: multiply each <code>(s,c,p,:)</code> by
-its LOSVD amplitude.</li>
-<li><code>norm="data"</code>: compute per-spaxel mean observed flux
-(from <code>/HyperCube/data_flux</code>), then split across components
-in proportion to their LOSVD amplitudes, preserving the (c) ratios
-determined by LOSVD at that spaxel.</li>
-</ul></li>
-<li><strong>Global column energy:</strong> simultaneously accumulate
-<code>E[c,p]=Σ_{s,λ in mask} A²</code> into
-<code>/HyperCube/col_energy</code> for solver preconditioning.</li>
-</ol>
-<p><strong>Resumability &amp; chunking:</strong> the builder creates
-<code>/HyperCube/models</code> with chunks
-<code>(S_chunk, C_chunk, P_chunk, L)</code> and maintains a
-<code>_done</code> bitmap over the
-<code>(S_chunk, C_chunk, P_chunk)</code> tile grid; this lets you resume
-safely or inspect progress mid-build. Metadata is flushed regularly.</p>
-<hr />
-<h2 id="normalization-conversion-post-hoc">Normalization conversion
-(post-hoc)</h2>
-<p>Flip between <code>norm="data"</code> and <code>norm="model"</code>
-after the build:</p>
-<div class="sourceCode" id="cb2"><pre
-class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.hypercube_builder <span class="im">import</span> convert_hypercube_norm</span>
-<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>convert_hypercube_norm(<span class="st">&quot;galaxy.h5&quot;</span>, to_mode<span class="op">=</span><span class="st">&quot;model&quot;</span>, recompute_energy<span class="op">=</span><span class="va">True</span>)</span></code></pre></div>
-<p>This reads <code>/HyperCube/norm/losvd_amp_sum</code> (and
-<code>/HyperCube/data_flux</code> when needed), computes a
-<strong>per-spaxel scalar</strong> <code>F[s]</code>, and scales
-<code>/HyperCube/models[s,:,:,:] *= F[s]</code> in
-<strong>S-tiles</strong> (chunk-aligned). It updates
-<code>/HyperCube/col_energy</code> (optional) and flips the
-<code>/HyperCube</code> attribute <code>norm.mode</code>. It also
-respects <code>/Mask</code> when deriving or validating the spaxel flux
-vector.</p>
-<p>This is a safe, <strong>no-FFT</strong> operation. Use it to avoid
-rebuilding the hypercube when only a normalization flip is required.</p>
-<hr />
-<h2 id="λ-feature-emphasis-line-weights">λ-feature emphasis (line
-weights)</h2>
-<p>Absorption features can be down-weighted in plain least squares. To
-emphasize them, the solver supports <strong>λ-weights</strong>:</p>
-<ul>
-<li>Build weights once via a <strong>median spectrum</strong> and a
-two-scale smoothing <strong>difference-of-Gaussians</strong>
-(implemented with boxcars), then map to <code>[min_w, 1]</code>. Store
-at <code>/HyperCube/lambda_weights</code>.</li>
-<li>During solving, multiply both <strong>residuals</strong> and
-<strong>design matrix columns</strong> by <code>sqrt(w)</code> —
-equivalent to solving in a diagonal metric where line pixels matter
-more.</li>
-</ul>
-<p>Helpers in <code>cube_utils.py</code>:</p>
-<div class="sourceCode" id="cb3"><pre
-class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.cube_utils <span class="im">import</span> ensure_lambda_weights, read_lambda_weights</span>
-<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>w <span class="op">=</span> ensure_lambda_weights(<span class="st">&quot;galaxy.h5&quot;</span>)  <span class="co"># writes /HyperCube/lambda_weights</span></span>
-<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>w2 <span class="op">=</span> read_lambda_weights(<span class="st">&quot;galaxy.h5&quot;</span>)   <span class="co"># reads, with floor &amp; mask handling</span></span></code></pre></div>
-<p>At solver startup you’ll see a banner printing
-<code>min/max/mean</code> of the λ-weights used (after masking).</p>
-<hr />
-<h2
-id="solver-multiprocess-batched-kaczmarz--weighted-nnls-polish">Solver:
-multiprocess batched Kaczmarz (+ weighted NNLS polish)</h2>
-<p>Entry point:</p>
-<div class="sourceCode" id="cb4"><pre
-class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.pipeline_runner <span class="im">import</span> PipelineRunner</span>
-<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>runner <span class="op">=</span> PipelineRunner(<span class="st">&quot;galaxy.h5&quot;</span>)</span>
-<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>x_global, stats <span class="op">=</span> runner.solve_all_mp_batched(</span>
-<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    epochs<span class="op">=</span>E,</span>
-<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    pixels_per_aperture<span class="op">=</span>...,            <span class="co"># row batching (if used)</span></span>
-<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    lr<span class="op">=</span>...,                             <span class="co"># base learning-rate</span></span>
-<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    project_nonneg<span class="op">=</span><span class="va">True</span>,                <span class="co"># x &gt;= 0</span></span>
-<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    processes<span class="op">=</span>..., blas_threads<span class="op">=</span>...,    <span class="co"># MP and BLAS knobs</span></span>
-<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    orbit_weights<span class="op">=</span>...,                  <span class="co"># optional (C,) ratio guidance</span></span>
-<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="co"># …other optional arguments…</span></span>
-<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
-<p>High-level flow (<code>pipeline_runner.py</code> →
-<code>kaczmarz_solver_cchunk_mp.py</code>):</p>
-<ol type="1">
-<li><strong>Tile scheduling:</strong> sort S-tiles by data norm (coarse
-“hardest first” ordering).</li>
-<li><strong>Workers:</strong> each process takes a contiguous
-<strong>c-band</strong> for the active S-tile.</li>
-<li><strong>Inside a worker (per band):</strong>
-<ul>
-<li><strong>Sanitize</strong> non-finite values in <code>A</code> and
-<code>R</code> to zeros.</li>
-<li><strong>Apply λ-weights</strong> by computing gradients and
-denominators on <code>√w · A</code> and <code>√w · R</code> (but updates
-and residuals are returned in the unweighted space).</li>
-<li><strong>Diagonal preconditioning:</strong> per-population step
-<code>dx_p ∝ g_p / Σ (A_w)^2</code>, blended with global column energy
-<code>E[c,p]</code> for stability.</li>
-<li><strong>Near-zero column freeze</strong> (relative &amp; absolute
-thresholds).</li>
-<li><strong>Trust region</strong> on ΔR in weighted space
-(<code>||ΔR_w|| ≤ τ ||R_w||</code>) + <strong>backtracking</strong> for
-monotone weighted RMSE drop.</li>
-<li><strong>Optional de-correlation nudge</strong> to avoid chasing flat
-null-space directions across <code>P</code>.</li>
-<li><strong>Candidate set</strong> for <strong>tile-local weighted NNLS
-polish</strong> (top-K by score).</li>
-</ul></li>
-<li><strong>Parent process:</strong>
-<ul>
-<li>Aggregates ΔR over bands and runs <strong>tile-level
-backtracking</strong>.</li>
-<li>Applies a <strong>global step cap</strong> using
-<code>Σ dx² · E[c,p]</code> vs. <code>||Y||</code>.</li>
-<li>Optionally runs <strong>NNLS polish</strong> on the proposed (c,p)
-set using a λ-subsample (rows) and accepts only if it reduces
-<strong>weighted RMSE</strong> enough.</li>
-<li>Commits the single global α for the tile: update <code>R</code> and
-<code>x</code>, enforce <code>x ≥ 0</code>.</li>
-<li>Optional <strong>ratio penalty</strong> step nudges the component
-totals toward <code>orbit_weights</code> (if provided).</li>
-<li>Streams metrics to <code>FitTracker</code> and snapshots
-(optional).</li>
-</ul></li>
-</ol>
-<p>The result is written to <code>/X_global</code> (flattened
-<code>(C*P,)</code>), along with run stats.</p>
-<hr />
-<h2
-id="reconstruction--plots-without-storing-a-full-modelcube">Reconstruction
-&amp; plots (without storing a full ModelCube)</h2>
-<p>You can reconstruct <code>Ŷ = A·x</code> for diagnostics without
-materializing a full <code>/ModelCube</code>:</p>
-<ul>
-<li><strong>Reconstruction utilities</strong> read <code>A</code> in the
-same chunk order and contract against <code>x</code> in λ-bands. They
-write a small target array you name (e.g., <code>/ReconTile</code>) or
-return the result.</li>
-<li><strong>Parallel spectral plots</strong> pull just the selected rows
-from <code>/DataCube</code> and the reconstructed array and produce
-side-by-side data/model spectral plots for worst/best spaxels.</li>
-</ul>
-<p>Both are tile-aligned and cache-aware; they never read
-<code>/HyperCube/models</code> beyond the needed slices.</p>
-<hr />
-<h2 id="fit-tracking--snapshots">Fit tracking &amp; snapshots</h2>
-<p><code>fit_tracker.py</code> provides a <strong>non-blocking</strong>
-sidecar writer process:</p>
-<ul>
-<li>Destination: a sidecar H5 next to the main file
-(<code>*.fit.&lt;pid&gt;.&lt;ts&gt;.h5</code>).</li>
-<li>Bounded <code>mp.Queue</code> so the solver never blocks on
-I/O.</li>
-<li>SWMR enabled for dashboards.</li>
-<li>Streams <strong>RMSE history</strong>, <strong>EWMA</strong>,
-<strong>progress</strong>, and optional <strong>x snapshots</strong>
-(best/last/history).</li>
-</ul>
-<p>Use <code>tracker=FitTracker(...)</code> in the solver; the runner
-wires this up for you.</p>
-<hr />
-<h2 id="utilities">Utilities</h2>
-<ul>
-<li><strong>Normalization conversion:</strong>
-<code>convert_hypercube_norm(h5, to_mode="model"|"data", recompute_energy=True)</code>
-— chunk-aligned, mask-aware.</li>
-<li><strong>Global column energy:</strong> created during build; can be
-recomputed later if you changed normalization.</li>
-<li><strong>Done-bitmap control:</strong> functions to inspect and
-invalidate <code>_done</code> to resume or redo specific tiles.</li>
-<li><strong>Recompression:</strong> rewrite
-<code>/HyperCube/models</code> with different compression/filter options
-(tile-wise copy).</li>
-</ul>
-<hr />
-<h2 id="environment-variables-knobs">Environment variables (knobs)</h2>
-<p>These can be exported to tune performance, stability, or behavior.
-Defaults shown are what the code uses if you don’t set them.</p>
-<h3 id="hdf5--dataset-caching">HDF5 &amp; dataset caching</h3>
-<table>
-<thead>
-<tr class="header">
-<th>Variable</th>
-<th style="text-align: right;">Default</th>
-<th>Purpose</th>
-</tr>
-</thead>
-<tbody>
-<tr class="odd">
-<td><code>HDF5_USE_FILE_LOCKING</code></td>
-<td style="text-align: right;"><code>FALSE</code></td>
-<td>Avoid HDF5 file locking issues on shared filesystems.</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_RDCC_NSLOTS</code></td>
-<td style="text-align: right;"><code>400003</code></td>
-<td>File-level raw chunk cache: number of slots.</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_RDCC_NBYTES</code></td>
-<td style="text-align: right;"><code>4294967296</code> (4 GiB)</td>
-<td>File-level raw chunk cache size in bytes.</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_RDCC_W0</code></td>
-<td style="text-align: right;"><code>0.9</code></td>
-<td>File-level raw chunk cache preemption policy.</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_RDCC_SLOTS</code></td>
-<td style="text-align: right;"><code>1000003</code></td>
-<td>Per-dataset cache slots used by some readers.</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_RDCC_BYTES</code></td>
-<td style="text-align: right;"><code>268435456</code> (256 MiB)</td>
-<td>Per-dataset cache size used by some readers.</td>
-</tr>
-</tbody>
-</table>
-<h3 id="multiprocessing--blasopenmp">Multiprocessing &amp;
-BLAS/OpenMP</h3>
-<table>
-<thead>
-<tr class="header">
-<th>Variable</th>
-<th style="text-align: right;">Default</th>
-<th>Purpose</th>
-</tr>
-</thead>
-<tbody>
-<tr class="odd">
-<td><code>CUBEFIT_MP_CTX</code></td>
-<td style="text-align: right;"><code>forkserver</code> (fallback
-<code>spawn</code>)</td>
-<td>MP start method for the solver pool.</td>
-</tr>
-<tr class="even">
-<td><code>OMP_NUM_THREADS</code></td>
-<td style="text-align: right;">set by code</td>
-<td>BLAS/OpenMP threads per worker (also
-<code>OPENBLAS_NUM_THREADS</code>, <code>MKL_NUM_THREADS</code>).</td>
-</tr>
-<tr class="odd">
-<td><code>KMP_INIT_AT_FORK</code></td>
-<td style="text-align: right;"><code>FALSE</code></td>
-<td>Avoid OpenMP deadlocks with <code>fork</code>.</td>
-</tr>
-<tr class="even">
-<td><code>SLURM_CPUS_PER_TASK</code></td>
-<td style="text-align: right;">(if present)</td>
-<td>Used by reconstruction helpers to set BLAS threads.</td>
-</tr>
-<tr class="odd">
-<td><code>PYTHONUNBUFFERED</code></td>
-<td style="text-align: right;"><code>1</code> (recommended)</td>
-<td>Unbuffered stdout for real-time logs on HPC.</td>
-</tr>
-</tbody>
-</table>
-<h3
-id="solver-worker-level-stability--steps-in-kaczmarz_solver_cchunk_mppy">Solver:
-worker-level stability &amp; steps (in
-<code>kaczmarz_solver_cchunk_mp.py</code>)</h3>
-<table>
-<thead>
-<tr class="header">
-<th>Variable</th>
-<th style="text-align: right;">Default</th>
-<th>Purpose</th>
-</tr>
-</thead>
-<tbody>
-<tr class="odd">
-<td><code>CUBEFIT_BT_STEPS</code></td>
-<td style="text-align: right;"><code>3</code></td>
-<td>Backtracking steps per band (worker) for monotone weighted
-RMSE.</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_BT_FACTOR</code></td>
-<td style="text-align: right;"><code>0.5</code></td>
-<td>Multiplicative α shrink in backtracking.</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_TRUST_TAU</code></td>
-<td style="text-align: right;"><code>0.7</code></td>
-<td>Trust-region cap: `</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_EPS</code></td>
-<td style="text-align: right;"><code>1e-12</code></td>
-<td>Numerical floor in denominators and divisions.</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_ZERO_COL_REL</code></td>
-<td style="text-align: right;"><code>1e-12</code></td>
-<td>Relative threshold (vs median energy) to <strong>freeze</strong>
-near-zero columns.</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_ZERO_COL_ABS</code></td>
-<td style="text-align: right;"><code>1e-24</code></td>
-<td>Absolute threshold to <strong>freeze</strong> columns.</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_DEBUG_SAFE</code></td>
-<td style="text-align: right;"><code>0</code></td>
-<td>Print sanitization/freeze stats per tile if <code>1</code>.</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_NNLS_PROP_PER_BAND</code></td>
-<td style="text-align: right;"><code>6</code></td>
-<td>How many (c,p) candidates to propose for NNLS polish per band.</td>
-</tr>
-</tbody>
-</table>
-<h3
-id="solver-aggregation--nnls-polish-in-kaczmarz_solver_cchunk_mppy">Solver:
-aggregation &amp; NNLS polish (in
-<code>kaczmarz_solver_cchunk_mp.py</code>)</h3>
-<table>
-<thead>
-<tr class="header">
-<th>Variable</th>
-<th style="text-align: right;">Default</th>
-<th>Purpose</th>
-</tr>
-</thead>
-<tbody>
-<tr class="odd">
-<td><code>CUBEFIT_TILE_BT_STEPS</code></td>
-<td style="text-align: right;"><code>6</code></td>
-<td>Backtracking steps for the <strong>aggregated</strong> ΔR across
-bands.</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_TILE_BT_FACTOR</code></td>
-<td style="text-align: right;"><code>0.5</code></td>
-<td>Aggregated α shrink factor.</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_GLOBAL_TAU</code></td>
-<td style="text-align: right;"><code>0.5</code></td>
-<td>Global step cap using <code>Σ dx²·E[c,p]</code> vs `</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_GLOBAL_ENERGY_BLEND</code></td>
-<td style="text-align: right;"><code>1e-3</code></td>
-<td>Blend local <code>Σ(A_w)^2</code> with global column energy
-<code>E[c,p]</code> in denominators.</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_NNLS_ENABLE</code></td>
-<td style="text-align: right;"><code>1</code></td>
-<td>Enable tile-local <strong>weighted</strong> NNLS polish.</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_NNLS_EVERY</code></td>
-<td style="text-align: right;"><code>1</code></td>
-<td>Run NNLS polish every N tiles.</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_NNLS_MAX_COLS</code></td>
-<td style="text-align: right;"><code>128</code></td>
-<td>Max columns K in the NNLS system.</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_NNLS_MAX_BYTES</code></td>
-<td style="text-align: right;"><code>1000000000</code></td>
-<td>Approx memory cap for NNLS system (rows×8 per column).</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_NNLS_SUB_L</code></td>
-<td style="text-align: right;"><code>0</code></td>
-<td>λ-subsample size for NNLS (0 → use all).</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_NNLS_SOLVER</code></td>
-<td style="text-align: right;"><code>nnls</code></td>
-<td>One of <code>nnls</code>, <code>lsq</code>, <code>mu</code>,
-<code>fista</code> (FISTA recommended for speed/accuracy).</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_NNLS_MAX_ITER</code></td>
-<td style="text-align: right;"><code>50</code></td>
-<td>Iteration cap for iterative NNLS (<code>mu</code>,
-<code>fista</code>, <code>lsq</code>’s TRF).</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_NNLS_MIN_IMPROVE</code></td>
-<td style="text-align: right;"><code>0.999</code></td>
-<td>Required weighted-RMSE ratio to accept polish (&lt; this
-accepts).</td>
-</tr>
-</tbody>
-</table>
-<h3
-id="solver-λ-weights-in-kaczmarz_solver_cchunk_mppy--cube_utilspy">Solver:
-λ-weights (in <code>kaczmarz_solver_cchunk_mp.py</code> /
-<code>cube_utils.py</code>)</h3>
-<table>
-<thead>
-<tr class="header">
-<th>Variable</th>
-<th style="text-align: right;">Default</th>
-<th>Purpose</th>
-</tr>
-</thead>
-<tbody>
-<tr class="odd">
-<td><code>CUBEFIT_LAMBDA_WEIGHTS_ENABLE</code></td>
-<td style="text-align: right;"><code>1</code></td>
-<td>Enable λ-weights for solver (<code>√w</code> weighting).</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_LAMBDA_WEIGHTS_DSET</code></td>
-<td
-style="text-align: right;"><code>/HyperCube/lambda_weights</code></td>
-<td>Dataset to read.</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_LAMBDA_MIN_W</code></td>
-<td style="text-align: right;"><code>1e-6</code></td>
-<td>Floor on λ-weights; protects √w.</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_LAMBDA_WEIGHTS_AUTO</code></td>
-<td style="text-align: right;"><code>1</code></td>
-<td>Auto-generate weights if missing.</td>
-</tr>
-</tbody>
-</table>
-<h3 id="fit-tracking-in-fit_trackerpy">Fit tracking (in
-<code>fit_tracker.py</code>)</h3>
-<table>
-<thead>
-<tr class="header">
-<th>Variable</th>
-<th style="text-align: right;">Default</th>
-<th>Purpose</th>
-</tr>
-</thead>
-<tbody>
-<tr class="odd">
-<td><code>FITTRACKER_START</code></td>
-<td style="text-align: right;"><code>spawn</code> (or best
-available)</td>
-<td>Start method for the tracker process
-(<code>spawn</code>/<code>forkserver</code>/<code>fork</code>).</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_TRACKER_QSIZE</code></td>
-<td style="text-align: right;"><code>8192</code></td>
-<td>Max queue size; drops messages when full if non-blocking.</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_TRACKER_FLUSH_EVERY</code></td>
-<td style="text-align: right;"><code>128</code></td>
-<td>Flush to disk after this many messages.</td>
-</tr>
-<tr class="even">
-<td><code>CUBEFIT_TRACKER_FLUSH_SEC</code></td>
-<td style="text-align: right;"><code>5.0</code></td>
-<td>Or flush if this many seconds have passed.</td>
-</tr>
-<tr class="odd">
-<td><code>CUBEFIT_RMSE_STRIDE</code></td>
-<td style="text-align: right;"><code>16</code></td>
-<td>Only enqueue every Nth batch RMSE sample (sub-sampling).</td>
-</tr>
-</tbody>
-</table>
-<hr />
-<h2 id="typical-end-to-end-workflow">Typical end-to-end workflow</h2>
-<div class="sourceCode" id="cb5"><pre
-class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1) Build HDF5 backbone &amp; rebin operator</span></span>
-<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>mgr <span class="op">=</span> H5Manager(<span class="st">&quot;galaxy.h5&quot;</span>, tem_pix<span class="op">=</span>tem_loglam, obs_pix<span class="op">=</span>obs_loglam)</span>
-<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>mgr.init_base(H5Dims(nSpat<span class="op">=</span>S, nLSpec<span class="op">=</span>L, nTSpec<span class="op">=</span>T, nVel<span class="op">=</span>V, nComp<span class="op">=</span>C, nPop<span class="op">=</span>P))</span>
-<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>mgr.populate_from_arrays(losvd<span class="op">=</span>H_SVC, datacube<span class="op">=</span>Y_SL, templates<span class="op">=</span>T_PT)</span>
-<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>mgr.ensure_rebin_and_resample()</span>
-<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 2) Build hypercube</span></span>
-<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.hypercube_builder <span class="im">import</span> build_hypercube</span>
-<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>build_hypercube(<span class="st">&quot;galaxy.h5&quot;</span>, norm_mode<span class="op">=</span><span class="st">&quot;data&quot;</span>)  <span class="co"># or &quot;model&quot;</span></span>
-<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="co"># (Optional) Flip normalization later without rebuild</span></span>
-<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.hypercube_builder <span class="im">import</span> convert_hypercube_norm</span>
-<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>convert_hypercube_norm(<span class="st">&quot;galaxy.h5&quot;</span>, to_mode<span class="op">=</span><span class="st">&quot;model&quot;</span>, recompute_energy<span class="op">=</span><span class="va">True</span>)</span>
-<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 3) Create λ-weights</span></span>
-<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.cube_utils <span class="im">import</span> ensure_lambda_weights</span>
-<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>ensure_lambda_weights(<span class="st">&quot;galaxy.h5&quot;</span>)</span>
-<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="co"># 4) Solve</span></span>
-<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.pipeline_runner <span class="im">import</span> PipelineRunner</span>
-<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>runner <span class="op">=</span> PipelineRunner(<span class="st">&quot;galaxy.h5&quot;</span>)</span>
-<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>x, stats <span class="op">=</span> runner.solve_all_mp_batched(</span>
-<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>    epochs<span class="op">=</span><span class="dv">6</span>, lr<span class="op">=</span><span class="fl">0.6</span>, project_nonneg<span class="op">=</span><span class="va">True</span>, processes<span class="op">=</span><span class="dv">8</span>, blas_threads<span class="op">=</span><span class="dv">2</span>,</span>
-<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>    orbit_weights<span class="op">=</span>orbit_w  <span class="co"># optional (C,)</span></span>
-<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
-<hr />
-<h2 id="notes-on-normalization--physics">Notes on normalization &amp;
-physics</h2>
-<ul>
-<li><code>norm="model"</code> keeps each <code>(s,c)</code> model’s
-scale proportional to the LOSVD amplitude — closest to “physical
-mass/flux” carried by LOSVD at that spaxel.</li>
-<li><code>norm="data"</code> ties the per-spaxel model sum to the
-observed mean flux (masked), splitting across components in proportion
-to LOSVD amplitudes. This is convenient for direct data-scale
-comparisons but can blur absolute differences across datasets. You can
-switch modes post-hoc with <code>convert_hypercube_norm</code>.</li>
-</ul>
-<p>The solver respects <code>/Mask</code> and λ-weights uniformly, so
-<strong>absorption features</strong> can dominate the fit when λ-weights
-are present (verify the printed min/max/mean at startup to ensure they
-are not all ones).</p>
-<hr />
-<h2 id="troubleshooting--sanity-checks">Troubleshooting &amp; sanity
-checks</h2>
-<ul>
-<li><strong>Hypercube completeness:</strong> use the <code>_done</code>
-bitmap helpers to inspect or reset tiles if needed.</li>
-<li><strong>Normalization flips:</strong> use
-<code>convert_hypercube_norm</code> (streams in S-tiles and handles
-<code>/Mask</code>); do <strong>not</strong> read the entire dataset
-into RAM.</li>
-<li><strong>Line weights:</strong> ensure
-<code>/HyperCube/lambda_weights</code> exists and spans a range (e.g.,
-min ≪ 1, max ≈ 1); the solver prints min/max/mean.</li>
-<li><strong>Population mixture looks uniform across components:</strong>
-<ul>
-<li>Confirm λ-weights are applied (banner shows they’re not all 1).</li>
-<li>Increase epochs modestly; keep <code>GLOBAL_ENERGY_BLEND</code>
-small but nonzero.</li>
-<li>Enable NNLS polish with a moderate
-<code>CUBEFIT_NNLS_MAX_COLS</code>, a λ-subsample
-(<code>CUBEFIT_NNLS_SUB_L</code>), and
-<code>CUBEFIT_NNLS_SOLVER=fista</code> for sharper per-tile
-updates.</li>
-</ul></li>
-</ul>
-<hr />
-<h2 id="where-to-look-in-the-code">Where to look in the code</h2>
-<ul>
-<li><strong>HDF5 backbone:</strong> <code>hdf5_manager.py</code> (safe
-open, grids, rebin operator).</li>
-<li><strong>Builder:</strong> <code>hypercube_builder.py</code> (FFT
-conv, normalization, col_energy, chunking + resume).</li>
-<li><strong>Solver:</strong> <code>kaczmarz_solver_cchunk_mp.py</code>
-(MP loop, λ-weights, trust/backtracking, NNLS polish).</li>
-<li><strong>Runner:</strong> <code>pipeline_runner.py</code>
-(orchestration, tracking, <code>/X_global</code>).</li>
-<li><strong>Tracking:</strong> <code>fit_tracker.py</code> (sidecar
-writer, RMSE history, progress, snapshots).</li>
-<li><strong>Recon/plots:</strong> utilities in
-<code>kz_fitSpec.py</code> (tile-aligned recon) and safe plotting
-helpers.</li>
-</ul>
-<hr />
-<h2 id="building-the-docs">Building the docs</h2>
-<p>Place this file at <code>docs/CubeFit.md</code> and run:</p>
-<div class="sourceCode" id="cb6"><pre
-class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span>            <span class="co"># builds docs/CubeFit.html and docs/CubeFit.pdf via pandoc</span></span>
-<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkdocs</span> serve    <span class="co"># live preview with Material theme (served from docs/)</span></span></code></pre></div>
-<p>Pandoc targets (from your Makefile):</p>
-<ul>
-<li><code>docs/CubeFit.html</code> via:<br />
-<code>pandoc -s -f gfm -t html5 docs/CubeFit.md -o docs/CubeFit.html --metadata title="CubeFit" --toc</code></li>
-<li><code>docs/CubeFit.pdf</code> via XeLaTeX:<br />
-<code>pandoc -s -f gfm docs/CubeFit.md -o docs/CubeFit.pdf --pdf-engine=xelatex -V geometry:margin=1in -V mainfont="Latin Modern Roman" -V monofont="Latin Modern Mono" --toc</code></li>
-</ul>
-<p>MkDocs (from your <code>mkdocs.yml</code>):</p>
-<div class="sourceCode" id="cb7"><pre
-class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">site_name</span><span class="kw">:</span><span class="at"> CubeFit</span></span>
-<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">theme</span><span class="kw">:</span></span>
-<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> material</span></span>
-<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="fu">nav</span><span class="kw">:</span></span>
-<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">Home</span><span class="kw">:</span><span class="at"> index.md</span></span>
-<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">CubeFit</span><span class="kw">:</span><span class="at"> CubeFit.md</span></span>
-<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="fu">docs_dir</span><span class="kw">:</span><span class="at"> docs</span></span></code></pre></div>
-</body>
-</html>
-</file>
-
-<file path="docs/CubeFit.md">
-# CubeFit — LOSVD-convolved stellar population fitting for IFU cubes
-
-CubeFit builds a **hypercube of convolved template spectra** for every `(spaxel S, component C, population P)` and solves for a global, non-negative mixture that best explains the observed IFU data cube. It is designed for large datasets (10^3–10^5 spaxels, 10^2–10^3 populations), is robust to restarts, and uses HDF5 end-to-end with streaming, tile-aligned I/O.
-
-- **Hypercube builder:** FFT-based LOSVD convolution on the template grid, followed by flux-conserving rebin to the observed grid.
-- **Normalization:** choose “model” (LOSVD amplitude) or “data” (per-spaxel observed flux with LOSVD-proportional splits). Convert between modes later without a rebuild.
-- **Line emphasis:** optional λ-weights so absorption features drive the fit.
-- **Solver:** multiprocess Kaczmarz with diagonal preconditioning, trust region, backtracking, global step caps, near-zero column freezing, optional de-correlation nudge, and a tile-local **weighted NNLS polish**.
-- **Tracking:** streaming fit metrics and optional snapshots to a SWMR-friendly sidecar.
-- **Utilities:** chunk-aware normalization conversion; global column energy; reconstruction and plotting helpers that never touch the giant `/HyperCube/models` unless needed.
-
----
-
-## HDF5 layout (what lives where)
-
-Core inputs:
-
-- `/Templates` — `(P, T)` template spectra on the template grid (time domain).
-- `/TemPix` — `(T,)` template grid in log-λ (natural log).
-- `/ObsPix` — `(L,)` observed wavelength grid (log-λ).
-- `/R_T` — `(T, L)` (or `(L, T)`) **flux-conserving** linear rebin operator mapping the template grid to the observed grid.
-- `/LOSVD` — `(S, V, C)` LOSVD histograms (per spaxel and component).
-- `/VelPix` — `(V,)` velocity grid in km/s (for LOSVD).
-
-Optional inputs:
-
-- `/Mask` — `(L,)` boolean wavelength mask; used consistently by builder and solver.
-- `/HyperCube/data_flux` — `(S,)` masked mean data flux per spaxel (required for `norm="data"`).
-
-Built artifacts:
-
-- `/HyperCube/models` — `(S, C, P, L)` float32 convolved+rebinned spectra, chunked for streaming and resumable via a `_done` bitmap.
-- `/HyperCube/col_energy` — `(C, P)` float64 global column energy `E[c,p] = Σ_{s,λ in mask} A^2`, for step-size control.
-- `/HyperCube/norm/losvd_amp` — `(S, C)` LOSVD amplitude (sum or trapz).
-- `/HyperCube/norm/losvd_amp_sum` — `(S,)` per-spaxel sum of amplitudes.
-- `/HyperCube/lambda_weights` — `(L,)` optional λ-weights in `[floor, 1]` (generated by a median-DoG heuristic).
-
-Fit outputs:
-
-- `/X_global` — `(C*P,)` solution vector, row-major `(C, P)` flattened.
-
----
-
-## Manager: creating and populating the HDF5 backbone
-
-`hdf5_manager.py` provides:
-
-- **Safe file open** with retries, optional SWMR, and lock-handling (`open_h5`).
-- **Dataset creation** for the core arrays and dimensions (`H5Manager` + `H5Dims`).
-- **Population** from NumPy arrays (`populate_from_arrays`), including grid checks.
-- **Flux-conserving rebin** operator construction (`ensure_rebin_and_resample`).
-
-Typical setup:
-
-```python
-from CubeFit.hdf5_manager import H5Manager, H5Dims
-
-mgr = H5Manager("galaxy.h5", tem_pix=tem_loglam, obs_pix=obs_loglam)
-mgr.init_base(H5Dims(nSpat=S, nLSpec=L, nTSpec=T, nVel=V, nComp=C, nPop=P))
-mgr.populate_from_arrays(losvd=H_SVC, datacube=Y_SL, templates=T_PT)
-mgr.ensure_rebin_and_resample()  # builds /R_T (and validates shapes)
-```
-
-Notes:
-
-- `/R_T` is built by exact bin overlap in log-λ, preserving flux.
-- `/Mask` (if present) is used later by both builder and solver.
-- Manager helpers centralize chunk-cache setup so downstream is fast.
-
----
-
-## Hypercube builder
-
-`hypercube_builder.py` constructs `/HyperCube/models` in streaming, tile-aligned passes:
-
-1. **Kernel from LOSVD:** each `(s,c)` LOSVD row → **unit-area** kernel on the template grid (linear interpolation to integer pixel shifts). A separate scalar **amplitude** is computed per `(s,c)` (either sum or trapezoidal integral).
-2. **Convolution (per p):** FFT-multiply template by kernel and crop the linear convolution back to the template length.
-3. **Rebin to observed grid:** multiply by `/R_T` to get `(P, L)` for each `(s,c)`.
-4. **Normalization:**  
-   - `norm="model"`: multiply each `(s,c,p,:)` by its LOSVD amplitude.  
-   - `norm="data"`: compute per-spaxel mean observed flux (from `/HyperCube/data_flux`), then split across components in proportion to their LOSVD amplitudes, preserving the (c) ratios determined by LOSVD at that spaxel.
-5. **Global column energy:** simultaneously accumulate `E[c,p]=Σ_{s,λ in mask} A²` into `/HyperCube/col_energy` for solver preconditioning.
-
-**Resumability & chunking:** the builder creates `/HyperCube/models` with chunks `(S_chunk, C_chunk, P_chunk, L)` and maintains a `_done` bitmap over the `(S_chunk, C_chunk, P_chunk)` tile grid; this lets you resume safely or inspect progress mid-build. Metadata is flushed regularly.
-
----
-
-## Normalization conversion (post-hoc)
-
-Flip between `norm="data"` and `norm="model"` after the build:
-
-```python
-from CubeFit.hypercube_builder import convert_hypercube_norm
-convert_hypercube_norm("galaxy.h5", to_mode="model", recompute_energy=True)
-```
-
-This reads `/HyperCube/norm/losvd_amp_sum` (and `/HyperCube/data_flux` when needed), computes a **per-spaxel scalar** `F[s]`, and scales `/HyperCube/models[s,:,:,:] *= F[s]` in **S-tiles** (chunk-aligned). It updates `/HyperCube/col_energy` (optional) and flips the `/HyperCube` attribute `norm.mode`. It also respects `/Mask` when deriving or validating the spaxel flux vector.
-
-This is a safe, **no-FFT** operation. Use it to avoid rebuilding the hypercube when only a normalization flip is required.
-
----
-
-## λ-feature emphasis (line weights)
-
-Absorption features can be down-weighted in plain least squares. To emphasize them, the solver supports **λ-weights**:
-
-- Build weights once via a **median spectrum** and a two-scale smoothing **difference-of-Gaussians** (implemented with boxcars), then map to `[min_w, 1]`. Store at `/HyperCube/lambda_weights`.
-- During solving, multiply both **residuals** and **design matrix columns** by `sqrt(w)` — equivalent to solving in a diagonal metric where line pixels matter more.
-
-Helpers in `cube_utils.py`:
-
-```python
-from CubeFit.cube_utils import ensure_lambda_weights, read_lambda_weights
-
-w = ensure_lambda_weights("galaxy.h5")  # writes /HyperCube/lambda_weights
-w2 = read_lambda_weights("galaxy.h5")   # reads, with floor & mask handling
-```
-
-At solver startup you’ll see a banner printing `min/max/mean` of the λ-weights used (after masking).
-
----
-
-## Solver: multiprocess batched Kaczmarz (+ weighted NNLS polish)
-
-Entry point:
-
-```python
-from CubeFit.pipeline_runner import PipelineRunner
-
-runner = PipelineRunner("galaxy.h5")
-x_global, stats = runner.solve_all_mp_batched(
-    epochs=E,
-    pixels_per_aperture=...,            # row batching (if used)
-    lr=...,                             # base learning-rate
-    project_nonneg=True,                # x >= 0
-    processes=..., blas_threads=...,    # MP and BLAS knobs
-    orbit_weights=...,                  # optional (C,) ratio guidance
-    # …other optional arguments…
-)
-```
-
-High-level flow (`pipeline_runner.py` → `kaczmarz_solver_cchunk_mp.py`):
-
-1. **Tile scheduling:** sort S-tiles by data norm (coarse “hardest first” ordering).
-2. **Workers:** each process takes a contiguous **c-band** for the active S-tile.
-3. **Inside a worker (per band):**
-   - **Sanitize** non-finite values in `A` and `R` to zeros.
-   - **Apply λ-weights** by computing gradients and denominators on `√w · A` and `√w · R` (but updates and residuals are returned in the unweighted space).
-   - **Diagonal preconditioning:** per-population step `dx_p ∝ g_p / Σ (A_w)^2`, blended with global column energy `E[c,p]` for stability.
-   - **Near-zero column freeze** (relative & absolute thresholds).
-   - **Trust region** on ΔR in weighted space (`||ΔR_w|| ≤ τ ||R_w||`) + **backtracking** for monotone weighted RMSE drop.
-   - **Optional de-correlation nudge** to avoid chasing flat null-space directions across `P`.
-   - **Candidate set** for **tile-local weighted NNLS polish** (top-K by score).
-4. **Parent process:**
-   - Aggregates ΔR over bands and runs **tile-level backtracking**.
-   - Applies a **global step cap** using `Σ dx² · E[c,p]` vs. `||Y||`.
-   - Optionally runs **NNLS polish** on the proposed (c,p) set using a λ-subsample (rows) and accepts only if it reduces **weighted RMSE** enough.
-   - Commits the single global α for the tile: update `R` and `x`, enforce `x ≥ 0`.
-   - Optional **ratio penalty** step nudges the component totals toward `orbit_weights` (if provided).
-   - Streams metrics to `FitTracker` and snapshots (optional).
-
-The result is written to `/X_global` (flattened `(C*P,)`), along with run stats.
-
----
-
-## Reconstruction & plots (without storing a full ModelCube)
-
-You can reconstruct `Ŷ = A·x` for diagnostics without materializing a full `/ModelCube`:
-
-- **Reconstruction utilities** read `A` in the same chunk order and contract against `x` in λ-bands. They write a small target array you name (e.g., `/ReconTile`) or return the result.
-- **Parallel spectral plots** pull just the selected rows from `/DataCube` and the reconstructed array and produce side-by-side data/model spectral plots for worst/best spaxels.
-
-Both are tile-aligned and cache-aware; they never read `/HyperCube/models` beyond the needed slices.
-
----
-
-## Fit tracking & snapshots
-
-`fit_tracker.py` provides a **non-blocking** sidecar writer process:
-
-- Destination: a sidecar H5 next to the main file (`*.fit.<pid>.<ts>.h5`).
-- Bounded `mp.Queue` so the solver never blocks on I/O.
-- SWMR enabled for dashboards.
-- Streams **RMSE history**, **EWMA**, **progress**, and optional **x snapshots** (best/last/history).
-
-Use `tracker=FitTracker(...)` in the solver; the runner wires this up for you.
-
----
-
-## Utilities
-
-- **Normalization conversion:** `convert_hypercube_norm(h5, to_mode="model"|"data", recompute_energy=True)` — chunk-aligned, mask-aware.
-- **Global column energy:** created during build; can be recomputed later if you changed normalization.
-- **Done-bitmap control:** functions to inspect and invalidate `_done` to resume or redo specific tiles.
-- **Recompression:** rewrite `/HyperCube/models` with different compression/filter options (tile-wise copy).
-
----
-
-## Environment variables (knobs)
-
-These can be exported to tune performance, stability, or behavior. Defaults shown are what the code uses if you don’t set them.
-
-### HDF5 & dataset caching
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `HDF5_USE_FILE_LOCKING` | `FALSE` | Avoid HDF5 file locking issues on shared filesystems. |
-| `CUBEFIT_RDCC_NSLOTS` | `400003` | File-level raw chunk cache: number of slots. |
-| `CUBEFIT_RDCC_NBYTES` | `4294967296` (4 GiB) | File-level raw chunk cache size in bytes. |
-| `CUBEFIT_RDCC_W0` | `0.9` | File-level raw chunk cache preemption policy. |
-| `CUBEFIT_RDCC_SLOTS` | `1000003` | Per-dataset cache slots used by some readers. |
-| `CUBEFIT_RDCC_BYTES` | `268435456` (256 MiB) | Per-dataset cache size used by some readers. |
-
-### Multiprocessing & BLAS/OpenMP
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `CUBEFIT_MP_CTX` | `forkserver` (fallback `spawn`) | MP start method for the solver pool. |
-| `OMP_NUM_THREADS` | set by code | BLAS/OpenMP threads per worker (also `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`). |
-| `KMP_INIT_AT_FORK` | `FALSE` | Avoid OpenMP deadlocks with `fork`. |
-| `SLURM_CPUS_PER_TASK` | (if present) | Used by reconstruction helpers to set BLAS threads. |
-| `PYTHONUNBUFFERED` | `1` (recommended) | Unbuffered stdout for real-time logs on HPC. |
-
-### Solver: worker-level stability & steps (in `kaczmarz_solver_cchunk_mp.py`)
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `CUBEFIT_BT_STEPS` | `3` | Backtracking steps per band (worker) for monotone weighted RMSE. |
-| `CUBEFIT_BT_FACTOR` | `0.5` | Multiplicative α shrink in backtracking. |
-| `CUBEFIT_TRUST_TAU` | `0.7` | Trust-region cap: `||ΔR_w|| ≤ τ ||R_w||`. |
-| `CUBEFIT_EPS` | `1e-12` | Numerical floor in denominators and divisions. |
-| `CUBEFIT_ZERO_COL_REL` | `1e-12` | Relative threshold (vs median energy) to **freeze** near-zero columns. |
-| `CUBEFIT_ZERO_COL_ABS` | `1e-24` | Absolute threshold to **freeze** columns. |
-| `CUBEFIT_DEBUG_SAFE` | `0` | Print sanitization/freeze stats per tile if `1`. |
-| `CUBEFIT_NNLS_PROP_PER_BAND` | `6` | How many (c,p) candidates to propose for NNLS polish per band. |
-
-### Solver: aggregation & NNLS polish (in `kaczmarz_solver_cchunk_mp.py`)
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `CUBEFIT_TILE_BT_STEPS` | `6` | Backtracking steps for the **aggregated** ΔR across bands. |
-| `CUBEFIT_TILE_BT_FACTOR` | `0.5` | Aggregated α shrink factor. |
-| `CUBEFIT_GLOBAL_TAU` | `0.5` | Global step cap using `Σ dx²·E[c,p]` vs `||Y||`. |
-| `CUBEFIT_GLOBAL_ENERGY_BLEND` | `1e-3` | Blend local `Σ(A_w)^2` with global column energy `E[c,p]` in denominators. |
-| `CUBEFIT_NNLS_ENABLE` | `1` | Enable tile-local **weighted** NNLS polish. |
-| `CUBEFIT_NNLS_EVERY` | `1` | Run NNLS polish every N tiles. |
-| `CUBEFIT_NNLS_MAX_COLS` | `128` | Max columns K in the NNLS system. |
-| `CUBEFIT_NNLS_MAX_BYTES` | `1000000000` | Approx memory cap for NNLS system (rows×8 per column). |
-| `CUBEFIT_NNLS_SUB_L` | `0` | λ-subsample size for NNLS (0 → use all). |
-| `CUBEFIT_NNLS_SOLVER` | `nnls` | One of `nnls`, `lsq`, `mu`, `fista` (FISTA recommended for speed/accuracy). |
-| `CUBEFIT_NNLS_MAX_ITER` | `50` | Iteration cap for iterative NNLS (`mu`, `fista`, `lsq`’s TRF). |
-| `CUBEFIT_NNLS_MIN_IMPROVE` | `0.999` | Required weighted-RMSE ratio to accept polish (< this accepts). |
-
-### Solver: λ-weights (in `kaczmarz_solver_cchunk_mp.py` / `cube_utils.py`)
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `CUBEFIT_LAMBDA_WEIGHTS_ENABLE` | `1` | Enable λ-weights for solver (`√w` weighting). |
-| `CUBEFIT_LAMBDA_WEIGHTS_DSET` | `/HyperCube/lambda_weights` | Dataset to read. |
-| `CUBEFIT_LAMBDA_MIN_W` | `1e-6` | Floor on λ-weights; protects √w. |
-| `CUBEFIT_LAMBDA_WEIGHTS_AUTO` | `1` | Auto-generate weights if missing. |
-
-### Fit tracking (in `fit_tracker.py`)
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `FITTRACKER_START` | `spawn` (or best available) | Start method for the tracker process (`spawn`/`forkserver`/`fork`). |
-| `CUBEFIT_TRACKER_QSIZE` | `8192` | Max queue size; drops messages when full if non-blocking. |
-| `CUBEFIT_TRACKER_FLUSH_EVERY` | `128` | Flush to disk after this many messages. |
-| `CUBEFIT_TRACKER_FLUSH_SEC` | `5.0` | Or flush if this many seconds have passed. |
-| `CUBEFIT_RMSE_STRIDE` | `16` | Only enqueue every Nth batch RMSE sample (sub-sampling). |
-
----
-
-## Typical end-to-end workflow
-
-```python
-# 1) Build HDF5 backbone & rebin operator
-mgr = H5Manager("galaxy.h5", tem_pix=tem_loglam, obs_pix=obs_loglam)
-mgr.init_base(H5Dims(nSpat=S, nLSpec=L, nTSpec=T, nVel=V, nComp=C, nPop=P))
-mgr.populate_from_arrays(losvd=H_SVC, datacube=Y_SL, templates=T_PT)
-mgr.ensure_rebin_and_resample()
-
-# 2) Build hypercube
-from CubeFit.hypercube_builder import build_hypercube
-build_hypercube("galaxy.h5", norm_mode="data")  # or "model"
-
-# (Optional) Flip normalization later without rebuild
-from CubeFit.hypercube_builder import convert_hypercube_norm
-convert_hypercube_norm("galaxy.h5", to_mode="model", recompute_energy=True)
-
-# 3) Create λ-weights
-from CubeFit.cube_utils import ensure_lambda_weights
-ensure_lambda_weights("galaxy.h5")
-
-# 4) Solve
-from CubeFit.pipeline_runner import PipelineRunner
-runner = PipelineRunner("galaxy.h5")
-x, stats = runner.solve_all_mp_batched(
-    epochs=6, lr=0.6, project_nonneg=True, processes=8, blas_threads=2,
-    orbit_weights=orbit_w  # optional (C,)
-)
-```
-
----
-
-## Notes on normalization & physics
-
-- `norm="model"` keeps each `(s,c)` model’s scale proportional to the LOSVD amplitude — closest to “physical mass/flux” carried by LOSVD at that spaxel.
-- `norm="data"` ties the per-spaxel model sum to the observed mean flux (masked), splitting across components in proportion to LOSVD amplitudes. This is convenient for direct data-scale comparisons but can blur absolute differences across datasets. You can switch modes post-hoc with `convert_hypercube_norm`.
-
-The solver respects `/Mask` and λ-weights uniformly, so **absorption features** can dominate the fit when λ-weights are present (verify the printed min/max/mean at startup to ensure they are not all ones).
-
----
-
-## Troubleshooting & sanity checks
-
-- **Hypercube completeness:** use the `_done` bitmap helpers to inspect or reset tiles if needed.  
-- **Normalization flips:** use `convert_hypercube_norm` (streams in S-tiles and handles `/Mask`); do **not** read the entire dataset into RAM.  
-- **Line weights:** ensure `/HyperCube/lambda_weights` exists and spans a range (e.g., min ≪ 1, max ≈ 1); the solver prints min/max/mean.  
-- **Population mixture looks uniform across components:**  
-  - Confirm λ-weights are applied (banner shows they’re not all 1).  
-  - Increase epochs modestly; keep `GLOBAL_ENERGY_BLEND` small but nonzero.  
-  - Enable NNLS polish with a moderate `CUBEFIT_NNLS_MAX_COLS`, a λ-subsample (`CUBEFIT_NNLS_SUB_L`), and `CUBEFIT_NNLS_SOLVER=fista` for sharper per-tile updates.
-
----
-
-## Where to look in the code
-
-- **HDF5 backbone:** `hdf5_manager.py` (safe open, grids, rebin operator).
-- **Builder:** `hypercube_builder.py` (FFT conv, normalization, col_energy, chunking + resume).
-- **Solver:** `kaczmarz_solver_cchunk_mp.py` (MP loop, λ-weights, trust/backtracking, NNLS polish).
-- **Runner:** `pipeline_runner.py` (orchestration, tracking, `/X_global`).
-- **Tracking:** `fit_tracker.py` (sidecar writer, RMSE history, progress, snapshots).
-- **Recon/plots:** utilities in `kz_fitSpec.py` (tile-aligned recon) and safe plotting helpers.
-
----
-
-## Building the docs
-
-Place this file at `docs/CubeFit.md` and run:
-
-```bash
-make            # builds docs/CubeFit.html and docs/CubeFit.pdf via pandoc
-mkdocs serve    # live preview with Material theme (served from docs/)
-```
-
-Pandoc targets (from your Makefile):
-
-- `docs/CubeFit.html` via:  
-  `pandoc -s -f gfm -t html5 docs/CubeFit.md -o docs/CubeFit.html --metadata title="CubeFit" --toc`
-- `docs/CubeFit.pdf` via XeLaTeX:  
-  `pandoc -s -f gfm docs/CubeFit.md -o docs/CubeFit.pdf --pdf-engine=xelatex -V geometry:margin=1in -V mainfont="Latin Modern Roman" -V monofont="Latin Modern Mono" --toc`
-
-MkDocs (from your `mkdocs.yml`):
-
-```yaml
-site_name: CubeFit
-theme:
-  name: material
-nav:
-  - Home: index.md
-  - CubeFit: CubeFit.md
-docs_dir: docs
-```
-</file>
-
 <file path="hypercube_reader.py">
 # -*- coding: utf-8 -*-
 r"""
@@ -2683,173 +1111,6 @@ class HyperCubeReader:
             return A, Y
 </file>
 
-<file path="kz_0All.sh">
-#!/bin/bash -l
-
-module purge
-module load foss/2023a
-module load Python/3.11.3-GCCcore-12.3.0
-# glibc / allocator hygiene
-export MALLOC_ARENA_MAX=2
-
-# Threading (OpenBLAS-backed NumPy)
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-48}
-export OPENBLAS_NUM_THREADS=$OMP_NUM_THREADS
-export OMP_DYNAMIC=FALSE
-export OMP_PROC_BIND=false
-unset GOMP_CPU_AFFINITY
-export KMP_AFFINITY=disabled
-export MKL_NUM_THREADS=1            # harmless, prevents surprise MKL use elsewhere
-export NUMEXPR_NUM_THREADS=1        # avoid hidden extra threads
-
-# File descriptors
-ulimit -n 8192
-
-# HDF5 raw chunk cache (tune if memory pressure)
-export CUBEFIT_RDCC_NBYTES=$((16*1024*1024*1024))  # 8–16 GiB are sane
-export CUBEFIT_RDCC_NSLOTS=400003
-export CUBEFIT_RDCC_W0=0.9
-
-cd /data/phys-gal-dynamics/phys2603/CubeFit
-# declare fSGA=$(sbatch --parsable "kz_1Gen.sh")
-# declare fSF=$(sbatch --parsable --dependency=afterok:"${fSGA}" "kz_2Fit.sh")
-declare fSF=$(sbatch --parsable "kz_2Fit.sh")
-sbatch --dependency=afterok:"${fSF}" "kz_3Rio.sh"
-</file>
-
-<file path="kz_1Gen.sh">
-#!/bin/bash -l
-# #SBATCH -A durham
-# #SBATCH -D "/cosma5/data/durham/dc-poci1/muse"
-# #SBATCH --output="/cosma5/data/durham/dc-poci1/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-# #SBATCH --error="/cosma5/data/durham/dc-poci1/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-
-# #SBATCH -A oz059
-# #SBATCH -D "/fred/oz059/poci/muse"
-# #SBATCH --output="/fred/oz059/poci/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-# #SBATCH --error="/fred/oz059/poci/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-
-#SBATCH -D "/data/phys-gal-dynamics/phys2603/muse"
-#SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_1Gen.log" --open-mode=append
-#SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_1Gen.log" --open-mode=append
-#SBATCH -p short
-
-#SBATCH --job-name="CubeFit_1Gen"
-#SBATCH --time=0-12:00
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
-#SBATCH --mem=150G
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=adriano.poci@physics.ox.ac.uk
-#SBATCH --hint=nomultithread
-#SBATCH --exclusive
-
-module purge
-module load foss/2023a
-module load Python/3.11.3-GCCcore-12.3.0
-# glibc / allocator hygiene
-export MALLOC_ARENA_MAX=2
-
-# Threading (OpenBLAS-backed NumPy)
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-48}
-export OPENBLAS_NUM_THREADS=$OMP_NUM_THREADS
-export OMP_DYNAMIC=FALSE
-export OMP_PROC_BIND=false
-unset GOMP_CPU_AFFINITY
-export KMP_AFFINITY=disabled
-export MKL_NUM_THREADS=1            # harmless, prevents surprise MKL use elsewhere
-export NUMEXPR_NUM_THREADS=1        # avoid hidden extra threads
-
-# File descriptors
-ulimit -n 8192
-
-# HDF5 raw chunk cache (tune if memory pressure)
-export CUBEFIT_RDCC_NBYTES=$((16*1024*1024*1024))  # 8–16 GiB are sane
-export CUBEFIT_RDCC_NSLOTS=400003
-export CUBEFIT_RDCC_W0=0.9
-
-cd /data/phys-gal-dynamics/phys2603/CubeFit
-# run your job as a Slurm step (gives you the full cpuset)
-srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python -m IPython kz_run.py -- --run-switch 'gen' --redraw
-</file>
-
-<file path="kz_3Rio.sh">
-#!/bin/bash -l
-# #SBATCH -A durham
-# #SBATCH -D "/cosma5/data/durham/dc-poci1/muse"
-# #SBATCH --output="/cosma5/data/durham/dc-poci1/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-# #SBATCH --error="/cosma5/data/durham/dc-poci1/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-
-# #SBATCH -A oz059
-# #SBATCH -D "/fred/oz059/poci/muse"
-# #SBATCH --output="/fred/oz059/poci/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-# #SBATCH --error="/fred/oz059/poci/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-
-#SBATCH -D "/data/phys-gal-dynamics/phys2603/muse"
-#SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_3Rio.log" --open-mode=append
-#SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_3Rio.log" --open-mode=append
-#SBATCH -p short
-
-#SBATCH --job-name="CubeFit_3Rio"
-#SBATCH --time=0-12:00
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
-#SBATCH --mem=150G
-#SBATCH --hint=nomultithread
-#SBATCH --exclusive
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=adriano.poci@physics.ox.ac.uk
-
-module purge
-module load foss/2023a
-module load Python/3.11.3-GCCcore-12.3.0
-
-# glibc / allocator hygiene
-export MALLOC_ARENA_MAX=2
-
-# Threading (OpenBLAS-backed NumPy)
-export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}      # harmless with OpenBLAS(pthreads)
-export OMP_DYNAMIC=FALSE
-export OMP_PROC_BIND=false
-unset GOMP_CPU_AFFINITY
-export KMP_AFFINITY=disabled
-export MKL_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-
-# HDF5 raw chunk cache (4 GiB is plenty; bump if you like)
-export CUBEFIT_RDCC_NBYTES=$((4*1024*1024*1024))  # 4 GiB
-export CUBEFIT_RDCC_NSLOTS=400003
-export CUBEFIT_RDCC_W0=0.9
-
-# FitTracker tweaks (reduce sidecar churn; enforce spawn)
-export CUBEFIT_RMSE_STRIDE=16
-export CUBEFIT_TRACKER_QSIZE=8192
-export FITTRACKER_START=spawn
-
-# File descriptors
-ulimit -n 8192
-
-cd /data/phys-gal-dynamics/phys2603/CubeFit
-
-# sanity print (once) to confirm cpuset and BLAS threads
-srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python - <<'PY'
-import os, json
-print(f"[sanity] cpuset cores: {len(os.sched_getaffinity(0))}")
-try:
-    from threadpoolctl import threadpool_info
-    print("[sanity] BLAS pools:", json.dumps(threadpool_info(), indent=2)[:600], "...")
-except Exception as e:
-    print("[sanity] threadpoolctl not available:", e)
-PY
-
-# run your job as a Slurm step (gives you the full cpuset)
-srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python -m IPython kz_rio.py -- --redraw
-</file>
-
 <file path="logger.py">
 # -*- coding: utf-8 -*-
 r"""
@@ -2968,126 +1229,6 @@ def get_logger(logfile=None, mode="a"):
         if _logger_instance is None:
             _logger_instance = CubeFitLogger(logfile, mode)
         return _logger_instance
-</file>
-
-<file path="Makefile">
-DOC=docs/CubeFit.md
-HTML=docs/CubeFit.html
-PDF=docs/CubeFit.pdf
-
-all: html pdf
-
-html:
-	pandoc -s -f gfm -t html5 $(DOC) -o $(HTML) --metadata title="CubeFit" --toc
-
-pdf:
-	pandoc -s -f gfm $(DOC) -o $(PDF) --pdf-engine=xelatex \
-	  -V geometry:margin=1in -V mainfont="Open Sans" \
-	  -V monofont="IntoneMono Nerd Font Mono" --toc
-</file>
-
-<file path="README.md">
-# CubeFit
-
-CubeFit is a high-throughput pipeline for orbital spectral–fitting on IFU data cubes.  
-It builds a **HyperCube** of convolved template populations, then solves for global
-population weights with a parallel **Kaczmarz** solver, including sidecar tracking,
-a live dashboard, and memory-safe reconstruction/plotting utilities.
-
-- Fast, chunk-aligned HDF5 I/O (SWMR-friendly)
-- On-the-fly or cached λ-weights and global column energy
-- Robust multi-process Kaczmarz with trust-region, backtracking, optional NNLS polish
-- Fit sidecar writer for live progress & EWMA metrics
-- Reconstruction of `ModelCube` without materializing the full basis
-- Lightweight plotting (best/worst residual spectra) and diagnostics
-
-> **Full documentation** → [`docs/CubeFit.md`](docs/CubeFit.md)  
-> **Environment variables (all knobs)** → [`docs/CubeFit.md#environment-variables`](docs/CubeFit.md#environment-variables)
-
----
-
-## Installation
-
-Requirements: Python ≥ 3.10, NumPy, SciPy, h5py, matplotlib, tqdm, threadpoolctl, (optional) Cython.
-
-```bash
-# (optional) create an environment
-python -m venv .venv && source .venv/bin/activate
-
-# install package & deps
-pip install -r requirements.txt  # if present
-pip install -e .
-```
-
-If your build includes Cython extensions (e.g., continuum detrending), ensure a C compiler
-is available; `pip install -e .` will compile them in place.
-
----
-
-## Quickstart
-
-Below is a minimal end-to-end sketch. See the manual for full options and data prep.
-
-```python
-from CubeFit.hypercube_builder import build_hypercube
-from CubeFit.pipeline_runner import PipelineRunner
-
-H5 = "CubeFit/NGC4365/NGC4365_04.h5"
-
-# 1) Build the HyperCube (choose normalization you’ll use in fitting)
-build_hypercube(
-    H5,
-    norm_mode="model",   # or "data" (see docs on normalization)
-    amp_mode="sum"       # or "trapz" (requires /VelPix)
-)
-
-# 2) Solve (multi-process Kaczmarz); see docs for all knobs/args
-pr = PipelineRunner(H5)
-x_global, stats = pr.solve_all_mp_batched(
-    epochs=3,
-    pixels_per_aperture=1247,
-    lr=0.9,
-    project_nonneg=True,
-    processes=8,
-    blas_threads=8,
-)
-
-# 3) Reconstruct the model cube for diagnostics/plots
-from CubeFit.kz_fitSpec import reconstruct_model_cube_single
-reconstruct_model_cube_single(h5_path=H5, x_global=x_global, array_name="ModelCube", blas_threads=8)
-```
-
-**Tips**
-- If your HyperCube was built in the other normalization, you can convert in-place
-  (streaming) without a full rebuild. See **Normalization utilities** in the manual.
-- λ-weights (feature emphasis) and global column energy are read/cached automatically if present.
-
----
-
-## Building the docs
-
-This repo ships a full manual at `docs/CubeFit.md`. You can build HTML/PDF with your Makefile:
-
-```bash
-make html
-make pdf
-```
-
-MkDocs config (`mkdocs.yml`) already points navigation to `docs/CubeFit.md`.
-
----
-
-## Where to next?
-
-- **Full reference & walkthrough**: [`docs/CubeFit.md`](docs/CubeFit.md)  
-- **All environment variables** (solver, NNLS, tracking, mp, etc.):
-  [`docs/CubeFit.md#environment-variables`](docs/CubeFit.md#environment-variables)
-
----
-
-## License
-
-See `LICENSE` (if present). If you plan to publish results, please cite the repository and any underlying data/model libraries you use (e.g., MILES/eMILES).
 </file>
 
 <file path="cube_debug.py">
@@ -3463,8 +1604,8 @@ v1.0:	12 November 2021
 # props = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=393, lOrder=7,
 #     specRange=[5100, 5950], full=True, lsf=True, iso='BaSTI', nProcs=1,
 #     band='F814W', smask=[[5550, 5560]], genSwitch=None)
-# props = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=207, lOrder=12,
-props = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=3, lOrder=12,
+props = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=207, lOrder=12,
+# props = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=3, lOrder=12,
     specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI', nProcs=1,
     band='F814W', genSwitch=None, kind='SMILES', cont=True,
     smask=[[5530, 5555], [6255, 6270], [6320, 6335], [7580, 7700], [8775, 9000]],
@@ -3538,11 +1679,13 @@ from CubeFit.kz_initNGC4365 import props
 def main():
     ap = argparse.ArgumentParser(description="Thin wrapper around genCubeFit")
     # boolean redraw with explicit on/off flags
+    ap.add_argument("--ncomp", type=int, default=None,
+        help="Number of components to fit")
     group = ap.add_mutually_exclusive_group()
     group.add_argument("--redraw", dest="redraw", action="store_true",
-                       help="Enable redraw mode")
+        help="Enable redraw mode")
     group.add_argument("--no-redraw", dest="redraw", action="store_false",
-                       help="Disable redraw mode")
+        help="Disable redraw mode")
     ap.set_defaults(redraw=False)
 
     args = ap.parse_args()
@@ -3568,8 +1711,12 @@ def main():
     props['redraw'] = bool(args.redraw)
     print(f"redraw = {props['redraw']}")
 
+    if args.ncomp is not None:
+        props['nCuts'] = args.ncomp
+    print(props)
+
     try:
-        loadCubeFit(**props, pplots=['spec', 'mw'])
+        loadCubeFit(**props)
     except SystemExit:
         # Let explicit sys.exit()s behave normally
         raise
@@ -3586,15 +1733,31 @@ if __name__ == "__main__":
 </file>
 
 <file path="fit_tracker.py">
-# -*- coding: utf-8 -*-
-"""
-fit_tracker.py
+r"""
+    fit_tracker.py
+    Adriano Poci
+    University of Oxford
+    2025
 
-Sidecar-based, non-blocking fit tracker for live Kaczmarz runs.
+    Platforms
+    ---------
+    Unix, Windows
 
-- Writes ONLY to <main>.fit.<pid>.<ts>.h5 (a sidecar), never the main HDF5.
-- Uses a bounded mp.Queue so the solver never blocks on I/O.
-- No SWMR; no file locking on the main file.
+    Synopsis
+    --------
+    Sidecar-based, non-blocking fit tracker for live Kaczmarz runs.
+
+    - Writes ONLY to <main>.fit.<pid>.<ts>.h5 (a sidecar), never the main HDF5.
+    - Uses a bounded mp.Queue so the solver never blocks on I/O.
+    - No SWMR; no file locking on the main file.
+
+    Authors
+    -------
+    Adriano Poci <adriano.poci@physics.ox.ac.uk>
+
+History
+-------
+v1.0:   Added `maybe_snapshot_x` to `NullTracker` for consistency. 1 January 2026
 """
 
 from __future__ import annotations
@@ -3940,10 +2103,11 @@ class FitTracker:
 
     def maybe_save(self, x_final: np.ndarray, stats: dict) -> None:
         self._try_put({"op": "save_x",
-                    "x": np.asarray(x_final, np.float32).ravel(order="C"),
-                    "epoch": int(stats.get("epochs", -1)),
-                    "rmse": float(stats.get("rmse_epoch_last",
-                                            stats.get("rmse_final", math.nan)))}, block=False)
+            "x": np.asarray(x_final, np.float32).ravel(order="C"),
+            "epoch": int(stats.get("epochs", -1)),
+            "rmse": float(stats.get("rmse_epoch_last",
+                stats.get("rmse_final", math.nan)))},
+            block=False)
 
     def maybe_snapshot_x(self, x: np.ndarray, *, epoch: int | None = None,
                         rmse: float | None = None, force: bool = False) -> bool:
@@ -3963,11 +2127,10 @@ class FitTracker:
         except Exception:
             return False
 
-        return self._try_put({"op": "x_snapshot",
-                            "x": x32,
-                            "epoch": int(epoch) if epoch is not None else None,
-                            "rmse": float(rmse) if (rmse is not None and np.isfinite(rmse)) else None},
-                            block=False)
+        return self._try_put({"op": "x_snapshot", "x": x32,
+            "epoch": int(epoch) if epoch is not None else None,
+            "rmse": float(rmse) if (rmse is not None and np.isfinite(rmse)) else None},
+            block=False)
 
 
     def close(self, timeout: float = 2.0) -> None:
@@ -4013,6 +2176,7 @@ class NullTracker:
     def on_batch_rmse(self, *a, **k): pass
     def on_epoch_end(self, *a, **k): pass
     def maybe_save(self, *a, **k): pass
+    def maybe_snapshot_x(self, *a, **k): pass
     def close(self, *a, **k): pass
 </file>
 
@@ -6198,6 +4362,8 @@ v1.1:   Added Zarr v3 sharding support and safe-direct writes. 5 September 2025
 v1.2:   Complete re-write to use HDF5. 7 September 2025
 v1.3:   Improved speed of `col_energy` computation, switching from `einsum` to
             `square`. 4 December 2025
+v1.4:   Compute and apply a global scale to the Hypercube model to improve
+            numerical stability during fitting. 8 January 2026
 
 
 Hypercube builder (LOSVD convolution in log-λ, then rebin to observed grid)
@@ -6302,7 +4468,6 @@ class _P2Median:
         if n <= 5:
             return float(np.median(self._q[:n]))
         return float(self._q[2])
-
 
 def _ensure_mask_indices(f, L: int) -> Optional[np.ndarray]:
     """
@@ -7054,14 +5219,14 @@ def _frac_shift_last_axis(X: np.ndarray, shift: float) -> np.ndarray:
 def build_hypercube(
     base_h5: str,
     *,
-    norm_mode: str = "data",        # "model" or "data"
-    amp_mode: str = "sum",           # "sum" or "trapz" for LOSVD amplitude
-    cp_flux_ref_mode: str = "median",   # "median" | "mean" | "off"
+    norm_mode: str = "data",
+    amp_mode: str = "sum",
+    cp_flux_ref_mode: str = "median",
     floor: float = 1e-12,
     S_chunk: int = 128,
     C_chunk: int = 1,
     P_chunk: int = 360,
-    compression: str | None = None,  # keep None for speed; compress later
+    compression: str | None = None,
     vel_bias_kms: float = 0.0,
 ) -> None:
     """
@@ -7079,7 +5244,6 @@ def build_hypercube(
         raise ValueError("norm_mode must be 'model' or 'data'.")
     if cp_flux_ref_mode not in ("median", "mean", "off"):
         raise ValueError("cp_flux_ref_mode must be 'median', 'mean', or 'off'.")
-
 
     # -------- Fast preflight: exit early if fully complete (reader-only)
     with open_h5(base_h5, "reader") as f_rd:
@@ -7178,6 +5342,62 @@ def build_hypercube(
         A = f[A_path] # (S,C) float64
         A_sum = f[A_sum_path] # (S,)  float64
 
+        # ------------------------------------------------------------
+        # Build spatial component support mask (tile-based)
+        # Uses LOSVD amplitudes: if A[s,c] == 0 then models[s,c,:,:] == 0
+        # ------------------------------------------------------------
+
+        # Number of spatial tiles (must match solver tiling)
+        n_tiles = math.ceil(S / S_chunk)
+
+        # Create /HyperCube/component_support : (n_tiles, C) uint8
+        if "/HyperCube/component_support" in f:
+            del f["/HyperCube/component_support"]
+
+        support_ds = g.create_dataset(
+            "component_support",
+            shape=(n_tiles, C),
+            dtype="u1",
+            chunks=(1, min(C, 256)),
+            compression="gzip",
+            compression_opts=1,
+        )
+
+        support_ds.attrs["definition"] = (
+            "component_support[t,c]=1 if any spaxel s in tile t has "
+            "losvd_amp[s,c] > eps_support; else 0"
+        )
+        support_ds.attrs["source"] = "losvd_amp"
+        support_ds.attrs["S_chunk"] = int(S_chunk)
+        support_ds.attrs["eps_mode"] = "relative_to_component_max"
+        support_ds.attrs["eps_factor"] = 1e-12
+
+        # Compute per-component max amplitude (C,)
+        # This is cheap: losvd_amp already exists
+        A_max = np.max(np.asarray(A[...], dtype=np.float64), axis=0)
+
+        # Conservative threshold per component
+        eps_support = 1e-12 * A_max
+
+        # Build mask tile-by-tile to keep memory bounded
+        for t in range(n_tiles):
+            s0 = t * S_chunk
+            s1 = min(S, s0 + S_chunk)
+
+            # Slice losvd amplitudes for this tile: (ΔS, C)
+            A_tile = np.asarray(A[s0:s1, :], dtype=np.float64, order="C")
+
+            # Component is active in tile if any spaxel exceeds threshold
+            active = np.any(A_tile > eps_support[None, :], axis=0)
+
+            support_ds[t, :] = active.astype(np.uint8)
+
+        try:
+            support_ds.id.flush()
+            f.flush()
+        except Exception:
+            pass
+
         # record attributes once
         g.attrs["norm.mode"] = norm_mode
         g.attrs["losvd_amplitude_mode"] = amp_mode
@@ -7206,7 +5426,7 @@ def build_hypercube(
         if "/HyperCube/col_energy" in f:
             del f["/HyperCube/col_energy"]
         E_ds = g.create_dataset("col_energy", shape=(C, P), dtype="f8",
-                                chunks=(min(C,256), min(P,1024)), compression="gzip")
+            chunks=(min(C,256), min(P,1024)), compression="gzip")
         # set attrs before swmr_mode
         E_ds.attrs["masked"] = bool(masked_flag)
         E_ds.attrs["lambda_weights"] = bool(w_lam_sqrt is not None)
@@ -7244,6 +5464,14 @@ def build_hypercube(
 
         # Initialize global column energy accumulator E[c,p] float64
         E_acc = np.zeros((C, P), dtype=np.float64)
+        # ------------------------------------------------------------
+        # Tile-wise component energy for spatial support (ENERGY-based)
+        # ------------------------------------------------------------
+        n_tiles = math.ceil(S / S_chunk)
+
+        # Accumulate energy per (tile, component)
+        # float64 but very small: (n_tiles, C)
+        E_tile_comp = np.zeros((n_tiles, C), dtype=np.float64)
 
         # --- iterate tiles; skip ones marked done
         def _iter_all_tiles():
@@ -7259,6 +5487,7 @@ def build_hypercube(
                         yield (p0, p1, s0, s1, c0, c1, (is_s, ic, ip))
 
         total_tiles = rem
+
         pbar = tqdm(total=total_tiles, desc="[HyperCube] tiles",
                     mininterval=2.0)
 
@@ -7272,6 +5501,24 @@ def build_hypercube(
 
             # For each (s,c) in this tile:
             for s_idx in range(s0, s1):
+
+                # --------------------------------------------
+                # GLOBAL SCALE: per-spaxel model accumulator
+                # --------------------------------------------
+                if norm_mode == "model":
+                    if masked_flag:
+                        model_sum = np.zeros((keep_idx.size,), dtype=np.float64)
+                        data_vec = np.asarray(
+                            f["/DataCube"][s_idx, keep_idx],
+                            dtype=np.float64
+                        )
+                    else:
+                        model_sum = np.zeros((L,), dtype=np.float64)
+                        data_vec = np.asarray(
+                            f["/DataCube"][s_idx, :],
+                            dtype=np.float64
+                        )
+
                 a_sum = float(A_sum[s_idx])  # scalar
                 for c_idx in range(c0, c1):
                     # 1) build unit-area kernel for (s,c)
@@ -7309,6 +5556,10 @@ def build_hypercube(
                     else:
                         Yv = Ycp               # (ΔP, L or Lk)
 
+                    if norm_mode == "model":
+                        # Sum over populations for this component
+                        model_sum += np.sum(Yv, axis=0)
+
                     # Compute per-population contribution for this (s_idx, c_idx, P-block)
                     if w_lam_sqrt is not None:
                         # weighted: sum_λ (√w·Y)^2 = sum_λ (w * Y^2)
@@ -7324,6 +5575,9 @@ def build_hypercube(
                         )  # (ΔP,)
 
                     E_acc[c_idx, p0:p1] += e_local
+                    # --- accumulate tile-wise component energy ---
+                    tile_idx = s_idx // S_chunk
+                    E_tile_comp[tile_idx, c_idx] += float(np.sum(e_local))
 
                     # --- cp_flux_ref: per-(c,p) masked λ-sum, one sample per spaxel
                     if do_ref:
@@ -7365,13 +5619,56 @@ def build_hypercube(
 
         E_ds[...] = E_acc
 
+        # ------------------------------------------------------------
+        # Build ENERGY-based component support mask
+        # ------------------------------------------------------------
+        if "/HyperCube/component_support_energy" in f:
+            del f["/HyperCube/component_support_energy"]
+
+        eps_energy = 1e-6   # conservative
+
+        suppE = g.create_dataset(
+            "component_support_energy",
+            shape=(n_tiles, C),
+            dtype="u1",
+            chunks=(1, min(C, 256)),
+            compression="gzip",
+            compression_opts=1,
+        )
+
+        suppE.attrs["definition"] = (
+            "component_support_energy[t,c]=1 iff "
+            "tile_energy[t,c] > eps_energy * median_c(tile_energy[t,:])"
+        )
+        suppE.attrs["eps_energy"] = float(eps_energy)
+        suppE.attrs["S_chunk"] = int(S_chunk)
+        suppE.attrs["source"] = "models energy"
+        suppE.attrs["shape"] = (int(n_tiles), int(C))
+
+        for t in range(n_tiles):
+            row = E_tile_comp[t, :]
+            pos = row[row > 0.0]
+            if pos.size == 0:
+                suppE[t, :] = 0
+                continue
+
+            med = float(np.median(pos))
+            thresh = eps_energy * med
+            suppE[t, :] = (row > thresh).astype(np.uint8)
+
+        try:
+            suppE.id.flush()
+            f.flush()
+        except Exception:
+            pass
+
         # --- finalize cp_flux_ref
         if do_ref:
             if "/HyperCube/norm/cp_flux_ref" in f:
                 del f["/HyperCube/norm/cp_flux_ref"]
             if cp_flux_ref_mode == "mean":
                 ref = np.divide(ref_sum, np.maximum(ref_cnt, 1, dtype=np.int64),
-                                dtype=np.float64)
+                    dtype=np.float64)
             else:
                 ref = np.empty((C, P), dtype=np.float64)
                 for c_ in range(C):
@@ -7391,8 +5688,7 @@ def build_hypercube(
                 "per-(c,p) statistic of sum_λ models[s,c,p,λ] over spaxels; "
                 "mask applied to λ if present"
             )
-
-
+        
         g.attrs["complete"] = True
         if vel_bias_kms is not None:
             g.attrs["vel_bias_kms"] = float(vel_bias_kms)
@@ -7400,7 +5696,6 @@ def build_hypercube(
         g.attrs["shape"] = (S, C, P, L)
         g.attrs["chunks"] = models.chunks
         g.attrs["cp_flux_ref_mode"] = cp_flux_ref_mode
-
 
         # help h5py close cleanly
         del models, losvd_ds, done, g, E_ds
@@ -7768,6 +6063,8 @@ def main():
         help="Single string passed directly as runSwitch to genCubeFit"
     )
     # boolean redraw with explicit on/off flags
+    ap.add_argument("--ncomp", type=int, default=None,
+        help="Number of components to fit")
     group = ap.add_mutually_exclusive_group()
     group.add_argument("--redraw", dest="redraw", action="store_true",
                        help="Enable redraw mode")
@@ -7820,6 +6117,9 @@ def main():
     os.environ["CUBEFIT_GLOBAL_ENERGY_BLEND"] = "0.0"
     os.environ["CUBEFIT_ZERO_COL_FREEZE"] = str(1)
     os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-4)
+
+    if args.ncomp is not None:
+        props['nCuts'] = args.ncomp
     print(props)
 
     try:
@@ -9525,86 +7825,25 @@ if __name__ == "__main__":
     main()
 </file>
 
-<file path="kz_2Fit.sh">
-#!/bin/bash -l
-# #SBATCH -A durham
-# #SBATCH -D "/cosma5/data/durham/dc-poci1/muse"
-# #SBATCH --output="/cosma5/data/durham/dc-poci1/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-# #SBATCH --error="/cosma5/data/durham/dc-poci1/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-
-# #SBATCH -A oz059
-# #SBATCH -D "/fred/oz059/poci/muse"
-# #SBATCH --output="/fred/oz059/poci/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-# #SBATCH --error="/fred/oz059/poci/muse/slurm_tri_losvdDecomp.log" --open-mode=append
-
-#SBATCH -D "/data/phys-gal-dynamics/phys2603/muse"
-#SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
-#SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
-#SBATCH -p short
-
-#SBATCH --job-name="CubeFit_2Fit"
-#SBATCH --time=0-12:00
-#SBATCH -N 1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=48
-#SBATCH --mem=200G
-#SBATCH --hint=nomultithread
-#SBATCH --exclusive
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=adriano.poci@physics.ox.ac.uk
-
-module purge
-module load foss/2023a
-module load Python/3.11.3-GCCcore-12.3.0
-
-# --- BLAS / OpenMP threading (per worker) ---
-export OMP_NUM_THREADS=12
-export OPENBLAS_NUM_THREADS=12
-export MKL_NUM_THREADS=12
-export NUMEXPR_NUM_THREADS=12
-export OMP_PROC_BIND=spread
-export OMP_PLACES=cores
-export OMP_DYNAMIC=FALSE
-export MKL_DYNAMIC=FALSE
-# For OpenBLAS, avoid accidental main-thread reuse:
-export OPENBLAS_VERBOSE=0
-
-# --- HDF5 raw-data chunk cache (reader side) ---
-export CUBEFIT_RDCC_NBYTES=$((16*1024*1024*1024))  # 16 GiB
-export CUBEFIT_RDCC_NSLOTS=400003                   # large-ish prime
-export CUBEFIT_RDCC_W0=0.9
-
-export HDF5_USE_FILE_LOCKING=FALSE
-
-# File descriptors
-ulimit -n 8192
-
-cd /data/phys-gal-dynamics/phys2603/CubeFit
-
-# sanity print (once) to confirm cpuset and BLAS threads
-srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python - <<'PY'
-import os, json
-print(f"[sanity] cpuset cores: {len(os.sched_getaffinity(0))}")
-try:
-    from threadpoolctl import threadpool_info
-    print("[sanity] BLAS pools:", json.dumps(threadpool_info(), indent=2)[:600], "...")
-except Exception as e:
-    print("[sanity] threadpoolctl not available:", e)
-PY
-
-# run your job as a Slurm step (gives you the full cpuset)
-srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python -m IPython kz_run.py -- --run-switch fit
-</file>
-
 <file path="cube_utils.py">
-# thread_utils.py
+"""
+
+History
+--------
+v1.0:   Added `build_component_support_from_losvd_amp` and
+            `build_component_support_energy_from_models` to efficiently determine
+            spatial support of components based on LOSVD amplitude or model
+            energy. 3 January 2026
+v1.1:   Added `apply_global_hypercube_scale_inplace` to compute and store a
+            global scale for the Hypercube model to improve numerical stability
+            during fitting. 8 January 2026
+"""
 from __future__ import annotations
 from contextlib import contextmanager
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Tuple, Sequence
 import numpy as np
-import os, glob, time, re
+from tqdm import tqdm
+import os, glob, time, re, math
 import pathlib as plp
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
@@ -11424,6 +9663,361 @@ def diagnose_tile_col_denom_threshold(
     return out
 
 # ------------------------------------------------------------------------------
+
+def build_component_support_from_losvd_amp(
+    h5_path: str,
+    *,
+    eps_factor: float = 1e-12,
+    overwrite: bool = False,
+) -> None:
+    """
+    Build /HyperCube/component_support for an existing HyperCube using
+    LOSVD amplitudes.
+
+    The support mask is tile-aligned:
+        component_support[t, c] = 1
+        iff there exists a spaxel s in spatial tile t such that
+        losvd_amp[s, c] > eps_factor * max_s losvd_amp[s, c].
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the CubeFit HDF5 file.
+    eps_factor : float, optional
+        Relative threshold factor (default 1e-12). Must be conservative:
+        false positives are OK, false negatives are not.
+    overwrite : bool, optional
+        If True, overwrite existing /HyperCube/component_support.
+        If False (default), raise if it already exists.
+    """
+
+    with open_h5(h5_path, role="writer") as f:
+        if "/HyperCube" not in f:
+            raise RuntimeError("Missing /HyperCube group.")
+
+        g = f["/HyperCube"]
+
+        # --- existence checks ---
+        if "/HyperCube/norm/losvd_amp" not in f:
+            raise RuntimeError(
+                "Missing /HyperCube/norm/losvd_amp. "
+                "Run _compute_and_store_losvd_amplitudes first."
+            )
+
+        if "models" not in g:
+            raise RuntimeError("Missing /HyperCube/models.")
+
+        if "component_support" in g:
+            if not overwrite:
+                raise RuntimeError(
+                    "/HyperCube/component_support already exists. "
+                    "Use overwrite=True to rebuild."
+                )
+            del g["component_support"]
+
+        # --- read shapes ---
+        models = g["models"]
+        S, C, P, L = map(int, models.shape)
+
+        # Infer spatial chunking from models dataset
+        chunks = models.chunks
+        if chunks is None or chunks[0] is None:
+            raise RuntimeError("models dataset has no spatial chunking.")
+        S_chunk = int(chunks[0])
+
+        n_tiles = int(math.ceil(S / S_chunk))
+
+        print(
+            f"[component_support] Building support mask: "
+            f"S={S}, C={C}, S_chunk={S_chunk}, n_tiles={n_tiles}"
+        )
+
+        # --- read losvd_amp ---
+        A = f["/HyperCube/norm/losvd_amp"]  # shape (S, C), float64
+
+        if A.shape != (S, C):
+            raise RuntimeError(
+                f"/HyperCube/norm/losvd_amp has shape {A.shape}, "
+                f"expected {(S, C)}."
+            )
+
+        # --- compute per-component max amplitude (C,) ---
+        # This is cheap: A is already stored
+        A_max = np.max(np.asarray(A[...], dtype=np.float64), axis=0)
+
+        # Conservative per-component threshold
+        eps_support = eps_factor * A_max
+
+        # --- create dataset ---
+        supp = g.create_dataset(
+            "component_support",
+            shape=(n_tiles, C),
+            dtype="u1",
+            chunks=(1, min(C, 256)),
+            compression="gzip",
+            compression_opts=1,
+        )
+
+        # Metadata
+        supp.attrs["definition"] = (
+            "component_support[t,c]=1 iff any spaxel s in tile t has "
+            "losvd_amp[s,c] > eps_factor * max_s losvd_amp[s,c]"
+        )
+        supp.attrs["source"] = "losvd_amp"
+        supp.attrs["eps_factor"] = float(eps_factor)
+        supp.attrs["S_chunk"] = int(S_chunk)
+        supp.attrs["shape"] = (int(n_tiles), int(C))
+
+        # --- build support tile-by-tile ---
+        for t in range(n_tiles):
+            s0 = t * S_chunk
+            s1 = min(S, s0 + S_chunk)
+
+            # Slice (ΔS, C)
+            A_tile = np.asarray(A[s0:s1, :], dtype=np.float64, order="C")
+
+            # Active if any spaxel in tile exceeds threshold
+            active = np.any(A_tile > eps_support[None, :], axis=0)
+
+            supp[t, :] = active.astype(np.uint8)
+
+        # Flush for SWMR readers
+        try:
+            supp.id.flush()
+            f.flush()
+        except Exception:
+            pass
+
+        # --- optional summary ---
+        mean_active = float(np.mean(np.sum(supp[...], axis=1)))
+        print(
+            f"[component_support] Done. "
+            f"Mean active components per tile: {mean_active:.1f} / {C}"
+        )
+
+# ------------------------------------------------------------------------------
+
+def build_component_support_energy_from_models(
+    h5_path: str,
+    *,
+    eps_energy: float = 1e-6,
+    overwrite: bool = False,
+) -> None:
+    """
+    Build /HyperCube/component_support_energy by streaming over
+    /HyperCube/models and accumulating tile-wise component energy.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to CubeFit HDF5 file.
+    eps_energy : float
+        Relative threshold vs per-tile median component energy.
+        Must be conservative (default 1e-6).
+    overwrite : bool
+        Overwrite existing dataset if present.
+    """
+
+    with open_h5(h5_path, role="writer") as f:
+        g = f["/HyperCube"]
+
+        if "models" not in g:
+            raise RuntimeError("Missing /HyperCube/models")
+
+        if "component_support_energy" in g:
+            if not overwrite:
+                raise RuntimeError(
+                    "/HyperCube/component_support_energy exists. "
+                    "Use overwrite=True."
+                )
+            del g["component_support_energy"]
+
+        M = g["models"]
+        S, C, P, L = map(int, M.shape)
+
+        # Infer chunking (this is critical)
+        chunks = M.chunks
+        if chunks is None:
+            raise RuntimeError("models dataset is not chunked")
+
+        S_chunk, C_chunk, P_chunk, L_chunk = map(int, chunks)
+        if C_chunk != 1:
+            raise RuntimeError("Expected C_chunk == 1 for efficient streaming")
+
+        n_tiles = math.ceil(S / S_chunk)
+
+        print(
+            f"[support_energy] Streaming build: "
+            f"S={S}, C={C}, P={P}, L={L}, "
+            f"S_chunk={S_chunk}, P_chunk={P_chunk}"
+        )
+
+        # Accumulator: (tile, component)
+        E_tile_comp = np.zeros((n_tiles, C), dtype=np.float64)
+
+        # Stream in EXACT chunk order
+        for s0 in range(0, S, S_chunk):
+            s1 = min(S, s0 + S_chunk)
+            tile_idx = s0 // S_chunk
+
+            for c in range(C):
+                acc = 0.0
+
+                for p0 in range(0, P, P_chunk):
+                    p1 = min(P, p0 + P_chunk)
+
+                    # Read one on-disk chunk:
+                    # shape = (ΔS, 1, ΔP, L)
+                    slab = np.asarray(
+                        M[s0:s1, c:c+1, p0:p1, :],
+                        dtype=np.float32,
+                        order="C"
+                    )
+
+                    # Sum of squares over s, p, λ
+                    acc += float(np.sum(
+                        np.square(slab, dtype=np.float64)
+                    ))
+
+                E_tile_comp[tile_idx, c] += acc
+
+        # Create dataset
+        suppE = g.create_dataset(
+            "component_support_energy",
+            shape=(n_tiles, C),
+            dtype="u1",
+            chunks=(1, min(C, 256)),
+            compression="gzip",
+            compression_opts=1,
+        )
+
+        suppE.attrs["definition"] = (
+            "component_support_energy[t,c]=1 iff "
+            "tile_energy[t,c] > eps_energy * median_c(tile_energy[t,:])"
+        )
+        suppE.attrs["eps_energy"] = float(eps_energy)
+        suppE.attrs["S_chunk"] = int(S_chunk)
+        suppE.attrs["source"] = "models energy (chunk-streamed)"
+        suppE.attrs["shape"] = (int(n_tiles), int(C))
+
+        # Threshold per tile
+        for t in range(n_tiles):
+            row = E_tile_comp[t, :]
+            pos = row[row > 0.0]
+            if pos.size == 0:
+                suppE[t, :] = 0
+                continue
+
+            med = float(np.median(pos))
+            thresh = eps_energy * med
+            suppE[t, :] = (row > thresh).astype(np.uint8)
+
+        try:
+            suppE.id.flush()
+            f.flush()
+        except Exception:
+            pass
+
+        mean_active = float(np.mean(np.sum(suppE[...], axis=1)))
+        print(
+            f"[support_energy] Done. "
+            f"Mean active components per tile: {mean_active:.1f} / {C}"
+        )
+
+# ------------------------------------------------------------------------------
+
+def apply_global_hypercube_scale_inplace(
+    h5_path: str,
+    *,
+    apply_mask: bool = True,
+    use_lambda_weights: bool = True,
+    rdcc_slots: int = 1_000_003,
+    rdcc_bytes: int = 256 * 1024**2,
+    rdcc_w0: float = 0.90,
+) -> dict:
+    """
+    Compute and apply the exact global HyperCube normalization in-place,
+    using full-cube L2 energies. Semantics are identical to HyperCube build.
+
+    Returns
+    -------
+    dict with keys:
+        scale
+        data_energy
+        model_energy
+    """
+
+    # ----------------------------
+    # 1. Compute data energy
+    # ----------------------------
+    data_energy = 0.0
+
+    with open_h5(h5_path, "reader") as f:
+        DC = f["/DataCube"]
+        S, L = DC.shape
+
+        keep_idx = None
+        if apply_mask and "/Mask" in f:
+            m = np.asarray(f["/Mask"][...], bool).ravel()
+            if m.size == L and np.any(m):
+                keep_idx = np.flatnonzero(m)
+
+        for s0 in range(0, S, 128):
+            s1 = min(S, s0 + 128)
+            Y = np.asarray(DC[s0:s1, :], np.float64, order="C")
+            if keep_idx is not None:
+                Y = Y[:, keep_idx]
+            data_energy += float(np.sum(Y * Y))
+
+    # ----------------------------
+    # 2. Read model energy (exact)
+    # ----------------------------
+    with open_h5(h5_path, "reader") as f:
+        if "/HyperCube/col_energy" not in f:
+            raise RuntimeError("Missing /HyperCube/col_energy")
+        E = np.asarray(f["/HyperCube/col_energy"][...], np.float64)
+        model_energy = float(np.sum(E))
+
+    if model_energy <= 0.0 or not np.isfinite(model_energy):
+        raise RuntimeError("Invalid model energy")
+
+    scale = np.sqrt(data_energy / model_energy)
+
+    # ----------------------------
+    # 3. Apply in-place
+    # ----------------------------
+    with open_h5(h5_path, "writer") as f:
+        M = f["/HyperCube/models"]
+        try:
+            M.id.set_chunk_cache(rdcc_slots, rdcc_bytes, rdcc_w0)
+        except Exception:
+            pass
+
+        S, C, P, L = M.shape
+        S_chunk = M.chunks[0] if M.chunks else 128
+
+        for s0 in tqdm(range(0, S, S_chunk),
+                        desc="[HyperCube] applying global scale",
+                        mininterval=2.0):
+            s1 = min(S, s0 + S_chunk)
+            M[s0:s1, :, :, :] *= scale
+
+        # scale col_energy consistently
+        f["/HyperCube/col_energy"][...] *= scale * scale
+
+        g = f["/HyperCube/norm"]
+        g.attrs["global_scale"] = float(scale)
+        g.attrs["global_scale_definition"] = (
+            "argmin || DataCube - α * sum_{c,p} models ||_2"
+        )
+
+    return dict(
+        scale=float(scale),
+        data_energy=float(data_energy),
+        model_energy=float(model_energy),
+    )
+
+# ------------------------------------------------------------------------------
 </file>
 
 <file path="pipeline_runner.py">
@@ -11469,6 +10063,9 @@ v1.7:   Read in NNLs `L2` ridge from environment variable in
             `solve_all_mp_batched`. 13 December 2025
 v1.8:   Implemented mtime-based decision for sidecar vs main file loading in
             `solve_all*` resume logic. 18 December 2025
+v1.9:   Added final elapsed time logging in `solve_all_mp_batched`. 1 January
+            2026
+v1.10:  Implemented SPG to Kaczmarz workflow. 7 January 2026
 """
 
 from __future__ import annotations
@@ -11483,7 +10080,7 @@ from CubeFit.hypercube_builder import build_hypercube, read_global_column_energy
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
 from CubeFit.kaczmarz_solver import solve_global_kaczmarz, SolverCfg
 from CubeFit.kaczmarz_solver_cchunk_mp_nnls import (
-    MPConfig, solve_global_kaczmarz_global_step_mp)
+    MPConfig, solve_global_kaczmarz_global_step_mp, solve_kaczmarz_nnls)
     # solve_global_kaczmarz_cchunk_mp)
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
@@ -12357,7 +10954,6 @@ class PipelineRunner:
         seed_cfg=None,
         tracker_mode="on",
         verbose=True,
-        ratio_cfg: RatioCfg | None = None,
     ):
 
         # --------------- Warm-start (same policy as SP path) -----------
@@ -12607,64 +11203,43 @@ class PipelineRunner:
 
         try:
             with logger.capture_all_output():
-                x_global, stats = solve_global_kaczmarz_global_step_mp(
+                x_solver, stats = solve_global_kaczmarz_global_step_mp(
                     self.h5_path,
                     cfg,
                     orbit_weights=orbit_weights,
-                    # ratio_cfg=ratio_cfg,
                     x0=x0_effective,
                     tracker=tracker,
                 )
 
-            # Do we need to project + polish?
-            if orbit_weights is not None:
-                logger.log("[Pipeline] Initial MP solve done; starting quick polish...")
-                E_global = read_global_column_energy(self.h5_path)   # (C,P) or None
-                # Tile budget for quick polish (no extra I/O; use the reader’s known shapes)
-                # --- STRICT projection (mass preserving, exact per-component)
-                logger.log('[Pipeline] Enforcing orbit weights via strict '\
-                    'projection.')
-                cu.project_to_component_weights(
-                    x_global, orbit_weights, E_cp=E_global, minw=1e-10,
-                    beta=1.0
-                )
-                logger.log('[Pipeline] Post-projection total mass: '\
-                    f'{float(np.sum(x_global)):.6e}')
-                total_tiles = (
-                    math.ceil(reader.nSpat / reader_s_tile)
-                    * math.ceil(reader.nComp / reader_c_tile)
-                    * math.ceil(reader.nPop  / reader_p_tile)
-                )
-                # --- QUICK POLISH (cheap 1-epoch touch-up, no projector/softbox)
-                # Use the solver's own API; seed it with the just-projected x_global.
-                # Keep it lightweight: a small fraction of tiles, no ratio projector, no softbox.
-                try:
-                    small_tile_budget = np.max((1, int(0.1 * total_tiles)))# ~10%
-                except Exception:
-                    small_tile_budget = 0  # fall back to solver default if your solver ignores max_tiles
-                logger.log(f"[Pipeline] Running quick polish with tile budget: "
-                    f"{small_tile_budget} tiles (~10% of total {total_tiles}).")
+                # ------------------------------------------------------------
+                # Final Kaczmarz NNLS polish (true row-action)
+                # ------------------------------------------------------------
+                logger.log("[Pipeline] Starting Kaczmarz NNLS polish...")
 
-                cfg_polish = MPConfig(
-                    epochs=1,
-                    lr=float(lr),
-                    project_nonneg=bool(project_nonneg),
-                    processes=int(processes),
-                    blas_threads=int(blas_threads),
-                    apply_mask=bool(reader_apply_mask),
-                    max_tiles=int(small_tile_budget)
-                )
+                C = self.nComp
+                P = self.nPop
+                Xcp = x_solver.reshape(C, P)
 
-                x_global, _ = solve_global_kaczmarz_global_step_mp(
+                # Use active set from SPG (rows only)
+                active_orbits = stats.get("active_orbits", None)
+
+                Xcp = solve_kaczmarz_nnls(
                     self.h5_path,
-                    cfg_polish,
-                    orbit_weights=None,
-                    # keep the enforced mixture; no projector here
-                    x0=np.asarray(x_global, np.float64, order="C"),
-                    tracker=NullTracker(), # silent + cheap
-                    # ratio_cfg=None, # disable ratio projector
+                    Xcp,
+                    active_orbits=active_orbits,
+                    orbit_weights=orbit_weights,
+                    orbit_beta=float(os.environ.get("CUBEFIT_ORBIT_BETA", "0.2")),
+                    max_epochs=int(os.environ.get("CUBEFIT_KACZMARZ_EPOCHS", "2")),
+                    tol_kkt=float(os.environ.get("CUBEFIT_KACZMARZ_KKT", "1e-6")),
+                    shuffle_spaxels=True,
+                    apply_mask=bool(reader_apply_mask),
+                    use_lambda_weights=True,
+                    tracker=tracker,
                 )
-                logger.log("[Pipeline] Quick polish done.")
+
+                x_solver = Xcp.ravel(order="C")
+
+                logger.log("[Pipeline] Kaczmarz NNLS polish complete.")
 
         finally:
             try:
@@ -12672,17 +11247,50 @@ class PipelineRunner:
             except Exception:
                 pass
 
+        logger.log("[Pipeline] Writing final /X_global to main HDF5...")
         with open_h5(self.h5_path, role="writer") as f_wr:
+            # Rescale to global units
+            logger.log("[Pipeline] Rescaling to global units...")
+            alpha = float(f_wr["/HyperCube/norm"].attrs.get("global_scale", 1.0))
+            if not np.isfinite(alpha) or alpha <= 0.0:
+                raise RuntimeError(
+                    f"Invalid HyperCube global_scale={alpha!r}; "
+                    "cannot rescale X_global safely."
+                )
+            x_global = x_solver / alpha
+            logger.log(f"[Pipeline] Rescale factor: {alpha:.6e}")
+
             if "/X_global" in f_wr:
                 del f_wr["/X_global"]
             x1d = np.asarray(x_global, np.float64).ravel(order="C")
-            f_wr.create_dataset("/X_global", data=x1d, dtype=np.float64,
-                chunks=(min(8192, x1d.size),), compression=None,
-                shuffle=True)
+            ds = f_wr.create_dataset(
+                "/X_global",
+                data=x1d,
+                dtype=np.float64,
+                chunks=(min(8192, x1d.size),),
+                compression=None,
+                shuffle=True,
+            )
+            ds.attrs["units"] = "physical"
+            ds.attrs["derived_from"] = "x_solver / global_scale"
+            ds.attrs["global_scale"] = alpha
 
         if tracker is not None:
             try: tracker.close()
             except Exception: pass
+        
+        logger.log(
+            "[Pipeline] ===================================================")
+        logger.log(
+            f"[Pipeline] Multi-process solve complete: epochs={epochs}, "
+            f"processes={processes}, blas_threads={blas_threads}."
+        )
+        logger.log(
+            '[Pipeline] ---------------------------------------------------')
+        logger.log("[Pipeline] Final elapsed time: "
+            f"{stats.get('elapsed_sec', np.nan):.2f} sec.")
+        logger.log(
+            "[Pipeline] ===================================================")
 
         return x_global, stats
 </file>
@@ -12713,6 +11321,8 @@ v1.0:   2025
 v1.1:   Read `zarrDir` from `kwargs` instead of hardcoding it. 12 August 2025
 v1.2:   Removed `cp_flux_ref` from `reconstruct_modelcube_fast`, since now all
             public `x` API is scaled to physical units. 5 December 2025
+v1.3:   Read in and un-scale `x_global` by stored Hypercube scale in
+            `loadCubeFit`. 8 January 2026
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -13296,33 +11906,15 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     #####################################
     # Multi-processing Batched Kaczmarz #
     #####################################
-    RC = cu.RatioCfg(
-        anchor="target",   # pull toward /CompWeights
-        eta=0.8,           # per-tile multiplicative strength
-        gamma=2.0,         # clamp for multiplicative factors
-        prob=1.0,          # apply every tile
-        batch=0,           # consider all active components
-        minw=1e-5,         # ignore ~zero-weight targets
-        # epoch-level projection (gentle, blended)
-        epoch_project=True,
-        epoch_eta=0.6,     # how hard the epoch projection pushes
-        epoch_gamma=3.0,   # clamp at epoch projection
-        epoch_beta=0.35,   # 0..1 blend toward the projected state
-        epoch_renorm=True, # keep target sum=1
-        tile_every=1,      # apply per tile
-        use=True           # actually enable the ratio term
-    )
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=8,
+        epochs=3,
         # x0=x0,
         lr=0.1,
         project_nonneg=True,
         orbit_weights=None, # or None for “free” fit
-        ratio_cfg=None,
-        # orbit_weights=cWeights, # Make sure to enable `CUBEFIT_ORBIT_BETA`
-        # ratio_cfg=RC,
-        processes=4, # 4 workers
-        blas_threads=12, # 12 BLAS threads each → 48 total
+        # orbit_weights=cWeights,
+        processes=48, # 48 workers
+        blas_threads=1, # 1 BLAS thread each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
         warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
@@ -13867,9 +12459,18 @@ def reconstruct_modelcube_fast(
         x_cp = np.ascontiguousarray(x_in.reshape(C, P), dtype=np.float64)
 
         # Optional sparse speedup: precompute nonzeros per component
-        nz_per_c = None
+        nz_per_c = [None] * C
         if use_sparse:
-            nz_per_c = [np.flatnonzero(x_cp[c, :] != 0.0) for c in range(C)]
+            for c in range(C):
+                nz = np.flatnonzero(x_cp[c, :] != 0.0)
+                if nz.size < 0.2 * P:
+                    nz_per_c[c] = nz
+                else:
+                    nz_per_c.append(None)  # fall back to dense
+        if use_sparse:
+            n_sparse = sum(nz is not None for nz in nz_per_c)
+            if n_sparse == 0:
+                nz_per_c = [None] * C
 
         # Progress
         n_tiles = math.ceil(S / S_blk) * math.ceil(L / L_band)
@@ -13891,24 +12492,18 @@ def reconstruct_modelcube_fast(
                 band = np.zeros((dS, l1 - l0), dtype=np.float64, order="C")
 
                 for c in range(C):
-                    if use_sparse:
-                        nz = nz_per_c[c]
-                        if nz.size == 0:
-                            continue
-                        w = x_cp[c, nz]  # (P_sub,)
-                        A_c = np.asarray(
-                            M[s0:s1, c, nz, l0:l1], dtype=np.float32, order="C"
-                        )
+                    if nz_per_c[c] is None:
+                        w = x_cp[c, :]
+                        A_c = M[s0:s1, c, :, l0:l1]
                     else:
-                        w = x_cp[c, :]    # (P,)
-                        A_c = np.asarray(
-                            M[s0:s1, c, :, l0:l1], dtype=np.float32, order="C"
-                        )
+                        nz = nz_per_c[c]
+                        w = x_cp[c, nz]
+                        A_c = M[s0:s1, c, nz, l0:l1]
 
                     # y += sum_p w[p] * A[:, p, :]
                     band += np.tensordot(
-                        w.astype(np.float64, copy=False),
-                        A_c.astype(np.float64, copy=False),
+                        w,
+                        A_c,
                         axes=(0, 1),
                     )
 
@@ -14446,12 +13041,18 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     else:
         logger.log("[ModelCube] Reconstructing…")
         # reconstruct_model_cube_single(  # or your parallel version
-        reconstruct_modelcube_fast(
-            h5_path=str(hdf5Path),
-            x_cp=x_global,
-            # array_name="ModelCube",
-            # blas_threads=nProcs,
-        )
+        try:
+            reconstruct_modelcube_fast(
+                h5_path=str(hdf5Path),
+                x_cp=x_global,
+                use_sparse=False,
+                # array_name="ModelCube",
+                # blas_threads=nProcs,
+            )
+        except Exception as e:
+            logger.log(
+                f"[ModelCube] Error: Could not reconstruct ModelCube")
+            raise e
         # Stamp digest so future runs can skip confidently
         try:
             with open_h5(str(hdf5Path), role="writer") as f:
@@ -15028,6 +13629,21 @@ v2.6:   Replaced expensive backtracking RMSE evaluations with O(1) quadratic
             coefficients. 30 December 2025
 v3.0:   Switched to diagonal-preconditioned Spectral Projected Gradient method
             to replace Kaczmarz updates. 31 December 2025
+v3.1:   Added orbit-weight projection step inside SPG loop in 
+            `solve_global_kaczmarz_global_step_mp`. 1 January 2026
+v3.2:   Properly account for active orbits using component support masks during
+            orbit-weight projection;
+        Fixed indentation bug in tile loop in
+            `solve_global_kaczmarz_global_step_mp`. 3 January 2026
+v3.3:   Correctly capped `dx` during SPG step in
+            `solve_global_kaczmarz_global_step_mp`;
+        Implement Armijo backtracking with cheap RMSE proxy in
+            `solve_global_kaczmarz_global_step_mp`;
+        Force small `D` to `np.inf` in `solve_global_kaczmarz_global_step_mp`. 5
+            January 2026
+v3.4:   Implemented SPG to Kaczmarz workflow. 7 January 2026
+v3.5:   Fixed indentation bug for Kaczmarz update in
+            `solve_global_kaczmarz_global_step_mp`. 8 January 2026
 """
 
 from __future__ import annotations, print_function
@@ -15518,11 +14134,8 @@ def solve_global_kaczmarz_global_step_mp(
     # Load cube metadata
     # ------------------------------------------------------------
     with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
-        M  = f["/HyperCube/models"]
-
-        S, L = map(int, DC.shape)
-        _, C, P, Lm = map(int, M.shape)
+        S, L = map(int, f["/DataCube"].shape)
+        _, C, P, Lm = map(int, f["/HyperCube/models"].shape)
         if Lm != L:
             raise RuntimeError("Model / data wavelength mismatch")
 
@@ -15530,7 +14143,9 @@ def solve_global_kaczmarz_global_step_mp(
         keep_idx = np.flatnonzero(mask) if mask is not None else None
         Lk = int(keep_idx.size) if keep_idx is not None else L
 
-        s_tile = int(M.chunks[0]) if (M.chunks and M.chunks[0] > 0) else 128
+        # read chunking info (but don't keep the dataset handle)
+        chunks = f["/HyperCube/models"].chunks
+        s_tile = int(chunks[0]) if (chunks and chunks[0]) else 128
         if cfg.s_tile_override is not None:
             s_tile = int(cfg.s_tile_override)
 
@@ -15541,6 +14156,43 @@ def solve_global_kaczmarz_global_step_mp(
         f"s_tile={s_tile}, epochs={cfg.epochs}, lr0={cfg.lr}",
         flush=True,
     )
+
+    # ------------------------------------------------------------
+    # Load spatial component support masks (LOSVD + ENERGY)
+    # ------------------------------------------------------------
+    with open_h5(h5_path, role="reader") as f:
+        supp_losvd = None
+        supp_energy = None
+
+        if "/HyperCube/component_support" in f:
+            ds = f["/HyperCube/component_support"]
+            supp_losvd = np.asarray(ds[...], dtype=bool)
+            if int(ds.attrs.get("S_chunk", s_tile)) != s_tile:
+                raise RuntimeError(
+                    "component_support S_chunk mismatch with solver tile size"
+                )
+            print("[SPG] Using LOSVD-based component support.", flush=True)
+
+        if "/HyperCube/component_support_energy" in f:
+            ds = f["/HyperCube/component_support_energy"]
+            supp_energy = np.asarray(ds[...], dtype=bool)
+            if int(ds.attrs.get("S_chunk", s_tile)) != s_tile:
+                raise RuntimeError(
+                    "component_support_energy S_chunk mismatch with solver tile size"
+                )
+            print("[SPG] Using ENERGY-based component support.", flush=True)
+
+        if supp_losvd is not None and supp_energy is not None:
+            component_support = supp_losvd & supp_energy
+            print("[SPG] Combined LOSVD ∧ ENERGY component support.", flush=True)
+        elif supp_losvd is not None:
+            component_support = supp_losvd
+        elif supp_energy is not None:
+            component_support = supp_energy
+        else:
+            component_support = None
+            print("[SPG] No component support masks found; using all components.",
+                  flush=True)
 
     # ------------------------------------------------------------
     # Global ||Y|| for trust region (compute once)
@@ -15647,9 +14299,10 @@ def solve_global_kaczmarz_global_step_mp(
     best_proxy = np.inf
 
     # --- Active set bookkeeping ---
-    active_orbits = np.arange(C, dtype=np.int32)   # start fully active
+    active_orbits = np.arange(C, dtype=np.int32)
     min_active = int(os.environ.get("CUBEFIT_MIN_ACTIVE_ORBITS", "8"))
 
+    rmse_prev = None
 
     # ============================================================
     # Main epochs
@@ -15660,6 +14313,15 @@ def solve_global_kaczmarz_global_step_mp(
             D_tot = np.zeros_like(x)
             ssq = 0.0
             nres = 0
+
+            # Precompute spatially active components per tile
+            if component_support is not None:
+                active_c_per_tile = [
+                    np.nonzero(component_support[it])[0]
+                    for it in range(len(s_ranges))
+                ]
+            else:
+                active_c_per_tile = None
 
             pbar = tqdm(
                 total=len(s_ranges),
@@ -15684,33 +14346,54 @@ def solve_global_kaczmarz_global_step_mp(
                     if keep_idx is not None:
                         Y = Y[:, keep_idx]
 
-                    # exact model prediction (ACTIVE ORBITS ONLY)
                     yhat = np.zeros_like(Y)
-                    for c in active_orbits:
+
+                    if active_c_per_tile is not None:
+                        tile_idx = s0 // s_tile
+                        spatial_active = active_c_per_tile[tile_idx]
+                        c_iter = np.intersect1d(
+                            active_orbits,
+                            spatial_active,
+                            assume_unique=True
+                        )
+                    else:
+                        c_iter = active_orbits
+
+                    for c in c_iter:
                         A = np.asarray(M[s0:s1, c, :, :], np.float32)
                         if keep_idx is not None:
                             A = A[:, :, keep_idx]
                         yhat += np.tensordot(x_eff[c], A, axes=(0, 1))
 
-                    R = Y - yhat
-                    if not np.all(np.isfinite(R)):
-                        R = np.nan_to_num(R, copy=False)
+                R = Y - yhat
+                if not np.all(np.isfinite(R)):
+                    R = np.nan_to_num(R, copy=False)
 
                 ssq += float(np.sum(R * R))
                 nres += int(R.size)
 
-                # ---- Worker jobs: FULL CONTIGUOUS BANDS (unchanged) ----
                 jobs = []
+                band_map = []
                 for (c_start, c_stop) in bands:
+                    if spatial_active is not None:
+                        mask = (spatial_active >= c_start) & (spatial_active < c_stop)
+                        if not np.any(mask):
+                            continue
+                        c_sel = spatial_active[mask]
+                        c0 = int(c_sel.min())
+                        c1 = int(c_sel.max()) + 1
+                    else:
+                        c0, c1 = c_start, c_stop
+
                     jobs.append(
                         (
                             h5_path,
                             int(s0),
                             int(s1),
                             keep_idx,
-                            int(c_start),
-                            int(c_stop),
-                            x_eff[c_start:c_stop].copy(order="C"),
+                            c0,
+                            c1,
+                            x_eff[c0:c1].copy(order="C"),
                             R.copy(order="C"),
                             w_lam_sqrt,
                             None,
@@ -15719,16 +14402,14 @@ def solve_global_kaczmarz_global_step_mp(
                             cfg.dset_w0,
                         )
                     )
+                    band_map.append((c0, c1))
 
-                if use_pool:
-                    results = pool.map(_worker_tile_global_grad_band, jobs)
-                else:
-                    results = [_worker_tile_global_grad_band(j) for j in jobs]
+                results = pool.map(_worker_tile_global_grad_band, jobs) if use_pool \
+                        else [_worker_tile_global_grad_band(j) for j in jobs]
 
-                # ---- Aggregate results (UNCHANGED, SAFE) ----
-                for (c_start, c_stop), (g_band, D_band) in zip(bands, results):
-                    g_tot[c_start:c_stop] += g_band
-                    D_tot[c_start:c_stop] += D_band
+                for (c0, c1), (g_band, D_band) in zip(band_map, results):
+                    g_tot[c0:c1] += g_band
+                    D_tot[c0:c1] += D_band
 
                 pbar.update(1)
 
@@ -15740,94 +14421,140 @@ def solve_global_kaczmarz_global_step_mp(
                 best_proxy = rmse_proxy
                 best_x = x.copy()
 
-            # diagonal preconditioner
-            abs_zero = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-24"))
-            denom_floor_frac = float(os.environ.get("CUBEFIT_DENOM_FLOOR_FRAC",
-                "1e-6"))
-            D_pos = D_tot[D_tot > 0.0]
-            D_scale = np.percentile(D_pos, 90.0) if D_pos.size else 1.0
-            D_floor = max(abs_zero, denom_floor_frac * D_scale)
-            D = np.maximum(D_tot, D_floor)
+            if rmse_prev is None:
+                rmse_rel_change = np.inf
+            else:
+                rmse_rel_change = abs(rmse_prev - rmse_proxy) / max(rmse_prev, 1.0)
+            rmse_prev = rmse_proxy
 
-            g = g_tot
+            # ------------------------------------------------------------
+            # Diagonal preconditioner (scale-free)
+            # ------------------------------------------------------------
+            D_raw = D_tot.copy()
+            pos = np.isfinite(D_raw) & (D_raw > 0.0)
 
-            # BB spectral step length
-            if x_prev is not None and g_prev is not None:
-                s = x - x_prev
-                y = g - g_prev
-                sy = float(np.sum(s * y))
-                if sy > 0.0:
-                    lr = float(np.sum(s * s) / sy)
-                    lr = np.clip(lr, 1e-6, cfg.lr)
-                else:
-                    lr = cfg.lr
+            if np.any(pos):
+                D_ref = np.median(D_raw[pos])
+            else:
+                D_ref = 1.0
 
-            # gradient descent step
-            x_prev = x.copy()
-            g_prev = g.copy()
+            D = D_raw / D_ref
+            abs_zero = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-30"))
+            D = np.where(pos, np.maximum(D, abs_zero), 0.0)
 
-            dx = -lr * (g / D)
-            # ---- GLOBAL TRUST REGION ----
-            tau_global = float(os.environ.get("CUBEFIT_GLOBAL_TAU", "0.5"))
-            if E_global is not None and Y_glob_norm > 0.0:
-                step_energy = float(np.sum((dx * dx) * E_global))
-                cap = float(tau_global * Y_glob_norm)
+            g = -g_tot
 
-                if step_energy > cap * cap:
-                    scale = cap / max(np.sqrt(step_energy), 1.0e-12)
-                    dx *= scale
+            # ------------------------------------------------------------
+            # GLOBAL freeze (relative)
+            # ------------------------------------------------------------
+            freeze_mul = float(os.environ.get("CUBEFIT_GLOBAL_FREEZE_MUL", "1e-6"))
+            D_freeze = freeze_mul
 
-            x += dx
-            # projection: nonnegativity
-            if cfg.project_nonneg:
-                np.maximum(x, 0.0, out=x)
-
-            # projection: orbit-weight prior
-            if w_target is not None and orbit_beta > 0.0:
-                cu.project_to_component_weights(
-                    x,
-                    w_target,
-                    E_cp=E_global,
-                    beta=orbit_beta,
-                    minw=1e-12,
+            freeze = (D <= D_freeze) | (~np.isfinite(D))
+            if np.any(freeze):
+                g = g.copy()
+                g[freeze] = 0.0
+                D = D.copy()
+                D[freeze] = np.inf
+                print(
+                    f"[SPG] GLOBAL freeze applied: {int(np.count_nonzero(freeze))} cols "
+                    f"(D < {D_freeze:.1e})",
+                    flush=True,
                 )
 
             # ------------------------------------------------------------
-            # Update active orbit set (NNLS-safe)
+            # KKT / projected gradient diagnostics
+            # ------------------------------------------------------------
+            viol = np.zeros_like(g)
+            pos_mask = x > 0.0
+            viol[pos_mask] = np.abs(g[pos_mask])
+            viol[~pos_mask] = np.maximum(-g[~pos_mask], 0.0)
+
+            kkt_norm = np.max(np.abs(viol)) / (np.max(np.abs(g)) + 1e-30)
+
+            g_plus = np.zeros_like(g)
+            g_plus[pos_mask] = g[pos_mask]
+            g_plus[~pos_mask] = np.minimum(g[~pos_mask], 0.0)
+            pg_norm = np.linalg.norm(g_plus)
+            pg_rel = pg_norm / (1.0 + np.linalg.norm(x))
+
+            finite = np.isfinite(D)
+            gap_est = np.sum((g[finite] ** 2) / D[finite]) / (np.sum(g[finite] ** 2) + 1e-30)
+
+            # ------------------------------------------------------------
+            # Step length
+            # ------------------------------------------------------------
+            if x_prev is not None and g_prev is not None:
+                s = x - x_prev
+                y = g - g_prev
+                sy = float(np.vdot(s, y))
+                lr = np.clip(np.vdot(s, s) / sy, 1e-8, 1e-3) if sy > 0 else lr
+            else:
+                lr = float(cfg.lr)
+
+            lr *= 0.99
+
+            dx = -lr * (g / D)
+            if np.vdot(dx, g) > 0:
+                dx = -dx
+
+            dx_norm = np.linalg.norm(dx)
+            g_norm = np.linalg.norm(g)
+            x_norm = np.linalg.norm(x)
+
+            step_cos = -np.vdot(dx, g) / (dx_norm * g_norm + 1e-30)
+
+            grad_cap = 3.0 * g_norm
+            x_cap = float(os.environ.get("CUBEFIT_MAX_FRAC", "0.02")) * x_norm
+            dx_cap = min(grad_cap, x_cap)
+
+            if dx_norm > dx_cap and dx_cap > 0:
+                dx *= dx_cap / dx_norm
+
+            # ------------------------------------------------------------
+            # Apply step
+            # ------------------------------------------------------------
+            x_prev = x.copy()
+            g_prev = g.copy()
+
+            x += dx
+            if cfg.project_nonneg:
+                np.maximum(x, 0.0, out=x)
+
+            # ------------------------------------------------------------
+            # Diagnostics
+            # ------------------------------------------------------------
+            print("[SPG] Step diagnostics:", flush=True)
+            print(f"  lr={lr:.3e}", flush=True)
+            print(f"  rmse_rel_change={rmse_rel_change:.3e}", flush=True)
+            print(f"  pg_rel={pg_rel:.3e}", flush=True)
+            print(f"  step_cos={step_cos:.3f}", flush=True)
+            print(f"  KKT_inf={kkt_norm:.3e}", flush=True)
+            print(f"  gap_est={gap_est:.3e}", flush=True)
+            print(f"  ||x||={x_norm:.3e}", flush=True)
+            print(f"  ||dx||={dx_norm:.3e}, dx_cap={dx_cap:.3e}", flush=True)
+
+            # ------------------------------------------------------------
+            # Active set update
             # ------------------------------------------------------------
             x_row_l1 = np.sum(x, axis=1)
             g_row_inf = np.max(np.abs(g), axis=1)
 
-            x_scale = max(float(np.sum(x_row_l1)), 1.0)
-            g_scale = max(float(np.max(g_row_inf)), 1.0)
-
-            eps_mass = 1e-12 * x_scale
-            eps_grad = 1e-10 * g_scale
+            eps_mass = 1e-12 * max(np.sum(x_row_l1), 1.0)
+            eps_grad = 1e-10 * max(np.max(g_row_inf), 1.0)
 
             new_active = np.nonzero(
                 (x_row_l1 > eps_mass) | (g_row_inf > eps_grad)
             )[0]
 
-            # Always keep a minimum number to avoid pathological empty sets
             if new_active.size < min_active:
-                topg = np.argsort(g_row_inf)[-min_active:]
-                new_active = np.unique(np.concatenate([new_active, topg]))
+                new_active = np.argsort(g_row_inf)[-min_active:]
 
             active_orbits = new_active.astype(np.int32)
 
+            print(f"[SPG] active orbits: {active_orbits.size}/{C}", flush=True)
             print(
-                f"[SPG] active orbits: {active_orbits.size}/{C}",
-                flush=True,
-            )
-
-            if tracker is not None:
-                tracker.maybe_snapshot_x(
-                    x, epoch=ep + 1, rmse=rmse_proxy, force=True
-                )
-
-            print(
-                f"[SPG] epoch {ep+1} RMSE(proxy)={rmse_proxy:.4e} "
-                f"lr={lr:.3e} ||x||={np.linalg.norm(x):.3e}",
+                f"[SPG] epoch {ep+1} RMSE(proxy)={rmse_proxy:.4e}",
                 flush=True,
             )
 
@@ -15836,12 +14563,178 @@ def solve_global_kaczmarz_global_step_mp(
             epochs=cfg.epochs,
             elapsed_sec=elapsed,
             rmse_proxy_best=float(best_proxy),
+            kkt_norm_best=float(kkt_norm),
+            active_orbits=active_orbits.copy(),
         )
 
     finally:
         if pool is not None:
             pool.close()
             pool.join()
+
+# ------------------------------------------------------------------------------
+
+def _kaczmarz_update_row(
+    x_row,            # (P,) current coefficients for component c
+    A_row,            # (P, Lk) model row for spaxel s, component c
+    r_row,            # (Lk,) residual at spaxel s
+    w_lam_sqrt=None,  # (Lk,) or None
+):
+    """
+    One projected Kaczmarz update for a single spaxel row.
+    """
+
+    if w_lam_sqrt is not None:
+        A = A_row * w_lam_sqrt[None, :]
+        r = r_row * w_lam_sqrt
+    else:
+        A = A_row
+        r = r_row
+
+    # numerator: <A, r>
+    num = A @ r
+
+    # denominator: ||A||^2
+    denom = np.sum(A * A)
+
+    if denom <= 0.0:
+        return x_row
+
+    alpha = num / denom
+
+    # update + projection
+    x_new = x_row + alpha * A @ np.ones(A.shape[1])
+    np.maximum(x_new, 0.0, out=x_new)
+
+    return x_new
+
+# ------------------------------------------------------------------------------
+
+def solve_kaczmarz_nnls(
+    h5_path: str,
+    x0: np.ndarray,                    # (C,P)
+    *,
+    active_orbits: np.ndarray | None = None,
+    orbit_weights: np.ndarray | None = None,
+    orbit_beta: float | None = None,
+    max_epochs: int = 10,
+    tol_kkt: float = 1e-6,
+    shuffle_spaxels: bool = True,
+    apply_mask: bool = True,
+    use_lambda_weights: bool = True,
+    tracker=None,
+):
+    """
+    Row-action (Kaczmarz) NNLS solver for CubeFit.
+    Supports orbit-weight projection (global, per epoch).
+    """
+
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M  = f["/HyperCube/models"]
+
+        S, L = DC.shape
+        _, C, P, _ = M.shape
+
+        mask = cu._get_mask(f) if apply_mask else None
+        keep_idx = np.flatnonzero(mask) if mask is not None else None
+
+        if use_lambda_weights and "/HyperCube/lambda_weights" in f:
+            w_full = np.asarray(f["/HyperCube/lambda_weights"], np.float64)
+            w_lam_sqrt = np.sqrt(np.maximum(
+                w_full[keep_idx] if keep_idx is not None else w_full,
+                1e-6
+            ))
+        else:
+            w_lam_sqrt = None
+
+    x = x0.copy()
+
+    if active_orbits is None:
+        active_orbits = np.arange(C)
+
+    # Canonical orbit-weight target
+    if orbit_weights is not None:
+        w_target = _canon_orbit_weights(
+            h5_path,
+            orbit_weights,
+            C=C,
+            P=P,
+        )
+        if orbit_beta is None:
+            orbit_beta = float(os.environ.get("CUBEFIT_ORBIT_BETA", "0.2"))
+    else:
+        w_target = None
+
+    spaxel_order = np.arange(S)
+
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M  = f["/HyperCube/models"]
+
+        for epoch in range(max_epochs):
+
+            if shuffle_spaxels:
+                np.random.shuffle(spaxel_order)
+
+            max_kkt = 0.0
+
+            for s in spaxel_order:
+                y = np.asarray(DC[s], np.float64)
+                if keep_idx is not None:
+                    y = y[keep_idx]
+
+                yhat = np.zeros_like(y)
+
+                for c in active_orbits:
+                    A = np.asarray(M[s, c], np.float32)
+                    if keep_idx is not None:
+                        A = A[:, keep_idx]
+                    yhat += x[c] @ A
+
+                r = y - yhat
+
+                for c in active_orbits:
+                    A = np.asarray(M[s, c], np.float32)
+                    if keep_idx is not None:
+                        A = A[:, keep_idx]
+
+                    x[c] = _kaczmarz_update_row(
+                        x[c], A, r, w_lam_sqrt
+                    )
+
+                    g_c = -(A @ r)
+                    viol = np.where(x[c] > 0.0,
+                                    np.abs(g_c),
+                                    np.maximum(-g_c, 0.0))
+                    max_kkt = max(max_kkt, np.max(viol))
+
+            # Global orbit-weight projection (once per epoch)
+            if w_target is not None and orbit_beta > 0.0:
+                cu.project_to_component_weights(
+                    x,
+                    w_target,
+                    E_cp=None,
+                    beta=orbit_beta,
+                    minw=1e-12,
+                )
+
+            if tracker is not None:
+                tracker.maybe_snapshot_x(
+                    x, epoch=epoch + 1, rmse=None, force=True
+                )
+
+            print(
+                f"[Kaczmarz] epoch {epoch+1}/{max_epochs}, "
+                f"KKT_inf={max_kkt:.3e}",
+                flush=True,
+            )
+
+            if max_kkt < tol_kkt:
+                print("[Kaczmarz] Converged (KKT residual small).", flush=True)
+                break
+
+    return x
 
 # ------------------------------------------------------------------------------
 

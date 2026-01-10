@@ -22,6 +22,8 @@ r"""
 History
 -------
 v1.0:   Initial HDF5 design and validation. 7 September 2025
+v1.1:   Normalise all LOSVD kernels to unity on write in `populate_from_arrays`.
+            10 January 2026
 
 
 HDF5 manager for CubeFit.
@@ -439,6 +441,59 @@ def _build_linrebin_matrix_from_range(lam_range: Tuple[float, float],
     old_edges = np.linspace(lam_lo, lam_hi, num=n_src + 1, dtype=np.float64)
     new_edges = np.linspace(lam_lo, lam_hi, num=n_obs + 1, dtype=np.float64)
     return _build_linrebin_matrix_from_edges(old_edges, new_edges)
+
+def _normalize_losvd_and_persist(h5f, losvd, losvd_path, norm_path):
+    """
+    Ensure LOSVD kernels integrate to unity. Persist original integrals.
+
+    Parameters
+    ----------
+    h5f : h5py.File
+        Open HDF5 file handle (r+).
+    losvd : np.ndarray
+        LOSVD kernel array read from HDF5. Shape (..., L).
+    losvd_path : str
+        Path to LOSVD dataset in HDF5.
+    norm_path : str
+        Path to store LOSVD normalization values.
+
+    Returns
+    -------
+    losvd_normed : np.ndarray
+        Normalized LOSVD kernels (same shape as input).
+    """
+
+    # If normalization already exists and marked done, just normalize in memory
+    if norm_path in h5f and bool(h5f[norm_path].attrs.get("normalized_to_unity", False)):
+        # Fast path: normalize in memory only (cheap)
+        s = losvd.sum(axis=-1, keepdims=True)
+        s[s == 0] = 1.0
+        return losvd / s
+
+    # Compute integrals
+    s = losvd.sum(axis=-1)
+    s_safe = s.copy()
+    s_safe[s_safe <= 0] = 1.0
+
+    # Normalize in memory
+    losvd_normed = losvd / s_safe[..., None]
+
+    # Persist norms exactly once
+    if norm_path not in h5f:
+        norm_ds = h5f.create_dataset(
+            norm_path,
+            data=s.astype(np.float64),
+            compression="gzip",
+            compression_opts=4,
+        )
+        norm_ds.attrs["normalized_to_unity"] = True
+        norm_ds.attrs["source"] = losvd_path
+        norm_ds.attrs["meaning"] = "LOSVD integral over wavelength"
+    else:
+        norm_ds = h5f[norm_path]
+        norm_ds[...] = s.astype(np.float64)
+
+    return losvd_normed
 
 # --------------------------------------------------------------------------- #
 # Manager
@@ -1051,9 +1106,52 @@ class H5Manager:
             _write("/DataCube",
                 datacube_SL.astype(np.float64, copy=False),
                 dtype=np.float64)  # (S,L)
-            _write("/LOSVD",
-                losvd_in.astype(np.float64, copy=False),
-                dtype=np.float64)  # (S,V,C)
+            # --- Normalize LOSVD kernels to unit integral and persist norms ---
+            # losvd_in has shape (S, V, C)
+            losvd_norm = losvd_in.astype(np.float64, copy=False)
+
+            # Sum over velocity axis (axis=1)
+            # Result shape: (S, C)
+            losvd_amp_sum = np.sum(losvd_norm, axis=1)
+
+            # Persist normalization factors
+            if "/HyperCube/losvd_norm" in f:
+                del f["/HyperCube/losvd_norm"]
+            ds_norm = f.create_dataset(
+                "/HyperCube/losvd_norm",
+                data=losvd_amp_sum.astype(np.float64),
+                dtype=np.float64,
+            )
+            ds_norm.attrs["semantic"] = "LOSVD integral over velocity (pre-normalization)"
+            ds_norm.attrs["normalized_to_unity"] = True
+            ds_norm.attrs["source"] = "H5Manager.populate_from_arrays"
+
+            # Normalize LOSVDs in-place (protect against zero mass)
+            safe = losvd_amp_sum > 0.0
+            # Expand denominator to (S, 1, C)
+            denom = losvd_amp_sum[:, None, :]
+
+            # Normalize where denom > 0, else zero
+            losvd_norm = np.where(
+                denom > 0.0,
+                losvd_norm / denom,
+                0.0,
+            )
+
+            # Optional sanity check (cheap and decisive)
+            if not np.allclose(
+                np.sum(losvd_norm, axis=1)[safe],
+                1.0,
+                rtol=1e-6,
+            ):
+                raise RuntimeError("LOSVD normalization failed in populate_from_arrays")
+
+            # Write normalized LOSVDs
+            _write(
+                "/LOSVD",
+                losvd_norm.astype(np.float64, copy=False),
+                dtype=np.float64,
+            )  # (S,V,C)
 
             Tds = _write("/Templates",
                         templates_c.astype(np.float64, copy=False),
@@ -1068,7 +1166,7 @@ class H5Manager:
                     f"[Mask] True==keep; fraction kept = {frac_true:.3f}")
                 _write("/Mask", mask, dtype=np.bool_)
             if x_init is not None:
-                x_init = np.asarray(x_init, dtype=np.float64).ravel()
+                x_init = np.asarray(x_init, dtype=np.float64)
                 if x_init.size != C * P:
                     raise ValueError(f"x_init length {x_init.size} != C*P={C*P}.")
                 _write("/X_global", x_init, dtype=np.float64)

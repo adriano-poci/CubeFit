@@ -28,6 +28,7 @@ v1.3:   Improved speed of `col_energy` computation, switching from `einsum` to
             `square`. 4 December 2025
 v1.4:   Compute and apply a global scale to the Hypercube model to improve
             numerical stability during fitting. 8 January 2026
+v1.5:   Removed global scale. 10 January 2026
 
 
 Hypercube builder (LOSVD convolution in log-λ, then rebin to observed grid)
@@ -388,6 +389,8 @@ def _fft_conv_centered(T_fft_slice: np.ndarray,
 def _direct_centered_conv(Templates: np.ndarray,
                           Hk_unit: np.ndarray,
                           km: _KM) -> np.ndarray:
+
+    assert Hk_unit.ndim == 1
     X = np.asarray(Templates, np.float64, order="C")
     H = np.maximum(np.asarray(Hk_unit, np.float64, order="C"), 0.0)
     s = float(np.sum(H))
@@ -399,7 +402,7 @@ def _direct_centered_conv(Templates: np.ndarray,
 
     dP, T = X.shape
     y = np.zeros((dP, T), dtype=np.float64)
-    for k in range(int(km.m)):
+    for k in range(Hk_unit.shape[0]):
         shift = int(k) - int(km.center_idx)
         if shift >= 0:
             if shift < T:
@@ -564,8 +567,7 @@ def preflight_hypercube_convolution(
 
     for s in s_sel:
         for c in c_sel:
-            H = LOSVD[s, :, c]
-            Hk = _losvd_to_unit_kernel(H, km)
+            Hk = LOSVD[s, :, c]
 
             n_fft = _next_pow2(int(T) + int(km.m) - 1)
             T_fft = np.fft.rfft(T_slice, n=int(n_fft), axis=1)
@@ -595,7 +597,7 @@ def preflight_hypercube_convolution(
 
             if verbose:
                 # expected pixel shift from LOSVD first moment
-                Hpos = np.maximum(H, 0.0)
+                Hpos = np.maximum(Hk, 0.0)
                 denom = float(np.trapezoid(Hpos, VelPix))
                 if denom > 0.0:
                     mu_v = float(np.trapezoid(Hpos * VelPix, VelPix) / denom)
@@ -892,8 +894,6 @@ def build_hypercube(
     P_chunk: int = 360,
     compression: str | None = None,
     vel_bias_kms: float = 0.0,
-    global_scale: float | None = None,
-    global_scale_auto: bool = True,
 ) -> None:
     """
     Build /HyperCube/models with LOSVD convolution on the template grid,
@@ -910,7 +910,6 @@ def build_hypercube(
         raise ValueError("norm_mode must be 'model' or 'data'.")
     if cp_flux_ref_mode not in ("median", "mean", "off"):
         raise ValueError("cp_flux_ref_mode must be 'median', 'mean', or 'off'.")
-
 
     # -------- Fast preflight: exit early if fully complete (reader-only)
     with open_h5(base_h5, "reader") as f_rd:
@@ -1093,7 +1092,7 @@ def build_hypercube(
         if "/HyperCube/col_energy" in f:
             del f["/HyperCube/col_energy"]
         E_ds = g.create_dataset("col_energy", shape=(C, P), dtype="f8",
-                                chunks=(min(C,256), min(P,1024)), compression="gzip")
+            chunks=(min(C,256), min(P,1024)), compression="gzip")
         # set attrs before swmr_mode
         E_ds.attrs["masked"] = bool(masked_flag)
         E_ds.attrs["lambda_weights"] = bool(w_lam_sqrt is not None)
@@ -1154,10 +1153,6 @@ def build_hypercube(
                         yield (p0, p1, s0, s1, c0, c1, (is_s, ic, ip))
 
         total_tiles = rem
-
-        # --- global scale accumulators ---
-        scale_num = 0.0   # Σ data * model
-        scale_den = 0.0   # Σ model^2
 
         pbar = tqdm(total=total_tiles, desc="[HyperCube] tiles",
                     mininterval=2.0)
@@ -1244,10 +1239,6 @@ def build_hypercube(
                             np.square(Yv, dtype=np.float64),
                             axis=1
                         )  # (ΔP,)
-                    # --------------------------------------------
-                    # GLOBAL SCALE: denominator accumulation
-                    # --------------------------------------------
-                    scale_den += float(np.sum(e_local))
 
                     E_acc[c_idx, p0:p1] += e_local
                     # --- accumulate tile-wise component energy ---
@@ -1270,12 +1261,6 @@ def build_hypercube(
 
                     # 7) write
                     models[s_idx, c_idx, p0:p1, 0:L] = Ycp
-
-                # --------------------------------------------
-                # GLOBAL SCALE: numerator accumulation
-                # --------------------------------------------
-                if norm_mode == "model":
-                    scale_num += float(np.dot(model_sum, data_vec))
 
 
             _done_set(done, idx3)
@@ -1349,7 +1334,7 @@ def build_hypercube(
                 del f["/HyperCube/norm/cp_flux_ref"]
             if cp_flux_ref_mode == "mean":
                 ref = np.divide(ref_sum, np.maximum(ref_cnt, 1, dtype=np.int64),
-                                dtype=np.float64)
+                    dtype=np.float64)
             else:
                 ref = np.empty((C, P), dtype=np.float64)
                 for c_ in range(C):
@@ -1369,41 +1354,6 @@ def build_hypercube(
                 "per-(c,p) statistic of sum_λ models[s,c,p,λ] over spaxels; "
                 "mask applied to λ if present"
             )
-
-        # ------------------------------------------------------------
-        # FINALIZE GLOBAL HYPERCUBE SCALE
-        # ------------------------------------------------------------
-        if norm_mode == "model":
-            if scale_den > 0.0:
-                global_scale = scale_num / scale_den
-            else:
-                global_scale = 1.0
-
-            g_norm = f.require_group("/HyperCube/norm")
-            g_norm.attrs["global_scale"] = float(global_scale)
-            g_norm.attrs["global_scale_definition"] = (
-                "argmin || DataCube - α * sum_{c,p} models ||_2"
-            )
-            g_norm.attrs["global_scale_masked"] = bool(masked_flag)
-            g_norm.attrs["global_scale_lambda_weighted"] = bool(w_lam_sqrt
-                is not None)
-
-            for s0 in tqdm(range(0, S, S_chunk),
-                          desc="[HyperCube] applying global scale",
-                          mininterval=2.0):
-                s1 = min(S, s0 + S_chunk)
-                models[s0:s1, :, :, :] *= np.float32(global_scale)
-                try:
-                    models.id.flush()
-                    f.flush()
-                except Exception:
-                    pass
-
-            # Also rescale col_energy consistently
-            if "col_energy" in g:
-                g["col_energy"][...] *= (global_scale ** 2)
-
-            print(f"[HyperCube] Applied global scale α={global_scale:.6e}")
         
         g.attrs["complete"] = True
         if vel_bias_kms is not None:
@@ -1412,7 +1362,6 @@ def build_hypercube(
         g.attrs["shape"] = (S, C, P, L)
         g.attrs["chunks"] = models.chunks
         g.attrs["cp_flux_ref_mode"] = cp_flux_ref_mode
-
 
         # help h5py close cleanly
         del models, losvd_ds, done, g, E_ds

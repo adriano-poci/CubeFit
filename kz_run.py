@@ -23,6 +23,8 @@ def main():
         help="Single string passed directly as runSwitch to genCubeFit"
     )
     # boolean redraw with explicit on/off flags
+    ap.add_argument("--ncomp", type=int, default=None,
+        help="Number of components to fit")
     group = ap.add_mutually_exclusive_group()
     group.add_argument("--redraw", dest="redraw", action="store_true",
                        help="Enable redraw mode")
@@ -75,6 +77,9 @@ def main():
     os.environ["CUBEFIT_GLOBAL_ENERGY_BLEND"] = "0.0"
     os.environ["CUBEFIT_ZERO_COL_FREEZE"] = str(1)
     os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-4)
+
+    if args.ncomp is not None:
+        props['nCuts'] = args.ncomp
     print(props)
 
     try:

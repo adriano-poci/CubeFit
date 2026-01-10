@@ -43,6 +43,7 @@ v1.8:   Implemented mtime-based decision for sidecar vs main file loading in
 v1.9:   Added final elapsed time logging in `solve_all_mp_batched`. 1 January
             2026
 v1.10:  Implemented SPG to Kaczmarz workflow. 7 January 2026
+v1.11:  Store `/X_global` as 2D array always. 10 january 2026
 """
 
 from __future__ import annotations
@@ -1180,7 +1181,7 @@ class PipelineRunner:
 
         try:
             with logger.capture_all_output():
-                x_global, stats = solve_global_kaczmarz_global_step_mp(
+                x_solver, stats = solve_global_kaczmarz_global_step_mp(
                     self.h5_path,
                     cfg,
                     orbit_weights=orbit_weights,
@@ -1195,14 +1196,13 @@ class PipelineRunner:
 
                 C = self.nComp
                 P = self.nPop
-                Xcp = x_global.reshape(C, P)
 
                 # Use active set from SPG (rows only)
                 active_orbits = stats.get("active_orbits", None)
 
-                Xcp = solve_kaczmarz_nnls(
+                x_solver = solve_kaczmarz_nnls(
                     self.h5_path,
-                    Xcp,
+                    x_solver,
                     active_orbits=active_orbits,
                     orbit_weights=orbit_weights,
                     orbit_beta=float(os.environ.get("CUBEFIT_ORBIT_BETA", "0.2")),
@@ -1214,8 +1214,6 @@ class PipelineRunner:
                     tracker=tracker,
                 )
 
-                x_global = Xcp.ravel(order="C")
-
                 logger.log("[Pipeline] Kaczmarz NNLS polish complete.")
 
         finally:
@@ -1224,14 +1222,24 @@ class PipelineRunner:
             except Exception:
                 pass
 
+        logger.log("[Pipeline] Writing final /X_global to main HDF5...")
         with open_h5(self.h5_path, role="writer") as f_wr:
+
+            assert x_solver.ndim == 2, "Xcp must be (C, P) before writing /X_global"
+
             if "/X_global" in f_wr:
                 del f_wr["/X_global"]
-            x1d = np.asarray(x_global, np.float64).ravel(order="C")
-            f_wr.create_dataset("/X_global", data=x1d, dtype=np.float64,
-                chunks=(min(8192, x1d.size),), compression=None,
-                shuffle=True)
 
+            f_wr.create_dataset(
+                "/X_global",
+                data=x_solver.astype(np.float64),
+                compression="gzip",
+                compression_opts=4,
+            )
+
+            f_wr["/X_global"].attrs["layout"] = "C_P"
+            f_wr["/X_global"].attrs["P"] = x_solver.shape[1]
+            f_wr["/X_global"].attrs["active_orbits"] = np.asarray(active_orbits, dtype=int)
         if tracker is not None:
             try: tracker.close()
             except Exception: pass
@@ -1249,4 +1257,4 @@ class PipelineRunner:
         logger.log(
             "[Pipeline] ===================================================")
 
-        return x_global, stats
+        return x_solver, stats

@@ -609,7 +609,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=3,
+        epochs=10,
         # x0=x0,
         lr=0.1,
         project_nonneg=True,
@@ -1713,7 +1713,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         if "/X_global" not in f:
             raise RuntimeError("No /X_global found — run the fit first.")
         x_global = f["/X_global"][...]
-        scale = float(f["/HyperCube"].attrs["global_scale"])
 
         if "/HyperCube/models" not in f:
             raise RuntimeError("No /HyperCube/models found — build the HyperCube first.")
@@ -1733,8 +1732,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         has_mask = ("/Mask" in f)
         mask_arr = f["/Mask"][...] if has_mask else None
         obs = f["/ObsPix"][...] if "/ObsPix" in f else np.arange(nLSpec)
-    
-    x_global /= scale  # undo scaling for ModelCube reconstruction
 
     spat_tile, nTiles = choose_spat_tile_fast(nSpat, nProcs, s_chunk, k=2)
     nProcs = min(nProcs, nTiles, 12)  # don’t spawn more processes than tiles

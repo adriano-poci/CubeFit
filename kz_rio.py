@@ -64,11 +64,13 @@ from CubeFit.kz_initNGC4365 import props
 def main():
     ap = argparse.ArgumentParser(description="Thin wrapper around genCubeFit")
     # boolean redraw with explicit on/off flags
+    ap.add_argument("--ncomp", type=int, default=None,
+        help="Number of components to fit")
     group = ap.add_mutually_exclusive_group()
     group.add_argument("--redraw", dest="redraw", action="store_true",
-                       help="Enable redraw mode")
+        help="Enable redraw mode")
     group.add_argument("--no-redraw", dest="redraw", action="store_false",
-                       help="Disable redraw mode")
+        help="Disable redraw mode")
     ap.set_defaults(redraw=False)
 
     args = ap.parse_args()
@@ -94,8 +96,12 @@ def main():
     props['redraw'] = bool(args.redraw)
     print(f"redraw = {props['redraw']}")
 
+    if args.ncomp is not None:
+        props['nCuts'] = args.ncomp
+    print(props)
+
     try:
-        loadCubeFit(**props,)
+        loadCubeFit(**props)
     except SystemExit:
         # Let explicit sys.exit()s behave normally
         raise

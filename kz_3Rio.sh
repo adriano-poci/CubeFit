@@ -68,6 +68,92 @@ except Exception as e:
     print("[sanity] threadpoolctl not available:", e)
 PY
 
+
+
+# ------------------------------------------------------------------------------
+# Argument parsing
+# ------------------------------------------------------------------------------
+set -euo pipefail
+IFS=$'\n\t'
+
+usage() {
+    cat <<EOF
+Usage: $0 [-n N] [--ncomp=N] [--ncomp N] [positional...]
+  -n N           short form
+  --ncomp=N      long form (either form optional)
+If provided, N must be a positive integer.
+EOF
+}
+
+NCOMP=""
+# Build a new argv array excluding any long-form --ncomp tokens
+new_argv=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --ncomp=*)
+            # long form with equals: --ncomp=VALUE
+            NCOMP="${1#--ncomp=}"
+            shift
+            ;;
+        --ncomp)
+            # long form with separate arg: --ncomp VALUE
+            if [ "$#" -lt 2 ]; then
+                echo "Error: --ncomp requires an argument." >&2
+                usage; exit 2
+            fi
+            NCOMP="$2"
+            shift 2
+            ;;
+        --)
+            # end-of-options marker: preserve and stop scanning
+            shift
+            # append the rest as positional args and break
+            while [ "$#" -gt 0 ]; do
+                new_argv+=("$1"); shift
+            done
+            break
+            ;;
+        *)
+            # keep other args for getopts / positional handling
+            new_argv+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Replace positional parameters with filtered args for getopts
+set -- "${new_argv[@]:-}"
+
+# Now parse short options (-n) with getopts
+while getopts ":n:" opt; do
+    case "$opt" in
+        n) NCOMP="$OPTARG" ;;
+        \?) echo "Unknown option: -$OPTARG" >&2; usage; exit 2 ;;
+        :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# Validate NCOMP if provided
+if [ -n "${NCOMP:-}" ]; then
+    if ! printf '%s' "$NCOMP" | grep -Eq '^[0-9]+$'; then
+        echo "Error: ncomp must be a positive integer, got '$NCOMP'." >&2
+        exit 2
+    fi
+    if [ "$NCOMP" -le 0 ]; then
+        echo "Error: ncomp must be > 0, got '$NCOMP'." >&2
+        exit 2
+    fi
+    echo "NCOMP set to $NCOMP"
+else
+    echo "NCOMP not provided; running with defaults"
+fi
+# ------------------------------------------------------------------------------
+# /Argument parsing
+# ------------------------------------------------------------------------------
+
+
+
 # run your job as a Slurm step (gives you the full cpuset)
 srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python -m IPython kz_rio.py -- --redraw
+  python -m IPython kz_rio.py -- --redraw ${NCOMP:+--ncomp="$NCOMP"}

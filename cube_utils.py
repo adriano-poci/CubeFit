@@ -2177,7 +2177,7 @@ def apply_global_hypercube_scale_inplace(
         # scale col_energy consistently
         f["/HyperCube/col_energy"][...] *= scale * scale
 
-        g = f["/HyperCube"]
+        g = f["/HyperCube/norm"]
         g.attrs["global_scale"] = float(scale)
         g.attrs["global_scale_definition"] = (
             "argmin || DataCube - α * sum_{c,p} models ||_2"

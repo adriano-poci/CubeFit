@@ -498,6 +498,71 @@ def apply_orbit_prior_to_seed(Xcp: np.ndarray,
 
 # ------------------------------------------------------------------------------
 
+def _normalize_losvd_kernels(losvd_kernels, keep_idx=None, logger=None):
+    """
+    Normalize LOSVD kernels in-place so each kernel sums to 1 over the
+    wavelength axis (last axis). Safe against zero-sum kernels.
+    """
+    if logger is None:
+        def _log(msg): print(msg)
+    else:
+        _log = logger.debug
+
+    # Force float64 for stable division, do in-place on a copy if dtype differs.
+    if losvd_kernels.dtype != np.float64:
+        losvd_kernels = losvd_kernels.astype(np.float64, copy=False)
+
+    # If a wavelength mask/keep_idx is used, we must sum only over those
+    # wavelengths so the kernel integrates to unity over the solved domain.
+    if keep_idx is not None:
+        # Extract the masked slice (this creates a view/temporary)
+        summed = np.sum(losvd_kernels[..., keep_idx], axis=-1, keepdims=True)
+    else:
+        summed = np.sum(losvd_kernels, axis=-1, keepdims=True)
+
+    # Summed shape is losvd_kernels.shape[:-1] + (1,)
+    # Compute median before for diagnostics
+    summed_flat = np.ravel(summed)
+    print(f"[nnls_patch] losvd_amp_sum (pre-normalize): min={float(summed_flat.min()):.3e} "
+         f"med={float(np.median(summed_flat)):.3e} max={float(summed_flat.max()):.3e}")
+
+    # Avoid dividing by zero: where sum <= eps, leave kernel unchanged (or set to zero).
+    eps = np.finfo(losvd_kernels.dtype).eps * losvd_kernels.shape[-1] * 1e2
+    safe = (summed > eps)
+
+    if keep_idx is not None:
+        # Normalize only the masked wavelengths in-place
+        # Create a view to the masked wavelengths for elementwise division
+        view = losvd_kernels[..., keep_idx]
+        # Broadcast safe (shape (...,1)) over last axis
+        view[safe[..., 0]] /= summed[safe]
+        # Note: above indexing selects those kernel-elements with safe True
+    else:
+        # Divide full kernels by their sums, only where safe is True
+        # Use in-place division for performance
+        # To broadcast, reshape summed to (...,1) already done via keepdims=True
+        # For kernels that are not safe (sum too small), set kernel to zero to avoid
+        # leaving pathological distributions.
+        losvd_kernels[safe[..., 0], :] /= summed[safe]
+        if not np.all(safe):
+            # set zero-sum kernels explicitly to zero
+            losvd_kernels[~safe[..., 0], :] = 0.0
+
+    # Recompute sums for diagnostics
+    if keep_idx is not None:
+        summed_after = np.sum(losvd_kernels[..., keep_idx], axis=-1)
+    else:
+        summed_after = np.sum(losvd_kernels, axis=-1)
+
+    summed_after_flat = np.ravel(summed_after)
+    print(f"[nnls_patch] losvd_amp_sum (post-normalize): min={float(summed_after_flat.min()):.3e} "
+         f"med={float(np.median(summed_after_flat)):.3e} max={float(summed_after_flat.max()):.3e}")
+
+    # Return the (possibly new) array reference so caller can assign if dtype was changed.
+    return losvd_kernels
+
+# ------------------------------------------------------------------------------
+
 def _solve_nnls(Bw: np.ndarray, yw: np.ndarray, solver="nnls", max_iter=200, ridge=0.0,
                 normalize_columns: bool = True) -> np.ndarray:
     """
@@ -867,10 +932,10 @@ def run_patch(h5_path: str,
             pos += Lk
             r = y_obs - y_fit
             # RMSE (unweighted) and χ² (λ-weighted on finite)
-            rmse[i] = float(np.sqrt(np.mean((r)**2)))
             w2 = wrow * wrow
             den = float(np.sum(w2)) or 1.0
             chi2[i] = float(np.sum((r * wrow)**2) / den)
+            rmse[i] = np.sqrt(chi2[i])
 
             if out_dir:
                 fig = plt.figure(figsize=(9.5, 3.2))
