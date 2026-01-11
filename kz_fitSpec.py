@@ -609,7 +609,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=10,
+        epochs=4,
         # x0=x0,
         lr=0.1,
         project_nonneg=True,
@@ -619,7 +619,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         blas_threads=1, # 1 BLAS thread each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
-        warm_start='resume',  # 'zeros', 'resume', 'jacobi', 'nnls'
+        warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
@@ -1884,99 +1884,104 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         otypes = copy(nzComp)
 
     if 'sfh' in pplots:
-        satube = (otypes == 0) # group short-axis tubes
-        latube = (otypes == 1)
-        boxess = (otypes == 2)
-        arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
-        coSFH = arSOL[satube, :, :, :].sum(axis=0)
-        laSFH = arSOL[latube, :, :, :].sum(axis=0)
-        boSFH = arSOL[boxess, :, :, :].sum(axis=0)
+        try:
+            satube = (otypes == 0) # group short-axis tubes
+            latube = (otypes == 1)
+            boxess = (otypes == 2)
+            assert satube.sum() > 0 and latube.sum() > 0 and boxess.sum() > 0, \
+                "Not all orbit types present; cannot plot orbital SFH."
+            arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
+            coSFH = arSOL[satube, :, :, :].sum(axis=0)
+            laSFH = arSOL[latube, :, :, :].sum(axis=0)
+            boSFH = arSOL[boxess, :, :, :].sum(axis=0)
 
-        minT, maxT = np.min(uages), np.max(uages)
-        minZ, maxZ = np.min(umetals), np.max(umetals)
+            minT, maxT = np.min(uages), np.max(uages)
+            minZ, maxZ = np.min(umetals), np.max(umetals)
 
-        wmax = np.max(np.log10(np.array([coSFH, laSFH, boSFH])))
-        sfhMin = np.min(np.log10((
-            np.min(coSFH[coSFH>0]),
-            np.min(laSFH[laSFH>0]),
-            np.min(boSFH[boSFH>0]))))
-        wmin = np.max((sfhMin, -12))
-        print(f"SFH plot limits: {wmin:.2f} ({sfhMin:.2f}) to {wmax:.2f}")
+            wmax = np.max(np.log10(np.array([coSFH, laSFH, boSFH])))
+            sfhMin = np.min(np.log10((
+                np.min(coSFH[coSFH>0]),
+                np.min(laSFH[laSFH>0]),
+                np.min(boSFH[boSFH>0]))))
+            wmin = np.max((sfhMin, -12))
+            print(f"SFH plot limits: {wmin:.2f} ({sfhMin:.2f}) to {wmax:.2f}")
 
-        fig = plt.figure(figsize=plt.figaspect(3./4.))
-        gs = gridspec.GridSpec(3, nAlphas, hspace=0., wspace=0.)
-        # one column per alpha, 3 orbit types
-        print(nAlphas, ualphas)
-        for ali in range(nAlphas):
-            ax = fig.add_subplot(gs[0, ali])
-            cnt = ax.imshow(np.log10(coSFH[:, :, ali]),
-                extent=[minT, maxT, minZ, maxZ],
-                aspect='auto', interpolation='none', origin='lower',
-                cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
-            if not ax.get_subplotspec().is_last_row():
-                ax.set_xticklabels([])
-            if not ax.get_subplotspec().is_first_col():
-                ax.set_yticklabels([])
-            if ax.get_subplotspec().is_first_col():
-                lT = ax.text(1e-2, 1e-2, r'$z$ Tubes', va='bottom', ha='left',
-                    color=POT.pgreen, transform=ax.transAxes)
-                lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
-                    foreground='k')])
-            if nAlphas > 1:
-                lT = ax.text(0.5, 1.05, rf"$[\alpha/Fe]={ualphas[ali]:.2f}$",
-                    va='bottom', ha='center', color=POT.pgreen,
-                    transform=ax.transAxes)
-                lT.set_path_effects(
-                    [PathEffects.withStroke(linewidth=1.5, foreground='k')])
-            ax = fig.add_subplot(gs[1, ali])
-            ax.imshow(np.log10(laSFH[:, :, ali]),
-                extent=[minT, maxT, minZ, maxZ],
-                aspect='auto', interpolation='none', origin='lower',
-                cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
-            if not ax.get_subplotspec().is_last_row():
-                ax.set_xticklabels([])
-            if not ax.get_subplotspec().is_first_col():
-                ax.set_yticklabels([])
-            if ax.get_subplotspec().is_first_col():
-                lT = ax.text(1e-2, 1e-2, r'$x$ Tubes', va='bottom', ha='left',
-                    color=POT.pgreen, transform=ax.transAxes)
-                lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
-                    foreground='k')])
-            ax = fig.add_subplot(gs[2, ali])
-            ax.imshow(np.log10(boSFH[:, :, ali]),
-                extent=[minT, maxT, minZ, maxZ],
-                aspect='auto', interpolation='none', origin='lower',
-                cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
-            if not ax.get_subplotspec().is_last_row():
-                ax.set_xticklabels([])
-            if not ax.get_subplotspec().is_first_col():
-                ax.set_yticklabels([])
-            if ax.get_subplotspec().is_first_col():
-                lT = ax.text(1e-2, 1e-2, r'Box', va='bottom', ha='left',
-                    color=POT.pgreen, transform=ax.transAxes)
-                lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
-                    foreground='k')])
+            fig = plt.figure(figsize=plt.figaspect(3./4.))
+            gs = gridspec.GridSpec(3, nAlphas, hspace=0., wspace=0.)
+            # one column per alpha, 3 orbit types
+            print(nAlphas, ualphas)
+            for ali in range(nAlphas):
+                ax = fig.add_subplot(gs[0, ali])
+                cnt = ax.imshow(np.log10(coSFH[:, :, ali]),
+                    extent=[minT, maxT, minZ, maxZ],
+                    aspect='auto', interpolation='none', origin='lower',
+                    cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
+                if not ax.get_subplotspec().is_last_row():
+                    ax.set_xticklabels([])
+                if not ax.get_subplotspec().is_first_col():
+                    ax.set_yticklabels([])
+                if ax.get_subplotspec().is_first_col():
+                    lT = ax.text(1e-2, 1e-2, r'$z$ Tubes', va='bottom', ha='left',
+                        color=POT.pgreen, transform=ax.transAxes)
+                    lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                        foreground='k')])
+                if nAlphas > 1:
+                    lT = ax.text(0.5, 1.05, rf"$[\alpha/Fe]={ualphas[ali]:.2f}$",
+                        va='bottom', ha='center', color=POT.pgreen,
+                        transform=ax.transAxes)
+                    lT.set_path_effects(
+                        [PathEffects.withStroke(linewidth=1.5, foreground='k')])
+                ax = fig.add_subplot(gs[1, ali])
+                ax.imshow(np.log10(laSFH[:, :, ali]),
+                    extent=[minT, maxT, minZ, maxZ],
+                    aspect='auto', interpolation='none', origin='lower',
+                    cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
+                if not ax.get_subplotspec().is_last_row():
+                    ax.set_xticklabels([])
+                if not ax.get_subplotspec().is_first_col():
+                    ax.set_yticklabels([])
+                if ax.get_subplotspec().is_first_col():
+                    lT = ax.text(1e-2, 1e-2, r'$x$ Tubes', va='bottom', ha='left',
+                        color=POT.pgreen, transform=ax.transAxes)
+                    lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                        foreground='k')])
+                ax = fig.add_subplot(gs[2, ali])
+                ax.imshow(np.log10(boSFH[:, :, ali]),
+                    extent=[minT, maxT, minZ, maxZ],
+                    aspect='auto', interpolation='none', origin='lower',
+                    cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
+                if not ax.get_subplotspec().is_last_row():
+                    ax.set_xticklabels([])
+                if not ax.get_subplotspec().is_first_col():
+                    ax.set_yticklabels([])
+                if ax.get_subplotspec().is_first_col():
+                    lT = ax.text(1e-2, 1e-2, r'Box', va='bottom', ha='left',
+                        color=POT.pgreen, transform=ax.transAxes)
+                    lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                        foreground='k')])
 
-        BIG = fig.add_subplot(gs[:])
-        BIG.set_frame_on(False)
-        BIG.set_xticks([])
-        BIG.set_yticks([])
-        BIG.set_xlabel(r'$t\ [{\rm Gyr}]$', labelpad=20)
-        BIG.set_ylabel(r'$[Z/H]$', labelpad=35)
-        cax = POT.attachAxis(BIG, 'right', 0.05)
-        cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
-        lT = cax.text(0.5, 0.5, r'$\log_{10}($Mass Weight$)$',
-            va='center', ha='center', color=POT.pgreen,
-            transform=cax.transAxes, rotation=270)
-        lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
-            foreground='k')])
-        cax.text(0.45, 1.0-1e-3, f"{wmax:.2f}", va='top', ha='center',
-            color='w', transform=cax.transAxes, rotation=270)
-        cax.text(0.45, 1e-3, f"{wmin:.2f}", va='bottom', ha='center',
-            color='k', transform=cax.transAxes, rotation=270)
-        cb.set_ticks([])
-        plt.savefig(figDir/\
-            f"orbitSFH_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+            BIG = fig.add_subplot(gs[:])
+            BIG.set_frame_on(False)
+            BIG.set_xticks([])
+            BIG.set_yticks([])
+            BIG.set_xlabel(r'$t\ [{\rm Gyr}]$', labelpad=20)
+            BIG.set_ylabel(r'$[Z/H]$', labelpad=35)
+            cax = POT.attachAxis(BIG, 'right', 0.05)
+            cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
+            lT = cax.text(0.5, 0.5, r'$\log_{10}($Mass Weight$)$',
+                va='center', ha='center', color=POT.pgreen,
+                transform=cax.transAxes, rotation=270)
+            lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                foreground='k')])
+            cax.text(0.45, 1.0-1e-3, f"{wmax:.2f}", va='top', ha='center',
+                color='w', transform=cax.transAxes, rotation=270)
+            cax.text(0.45, 1e-3, f"{wmin:.2f}", va='bottom', ha='center',
+                color='k', transform=cax.transAxes, rotation=270)
+            cb.set_ticks([])
+            plt.savefig(figDir/\
+                f"orbitSFH_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+        except AssertionError as e:
+            print(f"Could not make orbital SFH plot: {e}")
 
     # 7. Print summary
     print(f"Mean reduced χ²: {np.mean(rchi2):.2f} ± {np.std(rchi2):.2f}")

@@ -43,7 +43,9 @@ v1.8:   Implemented mtime-based decision for sidecar vs main file loading in
 v1.9:   Added final elapsed time logging in `solve_all_mp_batched`. 1 January
             2026
 v1.10:  Implemented SPG to Kaczmarz workflow. 7 January 2026
-v1.11:  Store `/X_global` as 2D array always. 10 january 2026
+v1.11:  Store `/X_global` as 2D array always. 10 January 2026
+v1.12:  Corrected Kaczmarz polish logic in `solve_all_mp_batched`. 11 January
+            2026
 """
 
 from __future__ import annotations
@@ -1188,7 +1190,7 @@ class PipelineRunner:
                     x0=x0_effective,
                     tracker=tracker,
                 )
-
+                
                 # ------------------------------------------------------------
                 # Final Kaczmarz NNLS polish (true row-action)
                 # ------------------------------------------------------------
@@ -1199,6 +1201,8 @@ class PipelineRunner:
 
                 # Use active set from SPG (rows only)
                 active_orbits = stats.get("active_orbits", None)
+
+                logger.log(f"PRE-KACZ ||x_solver|| = {float(np.linalg.norm(x_solver))}")
 
                 x_solver = solve_kaczmarz_nnls(
                     self.h5_path,
@@ -1213,6 +1217,7 @@ class PipelineRunner:
                     use_lambda_weights=True,
                     tracker=tracker,
                 )
+                logger.log(f"POST-KACZ ||x_solver|| = {float(np.linalg.norm(x_solver))}")
 
                 logger.log("[Pipeline] Kaczmarz NNLS polish complete.")
 

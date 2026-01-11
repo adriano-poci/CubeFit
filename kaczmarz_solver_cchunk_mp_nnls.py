@@ -70,6 +70,14 @@ v3.5:   Fixed indentation bug for Kaczmarz update in
             `solve_global_kaczmarz_global_step_mp`. 8 January 2026
 v3.6:   Corrected all diagnostics and solver heuristics for the new scale of the
             LOSVD. 10 January 2026
+v3.7:   Apply `dx` to the effective `x`, including inactive orbits, in SPG
+            solver `solve_global_kaczmarz_global_step_mp`;
+        Compute a proper `rmse_trial` in the Armijo backtracking step in the SPG
+            solver `solve_global_kaczmarz_global_step_mp` to determine step
+            acceptance --- otherwise shrink `lr`;
+        Corrected Kaczmarz block update accumulation in `solve_kaczmarz_nnls`
+            by normalising by the number of rows and the number of spaxels. 11
+            January 2026
 """
 
 from __future__ import annotations, print_function
@@ -932,7 +940,7 @@ def solve_global_kaczmarz_global_step_mp(
             step_cos = -np.vdot(dx, g) / (dx_norm * g_norm + 1e-30)
 
             grad_cap = 3.0 * g_norm
-            x_cap = float(os.environ.get("CUBEFIT_MAX_FRAC", "0.02")) * x_norm
+            x_cap = float(os.environ.get("CUBEFIT_MAX_FRAC", "0.002")) * x_norm
             dx_cap = min(grad_cap, x_cap)
 
             if dx_norm > dx_cap and dx_cap > 0:
@@ -956,33 +964,32 @@ def solve_global_kaczmarz_global_step_mp(
 
             # recompute proxy RMSE at trial point
             rmse_trial = rmse_proxy  # default
-            if True:
-                # reuse same residual logic as above
-                ssq_trial = 0.0
-                nres_trial = 0
-                for (s0, s1) in s_ranges:
-                    with open_h5(h5_path, role="reader") as f:
-                        DC = f["/DataCube"]
-                        M  = f["/HyperCube/models"]
+            # reuse same residual logic as above
+            ssq_trial = 0.0
+            nres_trial = 0
+            for (s0, s1) in s_ranges:
+                with open_h5(h5_path, role="reader") as f:
+                    DC = f["/DataCube"]
+                    M  = f["/HyperCube/models"]
 
-                        Y = np.asarray(DC[s0:s1, :], np.float64)
+                    Y = np.asarray(DC[s0:s1, :], np.float64)
+                    if keep_idx is not None:
+                        Y = Y[:, keep_idx]
+
+                    yhat = np.zeros_like(Y)
+                    for c in active_orbits:
+                        A = np.asarray(M[s0:s1, c, :, :], np.float32)
                         if keep_idx is not None:
-                            Y = Y[:, keep_idx]
+                            A = A[:, :, keep_idx]
+                        yhat += np.tensordot(x_eff[c], A, axes=(0, 1))
 
-                        yhat = np.zeros_like(Y)
-                        for c in active_orbits:
-                            A = np.asarray(M[s0:s1, c, :, :], np.float32)
-                            if keep_idx is not None:
-                                A = A[:, :, keep_idx]
-                            yhat += np.tensordot(x_eff[c], A, axes=(0, 1))
+                R = Y - yhat
+                if w_lam_sqrt is not None:
+                    R *= w_lam_sqrt[None, :]
+                ssq_trial += float(np.sum(R * R))
+                nres_trial += int(R.size)
 
-                    R = Y - yhat
-                    if w_lam_sqrt is not None:
-                        R *= w_lam_sqrt[None, :]
-                    ssq_trial += float(np.sum(R * R))
-                    nres_trial += int(R.size)
-
-                rmse_trial = np.sqrt(ssq_trial / max(nres_trial, 1))
+            rmse_trial = np.sqrt(ssq_trial / max(nres_trial, 1))
 
             # accept only if improvement
             if rmse_trial <= rmse_proxy:
@@ -1044,79 +1051,6 @@ def solve_global_kaczmarz_global_step_mp(
 
 # ------------------------------------------------------------------------------
 
-def _kaczmarz_update_block(
-    x_row,            # (P,) current coefficients for component c
-    A_row,            # (P, Lk) model block for spaxel s, component c
-    r_row,            # (Lk,) residual at spaxel s
-    w_lam_sqrt=None,  # (Lk,) or None
-):
-    """
-    Block Kaczmarz NNLS update for one spaxel / one coefficient chunk.
-
-    Parameters
-    ----------
-    x_row : ndarray, shape (P,)
-        Current coefficient vector for chunk c (float64).
-    A_row : ndarray, shape (P, Lk)
-        Model block for this spaxel and chunk. Columns correspond to
-        wavelength / equation (length Lk), rows to coefficients (P).
-    r_row : ndarray, shape (Lk,)
-        Residual vector for this spaxel: y - yhat.
-    w_lam_sqrt : ndarray or None, shape (Lk,)
-        Optional per-lambda sqrt-weights. If provided, they are applied
-        to the columns of A_row and to r_row before the update.
-
-    Returns
-    -------
-    x_row : ndarray, shape (P,)
-        Updated coefficient vector (same array returned; update done in
-        place where possible).
-    """
-    # Ensure float64 for update arithmetic (avoid precision surprises).
-    x_c = np.asarray(x_row, dtype=np.float64, copy=False)
-    A = np.asarray(A_row, dtype=np.float64, order="C")
-    r = np.asarray(r_row, dtype=np.float64, copy=False)
-
-    # Apply lambda weights (broadcast over columns).
-    if w_lam_sqrt is not None:
-        w = np.asarray(w_lam_sqrt, dtype=np.float64).ravel()
-        if w.size != A.shape[1]:
-            raise RuntimeError(
-                "_kaczmarz_update_row: w_lam_sqrt length "
-                f"{w.size} != Lk={A.shape[1]}"
-            )
-        # Aw has same layout (P, Lk); multiplication is BLAS-friendly.
-        Aw = A * w[None, :]
-        rw = r * w
-    else:
-        Aw = A
-        rw = r
-
-    # Row-wise squared norms (one value per column/lambda).
-    # Use sum over axis=0 (sum over P coefficients) -> shape (Lk,)
-    row_norm2 = np.sum(Aw * Aw, axis=0)
-
-    # Guard: if all rows are zero (no information), do nothing.
-    nonzero = row_norm2 > 0.0
-    if not np.any(nonzero):
-        return x_c
-
-    # scale[lam] = r[lam] / ||a_lam||^2  (0 where denom == 0)
-    scale = np.zeros_like(rw)
-    scale[nonzero] = rw[nonzero] / row_norm2[nonzero]
-
-    # Block Kaczmarz update: x += sum_l scale[l] * a_l
-    # Aw @ scale performs (P, Lk) @ (Lk,) -> (P,)
-    # This uses a single BLAS call for the heavy work.
-    x_c += Aw @ scale
-
-    # NNLS projection (in-place)
-    np.maximum(x_c, 0.0, out=x_c)
-
-    return x_c
-
-# ------------------------------------------------------------------------------
-
 def solve_kaczmarz_nnls(
     h5_path: str,
     x0: np.ndarray,                    # (C,P)
@@ -1146,10 +1080,6 @@ def solve_kaczmarz_nnls(
     """
     # Defensive copy of x
     x = np.asarray(x0, dtype=np.float64, copy=True)  # shape (C, P)
-
-    # Open HDF5 datasets using project helper (same as other module code).
-    from hdf5_manager import open_h5  # local helper in repo
-    from math import isfinite
 
     # Normalize active_orbits default
     with open_h5(h5_path, role="reader") as f:
@@ -1188,11 +1118,21 @@ def solve_kaczmarz_nnls(
         else:
             Lk = int(L)
 
-        # optional lambda sqrt weights (if present in file)
+        # optional lambda sqrt weights
         w_lam_sqrt = None
-        if use_lambda_weights and "/LambdaWeightsSqrt" in f:
-            w_lam_sqrt = np.asarray(f["/LambdaWeightsSqrt"][...], np.float64).ravel()
-            if keep_idx is not None:
+        if use_lambda_weights:
+            if "/LambdaWeights" in f:
+                w_full = np.asarray(f["/LambdaWeights"][...], np.float64).ravel()
+                w_lam_sqrt = np.sqrt(np.maximum(w_full, 1e-12))
+            else:
+                # fall back to helper (same source, consistent behavior)
+                try:
+                    w_full = cu.read_lambda_weights(h5_path)
+                    w_lam_sqrt = np.sqrt(np.maximum(w_full, 1e-12))
+                except Exception:
+                    w_lam_sqrt = None
+
+            if w_lam_sqrt is not None and keep_idx is not None:
                 w_lam_sqrt = w_lam_sqrt[keep_idx]
 
         for epoch in range(int(max_epochs)):
@@ -1202,51 +1142,67 @@ def solve_kaczmarz_nnls(
 
             max_kkt = 0.0
 
+            # ------------------------------------------------------------
+            # Jacobi-style Kaczmarz: accumulate updates over spaxels
+            # ------------------------------------------------------------
+            dx_accum = np.zeros_like(x, dtype=np.float64)
+            n_spax = 0
+
             for s in spaxel_order:
                 # read observed spectrum for spaxel s
                 y = np.asarray(DC[s, :], dtype=np.float64, order="C")
                 if keep_idx is not None:
                     y = y[keep_idx]
 
-                # compute yhat = sum_c x[c] @ A_c  (vectorized across c)
-                # yhat starts as zeros of length Lk
+                # build effective x for residuals (match SPG active set)
+                x_eff = x.copy()
+                inactive = np.ones(Ctot, dtype=bool)
+                inactive[active_orbits] = False
+                x_eff[inactive, :] = 0.0
+
+                # compute yhat
                 yhat = np.zeros_like(y)
                 for c in active_orbits:
-                    A = np.asarray(M[s, c], np.float32, order="C")  # (P, L)
+                    A = np.asarray(M[s, c], np.float32, order="C")
                     if keep_idx is not None:
-                        A = A[:, keep_idx]  # (P, Lk)
-                    # x[c] shape -> (P,), A -> (P, Lk) => (Lk,)
-                    yhat += x[c] @ A
+                        A = A[:, keep_idx]
+                    yhat += x_eff[c] @ A
 
-                # residual vector
+                # residual
                 r = y - yhat
+                if w_lam_sqrt is not None:
+                    r = r * w_lam_sqrt
 
-                # Update each active chunk using the block update.
+                # accumulate per-chunk updates
                 for c in active_orbits:
                     A = np.asarray(M[s, c], np.float32, order="C")
                     if keep_idx is not None:
                         A = A[:, keep_idx]
 
-                    # Apply orbit-weight target blending if requested.
-                    # Keep this logic consistent with original code paths.
+                    # orbit-weight blending (unchanged logic)
+                    x_c_eff = x[c]
                     if w_target is not None and orbit_beta is not None and orbit_beta > 0.0:
-                        # This operation mirrors the "blend to target weights"
-                        # pattern used in the repository (small additive bias).
-                        # Multiply coefficients temporarily by (1 - beta) before
-                        # computing residual-driven update, then scale back.
-                        # (This is cheap and done per chunk; adjust as needed.)
-                        prior = x[c].copy()
-                        x[c] = (1.0 - orbit_beta) * x[c] + orbit_beta * w_target[c]
+                        x_c_eff = (1.0 - orbit_beta) * x[c] + orbit_beta * w_target[c]
 
-                    # Block Kaczmarz update (handles lambda weighting).
-                    x[c] = _kaczmarz_update_block(x[c], A, r, w_lam_sqrt)
+                    # ---- compute Kaczmarz block update without touching x ----
+                    # Apply lambda weights to rows if present
+                    if w_lam_sqrt is not None:
+                        Aw = A * w_lam_sqrt[None, :]
+                        rw = r
+                    else:
+                        Aw = A
+                        rw = r
 
-                    # Re-apply any multiplicative correction if we changed x[c]
-                    # above for orbit blending (the blend is already applied so
-                    # nothing more is needed here; kept for clarity.)
+                    row_norm2 = np.sum(Aw * Aw, axis=0)
+                    row_norm2 = np.where(row_norm2 > 0.0, row_norm2, np.inf)
 
-                    # KKT / stationarity metric contribution for this chunk:
-                    # g_c = -(A @ r)   (shape (P,))
+                    scale = rw / row_norm2 # (Lk,)
+                    update = (Aw @ scale) / scale.size
+                    # (P,) wavelength-averaged
+
+                    dx_accum[c] += update
+
+                    # KKT metric (unchanged semantics)
                     g_c = -(A @ r)
                     viol = np.where(
                         x[c] > 0.0,
@@ -1255,14 +1211,23 @@ def solve_kaczmarz_nnls(
                     )
                     max_kkt = max(max_kkt, float(np.max(viol)))
 
-                # Optionally snapshot x into tracker (non-blocking sidecar).
-                if tracker is not None:
-                    try:
-                        # mirror earlier code: snapshot periodically / on demand
-                        tracker.maybe_snapshot_x(x, epoch=epoch + 1, rmse=None, force=False)
-                    except Exception:
-                        # tracker is best-effort: do not fail solver on tracker errors
-                        pass
+                n_spax += 1
+
+            # ------------------------------------------------------------
+            # Apply averaged update once per epoch
+            # ------------------------------------------------------------
+            if n_spax > 0:
+                x += dx_accum / n_spax
+                np.maximum(x, 0.0, out=x)
+
+            # Optionally snapshot x into tracker (non-blocking sidecar).
+            if tracker is not None:
+                try:
+                    # snapshot periodically / on demand
+                    tracker.maybe_snapshot_x(x, epoch=epoch + 1, rmse=None, force=False)
+                except Exception:
+                    # tracker is best-effort: do not fail solver on tracker errors
+                    pass
 
             # epoch end: print and optionally persist
             print(
@@ -1494,3 +1459,5 @@ def probe_kaczmarz_tile(
         }
         print("[Probe]", out)
         return out
+
+# ------------------------------------------------------------------------------

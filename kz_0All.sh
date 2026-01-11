@@ -111,7 +111,7 @@ fi
 
 
 cd /data/phys-gal-dynamics/phys2603/CubeFit
-# declare fSGA=$(sbatch --parsable "kz_1Gen.sh" ${NCOMP:+--ncomp="$NCOMP"})
-# declare fSF=$(sbatch --parsable --dependency=afterok:"${fSGA}" "kz_2Fit.sh" ${NCOMP:+--ncomp="$NCOMP"})
-declare fSF=$(sbatch --parsable "kz_2Fit.sh" ${NCOMP:+--ncomp="$NCOMP"})
+declare fSGA=$(sbatch --parsable "kz_1Gen.sh" ${NCOMP:+--ncomp="$NCOMP"})
+declare fSF=$(sbatch --parsable --dependency=afterok:"${fSGA}" "kz_2Fit.sh" ${NCOMP:+--ncomp="$NCOMP"})
+# declare fSF=$(sbatch --parsable "kz_2Fit.sh" ${NCOMP:+--ncomp="$NCOMP"})
 sbatch --dependency=afterok:"${fSF}" "kz_3Rio.sh" ${NCOMP:+--ncomp="$NCOMP"}
