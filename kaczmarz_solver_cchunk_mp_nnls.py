@@ -78,6 +78,10 @@ v3.7:   Apply `dx` to the effective `x`, including inactive orbits, in SPG
         Corrected Kaczmarz block update accumulation in `solve_kaczmarz_nnls`
             by normalising by the number of rows and the number of spaxels. 11
             January 2026
+v3.8:   Added additional acceptance guard in SPG solver based on `step_cos`
+            in `solve_global_kaczmarz_global_step_mp`;
+        Use epoch 1 as a warm-up with softer criteria in SPG solver in
+            `solve_global_kaczmarz_global_step_mp`. 12 January 2026
 """
 
 from __future__ import annotations, print_function
@@ -731,9 +735,6 @@ def solve_global_kaczmarz_global_step_mp(
     eps = float(os.environ.get("CUBEFIT_EPS", "1e-12"))
     lr = float(cfg.lr)
 
-    x_prev = None
-    g_prev = None
-
     best_x = x.copy()
     best_proxy = np.inf
 
@@ -748,6 +749,8 @@ def solve_global_kaczmarz_global_step_mp(
     # ============================================================
     try:
         for ep in range(cfg.epochs):
+            is_warmup = (ep == 0)
+
             g_tot = np.zeros_like(x)
             D_tot = np.zeros_like(x)
             ssq = 0.0
@@ -802,7 +805,7 @@ def solve_global_kaczmarz_global_step_mp(
                         A = np.asarray(M[s0:s1, c, :, :], np.float32)
                         if keep_idx is not None:
                             A = A[:, :, keep_idx]
-                        yhat += np.tensordot(x_eff[c], A, axes=(0, 1))
+                        yhat += x_eff[c] @ A
 
                 R = Y - yhat
                 if not np.all(np.isfinite(R)):
@@ -886,8 +889,10 @@ def solve_global_kaczmarz_global_step_mp(
             # ------------------------------------------------------------
             # GLOBAL freeze (relative)
             # ------------------------------------------------------------
-            freeze_mul = float(os.environ.get("CUBEFIT_GLOBAL_FREEZE_MUL", "1e-6"))
-            D_freeze = freeze_mul
+            if is_warmup:
+                D_freeze = 1e-8
+            else:
+                D_freeze = float(os.environ.get("CUBEFIT_GLOBAL_FREEZE_MUL", "1e-6"))
 
             freeze = (D <= D_freeze) | (~np.isfinite(D))
             if np.any(freeze):
@@ -940,7 +945,11 @@ def solve_global_kaczmarz_global_step_mp(
             step_cos = -np.vdot(dx, g) / (dx_norm * g_norm + 1e-30)
 
             grad_cap = 3.0 * g_norm
-            x_cap = float(os.environ.get("CUBEFIT_MAX_FRAC", "0.002")) * x_norm
+            if is_warmup:
+                # much tighter trust region on first epoch
+                x_cap = 0.0005 * x_norm   # instead of 0.002
+            else:
+                x_cap = float(os.environ.get("CUBEFIT_MAX_FRAC", "0.005")) * x_norm
             dx_cap = min(grad_cap, x_cap)
 
             if dx_norm > dx_cap and dx_cap > 0:
@@ -949,10 +958,6 @@ def solve_global_kaczmarz_global_step_mp(
             # ------------------------------------------------------------
             # Apply step
             # ------------------------------------------------------------
-            x_prev = x.copy()
-            g_prev = g.copy()
-
-            # Apply step in the same space used for gradient
             x_eff = x.copy()
             inactive = np.ones(C, dtype=bool)
             inactive[active_orbits] = False
@@ -962,41 +967,23 @@ def solve_global_kaczmarz_global_step_mp(
             if cfg.project_nonneg:
                 np.maximum(x_eff, 0.0, out=x_eff)
 
-            # recompute proxy RMSE at trial point
-            rmse_trial = rmse_proxy  # default
-            # reuse same residual logic as above
-            ssq_trial = 0.0
-            nres_trial = 0
-            for (s0, s1) in s_ranges:
-                with open_h5(h5_path, role="reader") as f:
-                    DC = f["/DataCube"]
-                    M  = f["/HyperCube/models"]
+            # ------------------------------------------------------------------
+            # Acceptance (projected-gradient sufficient decrease)
+            # ------------------------------------------------------------------
+            # predicted decrease along dx
+            pred = -np.vdot(g_plus, dx)
 
-                    Y = np.asarray(DC[s0:s1, :], np.float64)
-                    if keep_idx is not None:
-                        Y = Y[:, keep_idx]
-
-                    yhat = np.zeros_like(Y)
-                    for c in active_orbits:
-                        A = np.asarray(M[s0:s1, c, :, :], np.float32)
-                        if keep_idx is not None:
-                            A = A[:, :, keep_idx]
-                        yhat += np.tensordot(x_eff[c], A, axes=(0, 1))
-
-                R = Y - yhat
-                if w_lam_sqrt is not None:
-                    R *= w_lam_sqrt[None, :]
-                ssq_trial += float(np.sum(R * R))
-                nres_trial += int(R.size)
-
-            rmse_trial = np.sqrt(ssq_trial / max(nres_trial, 1))
-
-            # accept only if improvement
-            if rmse_trial <= rmse_proxy:
-                x = x_eff
+            accept = False
+            if pred > 0:
+                accept = True
             else:
-                # reject step → damp
                 lr *= 0.5
+            if step_cos < 0.5:
+                accept = False
+                lr *= 0.5
+
+            if accept:
+                x = x_eff
 
             # ------------------------------------------------------------
             # Diagnostics
@@ -1085,6 +1072,9 @@ def solve_kaczmarz_nnls(
     with open_h5(h5_path, role="reader") as f:
         M = f["/HyperCube/models"]
         S, Ctot, P, L = map(int, M.shape)
+        chunks = getattr(M, "chunks", None)
+        s_tile = int(chunks[0]) if (chunks and chunks[0]) else 128
+    s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
 
     if active_orbits is None:
         active_orbits = np.arange(Ctot, dtype=int)
@@ -1101,8 +1091,6 @@ def solve_kaczmarz_nnls(
             orbit_beta = float(os.environ.get("CUBEFIT_ORBIT_BETA", "0.2"))
     else:
         w_target = None
-
-    spaxel_order = np.arange(S, dtype=int)
 
     # Main loop over epochs and spaxels
     with open_h5(h5_path, role="reader") as f:
@@ -1137,9 +1125,6 @@ def solve_kaczmarz_nnls(
 
         for epoch in range(int(max_epochs)):
 
-            if shuffle_spaxels:
-                np.random.shuffle(spaxel_order)
-
             max_kkt = 0.0
 
             # ------------------------------------------------------------
@@ -1148,11 +1133,15 @@ def solve_kaczmarz_nnls(
             dx_accum = np.zeros_like(x, dtype=np.float64)
             n_spax = 0
 
-            for s in spaxel_order:
-                # read observed spectrum for spaxel s
-                y = np.asarray(DC[s, :], dtype=np.float64, order="C")
+            for (s0, s1) in tqdm(
+                s_ranges,
+                desc=f"[Kaczmarz] epoch {epoch+1}/{max_epochs}",
+                leave=False,
+            ):
+                # read data block once
+                Y = np.asarray(DC[s0:s1, :], dtype=np.float64)
                 if keep_idx is not None:
-                    y = y[keep_idx]
+                    Y = Y[:, keep_idx]
 
                 # build effective x for residuals (match SPG active set)
                 x_eff = x.copy()
@@ -1160,50 +1149,66 @@ def solve_kaczmarz_nnls(
                 inactive[active_orbits] = False
                 x_eff[inactive, :] = 0.0
 
-                # compute yhat
-                yhat = np.zeros_like(y)
-                for c in active_orbits:
-                    A = np.asarray(M[s, c], np.float32, order="C")
-                    if keep_idx is not None:
-                        A = A[:, keep_idx]
-                    yhat += x_eff[c] @ A
+                # apply orbit-weight blending to the effective x used for residuals
+                if (w_target is not None) and (orbit_beta is not None) and (orbit_beta > 0.0):
+                    # apply only to active_orbits rows
+                    ai = active_orbits
+                    x_eff[ai, :] = (1.0 - orbit_beta) * x_eff[ai, :] + orbit_beta * w_target[ai, :]
 
-                # residual
-                r = y - yhat
+                # yhat for tile
+                yhat = np.zeros_like(Y)
+                for c in active_orbits:
+                    A_blk = np.asarray(M[s0:s1, c], np.float32)
+                    if keep_idx is not None:
+                        A_blk = A_blk[:, :, keep_idx]
+                    yhat += x_eff[c] @ A_blk
+
+                R = Y - yhat
                 if w_lam_sqrt is not None:
-                    r = r * w_lam_sqrt
+                    R *= w_lam_sqrt[None, :]
 
-                # accumulate per-chunk updates
+                # accumulate updates over tile
                 for c in active_orbits:
-                    A = np.asarray(M[s, c], np.float32, order="C")
+                    A_blk = np.asarray(M[s0:s1, c], np.float32, order="C")
                     if keep_idx is not None:
-                        A = A[:, keep_idx]
+                        A_blk = A_blk[:, :, keep_idx]  # shape (tile_len, P, Lk)
 
-                    # orbit-weight blending (unchanged logic)
-                    x_c_eff = x[c]
-                    if w_target is not None and orbit_beta is not None and orbit_beta > 0.0:
-                        x_c_eff = (1.0 - orbit_beta) * x[c] + orbit_beta * w_target[c]
-
-                    # ---- compute Kaczmarz block update without touching x ----
-                    # Apply lambda weights to rows if present
+                    # Apply lambda weights to A if present (broadcast over tile and P)
                     if w_lam_sqrt is not None:
-                        Aw = A * w_lam_sqrt[None, :]
-                        rw = r
+                        Aw = A_blk * w_lam_sqrt[None, None, :]
                     else:
-                        Aw = A
-                        rw = r
+                        Aw = A_blk
 
-                    row_norm2 = np.sum(Aw * Aw, axis=0)
+                    # Compute per-(spaxel,lambda) squared norms across P: sum_p Aw^2 -> shape (tile_len, Lk)
+                    row_norm2 = np.sum(Aw * Aw, axis=1)   # (tile_len, Lk)
+                    # avoid division by zero
                     row_norm2 = np.where(row_norm2 > 0.0, row_norm2, np.inf)
 
-                    scale = rw / row_norm2 # (Lk,)
-                    update = (Aw @ scale) / scale.size
-                    # (P,) wavelength-averaged
+                    # scale per-(spaxel,lambda)
+                    # R shape (tile_len, Lk) -> scale same shape
+                    scale = R / row_norm2   # (tile_len, Lk)
+
+                    # Flatten tile and lambda dims, compute averaged update across all (s,λ)
+                    # Aw reshape -> (tile_len*P, Lk) ??? careful: we want (tile_len*Lk, P) for GEMV
+                    # so swap axes: Aw has (s, p, λ) -> reshape to (s*λ, p)
+                    Aw_flat = Aw.transpose(0, 2, 1).reshape(-1, Aw.shape[1])  # (s*Lk, P)
+
+                    # flatten scale to (s*Lk,)
+                    scale_flat = scale.ravel()  # (s*Lk,)
+
+                    # update (P,) is Aw_flat^T @ scale_flat  (GEMV)
+                    # use explicit matmul for BLAS: (P,) = Aw_flat.T @ scale_flat
+                    update = Aw_flat.T @ scale_flat    # shape (P,)
+
+                    # normalize by number of (s*Lk) contributions to average per-spaxel
+                    n_contrib = scale_flat.size if scale_flat.size > 0 else 1
+                    update /= n_contrib
 
                     dx_accum[c] += update
 
-                    # KKT metric (unchanged semantics)
-                    g_c = -(A @ r)
+                    # KKT metric over tile: g_c = - sum_{s,λ} A_blk[s,p,λ] * R[s,λ]
+                    # use einsum (cheap here) -> shape (P,)
+                    g_c = -np.einsum("sl,spl->p", R, A_blk)
                     viol = np.where(
                         x[c] > 0.0,
                         np.abs(g_c),
@@ -1211,14 +1216,24 @@ def solve_kaczmarz_nnls(
                     )
                     max_kkt = max(max_kkt, float(np.max(viol)))
 
-                n_spax += 1
+                n_spax += (s1 - s0)
+
+            # ------------------------------------------------------------
+            # Optional proximal pull toward orbit target (epoch-level)
+            # ------------------------------------------------------------
+            if (w_target is not None) and (orbit_beta is not None) and (orbit_beta > 0.0):
+                # small regularization toward target orbit weights
+                alpha = float(os.environ.get("CUBEFIT_ORBIT_PROX_ALPHA", "1e-3"))
+                for c in range(Ctot):
+                    dx_accum[c] += -alpha * (x[c] - w_target[c]) * n_spax
 
             # ------------------------------------------------------------
             # Apply averaged update once per epoch
             # ------------------------------------------------------------
             if n_spax > 0:
                 x += dx_accum / n_spax
-                np.maximum(x, 0.0, out=x)
+                if cfg.project_nonneg:
+                    np.maximum(x, 0.0, out=x)
 
             # Optionally snapshot x into tracker (non-blocking sidecar).
             if tracker is not None:

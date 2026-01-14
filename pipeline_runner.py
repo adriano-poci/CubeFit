@@ -1210,7 +1210,7 @@ class PipelineRunner:
                     active_orbits=active_orbits,
                     orbit_weights=orbit_weights,
                     orbit_beta=float(os.environ.get("CUBEFIT_ORBIT_BETA", "0.2")),
-                    max_epochs=int(os.environ.get("CUBEFIT_KACZMARZ_EPOCHS", "2")),
+                    max_epochs=int(os.environ.get("CUBEFIT_KACZMARZ_EPOCHS", "1")),
                     tol_kkt=float(os.environ.get("CUBEFIT_KACZMARZ_KKT", "1e-6")),
                     shuffle_spaxels=True,
                     apply_mask=bool(reader_apply_mask),
