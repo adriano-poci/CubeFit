@@ -714,6 +714,7 @@ def run_patch(h5_path: str,
             spec = np.asarray(DC[s, :], dtype=np.float64)
             spec = spec[keep_idx] if keep_idx is not None else spec
             finite_counts.append(int(np.count_nonzero(np.isfinite(spec))))
+        binCounts = np.asarray(f['/BinCounts'][...], dtype=int)
     finite_counts = np.asarray(finite_counts, int)
     print(f"[triage] finite pixels per spaxel (min/med/max): "
         f"{finite_counts.min()}/{int(np.median(finite_counts))}/{finite_counts.max()}")
@@ -789,7 +790,15 @@ def run_patch(h5_path: str,
             spec_sanit = np.where(good, spec, 0.0)
             y[pos:pos+Lk] = spec_sanit
             # per-row weights: √w_lambda * 1[finite]
-            sqrt_w_rows[pos:pos+Lk] = np.sqrt(w_lam) * good.astype(np.float64)
+            # per-row weights: √w_lambda * 1[finite] * 1/√binCounts[s]
+            bs = float(binCounts[s])
+            if not np.isfinite(bs) or bs <= 0.0:
+                raise RuntimeError(f"[nnls_patch] invalid binCounts[{s}] = {bs}")
+            sqrt_w_rows[pos:pos+Lk] = (
+                np.sqrt(w_lam)
+                * good.astype(np.float64)
+                / np.sqrt(bs)
+            )
             finite_counts.append(int(np.count_nonzero(good)))
             pos += Lk
     finite_counts = np.asarray(finite_counts, int)

@@ -81,11 +81,11 @@ def main():
     os.environ["CUBEFIT_ORBIT_BETA"] = str(0.1)
     os.environ["CUBEFIT_GLOBAL_STEP_FRAC"] = "1.0"
     os.environ["CUBEFIT_GLOBAL_TAU"] = "0.3"
-    os.environ["CUBEFIT_GLOBAL_ENERGY_BLEND"] = str(1e-2)
+    os.environ["CUBEFIT_GLOBAL_ENERGY_BLEND"] = str(3e-2)
     os.environ["CUBEFIT_ZERO_COL_FREEZE"] = str(1)
-    os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-4)
-    os.environ["CUBEFIT_LAMBDA_ORBIT"] = str(1e-4)
-    os.environ["CUBEFIT_LAMBDA_POP"] = str(3e-4)
+    os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-5)
+    os.environ["CUBEFIT_LAMBDA_ORBIT"] = str(3e-3)
+    os.environ["CUBEFIT_LAMBDA_POP"] = str(1e-3)
 
     if args.ncomp is not None:
         props['nCuts'] = args.ncomp

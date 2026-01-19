@@ -672,6 +672,7 @@ def solve_global_kaczmarz_global_step_mp(
                     Yt, nan=0.0, posinf=0.0, neginf=0.0, copy=False
                 )
             Y_glob_norm2 += float(np.sum(Yt * Yt))
+        binCounts = np.asarray(f['/BinCounts'][...], dtype=int)
 
     Y_glob_norm = float(np.sqrt(Y_glob_norm2))
     print(
@@ -811,11 +812,14 @@ def solve_global_kaczmarz_global_step_mp(
                 inactive[active_orbits] = False
                 x_eff[inactive, :] = 0.0
 
+                w_s = (1.0 / np.sqrt(binCounts[s0:s1])).astype(np.float32)
+
                 with open_h5(h5_path, role="reader") as f:
                     DC = f["/DataCube"]
                     M  = f["/HyperCube/models"]
 
                     Y = np.asarray(DC[s0:s1, :], np.float64)
+                    Y *= w_s[:, None]
                     if keep_idx is not None:
                         Y = Y[:, keep_idx]
 
@@ -952,13 +956,15 @@ def solve_global_kaczmarz_global_step_mp(
 
             freeze = (D <= D_freeze) | (~np.isfinite(D))
 
-            # ------------------------------------------------------------
-            # Do not freeze directions where orbit-mass prior is active
-            # ------------------------------------------------------------
             if g_prior_abs is not None:
-                # threshold relative to prior strength
                 prior_eps = 1e-12 * max(np.max(g_prior_abs), 1.0)
                 freeze &= (g_prior_abs <= prior_eps)
+
+            if lambda_pop > 0.0:
+                g_pop = population_age_curvature_grad(x, pop_shape)
+                pop_eps = 1e-12 * max(np.max(np.abs(g_pop)), 1.0)
+                freeze &= (np.abs(g_pop) <= pop_eps)
+
             if np.any(freeze):
                 g = g.copy()
                 g[freeze] = 0.0
@@ -969,11 +975,6 @@ def solve_global_kaczmarz_global_step_mp(
                     f"(D < {D_freeze:.1e})",
                     flush=True,
                 )
-            # Do not freeze AGE-curvature-driven directions
-            if lambda_pop > 0.0:
-                g_pop = population_age_curvature_grad(x, pop_shape)
-                pop_eps = 1e-12 * max(np.max(np.abs(g_pop)), 1.0)
-                freeze &= (np.abs(g_pop) <= pop_eps)
 
             # ------------------------------------------------------------
             # KKT / projected gradient diagnostics
