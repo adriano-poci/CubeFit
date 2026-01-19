@@ -34,7 +34,8 @@ IFS=$'\n\t'
 
 usage() {
     cat <<EOF
-Usage: $0 [-n N] [--ncomp=N] [--ncomp N] [positional...]
+Usage: $0 GALAXY [-n N] [--ncomp=N] [--ncomp N] [positional...]
+  GALAXY         galaxy name (string, required)
   -n N           short form
   --ncomp=N      long form (either form optional)
 If provided, N must be a positive integer.
@@ -47,12 +48,10 @@ new_argv=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --ncomp=*)
-            # long form with equals: --ncomp=VALUE
             NCOMP="${1#--ncomp=}"
             shift
             ;;
         --ncomp)
-            # long form with separate arg: --ncomp VALUE
             if [ "$#" -lt 2 ]; then
                 echo "Error: --ncomp requires an argument." >&2
                 usage; exit 2
@@ -61,16 +60,13 @@ while [ "$#" -gt 0 ]; do
             shift 2
             ;;
         --)
-            # end-of-options marker: preserve and stop scanning
             shift
-            # append the rest as positional args and break
             while [ "$#" -gt 0 ]; do
                 new_argv+=("$1"); shift
             done
             break
             ;;
         *)
-            # keep other args for getopts / positional handling
             new_argv+=("$1")
             shift
             ;;
@@ -80,7 +76,7 @@ done
 # Replace positional parameters with filtered args for getopts
 set -- "${new_argv[@]:-}"
 
-# Now parse short options (-n) with getopts
+# Parse short options (-n)
 while getopts ":n:" opt; do
     case "$opt" in
         n) NCOMP="$OPTARG" ;;
@@ -90,7 +86,23 @@ while getopts ":n:" opt; do
 done
 shift $((OPTIND - 1))
 
-# Validate NCOMP if provided
+# ------------------------------------------------------------------
+# Positional arguments
+# ------------------------------------------------------------------
+if [ "$#" -lt 1 ]; then
+    echo "Error: GALAXY argument is required." >&2
+    usage
+    exit 2
+fi
+
+GALAXY="$1"
+shift
+
+# Remaining positional args (if any) are now in "$@"
+
+# ------------------------------------------------------------------
+# Validation
+# ------------------------------------------------------------------
 if [ -n "${NCOMP:-}" ]; then
     if ! printf '%s' "$NCOMP" | grep -Eq '^[0-9]+$'; then
         echo "Error: ncomp must be a positive integer, got '$NCOMP'." >&2
@@ -100,8 +112,10 @@ if [ -n "${NCOMP:-}" ]; then
         echo "Error: ncomp must be > 0, got '$NCOMP'." >&2
         exit 2
     fi
-    echo "NCOMP set to $NCOMP"
+    echo "GALAXY = $GALAXY"
+    echo "NCOMP  = $NCOMP"
 else
+    echo "GALAXY = $GALAXY"
     echo "NCOMP not provided; running with defaults"
 fi
 # ------------------------------------------------------------------------------
@@ -110,8 +124,9 @@ fi
 
 
 
+
 cd /data/phys-gal-dynamics/phys2603/CubeFit
-# declare fSGA=$(sbatch --parsable "kz_1Gen.sh" ${NCOMP:+--ncomp="$NCOMP"})
-# declare fSF=$(sbatch --parsable --dependency=afterok:"${fSGA}" "kz_2Fit.sh" ${NCOMP:+--ncomp="$NCOMP"})
-declare fSF=$(sbatch --parsable "kz_2Fit.sh" ${NCOMP:+--ncomp="$NCOMP"})
-sbatch --dependency=afterok:"${fSF}" "kz_3Rio.sh" ${NCOMP:+--ncomp="$NCOMP"}
+# declare fSGA=$(sbatch --parsable "kz_1Gen.sh" "$GALAXY" ${NCOMP:+--ncomp="$NCOMP"})
+# declare fSF=$(sbatch --parsable --dependency=afterok:"${fSGA}" "kz_2Fit.sh" "$GALAXY" ${NCOMP:+--ncomp="$NCOMP"})
+declare fSF=$(sbatch --parsable "kz_2Fit.sh" "$GALAXY" ${NCOMP:+--ncomp="$NCOMP"})
+sbatch --dependency=afterok:"${fSF}" "kz_3Rio.sh" "$GALAXY" ${NCOMP:+--ncomp="$NCOMP"}

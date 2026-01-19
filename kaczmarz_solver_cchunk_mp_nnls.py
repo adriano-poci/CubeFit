@@ -82,6 +82,9 @@ v3.8:   Added additional acceptance guard in SPG solver based on `step_cos`
             in `solve_global_kaczmarz_global_step_mp`;
         Use epoch 1 as a warm-up with softer criteria in SPG solver in
             `solve_global_kaczmarz_global_step_mp`. 12 January 2026
+v3.9:   Added variational orbit-mass prior to break rank-1 degeneracy;
+        Softened freeze criteria to include `orbit_weights` prior gradient. 16
+            January 2026
 """
 
 from __future__ import annotations, print_function
@@ -198,73 +201,35 @@ def _xcorr_int_shift(a: np.ndarray, b: np.ndarray) -> int:
 
 # ------------------------------------------------------------------------------
 
-def _choose_tiles_fair_spread(
-    s_ranges: list[tuple[int, int]],
-    k: int,
-    seed: int = 12345,
-) -> list[tuple[int, int]]:
+def orbit_mass_prior_grad(x_cp: np.ndarray,
+                          w_target: np.ndarray,
+                          lam: float) -> np.ndarray:
     """
-    Pick k tile ranges with a roughly uniform spread over the spatial index.
+    Gradient of quadratic orbit-mass prior.
 
-    This avoids brightness bias: it sorts by s0 and stratifies the list into k bins,
-    selecting one tile per bin (random within each bin).
+    Penalizes deviation of per-orbit total mass from target w_target.
 
     Parameters
     ----------
-    s_ranges
-        List of (s0, s1) tile ranges.
-    k
-        Number of tiles to select.
-    seed
-        RNG seed.
+    x_cp : ndarray, shape (C, P)
+        Current solution in physical basis.
+    w_target : ndarray, shape (C,)
+        Target per-orbit mass fractions (normalized).
+    lam : float
+        Regularization strength.
 
     Returns
     -------
-    list[tuple[int, int]]
-        Selected tile ranges (k or fewer if s_ranges is smaller).
+    grad_cp : ndarray, shape (C, P)
+        Gradient contribution to add to data gradient.
     """
-    if k <= 0 or not s_ranges:
-        return []
-    if k >= len(s_ranges):
-        return list(s_ranges)
-
-    s_sorted = sorted(s_ranges, key=lambda t: int(t[0]))
-    n = len(s_sorted)
-    k = min(k, n)
-
-    rng = np.random.default_rng(seed)
-    edges = np.linspace(0, n, k + 1, dtype=int)
-
-    out: list[tuple[int, int]] = []
-    for i in range(k):
-        a = int(edges[i])
-        b = int(edges[i + 1])
-        if b <= a:
-            idx = a
-        else:
-            idx = int(rng.integers(a, b))
-        out.append(s_sorted[idx])
-
-    return out
-
-# ------------------------------------------------------------------------------
-
-def _safe_scalar_rmse(val: float, label: str) -> float:
-    """
-    Ensure a scalar RMSE used for epoch comparison is finite.
-
-    If 'val' is NaN, Inf, or negative, print a warning and return +inf
-    so that this value will never be considered an improvement over a
-    finite best RMSE.
-    """
-    if not np.isfinite(val) or val < 0.0:
-        print(
-            f"[Kaczmarz-MP] WARNING: {label} RMSE={val!r} is non-finite "
-            f"or negative; treating as +inf.",
-            flush=True,
-        )
-        return float("inf")
-    return float(val)
+    # per-orbit total mass
+    s = np.sum(x_cp, axis=1)          # (C,)
+    # residual relative to target
+    r = s - w_target                  # (C,)
+    # gradient: same correction applied to all populations of orbit c
+    grad_cp = lam * r[:, None]        # broadcast to (C,P)
+    return grad_cp
 
 # ------------------------------------------------------------------------------
 
@@ -555,6 +520,60 @@ def softbox_params_smooth(eq: int, E: int) -> tuple[float, float]:
 
 # ------------------------------------------------------------------------------
 
+def population_age_curvature_grad(
+    x_cp: np.ndarray,
+    pop_shape: tuple[int, int, int],
+) -> np.ndarray:
+    """
+    Population curvature gradient along the AGE axis only.
+
+    Assumes populations are ordered as (metal, age, alpha) and flattened
+    in C-order into length P.
+
+    Parameters
+    ----------
+    x_cp : ndarray, shape (C, P)
+        Current solution in physical basis.
+    pop_shape : tuple (n_metals, n_ages, n_alphas)
+        Population grid shape before flattening.
+
+    Returns
+    -------
+    grad_cp : ndarray, shape (C, P)
+        Curvature gradient to add to SPG gradient.
+    """
+    if x_cp.ndim != 2:
+        raise ValueError("x_cp must have shape (C, P)")
+
+    nM, nA, nZ = (int(v) for v in pop_shape)
+    C, P = x_cp.shape
+    if nM * nA * nZ != P:
+        raise ValueError(
+            f"pop_shape {pop_shape} incompatible with P={P}"
+        )
+
+    # Reshape to (C, nM, nA, nZ)
+    X = x_cp.reshape((C, nM, nA, nZ), order="C")
+    grad = np.zeros_like(X)
+
+    if nA > 1:
+        # interior ages
+        if nA > 2:
+            grad[:, :, 1:-1, :] = (
+                2.0 * X[:, :, 1:-1, :]
+                - X[:, :, 0:-2, :]
+                - X[:, :, 2:, :]
+            )
+
+        # boundaries (one-sided)
+        grad[:, :, 0, :] = X[:, :, 0, :] - X[:, :, 1, :]
+        grad[:, :, -1, :] = X[:, :, -1, :] - X[:, :, -2, :]
+
+    # Back to (C, P)
+    return grad.reshape((C, P), order="C")
+
+# ------------------------------------------------------------------------------
+
 def solve_global_kaczmarz_global_step_mp(
     h5_path: str,
     cfg: MPConfig,
@@ -689,6 +708,10 @@ def solve_global_kaczmarz_global_step_mp(
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
         print("[SPG] Orbit-weight projection enabled.", flush=True)
+    lambda_orbit = float(os.environ.get("CUBEFIT_LAMBDA_ORBIT", "0.0"))
+    if w_target is not None and lambda_orbit > 0.0:
+        print(f"[SPG] Orbit-mass prior enabled (lambda={lambda_orbit:.3e})",
+            flush=True)
 
     # ------------------------------------------------------------
     # Initialise x
@@ -743,6 +766,14 @@ def solve_global_kaczmarz_global_step_mp(
     min_active = int(os.environ.get("CUBEFIT_MIN_ACTIVE_ORBITS", "8"))
 
     rmse_prev = None
+
+    # ------------------------------------------------------------
+    # Population shapes
+    # ------------------------------------------------------------
+    with open_h5(h5_path, role="reader") as f:
+        if "/Templates" not in f:
+            raise RuntimeError("Missing /Templates group in HDF5")
+        pop_shape = tuple(f["/Templates"].attrs["pop_shape"])
 
     # ============================================================
     # Main epochs
@@ -887,6 +918,31 @@ def solve_global_kaczmarz_global_step_mp(
             g = -g_tot
 
             # ------------------------------------------------------------
+            # Orbit-mass quadratic prior (breaks orbit-degeneracy)
+            # ------------------------------------------------------------
+            if w_target is not None and lambda_orbit > 0.0:
+                # x has shape (C, P)
+                # g has shape (C, P)
+                # Per-orbit total mass
+                s = np.sum(x, axis=1)          # (C,)
+                # Deviation from target orbit weights
+                r = s - w_target               # (C,)
+                # Add gradient of 0.5*lambda*||s - w||^2
+                # Same correction applied to all populations of orbit c
+                g += lambda_orbit * r[:, None]
+            # Store prior gradient magnitude for freeze logic
+            if w_target is not None and lambda_orbit > 0.0:
+                g_prior_abs = np.abs(lambda_orbit * r[:, None])
+            else:
+                g_prior_abs = None
+            # ------------------------------------------------------------
+            # Population AGE curvature prior
+            # ------------------------------------------------------------
+            lambda_pop = float(os.environ.get("CUBEFIT_LAMBDA_POP", "0.0"))
+            if lambda_pop > 0.0:
+                g += lambda_pop * population_age_curvature_grad(x, pop_shape)
+
+            # ------------------------------------------------------------
             # GLOBAL freeze (relative)
             # ------------------------------------------------------------
             if is_warmup:
@@ -895,6 +951,14 @@ def solve_global_kaczmarz_global_step_mp(
                 D_freeze = float(os.environ.get("CUBEFIT_GLOBAL_FREEZE_MUL", "1e-6"))
 
             freeze = (D <= D_freeze) | (~np.isfinite(D))
+
+            # ------------------------------------------------------------
+            # Do not freeze directions where orbit-mass prior is active
+            # ------------------------------------------------------------
+            if g_prior_abs is not None:
+                # threshold relative to prior strength
+                prior_eps = 1e-12 * max(np.max(g_prior_abs), 1.0)
+                freeze &= (g_prior_abs <= prior_eps)
             if np.any(freeze):
                 g = g.copy()
                 g[freeze] = 0.0
@@ -905,6 +969,11 @@ def solve_global_kaczmarz_global_step_mp(
                     f"(D < {D_freeze:.1e})",
                     flush=True,
                 )
+            # Do not freeze AGE-curvature-driven directions
+            if lambda_pop > 0.0:
+                g_pop = population_age_curvature_grad(x, pop_shape)
+                pop_eps = 1e-12 * max(np.max(np.abs(g_pop)), 1.0)
+                freeze &= (np.abs(g_pop) <= pop_eps)
 
             # ------------------------------------------------------------
             # KKT / projected gradient diagnostics
@@ -1050,6 +1119,7 @@ def solve_kaczmarz_nnls(
     shuffle_spaxels: bool = True,
     apply_mask: bool = True,
     use_lambda_weights: bool = True,
+    project_nonneg: bool = True,
     tracker=None,
 ):
     """
@@ -1153,7 +1223,14 @@ def solve_kaczmarz_nnls(
                 if (w_target is not None) and (orbit_beta is not None) and (orbit_beta > 0.0):
                     # apply only to active_orbits rows
                     ai = active_orbits
-                    x_eff[ai, :] = (1.0 - orbit_beta) * x_eff[ai, :] + orbit_beta * w_target[ai, :]
+                    # Current per-orbit total mass
+                    s = np.sum(x_eff[ai, :], axis=1)          # shape (len(ai),)
+                    # Avoid divide-by-zero
+                    s_safe = np.maximum(s, 1e-30)
+                    # Target total mass after blending
+                    s_tgt = (1.0 - orbit_beta) * s + orbit_beta * w_target[ai]
+                    # Rescale SFH rows to match target mass
+                    x_eff[ai, :] *= (s_tgt / s_safe)[:, None]
 
                 # yhat for tile
                 yhat = np.zeros_like(Y)
@@ -1232,7 +1309,7 @@ def solve_kaczmarz_nnls(
             # ------------------------------------------------------------
             if n_spax > 0:
                 x += dx_accum / n_spax
-                if cfg.project_nonneg:
+                if project_nonneg:
                     np.maximum(x, 0.0, out=x)
 
             # Optionally snapshot x into tracker (non-blocking sidecar).

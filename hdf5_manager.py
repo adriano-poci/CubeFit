@@ -901,6 +901,7 @@ class H5Manager:
         xpix: np.ndarray | None = None,     # length nPix, float
         ypix: np.ndarray | None = None,     # length nPix, float
         binnum: np.ndarray | None = None,   # length nPix, int in [0, S)
+        bincounts: np.ndarray | None = None,  # length S, int
         orbit_weights: np.ndarray | None = None, 
     ) -> dict:
         """
@@ -922,6 +923,8 @@ class H5Manager:
         /XPix       -> (nPix,) float64
         /YPix       -> (nPix,) float64
         /BinNum     -> (nPix,) int32   (pixel → spatial-bin index in [0..S-1])
+        /BinCounts  -> (S,)    int32   (number of pixels per spatial bin)
+        /OrbitWeights -> (S,)  float64
         /HyperCube/data_flux -> (S,) float64
             Per-spaxel mean of observed flux over *unmasked* wavelengths (λ),
             computed only over unmasked wavelengths. Masked wavelengths
@@ -1219,6 +1222,12 @@ class H5Manager:
                     f, "/BinNum", binnum, np.int32,
                     units="index",
                     semantic="pixel→spatial-bin mapping [0..S-1]",
+                )
+            if bincounts is not None:
+                self._write_1d(
+                    f, "/BinCounts", bincounts, np.int32,
+                    units="count",
+                    semantic="number of pixels per spatial bin [0..S-1]",
                 )
 
             # ---------- compute & store /HyperCube/data_flux (S,) -----------

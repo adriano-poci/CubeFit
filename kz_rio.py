@@ -64,6 +64,8 @@ from CubeFit.kz_initNGC4365 import props
 def main():
     ap = argparse.ArgumentParser(description="Thin wrapper around genCubeFit")
     # boolean redraw with explicit on/off flags
+    ap.add_argument('--galaxy', type=str, default=None,
+        help='Galaxy name to process')
     ap.add_argument("--ncomp", type=int, default=None,
         help="Number of components to fit")
     group = ap.add_mutually_exclusive_group()
@@ -74,6 +76,12 @@ def main():
     ap.set_defaults(redraw=False)
 
     args = ap.parse_args()
+    if 'NGC4365' in args.galaxy:
+        from CubeFit.kz_initNGC4365 import props
+    elif 'FCC170' in args.galaxy:
+        from CubeFit.kz_initFCC170 import props
+    else:
+        raise ValueError(f"Unknown galaxy '{args.galaxy}'")
 
     # Detect CPUs
     slurm_cpu = os.environ.get('SLURM_CPUS_PER_TASK')

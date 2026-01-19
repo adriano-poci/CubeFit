@@ -1215,6 +1215,7 @@ class PipelineRunner:
                     shuffle_spaxels=True,
                     apply_mask=bool(reader_apply_mask),
                     use_lambda_weights=True,
+                    project_nonneg=cfg.project_nonneg,
                     tracker=tracker,
                 )
                 logger.log(f"POST-KACZ ||x_solver|| = {float(np.linalg.norm(x_solver))}")

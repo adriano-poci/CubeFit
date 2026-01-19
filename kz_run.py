@@ -11,11 +11,11 @@ import argparse
 
 # Custom modules
 from CubeFit.kz_fitSpec import genCubeFit
-from CubeFit.kz_initNGC4365 import props
-
 
 def main():
     ap = argparse.ArgumentParser(description="Thin wrapper around genCubeFit")
+    ap.add_argument('--galaxy', type=str, default=None,
+        help='Galaxy name to process')
     ap.add_argument(
         "--run-switch",
         type=str,
@@ -33,6 +33,13 @@ def main():
     ap.set_defaults(redraw=False)
 
     args = ap.parse_args()
+
+    if 'NGC4365' in args.galaxy:
+        from CubeFit.kz_initNGC4365 import props
+    elif 'FCC170' in args.galaxy:
+        from CubeFit.kz_initFCC170 import props
+    else:
+        raise ValueError(f"Unknown galaxy '{args.galaxy}'")
 
     # Detect CPUs
     slurm_cpu = os.environ.get('SLURM_CPUS_PER_TASK')
@@ -71,12 +78,14 @@ def main():
     os.environ["CUBEFIT_RMSE_PROXY_GUARD"] = "0"
     os.environ["CUBEFIT_NNLS_PROP_PER_BAND"] = "0"
     os.environ["CUBEFIT_NNLS_ENABLE"] = "0"
-    os.environ["CUBEFIT_ORBIT_BETA"] = "0.0"
+    os.environ["CUBEFIT_ORBIT_BETA"] = str(0.1)
     os.environ["CUBEFIT_GLOBAL_STEP_FRAC"] = "1.0"
     os.environ["CUBEFIT_GLOBAL_TAU"] = "0.3"
-    os.environ["CUBEFIT_GLOBAL_ENERGY_BLEND"] = "0.0"
+    os.environ["CUBEFIT_GLOBAL_ENERGY_BLEND"] = str(1e-2)
     os.environ["CUBEFIT_ZERO_COL_FREEZE"] = str(1)
     os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-4)
+    os.environ["CUBEFIT_LAMBDA_ORBIT"] = str(1e-4)
+    os.environ["CUBEFIT_LAMBDA_POP"] = str(3e-4)
 
     if args.ncomp is not None:
         props['nCuts'] = args.ncomp

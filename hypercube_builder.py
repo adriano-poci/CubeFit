@@ -946,7 +946,6 @@ def build_hypercube(
             if m.size == L and np.any(m):
                 keep_idx = np.flatnonzero(m)
 
-
         # Optional λ-weights for energy/statistics (apply same floor, use √w)
         w_lam_sqrt = None
         lamw_floor = 1e-6
@@ -958,7 +957,12 @@ def build_hypercube(
                 if keep_idx is not None:
                     _w = _w[keep_idx]
                 w_lam_sqrt = np.sqrt(_w).astype(np.float64, copy=False)  # (Lk,) or (L,)
+        binCounts = np.asarray(f_rd['/BinCounts'][...], dtype=int)
 
+    # Safety: empty bins should not occur, but guard anyway
+    if np.any(binCounts <= 0):
+        raise RuntimeError("Found empty bins in BinCounts; HyperCube build cannot proceed.")
+    
     # Precompute velocity→pixel mapping (shared for all (s,c))
     km = _kernel_map_from_grids(tem_loglam, vel_pix)
     n_fft = _choose_nfft(T, km.m)
@@ -1214,6 +1218,10 @@ def build_hypercube(
                         Ycp *= np.float32(scale)
                     else:
                         Ycp.fill(0.0)
+                    # ----------------------------------------------------------
+                    # CONVERT SB → RAW FLUX PER BIN
+                    # ----------------------------------------------------------
+                    Ycp *= np.float32(binCounts[s_idx])
 
                     # 6b) accumulate global energy E[c,p] with same λ-view:
                     # mask if present, and apply √w if lambda_weights exist.

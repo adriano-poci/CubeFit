@@ -2190,3 +2190,98 @@ def apply_global_hypercube_scale_inplace(
     )
 
 # ------------------------------------------------------------------------------
+
+def _losvd_fwhm_kms(H, VelPix):
+    """
+    Robust FWHM estimate (km/s) for a single LOSVD kernel H(v).
+    """
+    H = np.maximum(H, 0.0)
+    if not np.any(H > 0):
+        return 0.0
+
+    H /= np.trapz(H, VelPix)
+    vmax = H.max()
+    half = 0.5 * vmax
+
+    above = np.where(H >= half)[0]
+    if above.size < 2:
+        return 0.0
+
+    return float(VelPix[above[-1]] - VelPix[above[0]])
+
+def build_working_template_grid_from_losvd(
+    Templates,          # (P, T)
+    TemPix,             # (T,)
+    LOSVD,              # (S, V, C)
+    VelPix,             # (V,)
+    *,
+    histBinSize,        # km/s (canonical grid)
+    oversample=3.0,
+    oversample_max=6.0,
+    sample_spax=8,
+    sample_comp=4,
+):
+    """
+    Build a coarser internal template grid based on LOSVD widths.
+    Does NOT require LSF info and is safe for preflight.
+    """
+    from ppxf import ppxf_util as pxu
+
+    S, V, C = LOSVD.shape
+
+    # sample a few LOSVDs to estimate typical width
+    s_idx = np.linspace(0, S - 1, min(sample_spax, S), dtype=int)
+    c_idx = np.linspace(0, C - 1, min(sample_comp, C), dtype=int)
+
+    widths = []
+    for s in s_idx:
+        for c in c_idx:
+            w = _losvd_fwhm_kms(LOSVD[s, :, c], VelPix)
+            if w > 0:
+                widths.append(w)
+
+    if not widths:
+        raise RuntimeError("Could not estimate LOSVD widths.")
+
+    FWHM_kms = float(np.median(widths))
+
+    # oversampling bounds
+    v_min = FWHM_kms / oversample
+    v_max = FWHM_kms / oversample_max
+
+    # bounded compromise
+    velscale_work = max(histBinSize, v_min)
+    velscale_work = min(velscale_work, v_max)
+
+    # rebin templates
+    lam = np.exp(TemPix)
+    lam_min, lam_max = float(lam[0]), float(lam[-1])
+
+    P, _ = Templates.shape
+    Templates_work = []
+    TemPix_work = None
+
+    for p in range(P):
+        spec = Templates[p]
+        spec_new, loglam_new, _ = pxu.log_rebin(
+            [lam_min, lam_max],
+            spec,
+            velscale=velscale_work,
+        )
+        Templates_work.append(spec_new)
+        if TemPix_work is None:
+            TemPix_work = loglam_new
+
+    Templates_work = np.asarray(Templates_work, dtype=Templates.dtype)
+
+    print(
+        f"[WORKGRID] LOSVD_FWHM≈{FWHM_kms:.1f} km/s  "
+        f"hist={histBinSize:.2f} km/s  "
+        f"work={velscale_work:.2f} km/s  "
+        f"pix/FWHM={FWHM_kms/velscale_work:.2f}",
+        flush=True,
+    )
+
+    return Templates_work, TemPix_work, velscale_work
+
+# ------------------------------------------------------------------------------

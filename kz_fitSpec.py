@@ -327,10 +327,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     nComp = int(nComp)
 
     oDict = uu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
-    if 'binFN' not in oDict.keys():
-        oDict['binFN'] = 'bins_0.dat'
-        oDict['apFN'] = 'aperture_0.dat'
-        uu.Write.lzma(direc/f"decomp_{nCuts:d}.plt", oDict)
     binFN = oDict['binFN']
     apFN = oDict['apFN']
     dnPix, dgrid = uu.Read.bins(bDir/'infil'/binFN)
@@ -413,8 +409,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 maFile = cDir/'declib_apermass.out'
                 nbin, ID, k0 = uu.Read.massAperture(maFile)
                 aperMass[:, cn] = k0
-            except:
-                ERR += [cDir.name]
+            except Exception as e:
+                ERR += [[cDir.name, e]]
         if len(ERR) > 0:
             logger.log(ERR)
             breakpoint()
@@ -443,8 +439,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 wbin, hN, histBinSize, cArr = uu.Read.apertureHist(
                     apFile)
                 apHists[:, :, cn] = cArr
-            except:
-                ERR += [cDir.stem]
+            except Exception as e:
+                ERR += [[cDir.stem, e]]
         if len(ERR) > 0:
             logger.log(ERR)
             pdb.set_trace()
@@ -486,6 +482,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         vel_pix=copy(vbins),
         xpix=xpix, ypix=ypix,
         binnum=binNum,
+        bincounts=binCounts,
         orbit_weights=cWeights,
     )
     mgr.ensure_rebin_and_resample()
@@ -609,17 +606,17 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=4,
+        epochs=5,
         # x0=x0,
         lr=0.1,
         project_nonneg=True,
-        orbit_weights=None, # or None for “free” fit
-        # orbit_weights=cWeights,
+        # orbit_weights=None, # or None for “free” fit
+        orbit_weights=cWeights,
         processes=48, # 48 workers
         blas_threads=1, # 1 BLAS thread each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
-        warm_start='resume',  # 'zeros', 'resume', 'jacobi', 'nnls'
+        warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
@@ -1133,6 +1130,24 @@ def reconstruct_modelcube_fast(
         S_blk  = max(1, min(S_blk,  S))   # clamp
         L_band = max(1, min(L_band, L))   # clamp
 
+        # ------------------------------------------------------------
+        # Load component spatial support (solver-consistent)
+        # ------------------------------------------------------------
+        support = None
+        support_S_chunk = None
+        if "/HyperCube/component_support" in f:
+            support = np.asarray(
+                f["/HyperCube/component_support"][...], dtype=np.uint8
+            )  # shape (n_tiles, C)
+            support_S_chunk = int(
+                f["/HyperCube/component_support"].attrs["S_chunk"]
+            )
+        else:
+            raise RuntimeError(
+                "Missing /HyperCube/component_support; reconstruction must "
+                "use the same support as the solver."
+            )
+
         # Prepare /ModelCube with compatibility check (shape/dtype/chunks)
         ds = f.get(out_dset, None)
         if ds is not None:
@@ -1168,7 +1183,7 @@ def reconstruct_modelcube_fast(
                 if nz.size < 0.2 * P:
                     nz_per_c[c] = nz
                 else:
-                    nz_per_c.append(None)  # fall back to dense
+                    nz_per_c[c] = None
         if use_sparse:
             n_sparse = sum(nz is not None for nz in nz_per_c)
             if n_sparse == 0:
@@ -1193,7 +1208,11 @@ def reconstruct_modelcube_fast(
                 # Accumulate this λ band
                 band = np.zeros((dS, l1 - l0), dtype=np.float64, order="C")
 
-                for c in range(C):
+                # Determine solver tile index for this spatial block
+                t = s0 // support_S_chunk
+                # Components allowed in this tile (solver-consistent)
+                c_allowed = np.flatnonzero(support[t, :])
+                for c in c_allowed:
                     if nz_per_c[c] is None:
                         w = x_cp[c, :]
                         A_c = M[s0:s1, c, :, l0:l1]
@@ -1202,12 +1221,7 @@ def reconstruct_modelcube_fast(
                         w = x_cp[c, nz]
                         A_c = M[s0:s1, c, nz, l0:l1]
 
-                    # y += sum_p w[p] * A[:, p, :]
-                    band += np.tensordot(
-                        w,
-                        A_c,
-                        axes=(0, 1),
-                    )
+                    band += np.tensordot(w, A_c, axes=(0, 1))
 
                 # Drop the band into the tile buffer
                 Y_tile[:, l0:l1] += band
@@ -1306,15 +1320,13 @@ def parallel_spectrum_plots(
     """
     Memory-safe plotting:
       - Reads only needed rows from /DataCube and /ModelCube.
-      - Never touches /HyperCube/models.
       - Closes every figure immediately.
       - Small thread pool (I/O bound).
 
     Style:
       - Data in black, model in red (lw=0.8).
       - Residuals (data - model) as green diamonds at every pixel,
-        vertically offset (same offset policy as before) so they don’t
-        overlap the spectra.
+        vertically offset so they don't overlap the spectra.
       - A solid green line at the residual zero (i.e., the offset
         baseline), and thin dashed green lines at ±1σ (σ computed on
         masked residuals).
@@ -1561,6 +1573,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     ypix = np.compress(goods, ypix)
     xbix = np.compress(goods, xbix)
     ybix = np.compress(goods, ybix)
+    xbin, ybin = INF['kin']['moms'][0]['x'], INF['kin']['moms'][0]['y']
+    xbin, ybin = GEO.rotate2D(xbin, ybin, PA)
 
     with logger.capture_all_output():
         decDir, cDirs, cKeys, nComp, teLL, lnGrid, histBinSize, dataVelScale,\
@@ -1577,10 +1591,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     nComp = int(nComp)
 
     oDict = uu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
-    if 'binFN' not in oDict.keys():
-        oDict['binFN'] = 'bins_0.dat'
-        oDict['apFN'] = 'aperture_0.dat'
-        uu.Write.lzma(direc/f"decomp_{nCuts:d}.plt", oDict)
     binFN = oDict['binFN']
     apFN = oDict['apFN']
     dnPix, dgrid = uu.Read.bins(bDir/'infil'/binFN)
@@ -1663,8 +1673,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 maFile = cDir/'declib_apermass.out'
                 nbin, ID, k0 = uu.Read.massAperture(maFile)
                 aperMass[:, cn] = k0
-            except:
-                ERR += [cDir.name]
+            except Exception as e:
+                ERR += [[cDir.stem, e]]
         if len(ERR) > 0:
             logger.log(ERR)
             breakpoint()
@@ -1693,8 +1703,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 wbin, hN, histBinSize, cArr = uu.Read.apertureHist(
                     apFile)
                 apHists[:, :, cn] = cArr
-            except:
-                ERR += [cDir.stem]
+            except Exception as e:
+                ERR += [[cDir.stem, e]]
         if len(ERR) > 0:
             logger.log(ERR)
             pdb.set_trace()
@@ -1730,7 +1740,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
         # optional input data for plots
         has_mask = ("/Mask" in f)
-        mask_arr = f["/Mask"][...] if has_mask else None
+        mask_arr = np.asarray(f["/Mask"][...], bool) if has_mask else None
         obs = f["/ObsPix"][...] if "/ObsPix" in f else np.arange(nLSpec)
 
     spat_tile, nTiles = choose_spat_tile_fast(nSpat, nProcs, s_chunk, k=2)
@@ -1768,55 +1778,166 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             logger.log(f"[ModelCube] Warning: could not stamp digest ({e})")
 
     with open_h5(hdf5Path, role="reader") as f:
-        data_cube = f["/DataCube"][...]
-        model_cube = f["/ModelCube"][...]  # (nSpat, nLSpec)
+        data_cube  = np.asarray(f["/DataCube"][...], np.float64)
+        model_cube = np.asarray(f["/ModelCube"][...], np.float64)
 
     # chi^2 per spaxel
     if mask_arr is None:
         mask_arr = np.ones(nLSpec, dtype=bool)
-    resid = (data_cube - model_cube)[:, mask_arr]
-    rchi2 = np.sqrt((resid * resid).mean(axis=1))
+    assert mask_arr.shape[0] == data_cube.shape[1]
+
+    with open_h5(hdf5Path, role="reader") as f:
+        D = np.asarray(f["/DataCube"][...], np.float64)      # (nSpat, nLam)
+        M = np.asarray(f["/ModelCube"][...], np.float64)     # (nSpat, nLam)
+        mask = np.asarray(f["/Mask"][...], bool).ravel()
+        nSpat, nLam = D.shape
+
+    # # flatten BinNum and compute binCounts
+    # bin_flat = binNum.ravel()
+    # n_pix = bin_flat.size
+    # n_bins = int(bin_flat.max()) + 1
+
+    # # per-bin raw flux (sum over mask) and SB (sum / binCounts)
+    # data_raw = np.sum(D[:, mask], axis=1)     # raw total flux per bin
+    # model_raw = np.sum(M[:, mask], axis=1)
+
+    # data_sb = data_raw / binCounts
+    # model_sb = model_raw / binCounts
+
+    # # Basic summary
+    # def stats(x, name):
+    #     x = np.asarray(x)
+    #     ok = np.isfinite(x)
+    #     print(f"{name}: count={ok.sum()}, min={np.nanmin(x):.3e}, med={np.nanmedian(x):.3e}, max={np.nanmax(x):.3e}, std={np.nanstd(x):.3e}")
+
+    # print("BIN COUNTS summary (finite values):")
+    # stats(binCounts, "binCounts")
+
+    # print("\nDATA (raw / SB) summary:")
+    # stats(data_raw, "data_raw")
+    # stats(data_sb,  "data_sb")
+
+    # print("\nMODEL (raw / SB) summary:")
+    # stats(model_raw, "model_raw")
+    # stats(model_sb,  "model_sb")
+
+    # # Check consistency: does model_raw ≈ model_sb * binCounts?
+    # reconstruct_raw = model_sb * binCounts
+    # diff = model_raw - reconstruct_raw
+    # print("\nModel consistency check (model_raw - model_sb*binCounts):")
+    # print("  diff min/med/max/std:", np.nanmin(diff), np.nanmedian(diff), np.nanmax(diff), np.nanstd(diff))
+    # print("  relative RMS:", np.sqrt(np.nanmean((diff[np.isfinite(diff)]**2))) / (np.nanmedian(np.abs(model_raw[np.isfinite(model_raw)])) + 1e-30))
+
+    # # Correlations with binCounts
+    # valid = np.isfinite(binCounts) & np.isfinite(data_raw) & np.isfinite(model_raw)
+    # if valid.sum() > 5:
+    #     print("\nPearson corr(binCounts, data_raw) =",
+    #         np.corrcoef(binCounts[valid], data_raw[valid])[0,1])
+    #     print("Pearson corr(binCounts, model_raw) =",
+    #         np.corrcoef(binCounts[valid], model_raw[valid])[0,1])
+    # else:
+    #     print("Not enough valid bins to compute correlations.")
+
+    # # Quick plots (optional, remove if running in headless env)
+    # try:
+    #     fig, axs = plt.subplots(2, 2, figsize=(8,8))
+    #     axs[0,0].hist(binCounts[valid], bins=50); axs[0,0].set_title("binCounts")
+    #     axs[0,1].scatter(binCounts[valid], data_raw[valid], s=5); axs[0,1].set_title("binCounts vs data_raw")
+    #     axs[1,0].scatter(binCounts[valid], model_raw[valid], s=5); axs[1,0].set_title("binCounts vs model_raw")
+    #     axs[1,1].scatter(data_raw[valid], model_raw[valid], s=5); axs[1,1].set_title("data_raw vs model_raw")
+    #     plt.tight_layout()
+    #     plt.savefig('corr')
+    # except Exception:
+    #     pass
+
+    # ---------------------------------------------
+    # RAW-FLUX SPACE (solver space)
+    # ---------------------------------------------
+    data_raw = np.sum(data_cube[:, mask_arr], axis=1)
+    model_raw = np.sum(model_cube[:, mask_arr], axis=1)
+    # residuals in raw units (what the solver fits)
+    resid_raw = data_cube[:, mask_arr] - model_cube[:, mask_arr]   # (nSpat, nMask)
+
+    # RMS residual per bin in RAW flux units
+    rms_resid_raw = np.sqrt(np.mean(resid_raw**2, axis=1))         # (nSpat,)
+
+    # Mean signed residual per bin in RAW units
+    mean_resid_raw = np.mean(resid_raw, axis=1)                    # (nSpat,)
+
+    # ---------------------------------------------
+    # SURFACE-BRIGHTNESS SPACE (interpretation)
+    # ---------------------------------------------
+    # SB maps (broadband)
+    data_sb = data_raw / binCounts
+    model_sb = model_raw / binCounts
+
+    data_sb = np.ma.masked_invalid(np.ma.masked_less_equal(data_sb, 0.0))
+    model_sb = np.ma.masked_invalid(np.ma.masked_less_equal(model_sb, 0.0))
+
+    # Convert residuals to SB units
+    rms_resid_sb = rms_resid_raw / binCounts
+    mean_resid_sb = mean_resid_raw / binCounts
+
+    rms_resid_sb = np.ma.masked_invalid(rms_resid_sb)
+    mean_resid_sb = np.ma.masked_invalid(mean_resid_sb)
 
     plt.figure(figsize=(6, 4))
-    plt.hist(rchi2, bins=40, alpha=0.7)
+    plt.hist(rms_resid_raw, bins=40, alpha=0.7)
     plt.xlabel(r"${\rm Norm}/\sqrt{N_{\rm pix}}$")
     plt.ylabel("Number of apertures")
     plt.title("Distribution of fit quality")
     plt.savefig(figDir/"chi2_hist.png")
     plt.close()
 
-    if 'spec' in pplots:
-        logger.log("Generating spectrum plots...")
-        with logger.capture_all_output():
-            parallel_spectrum_plots(
-                h5_or_path=str(hdf5Path),
-                chi2=rchi2,
-                n=10,
-                plot_dir=str(figDir),
-                n_workers=min(12, max(1, nProcs)),
-                tag=f"C{nComp:04d}",
-                mask=mask_arr,
-            )
+    # ---------------------------------------------
+    # Plot
+    # ---------------------------------------------
+    fig = plt.figure(figsize=plt.figaspect(yLen / xLen) * 0.75)
+    ax = fig.add_subplot(111)
+    # Symmetric colour scale around zero
+    vlim = np.percentile(np.abs(mean_resid_sb), 99)
+    cnt = dbi(
+        xpix, ypix, mean_resid_sb[binNum],
+        pixelsize=pixs,
+        angle=PA,
+        cmap=divcmap,
+        vmin=-vlim,
+        vmax=+vlim,
+    )
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    cax = POT.attachAxis(ax, "top", 0.1, mid=True)
+    cb = plt.colorbar(cnt, cax=cax, orientation="horizontal")
+    cax.text(
+        0.5, 0.5,
+        r"$\langle D-M\rangle_\lambda / N_{\rm pix}$",
+        ha="center", va="center",
+        color=POT.pgreen,
+        transform=cax.transAxes,
+    )
+    cb.set_ticks([])
+    ax.set_xlabel(r"$x\ [{\rm arcsec}]$")
+    ax.set_ylabel(r"$y\ [{\rm arcsec}]$")
+    plt.savefig(
+        figDir / f"signed_residual_SB_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png"
+    )
+    plt.close(fig)
+
 
     if 'mw' in pplots:
-        data_cube = np.ma.masked_less_equal(data_cube, 0.0)
-        model_cube = np.ma.masked_less_equal(model_cube, 0.0)
-        flux = np.ma.masked_invalid(
-            # (np.ma.sum(laGrid, axis=0)/binCounts)[binNum], 0.))
-            (np.ma.sum(data_cube[:, mask_arr], axis=1)/binCounts))
-        modSB = np.ma.masked_array( # re-scale to original data levels
-            (np.ma.sum(model_cube[:, mask_arr], axis=1)/binCounts),
-            # (np.ma.sum(model_cube, axis=0)*laScales/binCounts)[binNum],
-            mask=np.ma.getmaskarray(flux))
-        fmin, fmax = np.log10(np.ma.min(flux)), np.log10(np.ma.max(flux))
+
+        fmin, fmax = np.log10(np.min(data_sb)), np.log10(np.max(data_sb))
         pren = 2
         miText = POT.prec(pren, fmin)
         maText = POT.prec(pren, fmax)
         gs = gridspec.GridSpec(3, 1, hspace=0., wspace=0.)
         fig = plt.figure(figsize=plt.figaspect((yLen*3.)/xLen)*0.75)
         ax = fig.add_subplot(gs[0])
-        cnt = dbi(xpix, ypix, np.log10(flux[binNum]), pixelsize=pixs, angle=PA,
-            cmap='gist_heat', vmin=fmin, vmax=fmax)
+        cnt = dbi(
+            xpix, ypix, np.log10(data_sb[binNum]),
+            pixelsize=pixs, angle=PA,
+            cmap="cet_fire", vmin=fmin, vmax=fmax
+        )
         ax.set_xticklabels([])
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
@@ -1833,26 +1954,34 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             transform=cax.transAxes)
         cb.set_ticks([])
         ax = fig.add_subplot(gs[1])
-        dbi(xpix, ypix, np.log10(modSB[binNum]), pixelsize=pixs, angle=PA,
-            cmap='cet_fire', vmin=fmin, vmax=fmax)
+        dbi(
+            xpix, ypix, np.log10(model_sb[binNum]),
+            pixelsize=pixs, angle=PA,
+            cmap="cet_fire", vmin=fmin, vmax=fmax
+        )
         ax.set_xticklabels([])
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
         # ax.add_patch(copy(pPatch))
 
-        delta = (flux-modSB)/flux
+        rmax = np.percentile(rms_resid_sb, 99)
+        maText = POT.prec(pren, rmax)
         ax = fig.add_subplot(gs[2])
-        cnt = dbi(xpix, ypix, delta[binNum], pixelsize=pixs, angle=PA,
-            cmap=divcmap, vmin=-0.1, vmax=0.1)
+        cnt = dbi(
+            xpix, ypix, rms_resid_sb[binNum],
+            pixelsize=pixs, angle=PA,
+            cmap=divcmap, vmin=0.0, vmax=rmax
+        )
         cax = POT.attachAxis(ax, 'top', 0.1, mid=True)
         cb = plt.colorbar(cnt, cax=cax, orientation='horizontal')
-        lT = cax.text(0.5, 0.5, r'$(D-M)/D$', va='center', ha='center',
+        lT = cax.text(0.5, 0.5,
+            r"${\rm RMS}(D-M)\ /\ N_{\rm pix}$", va='center', ha='center',
             color=POT.pgreen, transform=cax.transAxes)
         lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
             foreground='k')])
-        cax.text(1e-3, 0.5, '-0.1', va='center', ha='left', color='white',
+        cax.text(1e-3, 0.5, '0.0', va='center', ha='left', color='white',
             transform=cax.transAxes)
-        cax.text(1.0-1e-3, 0.5, '0.1', va='center', ha='right', color='white',
+        cax.text(1.0-1e-3, 0.5, maText, va='center', ha='right', color='white',
             transform=cax.transAxes)
         cb.set_ticks([])
         ax.set_xlim(xmin, xmax)
@@ -1867,11 +1996,92 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         BIG.set_ylabel(r'$y\ [{\rm arcsec}]$', labelpad=25)
 
         plt.savefig(figDir/\
-            f"modelCube_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+            f"modelCube_sb_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+
+        gs = gridspec.GridSpec(3, 1, hspace=0., wspace=0.)
+        fig = plt.figure(figsize=plt.figaspect((yLen*3.)/xLen)*0.75)
+        ax = fig.add_subplot(gs[0])
+        cnt = dbi(
+            xpix, ypix, np.log10(data_sb[binNum]),
+            pixelsize=pixs, angle=PA,
+            cmap="cet_fire", vmin=fmin, vmax=fmax
+        )
+        ax.set_xticklabels([])
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        # ax.add_patch(copy(pPatch))
+        cax = POT.attachAxis(ax, 'top', 0.1)
+        cb = plt.colorbar(cnt, cax=cax, orientation='horizontal')
+        lT = cax.text(0.5, 0.5, fr"$L\ [{UTS.lsun}]$", va='center', ha='center',
+            color=POT.pgreen, transform=cax.transAxes)
+        lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+            foreground='k')])
+        cax.text(1e-3, 0.5, miText, va='center', ha='left', color='white',
+            transform=cax.transAxes)
+        cax.text(1.0-1e-3, 0.5, maText, va='center', ha='right', color='black',
+            transform=cax.transAxes)
+        cb.set_ticks([])
+        ax = fig.add_subplot(gs[1])
+        dbi(
+            xpix, ypix, np.log10(model_sb[binNum]),
+            pixelsize=pixs, angle=PA,
+            cmap="cet_fire", vmin=fmin, vmax=fmax
+        )
+        ax.set_xticklabels([])
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        # ax.add_patch(copy(pPatch))
+
+        rmax = np.percentile(rms_resid_raw, 99)
+        maText = POT.prec(pren, rmax)
+        ax = fig.add_subplot(gs[2])
+        cnt = dbi(
+            xpix, ypix, rms_resid_sb[binNum],
+            pixelsize=pixs, angle=PA,
+            cmap=divcmap, vmin=0.0, vmax=rmax
+        )
+        cax = POT.attachAxis(ax, 'top', 0.1, mid=True)
+        cb = plt.colorbar(cnt, cax=cax, orientation='horizontal')
+        lT = cax.text(0.5, 0.5,
+            r"${\rm RMS}(D-M)\ /\ N_{\rm pix}$", va='center', ha='center',
+            color=POT.pgreen, transform=cax.transAxes)
+        lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+            foreground='k')])
+        cax.text(1e-3, 0.5, '0.0', va='center', ha='left', color='white',
+            transform=cax.transAxes)
+        cax.text(1.0-1e-3, 0.5, maText, va='center', ha='right', color='white',
+            transform=cax.transAxes)
+        cb.set_ticks([])
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        # ax.add_patch(copy(pPatch))
+
+        BIG = fig.add_subplot(gs[:])
+        BIG.set_frame_on(False)
+        BIG.set_xticks([])
+        BIG.set_yticks([])
+        BIG.set_xlabel(r'$x\ [{\rm arcsec}]$', labelpad=25)
+        BIG.set_ylabel(r'$y\ [{\rm arcsec}]$', labelpad=25)
+
+        plt.savefig(figDir/\
+            f"modelCube_flux_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+
+    if 'spec' in pplots:
+        logger.log("Generating spectrum plots...")
+        with logger.capture_all_output():
+            parallel_spectrum_plots(
+                h5_or_path=str(hdf5Path),
+                chi2=rms_resid_raw,
+                n=100,
+                plot_dir=str(figDir),
+                n_workers=min(12, max(1, nProcs)),
+                tag=f"C{nComp:04d}",
+                mask=mask_arr,
+            )
 
     if 'otype' not in oDict['cutOn']:
         return # only do orbital SFH if orbital decomposition
-    if len(oDict['cuts'])>0:
+    if oDict['cuts'] and len(oDict['cuts'])>0:
         # determine which components belong to which orbital categories
         allCuts = np.array([oDict['cuts'][key] for key in oDict['cuts'].keys()])
         uCuts, uCounts = np.unique(allCuts, axis=0, return_counts=True)
@@ -1984,11 +2194,11 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             print(f"Could not make orbital SFH plot: {e}")
 
     # 7. Print summary
-    print(f"Mean reduced χ²: {np.mean(rchi2):.2f} ± {np.std(rchi2):.2f}")
-    worst = np.argmax(rchi2)
-    best = np.argmin(rchi2)
-    print(f"Worst fit: aperture {worst} (χ² = {rchi2[worst]:.2f})")
-    print(f"Best fit:  aperture {best} (χ² = {rchi2[best]:.2f})")
+    print(f"Mean reduced χ²: {np.mean(rms_resid_raw):.2f} ± {np.std(rms_resid_raw):.2f}")
+    worst = np.argmax(rms_resid_raw)
+    best = np.argmin(rms_resid_raw)
+    print(f"Worst fit: aperture {worst} (χ² = {rms_resid_raw[worst]:.2f})")
+    print(f"Best fit:  aperture {best} (χ² = {rms_resid_raw[best]:.2f})")
     print(f"[CubeFit] All plots and maps saved in {str(figDir)}")
 
 # ------------------------------------------------------------------------------
