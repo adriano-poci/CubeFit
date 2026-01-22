@@ -1191,36 +1191,36 @@ class PipelineRunner:
                     tracker=tracker,
                 )
                 
-                # ------------------------------------------------------------
-                # Final Kaczmarz NNLS polish (true row-action)
-                # ------------------------------------------------------------
-                logger.log("[Pipeline] Starting Kaczmarz NNLS polish...")
+                # # ------------------------------------------------------------
+                # # Final Kaczmarz NNLS polish (true row-action)
+                # # ------------------------------------------------------------
+                # logger.log("[Pipeline] Starting Kaczmarz NNLS polish...")
 
-                C = self.nComp
-                P = self.nPop
+                # C = self.nComp
+                # P = self.nPop
 
-                # Use active set from SPG (rows only)
-                active_orbits = stats.get("active_orbits", None)
+                # # Use active set from SPG (rows only)
+                # active_orbits = stats.get("active_orbits", None)
 
-                logger.log(f"PRE-KACZ ||x_solver|| = {float(np.linalg.norm(x_solver))}")
+                # logger.log(f"PRE-KACZ ||x_solver|| = {float(np.linalg.norm(x_solver))}")
 
-                x_solver = solve_kaczmarz_nnls(
-                    self.h5_path,
-                    x_solver,
-                    active_orbits=active_orbits,
-                    orbit_weights=orbit_weights,
-                    orbit_beta=float(os.environ.get("CUBEFIT_ORBIT_BETA", "0.2")),
-                    max_epochs=int(os.environ.get("CUBEFIT_KACZMARZ_EPOCHS", "1")),
-                    tol_kkt=float(os.environ.get("CUBEFIT_KACZMARZ_KKT", "1e-6")),
-                    shuffle_spaxels=True,
-                    apply_mask=bool(reader_apply_mask),
-                    use_lambda_weights=True,
-                    project_nonneg=cfg.project_nonneg,
-                    tracker=tracker,
-                )
-                logger.log(f"POST-KACZ ||x_solver|| = {float(np.linalg.norm(x_solver))}")
+                # x_solver = solve_kaczmarz_nnls(
+                #     self.h5_path,
+                #     x_solver,
+                #     active_orbits=active_orbits,
+                #     orbit_weights=orbit_weights,
+                #     orbit_beta=float(os.environ.get("CUBEFIT_ORBIT_BETA", "0.2")),
+                #     max_epochs=int(os.environ.get("CUBEFIT_KACZMARZ_EPOCHS", "1")),
+                #     tol_kkt=float(os.environ.get("CUBEFIT_KACZMARZ_KKT", "1e-6")),
+                #     shuffle_spaxels=True,
+                #     apply_mask=bool(reader_apply_mask),
+                #     use_lambda_weights=True,
+                #     project_nonneg=cfg.project_nonneg,
+                #     tracker=tracker,
+                # )
+                # logger.log(f"POST-KACZ ||x_solver|| = {float(np.linalg.norm(x_solver))}")
 
-                logger.log("[Pipeline] Kaczmarz NNLS polish complete.")
+                # logger.log("[Pipeline] Kaczmarz NNLS polish complete.")
 
         finally:
             try:
@@ -1245,7 +1245,7 @@ class PipelineRunner:
 
             f_wr["/X_global"].attrs["layout"] = "C_P"
             f_wr["/X_global"].attrs["P"] = x_solver.shape[1]
-            f_wr["/X_global"].attrs["active_orbits"] = np.asarray(active_orbits, dtype=int)
+            # f_wr["/X_global"].attrs["active_orbits"] = np.asarray(active_orbits, dtype=int)
         if tracker is not None:
             try: tracker.close()
             except Exception: pass

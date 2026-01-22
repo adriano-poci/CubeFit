@@ -612,8 +612,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         project_nonneg=True,
         # orbit_weights=None, # or None for “free” fit
         orbit_weights=cWeights,
-        processes=48, # 48 workers
-        blas_threads=1, # 1 BLAS thread each → 48 total
+        processes=4, # 4 workers
+        blas_threads=12, # 12 BLAS threads each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
         warm_start='nnls',  # 'zeros', 'resume', 'jacobi', 'nnls'
@@ -1138,14 +1138,14 @@ def reconstruct_modelcube_fast(
         if "/HyperCube/component_support" in f:
             support = np.asarray(
                 f["/HyperCube/component_support"][...], dtype=np.uint8
-            )  # shape (n_tiles, C)
+            )
             support_S_chunk = int(
                 f["/HyperCube/component_support"].attrs["S_chunk"]
             )
-        else:
+        if support is not None and support_S_chunk != S_blk:
             raise RuntimeError(
-                "Missing /HyperCube/component_support; reconstruction must "
-                "use the same support as the solver."
+                f"component_support S_chunk={support_S_chunk} "
+                f"!= reconstruction S_blk={S_blk}"
             )
 
         # Prepare /ModelCube with compatibility check (shape/dtype/chunks)
@@ -1208,10 +1208,11 @@ def reconstruct_modelcube_fast(
                 # Accumulate this λ band
                 band = np.zeros((dS, l1 - l0), dtype=np.float64, order="C")
 
-                # Determine solver tile index for this spatial block
-                t = s0 // support_S_chunk
-                # Components allowed in this tile (solver-consistent)
-                c_allowed = np.flatnonzero(support[t, :])
+                if support is not None:
+                    t = s0 // support_S_chunk
+                    c_allowed = np.flatnonzero(support[t, :])
+                else:
+                    c_allowed = range(C)
                 for c in c_allowed:
                     if nz_per_c[c] is None:
                         w = x_cp[c, :]
@@ -1964,7 +1965,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         ax.set_ylim(ymin, ymax)
         # ax.add_patch(copy(pPatch))
 
-        rmax = np.percentile(rms_resid_sb, 99)
+        rmax = np.percentile(np.log10(rms_resid_sb), 99)
         maText = POT.prec(pren, rmax)
         ax = fig.add_subplot(gs[2])
         cnt = dbi(
@@ -2002,7 +2003,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         fig = plt.figure(figsize=plt.figaspect((yLen*3.)/xLen)*0.75)
         ax = fig.add_subplot(gs[0])
         cnt = dbi(
-            xpix, ypix, np.log10(data_sb[binNum]),
+            xpix, ypix, np.log10(data_raw[binNum]),
             pixelsize=pixs, angle=PA,
             cmap="cet_fire", vmin=fmin, vmax=fmax
         )
@@ -2023,7 +2024,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         cb.set_ticks([])
         ax = fig.add_subplot(gs[1])
         dbi(
-            xpix, ypix, np.log10(model_sb[binNum]),
+            xpix, ypix, np.log10(model_raw[binNum]),
             pixelsize=pixs, angle=PA,
             cmap="cet_fire", vmin=fmin, vmax=fmax
         )

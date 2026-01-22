@@ -24,6 +24,7 @@ History
 v1.0:   Initial HDF5 design and validation. 7 September 2025
 v1.1:   Normalise all LOSVD kernels to unity on write in `populate_from_arrays`.
             10 January 2026
+v1.2:   Fixed non-flux-conservation in `_build_R_T_dense`. 22 January 2026
 
 
 HDF5 manager for CubeFit.
@@ -718,20 +719,42 @@ class H5Manager:
     def _build_R_T_dense(self, tem_pix: np.ndarray, obs_pix: np.ndarray) -> np.ndarray:
         tem_pix = np.asarray(tem_pix, dtype=float).ravel()
         obs_pix = np.asarray(obs_pix, dtype=float).ravel()
+
         if not (np.all(np.diff(tem_pix) > 0) and np.all(np.diff(obs_pix) > 0)):
             raise ValueError("tem_pix and obs_pix must be strictly increasing (log-λ).")
+
         T, L = tem_pix.size, obs_pix.size
-        R_T = np.zeros((T, L), dtype=np.float32)
-        j  = np.searchsorted(tem_pix, obs_pix, side="right") - 1
-        j  = np.clip(j, 0, T - 2)
+        R_T = np.zeros((T, L), dtype=np.float64)
+
+        j = np.searchsorted(tem_pix, obs_pix, side="right") - 1
+        j = np.clip(j, 0, T - 2)
         j1 = j + 1
+
         t0, t1 = tem_pix[j], tem_pix[j1]
-        denom = (t1 - t0); denom[denom == 0.0] = 1.0
-        w1 = (obs_pix - t0) / denom; w0 = 1.0 - w1
+        denom = (t1 - t0)
+        denom[denom == 0.0] = 1.0
+
+        w1 = (obs_pix - t0) / denom
+        w0 = 1.0 - w1
+
         cols = np.arange(L)
-        R_T[j,  cols] += w0.astype(np.float32, copy=False)
-        R_T[j1, cols] += w1.astype(np.float32, copy=False)
-        return R_T
+        R_T[j,  cols] += w0
+        R_T[j1, cols] += w1
+
+        # normalize columns to unity
+        colsum = np.sum(R_T, axis=0)
+        bad = (colsum == 0.0)
+        if np.any(bad):
+            # nearest-neighbour fallback
+            for l in np.where(bad)[0]:
+                jj = np.searchsorted(tem_pix, obs_pix[l], side="right") - 1
+                jj = np.clip(jj, 0, T - 1)
+                R_T[:, l] = 0.0
+                R_T[jj, l] = 1.0
+            colsum = np.sum(R_T, axis=0)
+
+        R_T /= colsum[None, :]
+        return R_T.astype(np.float32)
 
     def get_spectral_grids(self) -> tuple[np.ndarray, np.ndarray]:
         with self._open_ro() as f:

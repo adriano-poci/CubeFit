@@ -90,7 +90,7 @@ v3.9:   Added variational orbit-mass prior to break rank-1 degeneracy;
 from __future__ import annotations, print_function
 
 import os, sys, traceback
-import math
+import math, builtins
 import time
 from dataclasses import dataclass
 from typing import Iterable, Tuple, Optional, List
@@ -241,8 +241,12 @@ def rmse_proxy_subset(
     inv_cp_flux_ref,
     w_lam_sqrt,
 ):
+    """
+    Compute RMSE proxy over a subset of tiles in the SAME weighted space
+    used by the gradient (i.e. apply √w_λ if present). Returns sqrt(ssq/n).
+    """
     ssq = 0.0
-    n = 0
+    nres = 0
 
     with open_h5(h5_path, role="reader") as f:
         DC = f["/DataCube"]
@@ -255,13 +259,15 @@ def rmse_proxy_subset(
 
             yhat = np.zeros_like(Y)
             for c in range(x_CP.shape[0]):
-                A = np.asarray(M[s0:s1, c, :, :], np.float32)
+                A = np.asarray(M[s0:s1, c, :, :], np.float64)
                 if keep_idx is not None:
                     A = A[:, :, keep_idx]
                 if inv_cp_flux_ref is not None:
                     A = A * inv_cp_flux_ref[c, :][None, :, None]
 
-                yhat += np.tensordot(x_CP[c, :], A, axes=(0, 1))
+                # x_CP[c,:] shape (P,), A shape (Sblk, P, Lk)
+                # tensordot over population dim -> (Sblk, Lk)
+                yhat += np.tensordot(A, x_CP[c, :], axes=([1], [0]))
 
             R = Y - yhat
             if not np.all(np.isfinite(R)):
@@ -273,9 +279,10 @@ def rmse_proxy_subset(
                 ssq += float(np.sum(Rw * Rw))
             else:
                 ssq += float(np.sum(R * R))
+
             nres += int(R.size)
 
-    return np.sqrt(ssq / max(n, 1))
+    return float(np.sqrt(ssq / builtins.max(nres, 1)))
 
 # ------------------------------------------------------------------------------
 
@@ -314,147 +321,95 @@ def _tiny_col_freeze_inplace(col_denom, grad, rel_zero, abs_zero):
 
 # ---------------------------- Worker ---------------------------------
 
-def _worker_tile_global_grad_band(args):
-    r"""
-    Compute global Kaczmarz-style gradient contributions for one spatial
-    tile and one contiguous band of components.
-
-    This worker does **not** update x or R. It only returns the
-    band-local contributions to the global gradient and diagonal
-    preconditioner:
-
-        g_band[c,p]  = sum_{s,λ} (√w_λ A_{s,c,p,λ}) * (√w_λ R_{s,λ})
-        D_band[c,p]  = sum_{s,λ} (√w_λ A_{s,c,p,λ})^2,
-
-    where R = Y - ŷ is the residual for the current epoch's global x_CP,
-    and A already includes any column-flux normalization in the "model"
-    basis.
-
-    Additionally, this worker can apply a tile-local "tiny-column freeze"
-    safety guard: columns with numerically tiny denom are zeroed in the
-    numerator and excluded from the denom accumulator for this tile. This
-    prevents large/noisy updates later when the coordinator forms
-    invD = 1/max(D, eps).
-
-    Control knobs (env)
-    -------------------
-    CUBEFIT_ZERO_COL_FREEZE : {0,1} (default 1)
-        Enable/disable tile-local freeze.
-    CUBEFIT_ZERO_COL_REL : float (default 1e-12)
-    CUBEFIT_ZERO_COL_ABS : float (default 1e-24)
-
-    Returns
-    -------
-    g_band : ndarray, shape (band_size, P), float64
-    D_band : ndarray, shape (band_size, P), float64
+def _worker_tile_grad_band_single_metric(args):
     """
-    (h5_path, s0, s1, keep_idx,
-     c_start, c_stop,
-     x_band,
-     R_tile,
-     w_lam_sqrt,
-     inv_ref_band,
-     dset_slots, dset_bytes, dset_w0) = args
+    Minimal, single-metric gradient worker.
 
-    eps = float(os.environ.get("CUBEFIT_EPS", "1e-12"))
+    Computes, for a spatial tile [s0:s1] and component band [c0:c1):
 
-    freeze_enable = os.environ.get(
-        "CUBEFIT_ZERO_COL_FREEZE", "1"
-    ).lower() not in ("0", "false", "no", "off")
-    rel_zero = float(os.environ.get("CUBEFIT_ZERO_COL_REL", "1e-12"))
-    abs_zero = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-24"))
+        g_band[c,p] = sum_{s,λ} Ã[s,c,p,λ] * R[s,λ]
+        D_band[c,p] = sum_{s,λ} Ã[s,c,p,λ]^2
 
-    # Shapes
-    R_tile = np.asarray(R_tile, dtype=np.float64, order="C")
-    Sblk, Lk = R_tile.shape
+    where:
+        Ã[s,c,p,λ] = A[s,c,p,λ] / sqrt(binCounts[s])
+        R[s,λ]      = (Y - Ã x)[s,λ]
 
-    # λ-weights (optional)
-    if w_lam_sqrt is not None:
-        wvec = np.asarray(w_lam_sqrt, np.float64).ravel()
-        if wvec.size != Lk:
-            raise RuntimeError(
-                f"_worker_tile_global_grad_band: w_lam_sqrt length "
-                f"{wvec.size} != Lk={Lk}"
-            )
-        Rw = R_tile * wvec[None, :]
-    else:
-        wvec = None
-        Rw = R_tile
+    """
 
-    band_size, P = x_band.shape
+    (
+        h5_path,
+        s0, s1,
+        keep_idx,
+        c0, c1,
+        R_tile, # shape (Sblk, Lk), already weighted by 1/sqrt(binCounts)
+        # w_s, # shape (Sblk,), = 1/sqrt(binCounts[s0:s1])
+        dset_slots,
+        dset_bytes,
+        dset_w0,
+    ) = args
 
-    g_band = np.zeros((band_size, P), dtype=np.float64)
-    D_band = np.zeros((band_size, P), dtype=np.float64)
+    # Ensure contiguous float64 arrays
+    Rw = np.asarray(R_tile, dtype=np.float64, order="C")
+    # w_s = np.asarray(w_s, dtype=np.float64, order="C")
+
+    Sblk, Lk = Rw.shape
+    band_size = c1 - c0
 
     with open_h5(h5_path, role="reader") as f:
-        M = f["/HyperCube/models"]  # (S, C, P, L)
+        M = f["/HyperCube/models"]
         try:
             M.id.set_chunk_cache(dset_slots, dset_bytes, dset_w0)
         except Exception:
             pass
 
-        for bi, c in enumerate(range(c_start, c_stop)):
-            A = np.asarray(
-                M[s0:s1, c, :, :], dtype=np.float32, order="C"
-            )  # (Sblk, P, L_full)
+        P = M.shape[2]
+
+        g_band = np.zeros((band_size, P), dtype=np.float64)
+        D_band = np.zeros((band_size, P), dtype=np.float64)
+
+        # BLAS temp threshold (bytes)
+        try:
+            blas_temp_max = int(
+                os.environ.get(
+                    "CUBEFIT_BLAS_TEMP_MAX_BYTES",
+                    str(1024 * 1024**2),  # default 1024 MiB
+                )
+            )
+        except Exception:
+            blas_temp_max = 64 * 1024**2
+
+        R_flat = Rw.reshape(-1)  # view, no copy
+
+        for bi, c in enumerate(range(c0, c1)):
+            # Read model slice
+            A = np.asarray(M[s0:s1, c, :, :], dtype=np.float64, order="C")
             if keep_idx is not None:
                 A = A[:, :, keep_idx]  # (Sblk, P, Lk)
 
-            # Apply column-flux normalization if present
-            if inv_ref_band is not None:
-                inv_ref = np.asarray(
-                    inv_ref_band[bi, :], dtype=np.float64, copy=False
-                )  # (P,)
-                A = A * inv_ref[None, :, None]
+            # Apply the single spatial weighting
+            # A *= w_s[:, None, None]
 
-            # Promote to float64 for safe dot products
-            A = A.astype(np.float64, copy=False)
+            # Diagonal term (cheap, no BLAS needed)
+            # D[p] = sum_{s,λ} A[s,p,λ]^2
+            D_band[bi] = np.sum(A * A, axis=(0, 2))
 
-            if wvec is not None:
-                A_w = A * wvec[None, None, :]  # (Sblk, P, Lk)
-            else:
-                A_w = A
+            # Gradient term
+            # g[p] = sum_{s,λ} A[s,p,λ] * R[s,λ]
+            # Prefer BLAS if temporary size is acceptable
+            temp_bytes = P * Sblk * Lk * 8  # float64
 
-            # g_row[p] = Σ_{s,λ} A_w[s,p,λ] * Rw[s,λ]
-            g_row = np.tensordot(A_w, Rw, axes=([0, 2], [0, 1]))
-
-            # D_row[p] = Σ_{s,λ} (A_w[s,p,λ])^2
-            D_row = np.sum(np.square(A_w, dtype=np.float64), axis=(0, 2))
-
-            # ---- Tiny-column freeze (tile-local) -------------------------
-            # Use the existing helper. It sets denom[frozen]=inf; for a
-            # global accumulator we instead want to *exclude* this tile’s
-            # contribution, so we revert denom[frozen] -> 0 before storing.
-            if freeze_enable:
-                freeze, _, _ = _tiny_col_freeze_inplace(
-                    D_row, g_row, rel_zero, abs_zero
+            if temp_bytes <= blas_temp_max and P * Sblk * Lk > 0:
+                # BLAS path: reshape to (P, Sblk*Lk) and matvec
+                A2 = np.ascontiguousarray(
+                    A.transpose(1, 0, 2).reshape(P, -1)
                 )
-                if np.any(freeze):
-                    D_row[freeze] = 0.0
-
-            g_band[bi, :] = g_row
-            D_band[bi, :] = D_row
-
-    # Numerical guards
-    if not np.all(np.isfinite(g_band)):
-        g_band = np.nan_to_num(
-            g_band, nan=0.0, posinf=0.0, neginf=0.0, copy=False
-        )
-
-    # For D: keep zeros (they are meaningful), but sanitize NaN/Inf.
-    if not np.all(np.isfinite(D_band)):
-        D_band = np.nan_to_num(
-            D_band, nan=0.0, posinf=0.0, neginf=0.0, copy=False
-        )
-
-    # Ensure no negative denom from numerical noise
-    np.maximum(D_band, 0.0, out=D_band)
-
-    # Optional hard floor (only if you later invert without g-masking);
-    # here we do NOT force a floor, because g has been frozen where denom
-    # is tiny/invalid.
-    if not np.isfinite(eps) or eps <= 0.0:
-        eps = 1e-12
+                g_band[bi] = A2 @ R_flat
+                del A2
+            else:
+                # Memory-light fallback
+                g_band[bi] = np.tensordot(
+                    A, Rw, axes=([0, 2], [0, 1])
+                )
 
     return g_band, D_band
 
@@ -788,15 +743,6 @@ def solve_global_kaczmarz_global_step_mp(
             ssq = 0.0
             nres = 0
 
-            # Precompute spatially active components per tile
-            if component_support is not None:
-                active_c_per_tile = [
-                    np.nonzero(component_support[it])[0]
-                    for it in range(len(s_ranges))
-                ]
-            else:
-                active_c_per_tile = None
-
             pbar = tqdm(
                 total=len(s_ranges),
                 desc=f"[SPG] epoch {ep+1}/{cfg.epochs}",
@@ -804,7 +750,7 @@ def solve_global_kaczmarz_global_step_mp(
                 dynamic_ncols=True,
             )
 
-            # ---------------- Gradient accumulation ----------------
+            # ---------------- Gradient accumulation (PARALLEL) ----------------
             for (s0, s1) in s_ranges:
 
                 x_eff = x.copy()
@@ -812,77 +758,99 @@ def solve_global_kaczmarz_global_step_mp(
                 inactive[active_orbits] = False
                 x_eff[inactive, :] = 0.0
 
-                w_s = (1.0 / np.sqrt(binCounts[s0:s1])).astype(np.float32)
-
+                bs = np.asarray(binCounts[s0:s1], dtype=np.float64)
+                if np.any(bs <= 0.0):
+                    raise RuntimeError(f"Invalid binCounts in tile {s0}:{s1}")
+                w_s = (1.0 / np.sqrt(bs)).astype(np.float64)     # (Sblk,)
                 with open_h5(h5_path, role="reader") as f:
                     DC = f["/DataCube"]
                     M  = f["/HyperCube/models"]
 
-                    Y = np.asarray(DC[s0:s1, :], np.float64)
-                    Y *= w_s[:, None]
+                    # ------------------------------------------------------------
+                    # 1) Read RAW bin flux (no SB conversion)
+                    # ------------------------------------------------------------
+                    Y = np.asarray(DC[s0:s1, :], dtype=np.float64)  # (Sblk, L)
                     if keep_idx is not None:
-                        Y = Y[:, keep_idx]
+                        Y = Y[:, keep_idx]                           # (Sblk, Lk)
 
+                    # apply weighting to data rows
+                    # Y *= w_s[:, None]
+
+                    # ------------------------------------------------------------
+                    # 3) Build prediction in the SAME weighted space
+                    # ------------------------------------------------------------
                     yhat = np.zeros_like(Y)
 
-                    if active_c_per_tile is not None:
+                    # ------------------------------------------------------------
+                    # Determine components to iterate for this tile
+                    # ------------------------------------------------------------
+                    if component_support is not None:
+                        # tile index from s0 (tiles are aligned to s_tile)
                         tile_idx = s0 // s_tile
-                        spatial_active = active_c_per_tile[tile_idx]
+
+                        # components supported in this tile
+                        spatial_active = np.nonzero(component_support[tile_idx])[0]
+
+                        # intersect with globally active orbits
                         c_iter = np.intersect1d(
                             active_orbits,
                             spatial_active,
                             assume_unique=True
                         )
-                    else:
-                        c_iter = active_orbits
 
+                        # safety fallback: never allow empty iteration
+                        if c_iter.size == 0:
+                            c_iter = active_orbits
+                    else:
+                        # no spatial support masks
+                        c_iter = active_orbits
                     for c in c_iter:
-                        A = np.asarray(M[s0:s1, c, :, :], np.float32)
+                        A = np.asarray(M[s0:s1, c, :, :], dtype=np.float64)
+                        # (Sblk, P, L)
                         if keep_idx is not None:
-                            A = A[:, :, keep_idx]
+                            A = A[:, :, keep_idx] # (Sblk, P, Lk)
+
+                        # apply SAME weighting to model rows
+                        # A *= w_s[:, None, None]
+
                         yhat += x_eff[c] @ A
 
+                # ------------------------------------------------------------
+                # 4) Residual (already weighted)
+                # ------------------------------------------------------------
                 R = Y - yhat
-                if not np.all(np.isfinite(R)):
-                    R = np.nan_to_num(R, copy=False)
-
                 ssq += float(np.sum(R * R))
-                nres += int(R.size)
+                nres += R.size
 
+                # ---- prepare worker jobs ----
                 jobs = []
                 band_map = []
-                for (c_start, c_stop) in bands:
-                    if spatial_active is not None:
-                        mask = (spatial_active >= c_start) & (spatial_active < c_stop)
-                        if not np.any(mask):
-                            continue
-                        c_sel = spatial_active[mask]
-                        c0 = int(c_sel.min())
-                        c1 = int(c_sel.max()) + 1
-                    else:
-                        c0, c1 = c_start, c_stop
 
-                    jobs.append(
-                        (
-                            h5_path,
-                            int(s0),
-                            int(s1),
-                            keep_idx,
-                            c0,
-                            c1,
-                            x_eff[c0:c1].copy(order="C"),
-                            R.copy(order="C"),
-                            w_lam_sqrt,
-                            None,
-                            cfg.dset_slots,
-                            cfg.dset_bytes,
-                            cfg.dset_w0,
-                        )
-                    )
+                for (c_start, c_stop) in bands:
+                    c_sel = np.intersect1d(active_orbits,
+                                        np.arange(c_start, c_stop),
+                                        assume_unique=True)
+                    if c_sel.size == 0:
+                        continue
+
+                    c0 = int(c_sel.min())
+                    c1 = int(c_sel.max()) + 1
+
+                    jobs.append((
+                        h5_path,
+                        int(s0), int(s1),
+                        keep_idx,
+                        c0, c1,
+                        R.copy(order="C"),
+                        # w_s.copy(order="C"),
+                        cfg.dset_slots,
+                        cfg.dset_bytes,
+                        cfg.dset_w0,
+                    ))
                     band_map.append((c0, c1))
 
-                results = pool.map(_worker_tile_global_grad_band, jobs) if use_pool \
-                        else [_worker_tile_global_grad_band(j) for j in jobs]
+                # ---- run workers ----
+                results = pool.map(_worker_tile_grad_band_single_metric, jobs)
 
                 for (c0, c1), (g_band, D_band) in zip(band_map, results):
                     g_tot[c0:c1] += g_band
@@ -892,76 +860,60 @@ def solve_global_kaczmarz_global_step_mp(
 
             pbar.close()
 
-            # ---------------- SPG step ----------------
-            rmse_proxy = np.sqrt(ssq / max(nres, 1))
-            if rmse_proxy < best_proxy:
-                best_proxy = rmse_proxy
-                best_x = x.copy()
+            # ---------------- Normalize to mean-squared objective ----------------
+            if nres > 0:
+                g_tot /= float(nres)
+                D_tot /= float(nres)
 
-            if rmse_prev is None:
-                rmse_rel_change = np.inf
+            # ---------------- Assemble gradient (data term) ----------------
+            g = -g_tot
+
+            # ---- orbit-mass prior ----
+            if w_target is not None and lambda_orbit > 0.0:
+                s_orb = np.sum(x, axis=1)
+                r_orb = s_orb - w_target
+                g += lambda_orbit * r_orb[:, None]
+                g_prior = np.abs(lambda_orbit * r_orb[:, None])
             else:
-                rmse_rel_change = abs(rmse_prev - rmse_proxy) / max(rmse_prev, 1.0)
-            rmse_prev = rmse_proxy
+                g_prior = None
 
-            # ------------------------------------------------------------
-            # Diagonal preconditioner (scale-free)
-            # ------------------------------------------------------------
-            D_raw = D_tot.copy()
+            # ---- population curvature prior ----
+            lambda_pop = float(os.environ.get("CUBEFIT_LAMBDA_POP", "0.0"))
+            if lambda_pop > 0.0:
+                g_pop = population_age_curvature_grad(x, pop_shape)
+                g += lambda_pop * g_pop
+            else:
+                g_pop = None
+
+            # ---------------- Build safe diagonal preconditioner ----------------
+            D_raw = D_tot.copy()  # per-col denom (may have zeros)
             pos = np.isfinite(D_raw) & (D_raw > 0.0)
 
             if np.any(pos):
-                D_ref = np.median(D_raw[pos])
+                D_ref = float(np.median(D_raw[pos]))
             else:
                 D_ref = 1.0
 
-            D = D_raw / D_ref
-            abs_zero = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-30"))
+            # normalize to median scale (scale-free)
+            D = D_raw / max(D_ref, 1e-30)
+
+            # compute absolute floor: env OR data-driven small fraction of D_ref
+            abs_zero_env = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-30"))
+            data_floor_mul = float(os.environ.get("CUBEFIT_ZERO_COL_DATAFLOOR_MUL", "1e-8"))
+            data_floor = data_floor_mul * max(D_ref, 1.0)
+            abs_zero = max(abs_zero_env, data_floor)
+
+            # positive denominators get at least abs_zero, others set to 0
             D = np.where(pos, np.maximum(D, abs_zero), 0.0)
 
-            g = -g_tot
+            # ---------------- Freeze logic (respect priors) ----------------
+            freeze = (D <= 0.0) | (~np.isfinite(D))
 
-            # ------------------------------------------------------------
-            # Orbit-mass quadratic prior (breaks orbit-degeneracy)
-            # ------------------------------------------------------------
-            if w_target is not None and lambda_orbit > 0.0:
-                # x has shape (C, P)
-                # g has shape (C, P)
-                # Per-orbit total mass
-                s = np.sum(x, axis=1)          # (C,)
-                # Deviation from target orbit weights
-                r = s - w_target               # (C,)
-                # Add gradient of 0.5*lambda*||s - w||^2
-                # Same correction applied to all populations of orbit c
-                g += lambda_orbit * r[:, None]
-            # Store prior gradient magnitude for freeze logic
-            if w_target is not None and lambda_orbit > 0.0:
-                g_prior_abs = np.abs(lambda_orbit * r[:, None])
-            else:
-                g_prior_abs = None
-            # ------------------------------------------------------------
-            # Population AGE curvature prior
-            # ------------------------------------------------------------
-            lambda_pop = float(os.environ.get("CUBEFIT_LAMBDA_POP", "0.0"))
-            if lambda_pop > 0.0:
-                g += lambda_pop * population_age_curvature_grad(x, pop_shape)
+            if g_prior is not None:
+                prior_eps = 1e-12 * max(np.max(g_prior), 1.0)
+                freeze &= (g_prior <= prior_eps)
 
-            # ------------------------------------------------------------
-            # GLOBAL freeze (relative)
-            # ------------------------------------------------------------
-            if is_warmup:
-                D_freeze = 1e-8
-            else:
-                D_freeze = float(os.environ.get("CUBEFIT_GLOBAL_FREEZE_MUL", "1e-6"))
-
-            freeze = (D <= D_freeze) | (~np.isfinite(D))
-
-            if g_prior_abs is not None:
-                prior_eps = 1e-12 * max(np.max(g_prior_abs), 1.0)
-                freeze &= (g_prior_abs <= prior_eps)
-
-            if lambda_pop > 0.0:
-                g_pop = population_age_curvature_grad(x, pop_shape)
+            if g_pop is not None:
                 pop_eps = 1e-12 * max(np.max(np.abs(g_pop)), 1.0)
                 freeze &= (np.abs(g_pop) <= pop_eps)
 
@@ -970,41 +922,27 @@ def solve_global_kaczmarz_global_step_mp(
                 g[freeze] = 0.0
                 D = D.copy()
                 D[freeze] = np.inf
-                print(
-                    f"[SPG] GLOBAL freeze applied: {int(np.count_nonzero(freeze))} cols "
-                    f"(D < {D_freeze:.1e})",
-                    flush=True,
-                )
 
-            # ------------------------------------------------------------
-            # KKT / projected gradient diagnostics
-            # ------------------------------------------------------------
-            viol = np.zeros_like(g)
-            pos_mask = x > 0.0
-            viol[pos_mask] = np.abs(g[pos_mask])
-            viol[~pos_mask] = np.maximum(-g[~pos_mask], 0.0)
+            # ---------------- form capped inverse diag (invD) ----------------
+            invD = np.zeros_like(D, dtype=np.float64)
+            finite_mask = np.isfinite(D) & (D > 0.0)
+            invD[finite_mask] = 1.0 / D[finite_mask]
 
-            kkt_norm = np.max(np.abs(viol)) / (np.max(np.abs(g)) + 1e-30)
+            # cap invD to avoid enormous steps in low-curvature directions
+            max_inv_d = float(os.environ.get("CUBEFIT_MAX_INV_D", "1e6"))
+            if np.isfinite(max_inv_d) and (max_inv_d > 0.0):
+                invD = np.minimum(invD, max_inv_d)
 
-            g_plus = np.zeros_like(g)
-            g_plus[pos_mask] = g[pos_mask]
-            g_plus[~pos_mask] = np.minimum(g[~pos_mask], 0.0)
-            pg_norm = np.linalg.norm(g_plus)
-            pg_rel = pg_norm / (1.0 + np.linalg.norm(x))
+            # ---------------- compute step (safe) ----------------
+            lr *= 0.99  # anneal
+            dx = -lr * (g * invD)
 
-            finite = np.isfinite(D)
-            gap_est = np.sum((g[finite] ** 2) / D[finite]) / (np.sum(g[finite] ** 2) + 1e-30)
+            # ---------------- rescale step if you have an E_global heuristic -------------
+            # NOTE: you previously divided dx by E_global which double-counts curvature.
+            # If you want that effect, re-enable here; default is NOT to rescale.
+            # dx /= np.maximum(E_global, 1e-12)
 
-            lr *= 0.99
-
-            dx = -lr * (g / D)
-            # ------------------------------------------------------------
-            # rescale step to match physical column units
-            # ------------------------------------------------------------
-            # E_global has shape (C, P) and encodes the natural scale of x
-            # This brings dx into the same coordinate system as x
-            dx /= np.maximum(E_global, 1e-12)
-            # ------------------------------------------------------------
+            # Ensure descent
             if np.vdot(dx, g) > 0:
                 dx = -dx
 
@@ -1012,65 +950,22 @@ def solve_global_kaczmarz_global_step_mp(
             g_norm = np.linalg.norm(g)
             x_norm = np.linalg.norm(x)
 
-            step_cos = -np.vdot(dx, g) / (dx_norm * g_norm + 1e-30)
-
+            # trust region / step capping
             grad_cap = 3.0 * g_norm
             if is_warmup:
-                # much tighter trust region on first epoch
-                x_cap = 0.0005 * x_norm   # instead of 0.002
+                x_cap = 0.0005 * x_norm
             else:
                 x_cap = float(os.environ.get("CUBEFIT_MAX_FRAC", "0.005")) * x_norm
             dx_cap = min(grad_cap, x_cap)
-
             if dx_norm > dx_cap and dx_cap > 0:
                 dx *= dx_cap / dx_norm
 
-            # ------------------------------------------------------------
             # Apply step
-            # ------------------------------------------------------------
-            x_eff = x.copy()
-            inactive = np.ones(C, dtype=bool)
-            inactive[active_orbits] = False
-            x_eff[inactive, :] = 0.0
-
-            x_eff += dx
+            x += dx
             if cfg.project_nonneg:
-                np.maximum(x_eff, 0.0, out=x_eff)
+                np.maximum(x, 0.0, out=x)
 
-            # ------------------------------------------------------------------
-            # Acceptance (projected-gradient sufficient decrease)
-            # ------------------------------------------------------------------
-            # predicted decrease along dx
-            pred = -np.vdot(g_plus, dx)
-
-            accept = False
-            if pred > 0:
-                accept = True
-            else:
-                lr *= 0.5
-            if step_cos < 0.5:
-                accept = False
-                lr *= 0.5
-
-            if accept:
-                x = x_eff
-
-            # ------------------------------------------------------------
-            # Diagnostics
-            # ------------------------------------------------------------
-            print("[SPG] Step diagnostics:", flush=True)
-            print(f"  lr={lr:.3e}", flush=True)
-            print(f"  rmse_rel_change={rmse_rel_change:.3e}", flush=True)
-            print(f"  pg_rel={pg_rel:.3e}", flush=True)
-            print(f"  step_cos={step_cos:.3f}", flush=True)
-            print(f"  KKT_inf={kkt_norm:.3e}", flush=True)
-            print(f"  gap_est={gap_est:.3e}", flush=True)
-            print(f"  ||x||={x_norm:.3e}", flush=True)
-            print(f"  ||dx||={dx_norm:.3e}, dx_cap={dx_cap:.3e}", flush=True)
-
-            # ------------------------------------------------------------
-            # Active set update
-            # ------------------------------------------------------------
+            # ---------------- Active orbit update (CRITICAL) ----------------
             x_row_l1 = np.sum(x, axis=1)
             g_row_inf = np.max(np.abs(g), axis=1)
 
@@ -1086,9 +981,18 @@ def solve_global_kaczmarz_global_step_mp(
 
             active_orbits = new_active.astype(np.int32)
 
-            print(f"[SPG] active orbits: {active_orbits.size}/{C}", flush=True)
+            # ---------------- Diagnostics (new, meaningful set) ----------------
+            rmse = np.sqrt(ssq / max(nres, 1))
+            pg_norm = np.linalg.norm(g[np.isfinite(g)])
+            D_pos = D[np.isfinite(D) & (D < np.inf)]
+
             print(
-                f"[SPG] epoch {ep+1} RMSE(proxy)={rmse_proxy:.4e}",
+                f"[SPG] epoch {ep+1} "
+                f"RMSE={rmse:.4e}  "
+                f"||x||={x_norm:.3e}  "
+                f"||dx||={dx_norm:.3e}  "
+                f"||g||={pg_norm:.3e}  "
+                f"active={active_orbits.size}/{C}",
                 flush=True,
             )
 
@@ -1097,7 +1001,6 @@ def solve_global_kaczmarz_global_step_mp(
             epochs=cfg.epochs,
             elapsed_sec=elapsed,
             rmse_proxy_best=float(best_proxy),
-            kkt_norm_best=float(kkt_norm),
             active_orbits=active_orbits.copy(),
         )
 
@@ -1176,6 +1079,8 @@ def solve_kaczmarz_nnls(
             Lk = int(keep_idx.size)
         else:
             Lk = int(L)
+        
+        binCounts = np.asarray(f['/BinCounts'][...], dtype=int)
 
         # optional lambda sqrt weights
         w_lam_sqrt = None
@@ -1214,79 +1119,91 @@ def solve_kaczmarz_nnls(
                 if keep_idx is not None:
                     Y = Y[:, keep_idx]
 
+                # binCounts for this tile -> single-metric spatial weight w_s = 1/sqrt(binCounts)
+                bs_tile = np.asarray(binCounts[s0:s1], dtype=np.float64)
+                if np.any(bs_tile <= 0.0):
+                    raise RuntimeError(f"Invalid binCounts in tile {s0}:{s1}")
+                w_s = (1.0 / np.sqrt(bs_tile)).astype(np.float64)  # (tile_len,)
+
+                # apply the SAME spatial weighting to data rows
+                Yw = Y * w_s[:, None]  # (tile_len, Lk)
+
                 # build effective x for residuals (match SPG active set)
                 x_eff = x.copy()
                 inactive = np.ones(Ctot, dtype=bool)
                 inactive[active_orbits] = False
                 x_eff[inactive, :] = 0.0
 
-                # apply orbit-weight blending to the effective x used for residuals
+                # apply epoch-level orbit blending to x_eff if requested (same as before)
                 if (w_target is not None) and (orbit_beta is not None) and (orbit_beta > 0.0):
-                    # apply only to active_orbits rows
                     ai = active_orbits
-                    # Current per-orbit total mass
-                    s = np.sum(x_eff[ai, :], axis=1)          # shape (len(ai),)
-                    # Avoid divide-by-zero
-                    s_safe = np.maximum(s, 1e-30)
-                    # Target total mass after blending
-                    s_tgt = (1.0 - orbit_beta) * s + orbit_beta * w_target[ai]
-                    # Rescale SFH rows to match target mass
+                    s_cur = np.sum(x_eff[ai, :], axis=1)
+                    s_safe = np.maximum(s_cur, 1e-30)
+                    s_tgt = (1.0 - orbit_beta) * s_cur + orbit_beta * w_target[ai]
                     x_eff[ai, :] *= (s_tgt / s_safe)[:, None]
 
-                # yhat for tile
-                yhat = np.zeros_like(Y)
+                # compute yhat in weighted space (apply w_s to model rows)
+                yhat = np.zeros_like(Yw)
                 for c in active_orbits:
-                    A_blk = np.asarray(M[s0:s1, c], np.float32)
+                    A_blk = np.asarray(M[s0:s1, c], np.float64, order="C")  # (tile_len, P, L)
                     if keep_idx is not None:
-                        A_blk = A_blk[:, :, keep_idx]
-                    yhat += x_eff[c] @ A_blk
+                        A_blk = A_blk[:, :, keep_idx]  # (tile_len, P, Lk)
 
-                R = Y - yhat
+                    # apply SAME spatial weighting to model rows
+                    A_blk *= w_s[:, None, None]
+
+                    yhat += x_eff[c] @ A_blk  # (tile_len, Lk)
+
+                # Residual in same weighted space
+                R = Yw - yhat
+
+                # apply λ-weights if present (√w_λ) — same convention as SPG
                 if w_lam_sqrt is not None:
-                    R *= w_lam_sqrt[None, :]
+                    Rw = R * w_lam_sqrt[None, :]
+                else:
+                    Rw = R
 
-                # accumulate updates over tile
+                # accumulate updates over tile: use weighted A (w_s applied) and λ-weights applied below
                 for c in active_orbits:
-                    A_blk = np.asarray(M[s0:s1, c], np.float32, order="C")
+                    A_blk = np.asarray(M[s0:s1, c], np.float64, order="C")
                     if keep_idx is not None:
                         A_blk = A_blk[:, :, keep_idx]  # shape (tile_len, P, Lk)
 
-                    # Apply lambda weights to A if present (broadcast over tile and P)
+                    # apply SAME spatial weighting to model block
+                    A_blk *= w_s[:, None, None]
+
+                    # apply lambda weights if present
                     if w_lam_sqrt is not None:
                         Aw = A_blk * w_lam_sqrt[None, None, :]
                     else:
                         Aw = A_blk
 
-                    # Compute per-(spaxel,lambda) squared norms across P: sum_p Aw^2 -> shape (tile_len, Lk)
-                    row_norm2 = np.sum(Aw * Aw, axis=1)   # (tile_len, Lk)
-                    # avoid division by zero
+                    # compute row_norm2 = sum_p Aw^2  -> shape (tile_len, Lk)
+                    row_norm2 = np.sum(Aw * Aw, axis=1)
+                    # avoid divide-by-zero
                     row_norm2 = np.where(row_norm2 > 0.0, row_norm2, np.inf)
 
-                    # scale per-(spaxel,lambda)
-                    # R shape (tile_len, Lk) -> scale same shape
-                    scale = R / row_norm2   # (tile_len, Lk)
+                    # scale = Rw / row_norm2  -> shape (tile_len, Lk)
+                    scale = Rw / row_norm2
 
-                    # Flatten tile and lambda dims, compute averaged update across all (s,λ)
-                    # Aw reshape -> (tile_len*P, Lk) ??? careful: we want (tile_len*Lk, P) for GEMV
-                    # so swap axes: Aw has (s, p, λ) -> reshape to (s*λ, p)
+                    # flatten Aw to shape (tile_len*Lk, P) for BLAS matvec
                     Aw_flat = Aw.transpose(0, 2, 1).reshape(-1, Aw.shape[1])  # (s*Lk, P)
+                    scale_flat = scale.ravel()
 
-                    # flatten scale to (s*Lk,)
-                    scale_flat = scale.ravel()  # (s*Lk,)
-
-                    # update (P,) is Aw_flat^T @ scale_flat  (GEMV)
-                    # use explicit matmul for BLAS: (P,) = Aw_flat.T @ scale_flat
-                    update = Aw_flat.T @ scale_flat    # shape (P,)
-
-                    # normalize by number of (s*Lk) contributions to average per-spaxel
-                    n_contrib = scale_flat.size if scale_flat.size > 0 else 1
-                    update /= n_contrib
+                    # update = Aw_flat.T @ scale_flat  -> (P,)
+                    if scale_flat.size:
+                        update = Aw_flat.T @ scale_flat
+                        update /= float(scale_flat.size)  # average over contributions
+                    else:
+                        update = np.zeros(Aw.shape[1], dtype=np.float64)
 
                     dx_accum[c] += update
 
-                    # KKT metric over tile: g_c = - sum_{s,λ} A_blk[s,p,λ] * R[s,λ]
-                    # use einsum (cheap here) -> shape (P,)
-                    g_c = -np.einsum("sl,spl->p", R, A_blk)
+                    # KKT diagnostic for this tile (data gradient sign)
+                    # g_c = - sum_{s,λ} (Aw_no_lambda ? A_blk : Aw) * Rw
+                    # Use A_blk (un-weighted by sqrt(lambda)) so sign corresponds to raw gradient if desired;
+                    # here we compute using Aw (with λ) to match the current metric.
+                    g_c = -np.einsum("sl,spl->p", Rw, Aw)
                     viol = np.where(
                         x[c] > 0.0,
                         np.abs(g_c),

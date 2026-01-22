@@ -46,7 +46,7 @@ Requires the HDF5 to already contain:
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional, Dict, Any, List, Tuple
-import os, math
+import os, math, builtins
 import numpy as np
 from tqdm import tqdm
 
@@ -244,9 +244,9 @@ def _compute_and_store_losvd_amplitudes(f, *, amp_mode: str) -> tuple[str, str]:
 
     # stream over spaxels to bound RAM
     losvd = f["/LOSVD"]
-    step = max(1, 64)
+    step = builtins.max(1, 64)
     for s0 in range(0, S, step):
-        s1 = min(S, s0 + step)
+        s1 = builtins.min(S, s0 + step)
         slab = np.asarray(losvd[s0:s1, :, :], np.float64, order="C")  # (dS,V,C)
         if amp_mode == "trapz":
             a = np.trapz(slab, vel_pix, axis=1)                       # (dS,C)
@@ -528,6 +528,7 @@ def preflight_hypercube_convolution(
 
         Templates = np.asarray(f["/Templates"][...], np.float64, order="C")
         TemPix = np.asarray(f["/TemPix"][...], np.float64)
+        ObsPix = np.asarray(f["/ObsPix"][...],    dtype=np.float64)
         LOSVD = np.asarray(f["/LOSVD"][...], np.float64, order="C")
         VelPix = np.asarray(f["/VelPix"][...], np.float64)
 
@@ -560,9 +561,9 @@ def preflight_hypercube_convolution(
     flat_right: List[float] = []
     passes: List[bool] = []
 
-    # Rebin flatness on obs grid
+    # Rebin flatness on obs grid (value-preserving)
     ones_T = np.ones((1, T), dtype=np.float64)
-    flat_obs = ones_T @ R_T
+    flat_obs = ones_T @ R_T          # shape (1, L)
     rt_flat_check = float(np.max(np.abs(flat_obs - 1.0)))
 
     for s in s_sel:
@@ -1206,13 +1207,25 @@ def build_hypercube(
 
                     # 4) apply FINAL scale according to norm_mode
                     if norm_mode == "model":
+                        # model-mode: A already encodes the desired per-(s,c) column amplitude
                         scale = float(A[s_idx, c_idx])
                     else:
+                        # data-mode: L_vec stores per-spaxel SURFACE-BRIGHTNESS (SB)
+                        # but the HyperCube models are constructed in raw detector-pixel flux units.
+                        # Convert L_vec (SB) → total raw flux by multiplying by binCounts[s_idx].
+                        # `binCounts` was read in preflight and is available here.
                         if a_sum <= 0.0 or L_vec[s_idx] <= 0.0:
                             scale = 0.0
                         else:
                             frac = float(A[s_idx, c_idx]) / np.maximum(a_sum, 1.0e-30)
-                            scale = float(L_vec[s_idx]) * frac
+                            # guard: if binCounts missing fall back to 1
+                            bs = int(binCounts[s_idx]) if ("binCounts" in locals() or "binCounts" in globals()) else 1
+                            scale = float(L_vec[s_idx]) * float(bs) * frac
+
+                    if scale != 0.0:
+                        Ycp *= np.float32(scale)
+                    else:
+                        Ycp.fill(0.0)
 
                     if scale != 0.0:
                         Ycp *= np.float32(scale)

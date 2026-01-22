@@ -30,9 +30,9 @@ module load foss/2023a
 module load Python/3.11.3-GCCcore-12.3.0
 
 # --- BLAS / OpenMP threading (per worker) ---
-export OMP_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
+export OMP_NUM_THREADS=12
+export OPENBLAS_NUM_THREADS=12
+export MKL_NUM_THREADS=12
 export NUMEXPR_NUM_THREADS=1
 export OMP_PROC_BIND=spread
 export OMP_PLACES=cores

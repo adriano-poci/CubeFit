@@ -194,10 +194,15 @@ def _predict_spaxel_sparse_from_models(M,
                     A32 = A32[:, keep_idx_local]  # (Kb, Lk)
 
                 # Weights for this block
-                w64 = x_cp[c, p0:p1][local_idx]                 # (Kb,) float64
-                w32 = w64.astype(np.float32, copy=False)        # float32 GEMV
+                w64 = x_cp[c, p0:p1][local_idx]
+                w32 = w64.astype(np.float32, copy=False)
 
-                # Accumulate: y += A^T w
+                if "/HyperCube/norm/cp_flux_ref" in M.file:
+                    inv_ref = 1.0 / np.asarray(
+                        M.file["/HyperCube/norm/cp_flux_ref"][c, p0:p1],
+                        dtype=np.float64)
+                    w32 = w32 * inv_ref[local_idx].astype(np.float32)
+
                 y_fit += (A32.T @ w32).astype(np.float64, copy=False)
 
     return y_fit
@@ -797,7 +802,7 @@ def run_patch(h5_path: str,
             sqrt_w_rows[pos:pos+Lk] = (
                 np.sqrt(w_lam)
                 * good.astype(np.float64)
-                / np.sqrt(bs)
+                # / np.sqrt(bs)
             )
             finite_counts.append(int(np.count_nonzero(good)))
             pos += Lk
@@ -831,6 +836,9 @@ def run_patch(h5_path: str,
     with open_h5(h5_path, role="reader") as f:
         M = f["/HyperCube/models"]  # (S, C, P, L)
 
+        cp_flux_ref = np.asarray(f['/HyperCube/norm/cp_flux_ref'][...],
+            dtype=np.float64)  # (C,P)
+
         for c, plist in enumerate(
             tqdm(
                 picks,
@@ -855,6 +863,8 @@ def run_patch(h5_path: str,
             A_c = np.nan_to_num(
                 A_c, nan=0.0, posinf=0.0, neginf=0.0, copy=False
             )
+            inv_ref = 1.0 / cp_flux_ref[c, :]
+            A_c *= inv_ref[None, :, None]
 
             A_c *= row_mask[:, None, :]   # (Ns, P, Lk)
 
@@ -916,8 +926,11 @@ def run_patch(h5_path: str,
         x_CP[c, p] = x_patch[j]
     # --- Enforce orbit prior on the seed (energy metric) --- FAST and strict
     if orbit_weights is not None:
-        x_CP = apply_orbit_prior_to_seed(x_CP, orbit_weights,
-            E_cp=E, preserve_total=True, min_w_frac=1e-4)
+        s = np.sum(x_CP, axis=1)
+        tot = float(np.sum(s))
+        if tot > 0:
+            target = orbit_weights / np.sum(orbit_weights)
+            x_CP *= (target[:, None] * tot) / np.maximum(s[:, None], 1e-30)
 
     # --- Reconstruct + diagnostics per spaxel
     rmse = np.zeros(s_idx.size, dtype=np.float64)
