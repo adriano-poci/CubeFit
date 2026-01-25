@@ -72,9 +72,7 @@ def main():
     os.environ['CUBEFIT_NNLS_SUB_L']=str(512)
     os.environ['CUBEFIT_NNLS_SOLVER']='nnls'
     os.environ["CUBEFIT_USE_NNLS_PRIOR"] = "0"
-    os.environ['CUBEFIT_NNLS_L2']=str(0)
     os.environ["CUBEFIT_LAMBDA_WEIGHTS_ENABLE"] = "1"
-    os.environ["CUBEFIT_KACZ_L2"] = "0.0"
     os.environ["CUBEFIT_RMSE_PROXY_GUARD"] = "0"
     os.environ["CUBEFIT_NNLS_PROP_PER_BAND"] = "0"
     os.environ["CUBEFIT_NNLS_ENABLE"] = "0"
@@ -84,7 +82,7 @@ def main():
     os.environ["CUBEFIT_GLOBAL_ENERGY_BLEND"] = str(3e-2)
     os.environ["CUBEFIT_ZERO_COL_FREEZE"] = str(1)
     os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-5)
-    os.environ["CUBEFIT_LAMBDA_ORBIT"] = str(3e-3)
+    os.environ["CUBEFIT_LAMBDA_ORBIT"] = str(5e-1)
     os.environ["CUBEFIT_LAMBDA_POP"] = str(1e-3)
 
     if args.ncomp is not None:

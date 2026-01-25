@@ -9,24 +9,87 @@ v1.0:   Added `build_component_support_from_losvd_amp` and
 v1.1:   Added `apply_global_hypercube_scale_inplace` to compute and store a
             global scale for the Hypercube model to improve numerical stability
             during fitting. 8 January 2026
+v1.2:   Defined all the useful `muse` functions including `_oneTimeSpec` for
+            self-containment. 25 January 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any, Dict, Optional, Tuple, Sequence
 import numpy as np
 from tqdm import tqdm
-import os, glob, time, re, math
+import os, glob, time, re, math, sys, builtins, warnings, traceback
 import pathlib as plp
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
+from astropy.io import fits as pf
+from scipy.interpolate import interp1d
 
 from dynamics.IFU.Constants import Constants
+from dynamics.IFU.FileIO import Load, Write, Read
+from dynamics.IFU.Galaxy import Redshift
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
 from CubeFit.hypercube_builder import read_global_column_energy
 from CubeFit.hdf5_manager import open_h5
 
+import ppxf.ppxf_util as pxu
+
+curdir = plp.Path(__file__).parent
+
 CTS = Constants()
 C_KMS = CTS.c
+keySep = '_'
+freez = ['bh', 'q', 'p', 'u', 'dm', 'df', 'ml']
+pDir = curdir.parent/'pxf'
+mDir = curdir.parent/'muse'
+
+# ------------------------------------------------------------------------------
+
+def _ddir():
+    """
+    This function finds the absolute path to `dynamics` from the system path
+    """
+    for diir in [x for x in sys.path if plp.Path(x, 'dynamics').is_dir()]:
+        dDir = diir
+    del diir
+
+    return plp.Path(dDir, 'dynamics')
+dDir = _ddir()
+
+# ------------------------------------------------------------------------------
+
+def rReplace(s, old, new, occurrence):
+    li = s.rsplit(old, occurrence)
+    return new.join(li)
+
+# ------------------------------------------------------------------------------
+
+def _deetExtr(fnKey):
+    # temp = rReplace(fnKey, os.sep, keySep, 1).split(keySep)
+    rstru = ''
+    for ji in range(len(freez)-1):
+        rstru += r'([a-z]+)([+-]?[0-9]{1,}(?:\.[0-9]+))'
+        if ji < len(freez)-2:
+            rstru += keySep
+        else:
+            rstru += r'[\/\\]?(?:([a-z]+)([+-]?[0-9]{1,}(?:\.[0-9]+)))?'
+            # optional group with either path sep for M/L
+
+    # Join `temp` instead of using `fnKey` to get rid of the `keySep`
+    rmat = re.search(rstru, str(fnKey))
+    if isinstance(rmat, type(None)):
+        # warnings.warn(f"Key did not return matches for:\n{fnKey}\n{rstru}",
+            # RuntimeWarning)
+        return None
+
+    fpDict = dict()
+    gpKeys = list(rmat.groups())[::2]
+    gpVals = list(rmat.groups())[1::2]
+    for key, val in zip(gpKeys, gpVals):
+        if key:
+            fpDict[key] = float(val)
+    return fpDict
+
+# ------------------------------------------------------------------------------
 
 @contextmanager
 def blas_threads_ctx(n: Optional[int]):
@@ -2283,5 +2346,630 @@ def build_working_template_grid_from_losvd(
     )
 
     return Templates_work, TemPix_work, velscale_work
+
+# ------------------------------------------------------------------------------
+
+def _fnMILES(dirs):
+    metals, ages, alphas = [], [], []
+    for lmd in dirs:
+        expr = r'Z([mp][0-9.]+)T([0-9.]+).i.([mp][0-9.]+).{0,2}([mp][0-9.]+|'\
+            'baseFe)'
+        matches = re.search(expr, lmd.stem).groups()
+        metals += [float(matches[0].replace('p', '+').replace('m', '-'))]
+        ages += [float(matches[1].replace('p', '+').replace('m', '-'))]
+        alphas += [float(matches[3].replace('p', '+').replace('m', '-'))]
+
+    return np.asarray(metals), np.asarray(ages), np.asarray(alphas)
+
+# ------------------------------------------------------------------------------
+
+def _fnEMILES(dirs):
+    metals, ages = [], []
+    for lmd in dirs:
+        expr = r'Z([mp][0-9.]+)T([0-9.]+).i.([mp][0-9.]+).{0,2}([mp][0-9.]+|'\
+            'baseFe)'
+        matches = re.search(expr, lmd.stem).groups()
+        metals += [float(matches[0].replace('p', '+').replace('m', '-'))]
+        ages += [float(matches[1].replace('p', '+').replace('m', '-'))]
+
+    return np.asarray(metals), np.asarray(ages), None
+
+# ------------------------------------------------------------------------------
+
+def _fnSMILES(dirs):
+    metals, ages, alphas = [], [], []
+    for lmd in dirs:
+        expr = r'Z([mp][0-9.]+)T([0-9.]+).*aFe([mp][0-9]+)'
+        matches = re.search(expr, lmd.stem).groups()
+        metals += [float(matches[0].replace('p', '+').replace('m', '-'))]
+        ages += [float(matches[1].replace('p', '+').replace('m', '-'))]
+        alphas += [float(matches[2].replace('p', '+').replace('m', '-'))/10.0]
+
+    return np.asarray(metals), np.asarray(ages), np.asarray(alphas)
+
+# ------------------------------------------------------------------------------
+
+def _readSSP(fn):
+    hdu = pf.open(fn)
+    hdr = hdu[0].header
+    ssp = np.squeeze(hdu[0].data)
+    hdu.close()
+    tPix = hdr['CRVAL1']+np.arange(hdr['NAXIS1'])*hdr['CDELT1']
+
+    return tPix, ssp
+
+# ------------------------------------------------------------------------------
+
+def _globEMILES(iso, IMF, slope):
+    """
+    This function generates the glob pattern for the EMILES templates
+    Args
+    ----
+        iso (str): choice of `['BaSTI', 'pad']` to use either the BaSTI or
+            Padova (Girardi et al., 2000) isochrones, respectively
+        IMF (str): the IMF abbreviation
+        slope (float): the slope of the assumed IMF
+    Returns
+    -------
+        glob (str): the glob pattern for the EMILES templates
+    """
+    tglob = np.sort(np.array(list(dDir.rglob(str(plp.Path(
+        f"EMILES*{iso.upper()}*{IMF}*", f"E{IMF.lower()}{slope:.2f}*.fits"))))))
+
+    return tglob
+
+# ------------------------------------------------------------------------------
+
+def _globMILES(iso, IMF, slope):
+    """
+    This function generates the glob pattern for the MILES templates
+    Args
+    ----
+        iso (str): choice of `['BaSTI', 'pad']` to use either the BaSTI or
+            Padova (Girardi et al., 2000) isochrones, respectively
+        IMF (str): the IMF abbreviation
+        slope (float): the slope of the assumed IMF
+    Returns
+    -------
+        glob (str): the glob pattern for the MILES templates
+    """
+    tglob = np.sort(np.array(list(dDir.rglob(str(plp.Path(
+        f"MILES*{iso.upper()}*{IMF}*",
+        f"M{IMF.lower()}{slope:.2f}*E*0.00.fits")))+\
+        list(dDir.rglob(str(plp.Path(f"MILES*{iso.upper()}*{IMF}*",
+        f"M{IMF.lower()}{slope:.2f}*E*0.40.fits")))))))
+
+    return tglob
+
+# ------------------------------------------------------------------------------
+
+def _globSMILES(iso, IMF, slope):
+    """
+    This function generates the glob pattern for the SMILES templates
+    Args
+    ----
+        iso (str): choice of `['BaSTI', 'pad']` to use either the BaSTI or
+            Padova (Girardi et al., 2000) isochrones, respectively
+        IMF (str): the IMF abbreviation
+        slope (float): the slope of the assumed IMF
+    Returns
+    -------
+        glob (str): the glob pattern for the SMILES templates
+    """
+    imfDict = dict(KB='Revised_Kroupa', KU='Universal_Kroupa', BI='Bimodal',
+        CH='Chabrier_1.3', UN='Unimodel')
+    tglob = np.sort(np.array(list(dDir.rglob(str(plp.Path('sMILES_SSPs',
+        imfDict[IMF], 'aFe*', f"M{IMF.lower()}{slope:.2f}*.fits"))))))
+
+    return tglob
+
+# ------------------------------------------------------------------------------
+
+def legendre_detrend(
+    lam,
+    arr,
+    *,
+    order: int,
+    axis: int = 0,
+    scale: str | None = False,        # False, "median", or "mean"
+    return_continuum: bool = False,
+):
+    """
+    Legendre continuum detrending for an N-D array `arr` along `axis`.
+
+    lam  : (L,) wavelength/pixel vector
+    arr  : (..., L, ...) data/models with spectral axis at `axis`
+    order: polynomial order (>=0)
+    axis : spectral axis
+    scale: normalize each spectrum after detrend (False|"median"|"mean")
+    return_continuum: also return the fitted continuum with same shape
+    """
+    x = np.asarray(arr, dtype=np.float64)
+    lam = np.asarray(lam, dtype=np.float64).ravel()
+
+    # Move spectral axis to front → (L, ...)
+    x0 = np.moveaxis(x, axis, 0)
+    L = x0.shape[0]
+    if lam.size != L:
+        raise ValueError(f"lam length {lam.size} != spectral length {L} along axis={axis}")
+
+    # Collapse the rest → (L, N)
+    rest_shape = x0.shape[1:]
+    X = x0.reshape(L, -1)  # (L, N)
+
+    # Legendre Vandermonde on scaled λ in [-1, 1]
+    eps = 1e-30
+    lam_n = (2.0 * (lam - lam.min()) / (lam.max() - lam.min() + eps)) - 1.0
+    K = int(order) + 1
+    V = np.polynomial.legendre.legvander(lam_n, order)  # (L, K)
+
+    # Fit coefficients and evaluate continuum
+    if np.isfinite(X).all():
+        # One shot, multi-RHS least squares: (K, N) coeffs
+        coef, *_ = np.linalg.lstsq(V, X, rcond=None)
+        C = V @ coef                                   # (L, N)
+    else:
+        # Robust per-column fallback when NaNs/Infs present
+        C = np.empty_like(X)
+        for j in range(X.shape[1]):
+            y = X[:, j]
+            m = np.isfinite(y)
+            if m.sum() < K:
+                C[:, j] = 1.0
+            else:
+                cj, *_ = np.linalg.lstsq(V[m, :], y[m], rcond=None)  # (K,)
+                C[:, j] = V @ cj
+
+    # Normalize continuum per spectrum to unit median (stable division)
+    cmed = np.nanmedian(C, axis=0, keepdims=True)
+    cmed = np.where(np.isfinite(cmed) & (cmed != 0.0), cmed, 1.0)
+    C = C / cmed
+
+    # Detrend (shapes guaranteed: X and C are both (L, N))
+    denom = np.where(np.isfinite(C) & (np.abs(C) > eps), C, 1.0)
+    Y = X / denom
+
+    # Optional per-spectrum renormalization
+    if scale:
+        if scale == "median":
+            s = np.nanmedian(Y, axis=0, keepdims=True)
+        elif scale == "mean":
+            s = np.nanmean(Y, axis=0, keepdims=True)
+        else:
+            raise ValueError("scale must be False, 'median', or 'mean'")
+        s = np.where(np.isfinite(s) & (s != 0.0), s, 1.0)
+        Y = Y / s
+
+    # Restore original shape/orientation
+    detr = Y.reshape((L,) + rest_shape)
+    detr = np.moveaxis(detr, 0, axis)
+
+    if return_continuum:
+        cont = C.reshape((L,) + rest_shape)
+        cont = np.moveaxis(cont, 0, axis)
+        return detr, cont
+    return detr
+
+# ------------------------------------------------------------------------------
+
+def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
+    full=False, lOrder=10, rescale=False, specRange=None, lsf=False, band='r',
+    source='ppxf', **kwargs):
+    """
+    This function is designed to reduce redundancy in acquiring the necessary
+        input data for the spectral decomposition
+    Args
+    ----
+        galaxy (str): the galaxy name
+        mPath (str): the directory containing the input and output directories
+        decDir (str): the directory containing the decomposition results
+        nCuts (int): the number of components in the selected decomposition
+        proj (str): the projection to be used. Either an observing angle in the
+            interval [0,90], or `'i'` to use to optimised viewing angles from
+            dynamical model
+        SN (int): the S/N threshold used to bin the data cube
+        full (bool): toggles whether the data was fitted to the `full' spectral
+            range
+        slope (float): the slope of the assumed IMF
+        IMF (str): the IMF abbreviation
+        iso (str): choice of `['BaSTI', 'pad']` to use either the BaSTI or
+            Padova (Girardi et al., 2000) isochrones, respectively
+        weighting (str): choice of `['mass', 'luminosity']` to fit mass-
+            weighted or luminosity-weighted SSP properties
+        lOrder (int): the order of the Legendre polynomial used for continuum
+            subtraction
+        rescale (bool): toggles whether to rescale the data cube by the MGE
+            flux
+        specRange (list:float): the spectral range on which to conduct the fit
+        lsf (bool): toggles whether to convolve the templates by the
+            instrumental LSF
+        band (str): the band in which the MGE was fit, in order to use the
+            correct spectral range. Only if `rescale==True`
+        method (str): choice of `['fsf', 'fif']` to indicte Full-Spectral-
+            Fitting and Full-Index-Fitting, respectively
+        varIMF (bool): toggles whether an IMF was fit for
+    Returns
+    -------
+        decDir (str): the directory containing the decomposition results
+        cDirs (list:str): the directories containing the decomposition results
+            for each component, of length `nComp`
+        cKeys (list:str): the names of the components, of length `nComp`
+        nComp (int): the number of components
+        teLL (arr:float): the logarithmic spectral coordinates of the SSP
+            templates, of size `(nSpec,)`
+        lnGrid (arr:float): the logarithmically-rebinned grid of SSP templates,
+            of size `(nSpec, nAge, nMetals, nAlphas)`
+        histBinSize (float): the width of one bin in the LOSVD histogram, in
+            [km s^{-1}]
+        RZ (Redshift): the redshift object of the galaxy
+        spLL (arr:float): the logarithmic spectral coordinates of the data, of
+            size `(nSpec,)`
+        laGrid (arr:float): the logarithmically-rebinned grid of data spectra,
+            of size `(nSpec, nSpat)`
+        laScales (arr:float): the normalisation for each spectrum
+        lmin (float): the minimum value from `lPix` that satisfies `sMask`
+        lmax (float): the maximum value from `lPix` that satisfies `sMask`
+        umetals (arr:float): the metallicity values in the SSP library, of size
+            `(nMetal,)`
+        uages (arr:float): the age values in the SSP library, of size
+            `(nAges,)`
+        ualphas (arr:float): the [alpha/Fe] values in the SSP library, of size
+            `(nAlphas,)`
+        pixOff (int): the number of spectral pixels to remove from each end of
+            the wavelength array
+    """
+
+    bDir = mDir/'tri_models'/mPath
+    spDir = bDir/'SPDec'
+    spDir.mkdir(parents=True, exist_ok=True)
+    if isinstance(decDir, type(None)):
+        with open(bDir/'decomp.dir', 'r+') as dd:
+            decDir = dd.readline().strip()
+    if isinstance(nCuts, type(None)):
+        direc = list(filter(lambda xd: xd.is_dir(),
+            (bDir/decDir).glob('decomp_*')))[0]
+        nCuts = int(direc.stem.lstrip('decomp_'))
+    else:
+        direc = bDir/decDir/f"decomp_{nCuts:d}"
+
+    SN = int(SN)
+    if not full:
+        tEnd = 'trunc'
+    else:
+        tEnd = 'full'
+
+    # kwargs for SSP library and pPXF runs
+    IMF = kwargs.get('IMF', 'KB')
+    iso = kwargs.get('iso', 'BaSTI')
+    slope = kwargs.get('slope', 1.30)
+    kind = kwargs.get('kind', 'EMILES')
+    cont = kwargs.get('cont', False)
+
+    if 'ppxf' in source:
+        sDir = curdir.parent/'pxf'/galaxy
+
+        #pPXF kwargs:
+        method = kwargs.get('method', 'fsf')
+        regul = kwargs.get('regul', None)
+        weighting = kwargs.get('weighting', 'luminosity')
+        varIMF = kwargs.get('varIMF', False)
+        if 'fif' in method:
+            IMF = 'FIF'
+            iso = 'fif'
+        
+        if not isinstance(regul, type(None)):
+            rStr = f"_reg{float(regul):2.3f}"
+        else:
+            rStr = ''
+        w8Str = f"{weighting[0].upper()}W"
+        tag = f"_SN{SN:02d}_{iso}_{IMF}{slope:.2f}_{w8Str}{rStr}"
+        if varIMF:
+            fStr = 'varIMF'
+        else:
+            fStr = 'fixIMF'
+
+    elif 'alf' in source:
+        pass
+    gfn = mDir/'obsData'/f"{galaxy}.xz"
+    ifn = bDir/'infil.xz'
+    vbSpec = sDir/f"voronoi_SN{SN:02d}_{tEnd}.xz"
+
+    # Filenames
+    logFile = spDir/f"fitSpec_{galaxy}.log"
+
+    lrb = spDir/'laDataFS.xz'
+    tfn = spDir/f"templsFS{tag}.xz" # stored SSP grid
+
+    gal = Load.lzma(gfn)
+    INF = Load.lzma(ifn)
+    if 'distance' in gal.keys():
+        distance = gal['distance']
+        RZ = Redshift(distance=distance)
+    elif 'z' in gal.keys():
+        zShift = gal['z']
+        RZ = Redshift(redshift=zShift)
+    else:
+        raise RuntimeError('No distance information.')
+    if '__main__' in __name__:
+        print(RZ)
+
+    VB = Load.lzma(vbSpec)
+    binSpec = VB['binSpec']
+    try:
+        dPix = VB['linLam']/(RZ.zShift+1)
+        lDel = VB['lDel']
+        lmin, lmax = np.amin(dPix), np.amax(dPix)
+        smin, smax = lmin, lmax
+        dN = dPix.size
+        lDel = np.min(dPix[1:]-dPix[:-1])
+    except KeyError:
+        lmin = VB['lVal']
+        dN = VB['lN']
+        lDel = VB['lDel']
+        lmax = lmin + (dN*lDel)
+        dPix = np.arange(lmin, lmax, lDel)/(RZ.zShift+1)
+        lmin, lmax = np.amin(dPix), np.amax(dPix)
+        smin, smax = lmin, lmax
+    if not isinstance(specRange, type(None)):
+        assert len(specRange) == 2, '`specRange` must be `[smin, smax]`'
+        smin, smax = specRange
+        lmin, lmax = dPix[[np.argmin(np.abs(dPix-smin)),
+            np.argmin(np.abs(dPix-smax))]]
+        dlMask = np.where((dPix >= (lmin-lDel*0.1)) &\
+            (dPix <= (lmax+lDel*0.1)))[0]
+        binSpec = np.take(binSpec, dlMask, axis=0)
+        dPix = dPix[dlMask]
+    nSpec, nSpat = binSpec.shape
+
+    print(f"Data Spectral Range=[{lmin: .3f}, {lmax: .3f}]")
+    print(f"Data Shape=[{nSpec: 04d}, {nSpat: 04d}]")
+
+    if rescale:
+        # MGE band photometric scaling of data spectra
+        bands = Load.json(curdir/'obsData'/'bands.json')
+        try:
+            mgeWind = np.array([bands[band]['centre']-bands[band]['width']/2.5,
+                bands[band]['centre']+bands[band]['width']/2.5])*10 # in [A]
+        except KeyError:
+            # logging.exception(f"`band` {band} not in `bands`")
+            sys.exit()
+        del bands
+        specWind = np.where((dPix >= mgeWind[0]) & (dPix <= mgeWind[1]))[0]
+    else:
+        specWind = np.ones_like(dPix, dtype=bool)
+
+    cDirs = sorted(list(filter(lambda xd: xd.is_dir(),
+        direc.glob(f"i{proj}_*"))))
+    cKeys = np.array([cDir.name for cDir in cDirs])
+    nComp = len(cDirs)
+    if nComp != nCuts:
+        warnings.warn('nCuts != nComp', RuntimeWarning)
+        nComp = nCuts # prefer `nCuts` if not equal
+    afDir = spDir/'apers'/f"C{nComp:04d}"
+    sfDir = spDir/'SSPFit'/f"C{nComp:04d}"
+    [DIR.mkdir(parents=True, exist_ok=True) for DIR in [afDir, sfDir]]
+
+    # Get one just for `histBinSize` - which should be universal between
+        # components
+    apFile = cDirs[0]/'declib_aphist.out'
+    wbin, hN, histBinSize, hArr = Read.apertureHist(apFile)
+
+    # Data spectra
+    if lrb.is_file():
+        print('Reading binned data...')
+        outs = Load.lzma(lrb)
+        spLL = outs['spec']
+        laGrid = outs['data']
+        vScale = outs['vscale']
+    elif vbSpec.is_file():
+        print('Generating binned data...')
+        spLR = [lmin, lmax]
+        dL = np.diff(spLR)/(nSpec-1)
+        lims = spLR/dL + [-0.5, 0.5]
+        vScale = float(np.squeeze(np.diff(np.log(lims))/nSpec*CTS.c))
+        laGrid = np.ma.ones((nSpec, nSpat), dtype=np.float64)*np.nan
+        for qk in tqdm(range(nSpat), desc='Data Spectra', total=nSpat):
+            laSpec, spLL, _vs = pxu.log_rebin(spLR, binSpec[:, qk],
+                velscale=vScale)
+            laGrid[:, qk] = laSpec
+        print('\n')
+        # outs = dict(data=laGrid, spec=spLL, vscale=vScale)
+        # Write.lzma(lrb, outs)
+        print('Done.')
+    else:
+        raise RuntimeError('No binned spectra.')
+    laGrid = np.ma.masked_invalid(laGrid)
+    # pixOff = int(laGrid.shape[0]*0.01)
+    pixOff = 5
+
+    # try:
+    #     lfn = f"out_phot_{IMF}*{iso.upper()}*"
+    #     mfn = f"out_mass_{IMF}*{iso.upper()}*"
+    #     lfn = next((dDir/'MILESPredict').glob(lfn))
+    #     mfn = next((dDir/'MILESPredict').glob(mfn))
+    #     mfn = next((dDir/'MILESPredict').glob(mfn))
+    #     mfn = next((dDir/'MILESPredict').glob(mfn))
+    #     mfn = next((dDir/'MILESPredict').glob(mfn))
+    # except StopIteration:
+    #     logging.exception('Files not found\n'+\
+    #           f"out_phot_{IMF}_*{iso.upper()}*.txt\n"+\
+    #           f"out_mass_{IMF}_*{iso.upper()}*.txt")
+    #     sys.exit()
+    gFuncs = dict(MILES=_globMILES, EMILES=_globEMILES, SMILES=_globSMILES)
+    fFuncs = dict(MILES=_fnMILES, EMILES=_fnEMILES, SMILES=_fnSMILES)
+
+    assert kind in gFuncs.keys(), f"Unknown template library: {kind}"
+    gFunc = gFuncs[kind]
+    fFunc = fFuncs[kind]
+    print(f"Using {kind} library...")
+
+    # Get the template library
+    teDir = gFunc(iso, IMF, slope)
+
+    tmetals, tages, talphas = fFunc(teDir)
+    # Template library trimming
+    if iso == 'pad':
+        selIso = np.where((tages >= 0.1) & (tages <= 14.2) &\
+            (tmetals >= -1.71) & (tmetals <= 0.22))[0]
+    else:
+        selIso = np.where((tages >= 0.1) & (tmetals >= -2.0))[0]
+    tages = tages[selIso]
+    tmetals = tmetals[selIso]
+    teDir = teDir[selIso]
+    umetals, uages = np.unique(tmetals), np.unique(tages)
+    ualphas = np.unique(talphas) if not isinstance(talphas, type(None)) else\
+        np.array([0.0]) # no alphas in EMILES
+
+    # # thinning
+    aIdx = np.asarray([np.argmin(np.abs(uages-xc)) for xc in
+        # [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0]])
+        [4.0, 6.0, 8.0, 10.0, 11.5, 13.0, 14.0]])
+    zIdx = np.asarray([np.argmin(np.abs(umetals-xc)) for xc in
+        # [-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26, 0.4]])
+        [-1.0, -0.6, 0.0, 0.15, 0.26, 0.4]])
+    if not isinstance(talphas, type(None)):
+        talphas = talphas[selIso]
+        ualphas = np.unique(talphas)
+        lIdx = np.asarray([np.argmin(np.abs(ualphas-xc)) for xc in
+            [-0.2, 0.0, 0.2, 0.4, 0.6]])
+            # [-0.2, 0.0, 0.4]])
+    else:
+        talphas = np.zeros_like(tages)
+        ualphas = np.array([0.0])
+        lIdx = np.atleast_1d(0)
+    
+    # Select the templates
+    teDir = teDir.reshape(umetals.size, uages.size, ualphas.size)[
+        zIdx[:, np.newaxis, np.newaxis], aIdx[np.newaxis, :, np.newaxis],
+        lIdx[np.newaxis, np.newaxis, :]]
+    uages = uages[aIdx]
+    umetals = umetals[zIdx]
+    ualphas = ualphas[lIdx]
+
+    nMetals = umetals.size
+    nAges = uages.size
+    nAlphas = ualphas.size
+    teDir = teDir.reshape(nMetals, nAges, nAlphas)
+
+    wLow, wHigh = 5200., 5300. # normalisation range
+    ## Templates
+    if tfn.is_file():
+        print('Reading SSP template library...')
+        teLL, lnGrid, lnScales = Load.lzma(tfn)
+    else:
+
+        # smin, smax = np.asarray([smin, smax]) + [-0.5, 0.5]
+        print('Generating SSP template library...')
+        try:
+            nTemps = teDir.size
+            hdu = pf.open(teDir[0, 0, 0])
+            thdr = hdu[0].header
+            ossp = np.squeeze(hdu[0].data)
+            hdu.close()
+            tPix = thdr['CRVAL1']+np.arange(thdr['NAXIS1'])*thdr['CDELT1']
+
+            assert (np.min(tPix) <= smin) and\
+                (np.max(tPix) >= smax), 'Template range does not cover '\
+                f'data range: [{np.min(tPix):.3f}, {np.max(tPix):.3f}] vs '\
+                f'[{smin:.3f}, {smax:.3f}]'
+
+            rmin, rmax = np.max((np.max(tPix[np.where(tPix <= smin-thdr['CDELT1']
+                    )[0]])-thdr['CDELT1']*1000, np.min(tPix))),\
+                np.min((np.min(tPix[np.where(tPix >= smax+thdr['CDELT1']
+                    )[0]])+thdr['CDELT1']*1000, np.max(tPix)))
+            tmask = (tPix >= rmin) & (tPix <= rmax)
+
+            if lsf:
+                dWave, dLSF = np.loadtxt(dDir/'MUSE.lsf', unpack=True)
+                # mWave, mLSF = np.loadtxt(dDir/'EMILES.lsf', unpack=True)
+                mWave, mLSF = np.loadtxt(dDir/'MILES_star.lsf', unpack=True)
+
+                dLSFFunc = interp1d(dWave, dLSF, 'linear',
+                    fill_value='extrapolate')
+                mLSFFunc = interp1d(mWave, mLSF, 'linear',
+                    fill_value='extrapolate')
+                museLSF  = dLSFFunc(tPix)
+                milesLSF = mLSFFunc(tPix)
+                assert np.all(museLSF >= milesLSF), 'Data resolution '\
+                    'better than templates resolution; can not convolve.'
+                delFWHM = np.sqrt(museLSF**2 - milesLSF**2)
+                sigma = delFWHM/2.355/thdr['CDELT1']
+
+                tssp = pxu.gaussian_filter1d(ossp, sigma)[tmask]
+                # broaden the template
+
+            else:
+                tssp = ossp[tmask]
+
+            tPix = tPix[tmask]
+            lsTL = [np.amin(tPix), np.amax(tPix)]
+            print(f"Template Range=[{lsTL[0]: .3f}, {lsTL[1]: .3f}]", flush=True)
+
+            # Use v_scale_kms for pxu.log_rebin for templates
+            tSpec, teLL, _vs = pxu.log_rebin(lsTL, tssp, velscale=histBinSize)
+            # log-rebin to the same wavelength range as data
+
+            lnGrid = np.ma.ones([tSpec.size, nMetals, nAges, nAlphas])*np.nan
+            # lnScales = np.ma.ones([nMetals, nAges, nAlphas])*np.nan
+            window = np.where((teLL >= np.log(wLow)) &\
+                (teLL <= np.log(wHigh)))[0]
+            # natural log to match `pxu.log_rebin`
+            for mm, metal in tqdm(enumerate(umetals), total=nMetals,
+                desc='Metals'):
+                for aa, age in enumerate(uages):
+                    for bb, alpha in enumerate(ualphas):
+                        tGlob = teDir[mm, aa, bb]
+                        with pf.open(tGlob) as hdu:
+                            ssp = np.squeeze(hdu[0].data)
+                        if lsf:
+                            ssp = pxu.gaussian_filter1d(ssp, sigma)[tmask]
+                            # broaden the template
+                        else:
+                            ssp = ssp[tmask]
+                        teSpec, _teLL, _vs = pxu.log_rebin(tPix, ssp,
+                            velscale=histBinSize)
+                        if 'luminosity' in weighting:
+                            scale = np.ma.median(teSpec[window])
+                        else:
+                            scale = 1.0
+                        # teGrid[:, aa, mm] = ssp
+                        lnGrid[:, mm, aa, bb] = teSpec/scale
+                        # lnScales[mm, aa, bb] = scale
+            # lnScales = _specNorm( teLL, lnGrid )
+            # lnGrid /= lnScales
+            print('\n')
+            # Write.lzma(tfn, [teLL, lnGrid, lnScales])
+            # del ssp, tssp, thdr, tPix, lsfPix, teSpec, newt, bttssp, btssp,\
+                # bssp#, tMask, truPix
+        except Exception as e:
+            # logging.exception('Exception generating SSP library.')
+            traceback.print_exc()
+            sys.exit(0)
+    lnGrid = np.ma.masked_invalid(lnGrid)
+    # lnGrid, lnScales = map(np.ma.masked_invalid, [lnGrid, lnScales])
+    print(f"Template Shape=[{lnGrid.shape[0]: 04d}, "\
+        f"{np.prod(lnGrid.shape[1:]): 04d}]")
+    print('Done.')
+    # Since the spectral pixels are different sizes, find the number of model
+    # pixels which are below the new data pixel start wavelength
+
+    if cont:
+        print('Continuum subtracting...')
+        cLaGrid = legendre_detrend(spLL, laGrid, order=lOrder, scale=None,
+            axis=0, return_continuum=False) # continuum subtraction
+        cLnGrid = legendre_detrend(teLL, np.atleast_2d(lnGrid),
+            order=lOrder, scale=None, axis=0, return_continuum=False)
+        print('Done.')
+    else:
+        cLaGrid = laGrid
+        cLnGrid = lnGrid
+    # laScales = Cfs.specNormal(spLL, np.atleast_2d(laGrid), wLow, wHigh)
+
+    # assert cLaGrid.shape[0] == lnGrid.shape[0], 'Spectral shapes do not'\
+    #     f"match:\n{'': <4s}Data: {cLaGrid.shape[0]}\n{'': <4s}Templates: "\
+    #     f"{lnGrid.shape[0]}"
+
+    return [decDir, cDirs, cKeys, nComp, teLL, cLnGrid, histBinSize,
+        vScale, RZ, spLL, cLaGrid, lmin, lmax, umetals, uages, ualphas, pixOff]
 
 # ------------------------------------------------------------------------------

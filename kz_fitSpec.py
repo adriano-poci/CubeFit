@@ -25,6 +25,10 @@ v1.2:   Removed `cp_flux_ref` from `reconstruct_modelcube_fast`, since now all
             public `x` API is scaled to physical units. 5 December 2025
 v1.3:   Read in and un-scale `x_global` by stored Hypercube scale in
             `loadCubeFit`. 8 January 2026
+v1.4:   Universally removed all ad-hoc scalings;
+        Converted to `cube_utils` functions instead of `muse`;
+        Updated `compare_orbit_vs_solution` to new `orbit_weights` maths
+            in the SPG solver. 25 January 2026
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -36,7 +40,7 @@ logger = get_logger(lfn, mode='w')
 logger.log(f"[CubeFit] CubeFit logger initialised to {logger.logfile}",
     flush=True)
 
-import os, pdb, math, ctypes, sys
+import os, pdb, math, ctypes, sys, builtins
 import numpy as np
 import hashlib
 from tqdm.auto import tqdm
@@ -59,13 +63,11 @@ from CubeFit.hypercube_builder import build_hypercube, assert_preflight_ok,\
     estimate_global_velocity_bias_prebuild
 from CubeFit.pipeline_runner   import PipelineRunner
 from CubeFit import cube_utils as cu
-from muse import tri_fitSpec as tf
-from muse import tri_utils as uu
 from dynamics.IFU.Constants import Constants, Units, UnitStr
 from dynamics.IFU.Functions import Plot, Geometric
 
 mDir = curdir.parent/'muse'
-dDir = uu._ddir()
+dDir = cu._ddir()
 
 UTS = UnitStr()
 UTT = Units()
@@ -275,28 +277,28 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     infn = bDir/'infil.xz'
     gfn = curdir/'obsData'/f"{galaxy}.xz"
 
-    INF = uu.Load.lzma(infn)
+    INF = cu.Load.lzma(infn)
     PA = INF['angle'][0]
 
-    xpix, ypix, sele, pixs = uu.Load.lzma(pfs)
-    # saur,goods = uu.Load.lzma(sfs)
+    xpix, ypix, sele, pixs = cu.Load.lzma(pfs)
+    # saur,goods = cu.Load.lzma(sfs)
     # del saur
     xbix, ybix = GEO.rotate2D(xpix, ypix, PA)
     pfn = dDir.parent/'muse'/'obsData'/f"{galaxy}-poly-rot.xz"
     polyProps = dict(ec=POT.brown, linestyle='--', fill=False, zorder=100,
         lw=0.75, salpha=0.5)
     if pfn.is_file():
-        aShape = uu.Load.lzma(pfn)
+        aShape = cu.Load.lzma(pfn)
         aShape, pPatch = POT.polyPatch(POLYGON=aShape, Xpo=xbix, Ypo=ybix,
             **polyProps)
     else:
         aShape, pPatch = POT.polyPatch(Xpo=xbix, Ypo=ybix, **polyProps)
-        uu.Write.lzma(pfn, aShape)
+        cu.Write.lzma(pfn, aShape)
     xmin, xmax = np.amin(xbix), np.amax(xbix)
     ymin, ymax = np.amin(ybix), np.amax(ybix)
     xLen, yLen = np.ptp(xbix), np.ptp(ybix) # unmasked pixels
 
-    saur, goods = uu.Load.lzma(pDir/galaxy/f"selection_SN{SN:02d}_{tEnd}.xz")
+    saur, goods = cu.Load.lzma(pDir/galaxy/f"selection_SN{SN:02d}_{tEnd}.xz")
     xpix = np.compress(goods, xpix)
     ypix = np.compress(goods, ypix)
     xbix = np.compress(goods, xbix)
@@ -304,7 +306,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     # Data spectra
     if vbSpec.is_file():
-        VB = uu.Load.lzma(vbSpec)
+        VB = cu.Load.lzma(vbSpec)
         binNum = VB['binNum']
         binCounts = VB['binCounts']
         binFlux = VB['binFlux']
@@ -315,7 +317,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     with logger.capture_all_output():
         decDir, cDirs, cKeys, nComp, teLL, lnGrid, histBinSize, dataVelScale,\
             RZ, spLL, laGrid, lmin, lmax, umetals, uages, ualphas, pixOff = \
-            tf._oneTimeSpec(galaxy=galaxy, mPath=mPath, decDir=decDir,
+            cu._oneTimeSpec(galaxy=galaxy, mPath=mPath, decDir=decDir,
             nCuts=nCuts, proj=proj, SN=SN, full=full, slope=slope, IMF=IMF,
             iso=iso, weighting=weighting, lOrder=lOrder, rescale=rescale,
             lsf=lsf, specRange=specRange, band=band, method=method,
@@ -326,22 +328,22 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     pred = f"0{len(repr(nComp)):d}"
     nComp = int(nComp)
 
-    oDict = uu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
+    oDict = cu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
     binFN = oDict['binFN']
     apFN = oDict['apFN']
-    dnPix, dgrid = uu.Read.bins(bDir/'infil'/binFN)
+    dnPix, dgrid = cu.Read.bins(bDir/'infil'/binFN)
     dnbins = int(np.max(dgrid))
     dgrid -= 1
     dss = np.where(dgrid >= 0)[0]
-    dx0, dx1, dnx, dy0, dy1, dny, dtheta = uu.Read.aperture(
+    dx0, dx1, dnx, dy0, dy1, dny, dtheta = cu.Read.aperture(
         bDir/'infil'/apFN)
     ddx = np.abs((dx1-dx0)/dnx)
     ddy = np.abs((dy1-dy0)/dny)
     dpixs = np.min([ddx, ddy])
     dxr = np.arange(dnx)*dpixs + dx0 + 0.5*dpixs
     dyr = np.arange(dny)*dpixs + dy0 + 0.5*dpixs
-    dxtss = uu._hash(dxr, np.full_like(dyr, 1)).ravel()[dss]
-    dytss = uu._hash(np.full_like(dxr, 1), dyr).ravel()[dss]
+    dxtss = np.einsum('i,k->ki', dxr, np.full_like(dyr, 1)).ravel()[dss]
+    dytss = np.einsum('i,k->ki', np.full_like(dxr, 1), dyr).ravel()[dss]
     dtestX, dtestY = GEO.rotate2D(dxtss, dytss, dtheta)
     duPix, dpInverse, dpCounts = np.unique(dgrid[dss], return_inverse=True,
         return_counts=True)
@@ -365,18 +367,18 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     nnOrb = plp.Path(*oDict['nnOrb'])
     oClass = plp.Path(*oDict['oClass'])
     obClass = plp.Path(*oDict['obClass'])
-    bLKey = uu.keySep.join([nnOrb.parent.parent.name, nnOrb.parent.name])
-    bLKey = uu.rReplace(bLKey, uu.keySep, os.sep, 1)
+    bLKey = cu.keySep.join([nnOrb.parent.parent.name, nnOrb.parent.name])
+    bLKey = cu.rReplace(bLKey, cu.keySep, os.sep, 1)
     nnOrb = plp.Path(bDir, decDir, nnOrb.parent.name, nnOrb.name)
     oClass = plp.Path(bDir, decDir, oClass.parent.name, oClass.name)
     obClass = plp.Path(bDir, decDir, obClass.parent.name, obClass.name)
-    fpd = uu._deetExtr(bLKey)
+    fpd = cu._deetExtr(bLKey)
     apDir = bDir/bLKey/'nn_aphist.out'
     maDir = (bDir/bLKey).parent/'datfil'/'mass_aper.dat'
     nnK = bDir/bLKey/'nn_kinem.out'
 
     NOrbs, inds, energs, I2s, I3s, regs, types, weights, lcuts =\
-        uu.Read.orbits(nnOrb)
+        cu.Read.orbits(nnOrb)
     cWeights = np.array([
         np.ma.sum(oDict['weights'][f"{comp:{pred}d}"]) for comp in nzComp])
 
@@ -384,11 +386,11 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     assert nbins == kiBin, 'Output does not agree with input bins\nInput:'+\
         f"{kiBin}\nOutput: {nbins}"
 
-    wbin, hN, histBinSize, hArr = uu.Read.apertureHist(apDir)
+    wbin, hN, histBinSize, hArr = cu.Read.apertureHist(apDir)
     logger.log(f"{'Mass outside of the histograms:': <45s}"\
           f"{np.sum(hArr[:, 0] + hArr[:, wbin * 2]):5.5}")
 
-    fullBin, fullID, fullK0 = uu.Read.massAperture(maDir)
+    fullBin, fullID, fullK0 = cu.Read.massAperture(maDir)
     logger.log(f"{'Mass normalisation is:': <45s}"\
         f"{np.sum(hArr) / np.sum(fullK0):5.5}")
     if isinstance(proj, list):
@@ -400,35 +402,35 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     apMassFile = direc/f"apMass_i{proj}_{nComp:{pred}d}.xz"
     if apMassFile.is_file():
-        aperMass = uu.Load.lzma(apMassFile)
+        aperMass = cu.Load.lzma(apMassFile)
     else:
         aperMass = np.ma.ones((nSpat, nComp), dtype=float)*np.nan
         ERR = []
         for cn, cDir in tqdm(enumerate(cDirs), desc='Mass', total=nComp):
             try:
                 maFile = cDir/'declib_apermass.out'
-                nbin, ID, k0 = uu.Read.massAperture(maFile)
+                nbin, ID, k0 = cu.Read.massAperture(maFile)
                 aperMass[:, cn] = k0
             except Exception as e:
                 ERR += [[cDir.name, e]]
         if len(ERR) > 0:
             logger.log(ERR)
             breakpoint()
-        uu.Write.lzma(apMassFile, aperMass)
+        cu.Write.lzma(apMassFile, aperMass)
     aperMass = np.ma.masked_invalid(aperMass)
     norma = np.sum(aperMass, axis=1)
 
     logger.log('Done.', flush=True)
     apFile = cDirs[0]/'declib_aphist.out'
-    wbin, hN, histBinSize, hArr = uu.Read.apertureHist(apFile)
+    wbin, hN, histBinSize, hArr = cu.Read.apertureHist(apFile)
     # Load the parameters regardless
     apHistFile = direc/f"apHists_i{pStr}_{nComp:{pred}d}.jl"
     if apHistFile.is_file():
         logger.log('Reading histograms...', flush=True)
-        apHists = uu.Load.jobl(apHistFile)
+        apHists = cu.Load.jobl(apHistFile)
     else:
         apFile = cDirs[0]/'declib_aphist.out'
-        wbin, hN, histBinSize, cArr = uu.Read.apertureHist(apFile)
+        wbin, hN, histBinSize, cArr = cu.Read.apertureHist(apFile)
         logger.log('Generating histograms...', flush=True)
         apHists = np.ma.ones((*cArr.shape, nComp))*np.nan
         ERR = []
@@ -436,7 +438,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             total=nComp):
             try:
                 apFile = cDir/'declib_aphist.out'
-                wbin, hN, histBinSize, cArr = uu.Read.apertureHist(
+                wbin, hN, histBinSize, cArr = cu.Read.apertureHist(
                     apFile)
                 apHists[:, :, cn] = cArr
             except Exception as e:
@@ -444,7 +446,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         if len(ERR) > 0:
             logger.log(ERR)
             pdb.set_trace()
-        uu.Write.jobw(apHistFile, apHists)
+        cu.Write.jobw(apHistFile, apHists)
     logger.log('Done.')
     apHists = np.ma.masked_invalid(apHists)
     nApHists = (apHists*(massNorm/norma)[:, np.newaxis, np.newaxis])
@@ -606,7 +608,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=5,
+        epochs=6,
         # x0=x0,
         lr=0.1,
         project_nonneg=True,
@@ -860,186 +862,6 @@ def parallel_model_cube_global_batched(
 
 # ------------------------------------------------------------------------------
 
-def reconstruct_model_cube_single(h5_path: str,
-                                  x_global,
-                                  array_name: str = "ModelCube",
-                                  blas_threads: int = 8,
-                                  S_tile: int | None = None,
-                                  L_band: int = 128) -> None:
-    """
-    Chunk-aligned, streaming reconstruction of Y = (HyperCube) · x.
-
-    Reads the model cube in the same order it is chunked:
-      S in blocks of S_chunk, C in blocks of 1 (C_chunk=1), and P in
-      blocks of P_chunk. For each (S_chunk, C=1) slab it contracts over
-      P against x[c, :] using BLAS on small 2-D views, accumulating into
-      a (S_chunk, L) float64 tile. Optionally processes L in bands to
-      keep the GEMV working set small. Never materializes a (ΔS,C,P,L)
-      float64 slab.
-
-    Parameters
-    ----------
-    h5_path : str
-        Path to the base HDF5 file.
-    x_global : array-like
-        Global weights, shape (C*P,) or (C,P). Internally used in f32
-        for speed; accumulation into output stays f64.
-    array_name : str
-        Name of output dataset to create (S,L) float64.
-    blas_threads : int
-        Number of BLAS threads to use inside this process.
-    S_tile : Optional[int]
-        If given, caps the S block size. Otherwise uses S_chunk.
-    L_band : int
-        Optional λ-banding for GEMV working set (does not change how
-        HDF5 reads; it just limits the temporary 2-D views).
-    """
-
-    # Try to limit BLAS threads for predictability on clusters
-    try:
-        from threadpoolctl import threadpool_limits
-    except Exception:
-        threadpool_limits = None
-
-    t = int(os.environ.get("SLURM_CPUS_PER_TASK", blas_threads))
-    os.environ["OMP_NUM_THREADS"] = os.environ["MKL_NUM_THREADS"] = \
-        os.environ["OPENBLAS_NUM_THREADS"] = str(t)
-    if threadpool_limits:
-        try:
-            threadpool_limits(t)
-        except Exception:
-            pass
-
-    # Small helper to return free heap to the OS (keeps RSS flat).
-    try:
-        libc = ctypes.CDLL("libc.so.6")
-        def trim_heap(): libc.malloc_trim(0)
-    except Exception:
-        def trim_heap(): pass
-
-    # Optional dataset chunk-cache tuning (local to this dataset)
-    rdcc_slots = int(os.environ.get("CUBEFIT_RDCC_SLOTS", "1000003"))
-    rdcc_bytes = int(os.environ.get("CUBEFIT_RDCC_BYTES", str(256 * 1024**2)))
-    rdcc_w0    = float(os.environ.get("CUBEFIT_RDCC_W0", "0.90"))
-
-    # Force unbuffered writes so tqdm appears immediately on HPC logs
-    try:
-        sys.stdout.reconfigure(line_buffering=True)  # py3.7+
-    except Exception:
-        pass
-    os.environ.setdefault("PYTHONUNBUFFERED", "1")
-
-    with open_h5(h5_path, role="writer") as f:
-        M = f["/HyperCube/models"]              # (S,C,P,L) float32
-        S, C, P, L = map(int, M.shape)
-        try:
-            M.id.set_chunk_cache(rdcc_slots, rdcc_bytes, rdcc_w0)
-        except Exception:
-            pass
-
-        chunks = M.chunks or (S, 1, P, L)
-        S_chunk, C_chunk, P_chunk, L_chunk = map(int, chunks)
-
-        # Choose S block aligned to storage chunk (or user cap).
-        S_blk = S_chunk if S_tile is None else max(1, int(S_tile))
-        S_blk = min(S_blk, S_chunk, S)
-
-        # Prepare output (tile-aligned; uncompressed is fastest).
-        if array_name in f:
-            del f[array_name]
-        out = f.create_dataset(array_name, shape=(S, L), dtype="f8",
-                               chunks=(S_blk, L))
-
-        # Weights as (C,P) — math in f32 for speed; sum in f64.
-        x_cp = np.asarray(x_global)
-        if x_cp.ndim == 1:
-            x_cp = x_cp.reshape(C, P)
-        if x_cp.shape != (C, P):
-            raise ValueError(f"x shape {x_cp.shape} != (C,P)=({C},{P})")
-        x32 = np.asarray(x_cp, dtype=np.float32, order="C")
-
-        # Progress — write to stdout & flush so it shows immediately
-        n_tiles = math.ceil(S / S_blk)
-        header = (f"[Recon] S_chunk={S_chunk} C_chunk={C_chunk} "
-                  f"P_chunk={P_chunk} L_chunk={L_chunk} S_blk={S_blk} "
-                  f"L_band={L_band}")
-        print(header, flush=True)
-
-        pbar = tqdm(total=n_tiles,
-                    desc="[Reconstruct] tiles",
-                    unit="tile",
-                    dynamic_ncols=True,
-                    mininterval=2.0,
-                    miniters=1,
-                    smoothing=0.0,
-                    file=sys.stdout,
-                    leave=True)
-        pbar.refresh(); sys.stdout.flush()
-
-        # --- main loop: S in storage-aligned tiles -------------------
-        for s0 in range(0, S, S_blk):
-            s1 = min(S, s0 + S_blk)
-            dS = s1 - s0
-
-            # Tile accumulator in f64
-            Y_tile = np.zeros((dS, L), dtype=np.float64, order="C")
-
-            # Iterate components in storage order (C_chunk == 1)
-            for c0 in range(0, C, max(1, C_chunk)):
-                c1 = min(C, c0 + max(1, C_chunk))
-                c = c0  # C_chunk is 1 in our files
-
-                # Optional λ-banding for small GEMV views
-                for l0 in range(0, L, max(1, L_band)):
-                    l1  = min(L, l0 + max(1, L_band))
-                    Lb  = l1 - l0
-
-                    # Accumulator for this (c, L band)
-                    band_acc = np.zeros((dS, Lb), dtype=np.float64, order="C")
-
-                    # Contract over P in P_chunk steps
-                    for p0 in range(0, P, max(1, P_chunk)):
-                        p1  = min(P, p0 + max(1, P_chunk))
-                        Pb  = p1 - p0
-
-                        # Read one storage-aligned slab: (dS, 1, Pb, Lb) f32
-                        A32 = M[s0:s1, c:c1, p0:p1, l0:l1][...]
-                        A32 = np.asarray(A32, dtype=np.float32, order="C")
-
-                        # Make a (dS*Lb, Pb) 2-D view for GEMV
-                        A2D = A32[:, 0, :, :].swapaxes(1, 2).reshape(dS * Lb, Pb)
-
-                        # Multiply by weights for this (c, p-block) in f32
-                        w32 = x32[c, p0:p1]          # (Pb,)
-                        tmp = A2D @ w32              # (dS*Lb,) f32
-
-                        # Accumulate into f64 band
-                        band_acc += tmp.reshape(dS, Lb).astype(np.float64, copy=False)
-
-                    # Add this component's band into the tile
-                    Y_tile[:, l0:l1] += band_acc
-
-            # Write the finished S-tile
-            out[s0:s1, :] = Y_tile
-
-            # Make progress visible right now
-            pbar.update(1)
-            pbar.refresh()
-            try:
-                out.id.flush()    # SWMR-friendly: expose new tile
-            except Exception:
-                pass
-            try:
-                f.flush()
-            except Exception:
-                pass
-            sys.stdout.flush()
-            trim_heap()
-
-        pbar.close()
-
-# ------------------------------------------------------------------------------
-
 def reconstruct_modelcube_fast(
     h5_path: str,
     x_cp: np.ndarray,
@@ -1130,23 +952,23 @@ def reconstruct_modelcube_fast(
         S_blk  = max(1, min(S_blk,  S))   # clamp
         L_band = max(1, min(L_band, L))   # clamp
 
-        # ------------------------------------------------------------
-        # Load component spatial support (solver-consistent)
-        # ------------------------------------------------------------
-        support = None
-        support_S_chunk = None
-        if "/HyperCube/component_support" in f:
-            support = np.asarray(
-                f["/HyperCube/component_support"][...], dtype=np.uint8
-            )
-            support_S_chunk = int(
-                f["/HyperCube/component_support"].attrs["S_chunk"]
-            )
-        if support is not None and support_S_chunk != S_blk:
-            raise RuntimeError(
-                f"component_support S_chunk={support_S_chunk} "
-                f"!= reconstruction S_blk={S_blk}"
-            )
+        # # ------------------------------------------------------------
+        # # Load component spatial support (solver-consistent)
+        # # ------------------------------------------------------------
+        # support = None
+        # support_S_chunk = None
+        # if "/HyperCube/component_support" in f:
+        #     support = np.asarray(
+        #         f["/HyperCube/component_support"][...], dtype=np.uint8
+        #     )
+        #     support_S_chunk = int(
+        #         f["/HyperCube/component_support"].attrs["S_chunk"]
+        #     )
+        # if support is not None and support_S_chunk != S_blk:
+        #     raise RuntimeError(
+        #         f"component_support S_chunk={support_S_chunk} "
+        #         f"!= reconstruction S_blk={S_blk}"
+        #     )
 
         # Prepare /ModelCube with compatibility check (shape/dtype/chunks)
         ds = f.get(out_dset, None)
@@ -1208,11 +1030,11 @@ def reconstruct_modelcube_fast(
                 # Accumulate this λ band
                 band = np.zeros((dS, l1 - l0), dtype=np.float64, order="C")
 
-                if support is not None:
-                    t = s0 // support_S_chunk
-                    c_allowed = np.flatnonzero(support[t, :])
-                else:
-                    c_allowed = range(C)
+                # if support is not None:
+                #     t = s0 // support_S_chunk
+                #     c_allowed = np.flatnonzero(support[t, :])
+                # else:
+                c_allowed = range(C)
                 for c in c_allowed:
                     if nz_per_c[c] is None:
                         w = x_cp[c, :]
@@ -1313,7 +1135,7 @@ def parallel_spectrum_plots(
     h5_or_path: str,
     chi2: np.ndarray,
     n: int,
-    plot_dir: str,
+    plot_dir: plp.Path | str,
     n_workers: int,
     tag: str,
     mask: np.ndarray | None = None,
@@ -1334,11 +1156,8 @@ def parallel_spectrum_plots(
       - If /Mask exists (or 'mask' provided), masked regions are shaded
         with semi-transparent grey bands.
     """
-    import os
-    import pathlib as plp
-    from concurrent.futures import ThreadPoolExecutor
-
-    plp.Path(plot_dir).mkdir(parents=True, exist_ok=True)
+    pDir = plp.Path(plot_dir)
+    pDir.mkdir(parents=True, exist_ok=True)
 
     n = int(np.maximum(1, n))
     chi2 = np.asarray(chi2, dtype=np.float64)
@@ -1429,7 +1248,7 @@ def parallel_spectrum_plots(
         )
 
         # Residual baseline (solid) and ±1σ (dashed)
-        ax.axhline(y_off,             ls="-",  lw=0.7, color="g")          # zero residual
+        ax.axhline(y_off, ls="-",  lw=0.7, color="g") # zero residual
         if sigma > 0.0 and np.isfinite(sigma):
             ax.axhline(y_off + sigma, ls="--", lw=0.6, color="g")
             ax.axhline(y_off - sigma, ls="--", lw=0.6, color="g")
@@ -1445,17 +1264,14 @@ def parallel_spectrum_plots(
                 ax.axvspan(x0, x1, color="0.2", alpha=0.12, zorder=0)
             ax.set_ylim(y0, y1)
 
-        # ax.set_title(f"spaxel {int(s_idx)}  χ={chi2[int(s_idx)]:.3f}")
         ax.set_xlabel("log(\u03bb [\u212B])")
-        ax.set_ylabel("$F_\lambda$ (arb. units)")
-        # ax.legend(loc="best", fontsize=8)
-        fig.savefig(os.path.join(
-            plot_dir, f"{rank_tag}_{tag}_spax{int(s_idx):05d}.png"
-        ), dpi=120)
+        ax.set_ylabel(r"$F_\lambda$ (arb. units)")
+        fig.savefig(pDir/f"{rank_tag}_{tag}_spax{int(s_idx):05d}.png",
+            dpi=120)
         plt.close(fig)
 
-    # Tiny pool; ≤4 for I/O friendliness (NumPy math, not builtins)
-    pool_n = int(np.minimum(np.maximum(1, int(n_workers)), 4))
+    # Tiny pool; ≤4 for I/O friendliness
+    pool_n = int(np.minimum(np.maximum(1, int(n_workers)), 6))
     jobs = [(int(s), "worst") for s in idx_worst] + \
            [(int(s), "best")  for s in idx_best]
 
@@ -1541,35 +1357,35 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     vbSpec = pDir/galaxy/f"voronoi_SN{SN:02d}_{tEnd}.xz"
     infn = bDir/'infil.xz'
 
-    INF = uu.Load.lzma(infn)
+    INF = cu.Load.lzma(infn)
     PA = INF['angle'][0]
     if vbSpec.is_file():
-        VB = uu.Load.lzma(vbSpec)
+        VB = cu.Load.lzma(vbSpec)
         binNum = VB['binNum']
         binCounts = VB['binCounts']
         del VB
     else:
         raise RuntimeError(f"No binned spectra.\n{'': <4s}{vbSpec}")
 
-    xpix, ypix, sele, pixs = uu.Load.lzma(pfs)
-    # saur,goods = uu.Load.lzma(sfs)
+    xpix, ypix, sele, pixs = cu.Load.lzma(pfs)
+    # saur,goods = cu.Load.lzma(sfs)
     # del saur
     xbix, ybix = GEO.rotate2D(xpix, ypix, PA)
     pfn = dDir.parent/'muse'/'obsData'/f"{galaxy}-poly-rot.xz"
     polyProps = dict(ec=POT.brown, linestyle='--', fill=False, zorder=100,
         lw=0.75, salpha=0.5)
     if pfn.is_file():
-        aShape = uu.Load.lzma(pfn)
+        aShape = cu.Load.lzma(pfn)
         aShape, pPatch = POT.polyPatch(POLYGON=aShape, Xpo=xbix, Ypo=ybix,
             **polyProps)
     else:
         aShape, pPatch = POT.polyPatch(Xpo=xbix, Ypo=ybix, **polyProps)
-        uu.Write.lzma(pfn, aShape)
+        cu.Write.lzma(pfn, aShape)
     xmin, xmax = np.amin(xbix), np.amax(xbix)
     ymin, ymax = np.amin(ybix), np.amax(ybix)
     xLen, yLen = np.ptp(xbix), np.ptp(ybix) # unmasked pixels
 
-    saur, goods = uu.Load.lzma(pDir/galaxy/f"selection_SN{SN:02d}_{tEnd}.xz")
+    saur, goods = cu.Load.lzma(pDir/galaxy/f"selection_SN{SN:02d}_{tEnd}.xz")
     xpix = np.compress(goods, xpix)
     ypix = np.compress(goods, ypix)
     xbix = np.compress(goods, xbix)
@@ -1580,7 +1396,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     with logger.capture_all_output():
         decDir, cDirs, cKeys, nComp, teLL, lnGrid, histBinSize, dataVelScale,\
             RZ, spLL, laGrid, lmin, lmax, umetals, uages, ualphas, pixOff = \
-            tf._oneTimeSpec(galaxy=galaxy, mPath=mPath, decDir=decDir,
+            cu._oneTimeSpec(galaxy=galaxy, mPath=mPath, decDir=decDir,
             nCuts=nCuts, proj=proj, SN=SN, full=full, slope=slope, IMF=IMF,
             iso=iso, weighting=weighting, lOrder=lOrder, rescale=rescale,
             lsf=lsf, specRange=specRange, band=band, method=method,
@@ -1591,22 +1407,22 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     pred = f"0{len(repr(nComp)):d}"
     nComp = int(nComp)
 
-    oDict = uu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
+    oDict = cu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
     binFN = oDict['binFN']
     apFN = oDict['apFN']
-    dnPix, dgrid = uu.Read.bins(bDir/'infil'/binFN)
+    dnPix, dgrid = cu.Read.bins(bDir/'infil'/binFN)
     dnbins = int(np.max(dgrid))
     dgrid -= 1
     dss = np.where(dgrid >= 0)[0]
-    dx0, dx1, dnx, dy0, dy1, dny, dtheta = uu.Read.aperture(
+    dx0, dx1, dnx, dy0, dy1, dny, dtheta = cu.Read.aperture(
         bDir/'infil'/apFN)
     ddx = np.abs((dx1-dx0)/dnx)
     ddy = np.abs((dy1-dy0)/dny)
     dpixs = np.min([ddx, ddy])
     dxr = np.arange(dnx)*dpixs + dx0 + 0.5*dpixs
     dyr = np.arange(dny)*dpixs + dy0 + 0.5*dpixs
-    dxtss = uu._hash(dxr, np.full_like(dyr, 1)).ravel()[dss]
-    dytss = uu._hash(np.full_like(dxr, 1), dyr).ravel()[dss]
+    dxtss = np.einsum('i,k->ki', dxr, np.full_like(dyr, 1)).ravel()[dss]
+    dytss = np.einsum('i,k->ki', np.full_like(dxr, 1), dyr).ravel()[dss]
     dtestX, dtestY = GEO.rotate2D(dxtss, dytss, dtheta)
     duPix, dpInverse, dpCounts = np.unique(dgrid[dss], return_inverse=True,
         return_counts=True)
@@ -1630,17 +1446,17 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     nnOrb = plp.Path(*oDict['nnOrb'])
     oClass = plp.Path(*oDict['oClass'])
     obClass = plp.Path(*oDict['obClass'])
-    bLKey = uu.keySep.join([nnOrb.parent.parent.name, nnOrb.parent.name])
-    bLKey = uu.rReplace(bLKey, uu.keySep, os.sep, 1)
+    bLKey = cu.keySep.join([nnOrb.parent.parent.name, nnOrb.parent.name])
+    bLKey = cu.rReplace(bLKey, cu.keySep, os.sep, 1)
     nnOrb = plp.Path(bDir, decDir, nnOrb.parent.name, nnOrb.name)
     oClass = plp.Path(bDir, decDir, oClass.parent.name, oClass.name)
     obClass = plp.Path(bDir, decDir, obClass.parent.name, obClass.name)
-    fpd = uu._deetExtr(bLKey)
+    fpd = cu._deetExtr(bLKey)
     apDir = bDir/bLKey/'nn_aphist.out'
     maDir = (bDir/bLKey).parent/'datfil'/'mass_aper.dat'
 
     NOrbs, inds, energs, I2s, I3s, regs, types, weights, lcuts =\
-        uu.Read.orbits(nnOrb)
+        cu.Read.orbits(nnOrb)
     cWeights = np.zeros(nComp)
     for jk, comp in enumerate(nzComp):
         cWeights[jk] = np.ma.sum(weights[oDict['wheres'][f"{comp:{pred}d}"]])
@@ -1649,11 +1465,11 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     assert nbins == kiBin, 'Output does not agree with input bins\nInput:'+\
         f"{kiBin}\nOutput: {nbins}"
 
-    wbin, hN, histBinSize, hArr = uu.Read.apertureHist(apDir)
+    wbin, hN, histBinSize, hArr = cu.Read.apertureHist(apDir)
     logger.log(f"{'Mass outside of the histograms:': <45s}"\
           f"{np.sum(hArr[:, 0] + hArr[:, wbin * 2]):5.5}")
 
-    fullBin, fullID, fullK0 = uu.Read.massAperture(maDir)
+    fullBin, fullID, fullK0 = cu.Read.massAperture(maDir)
     logger.log(f"{'Mass normalisation is:': <45s}"\
         f"{np.sum(hArr) / np.sum(fullK0):5.5}")
     if isinstance(proj, list):
@@ -1665,35 +1481,35 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     apMassFile = direc/f"apMass_i{proj}_{nComp:{pred}d}.xz"
     if apMassFile.is_file():
-        aperMass = uu.Load.lzma(apMassFile)
+        aperMass = cu.Load.lzma(apMassFile)
     else:
         aperMass = np.ma.ones((nSpat, nComp), dtype=float)*np.nan
         ERR = []
         for cn, cDir in tqdm(enumerate(cDirs), desc='Mass', total=nComp):
             try:
                 maFile = cDir/'declib_apermass.out'
-                nbin, ID, k0 = uu.Read.massAperture(maFile)
+                nbin, ID, k0 = cu.Read.massAperture(maFile)
                 aperMass[:, cn] = k0
             except Exception as e:
                 ERR += [[cDir.stem, e]]
         if len(ERR) > 0:
             logger.log(ERR)
             breakpoint()
-        uu.Write.lzma(apMassFile, aperMass)
+        cu.Write.lzma(apMassFile, aperMass)
     aperMass = np.ma.masked_invalid(aperMass)
     norma = np.sum(aperMass, axis=1)
 
     logger.log('Done.', flush=True)
     apFile = cDirs[0]/'declib_aphist.out'
-    wbin, hN, histBinSize, hArr = uu.Read.apertureHist(apFile)
+    wbin, hN, histBinSize, hArr = cu.Read.apertureHist(apFile)
     # Load the parameters regardless
     apHistFile = direc/f"apHists_i{pStr}_{nComp:{pred}d}.jl"
     if apHistFile.is_file():
         logger.log('Reading histograms...', flush=True)
-        apHists = uu.Load.jobl(apHistFile)
+        apHists = cu.Load.jobl(apHistFile)
     else:
         apFile = cDirs[0]/'declib_aphist.out'
-        wbin, hN, histBinSize, cArr = uu.Read.apertureHist(apFile)
+        wbin, hN, histBinSize, cArr = cu.Read.apertureHist(apFile)
         logger.log('Generating histograms...', flush=True)
         apHists = np.ma.ones((*cArr.shape, nComp))*np.nan
         ERR = []
@@ -1701,7 +1517,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             total=nComp):
             try:
                 apFile = cDir/'declib_aphist.out'
-                wbin, hN, histBinSize, cArr = uu.Read.apertureHist(
+                wbin, hN, histBinSize, cArr = cu.Read.apertureHist(
                     apFile)
                 apHists[:, :, cn] = cArr
             except Exception as e:
@@ -1709,7 +1525,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         if len(ERR) > 0:
             logger.log(ERR)
             pdb.set_trace()
-        uu.Write.jobw(apHistFile, apHists)
+        cu.Write.jobw(apHistFile, apHists)
     logger.log('Done.')
     apHists = np.ma.masked_invalid(apHists)
     nApHists = (apHists*(massNorm/norma)[:, np.newaxis, np.newaxis])
@@ -1745,7 +1561,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         obs = f["/ObsPix"][...] if "/ObsPix" in f else np.arange(nLSpec)
 
     spat_tile, nTiles = choose_spat_tile_fast(nSpat, nProcs, s_chunk, k=2)
-    nProcs = min(nProcs, nTiles, 12)  # don’t spawn more processes than tiles
+    nProcs = builtins.min(nProcs, nTiles, 12) 
+    # don’t spawn more processes than tiles
 
     ok, why = modelcube_status(str(hdf5Path), x_global=x_global, require_float64=True, redraw=redraw)
     logger.log(f"[ModelCube] status: {why}")
@@ -1793,63 +1610,13 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         mask = np.asarray(f["/Mask"][...], bool).ravel()
         nSpat, nLam = D.shape
 
-    # # flatten BinNum and compute binCounts
-    # bin_flat = binNum.ravel()
-    # n_pix = bin_flat.size
-    # n_bins = int(bin_flat.max()) + 1
-
-    # # per-bin raw flux (sum over mask) and SB (sum / binCounts)
-    # data_raw = np.sum(D[:, mask], axis=1)     # raw total flux per bin
-    # model_raw = np.sum(M[:, mask], axis=1)
-
-    # data_sb = data_raw / binCounts
-    # model_sb = model_raw / binCounts
-
-    # # Basic summary
-    # def stats(x, name):
-    #     x = np.asarray(x)
-    #     ok = np.isfinite(x)
-    #     print(f"{name}: count={ok.sum()}, min={np.nanmin(x):.3e}, med={np.nanmedian(x):.3e}, max={np.nanmax(x):.3e}, std={np.nanstd(x):.3e}")
-
-    # print("BIN COUNTS summary (finite values):")
-    # stats(binCounts, "binCounts")
-
-    # print("\nDATA (raw / SB) summary:")
-    # stats(data_raw, "data_raw")
-    # stats(data_sb,  "data_sb")
-
-    # print("\nMODEL (raw / SB) summary:")
-    # stats(model_raw, "model_raw")
-    # stats(model_sb,  "model_sb")
-
-    # # Check consistency: does model_raw ≈ model_sb * binCounts?
-    # reconstruct_raw = model_sb * binCounts
-    # diff = model_raw - reconstruct_raw
-    # print("\nModel consistency check (model_raw - model_sb*binCounts):")
-    # print("  diff min/med/max/std:", np.nanmin(diff), np.nanmedian(diff), np.nanmax(diff), np.nanstd(diff))
-    # print("  relative RMS:", np.sqrt(np.nanmean((diff[np.isfinite(diff)]**2))) / (np.nanmedian(np.abs(model_raw[np.isfinite(model_raw)])) + 1e-30))
-
-    # # Correlations with binCounts
-    # valid = np.isfinite(binCounts) & np.isfinite(data_raw) & np.isfinite(model_raw)
-    # if valid.sum() > 5:
-    #     print("\nPearson corr(binCounts, data_raw) =",
-    #         np.corrcoef(binCounts[valid], data_raw[valid])[0,1])
-    #     print("Pearson corr(binCounts, model_raw) =",
-    #         np.corrcoef(binCounts[valid], model_raw[valid])[0,1])
-    # else:
-    #     print("Not enough valid bins to compute correlations.")
-
-    # # Quick plots (optional, remove if running in headless env)
-    # try:
-    #     fig, axs = plt.subplots(2, 2, figsize=(8,8))
-    #     axs[0,0].hist(binCounts[valid], bins=50); axs[0,0].set_title("binCounts")
-    #     axs[0,1].scatter(binCounts[valid], data_raw[valid], s=5); axs[0,1].set_title("binCounts vs data_raw")
-    #     axs[1,0].scatter(binCounts[valid], model_raw[valid], s=5); axs[1,0].set_title("binCounts vs model_raw")
-    #     axs[1,1].scatter(data_raw[valid], model_raw[valid], s=5); axs[1,1].set_title("data_raw vs model_raw")
-    #     plt.tight_layout()
-    #     plt.savefig('corr')
-    # except Exception:
-    #     pass
+    compare_orbit_vs_solution(
+        h5_path=str(hdf5Path),
+        orbit_weights=cWeights,
+        x_global=x_global,
+        save=figDir/\
+            f"compare_prior_{nComp:{pred}d}_i{proj}_{lOrder:02d}.png"
+    )
 
     # ---------------------------------------------
     # RAW-FLUX SPACE (solver space)
@@ -1919,8 +1686,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     cb.set_ticks([])
     ax.set_xlabel(r"$x\ [{\rm arcsec}]$")
     ax.set_ylabel(r"$y\ [{\rm arcsec}]$")
-    plt.savefig(
-        figDir / f"signed_residual_SB_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png"
+    plt.savefig(figDir/\
+        f"signed_residual_SB_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png"
     )
     plt.close(fig)
 
@@ -1965,7 +1732,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         ax.set_ylim(ymin, ymax)
         # ax.add_patch(copy(pPatch))
 
-        rmax = np.percentile(np.log10(rms_resid_sb), 99)
+        rmax = np.percentile(rms_resid_sb, 99)
         maText = POT.prec(pren, rmax)
         ax = fig.add_subplot(gs[2])
         cnt = dbi(
@@ -1999,6 +1766,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         plt.savefig(figDir/\
             f"modelCube_sb_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
 
+        fmin, fmax = np.log10(np.min(data_raw)), np.log10(np.max(data_raw))
         gs = gridspec.GridSpec(3, 1, hspace=0., wspace=0.)
         fig = plt.figure(figsize=plt.figaspect((yLen*3.)/xLen)*0.75)
         ax = fig.add_subplot(gs[0])
@@ -2037,7 +1805,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         maText = POT.prec(pren, rmax)
         ax = fig.add_subplot(gs[2])
         cnt = dbi(
-            xpix, ypix, rms_resid_sb[binNum],
+            xpix, ypix, rms_resid_raw[binNum],
             pixelsize=pixs, angle=PA,
             cmap=divcmap, vmin=0.0, vmax=rmax
         )
@@ -2075,7 +1843,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 chi2=rms_resid_raw,
                 n=100,
                 plot_dir=str(figDir),
-                n_workers=min(12, max(1, nProcs)),
+                n_workers=builtins.min(12, builtins.max(1, nProcs)),
                 tag=f"C{nComp:04d}",
                 mask=mask_arr,
             )
@@ -2092,19 +1860,24 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         obins = np.arange(1, notypes+1) * uCuts.shape[0]
         otypes = np.digitize(nzComp, bins=obins, right=True)
     else:
-        otypes = copy(nzComp)
+        otypes = copy(nzComp)-1 # zero-indexed
 
     if 'sfh' in pplots:
         try:
             satube = (otypes == 0) # group short-axis tubes
             latube = (otypes == 1)
             boxess = (otypes == 2)
-            assert satube.sum() > 0 and latube.sum() > 0 and boxess.sum() > 0, \
-                "Not all orbit types present; cannot plot orbital SFH."
             arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
-            coSFH = arSOL[satube, :, :, :].sum(axis=0)
-            laSFH = arSOL[latube, :, :, :].sum(axis=0)
-            boSFH = arSOL[boxess, :, :, :].sum(axis=0)
+
+            coSFH = np.zeros((nMetals, nAges, nAlphas), dtype=float)
+            laSFH = np.zeros((nMetals, nAges, nAlphas), dtype=float)
+            boSFH = np.zeros((nMetals, nAges, nAlphas), dtype=float)
+            if satube.sum() > 0:
+                coSFH = arSOL[satube, :, :, :].sum(axis=0)
+            if latube.sum() > 0:
+                laSFH = arSOL[latube, :, :, :].sum(axis=0)
+            if boxess.sum() > 0:
+                boSFH = arSOL[boxess, :, :, :].sum(axis=0)
 
             minT, maxT = np.min(uages), np.max(uages)
             minZ, maxZ = np.min(umetals), np.max(umetals)
@@ -2329,9 +2102,7 @@ def compare_orbit_vs_solution(
     *,
     orbit_weights: np.ndarray | None = None,   # shape (C,), raw or normalized
     x_global: np.ndarray | None = None,        # shape (C*P,) or (C,P)
-    title: str | None = None,
     save: str | None = None,
-    show: bool = True,
 ):
     """
     Visualize how the learned per-component mass (sum over P) compares to the
@@ -2364,18 +2135,17 @@ def compare_orbit_vs_solution(
     sol_pdf = (sol_tot / sol_sum)
 
     # ------------------- ratio penalty setup (simple) -------------------
-    have_ratio = False
-    w_full = None  # per-component step scaling
 
     # If not passed explicitly, read from HDF5 only (no other fallbacks)
     if orbit_weights is None:
         ow_dset = os.environ.get("CUBEFIT_ORBIT_WEIGHTS_DSET",
                                  "/HyperCube/norm/orbit_weights")
         with open_h5(h5_path, role="reader") as f:
-            if ow_dset not in f:
+            if '/CompWeights' not in f:
                 raise RuntimeError(f"orbit_weights requested but dataset "
-                                   f"'{ow_dset}' not found in {h5_path}")
-            w_in = np.asarray(f[ow_dset][...], dtype=np.float64).ravel(order="C")
+                                   f"'/CompWeights' not found in {h5_path}")
+            w_in = np.asarray(f['/CompWeights'][...],
+                dtype=np.float64).ravel(order="C")
     else:
         w_in = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
 
@@ -2390,6 +2160,30 @@ def compare_orbit_vs_solution(
     # Normalized component prior (probabilities)
     w_c = (w_in / w_sum).astype(np.float64, copy=False)
 
+    # --- ratio-space diagnostics (solver-consistent) ---
+    eps = 1e-12
+    s = np.maximum(sol_tot, eps)
+    w = np.maximum(w_c, eps)
+
+    # choose a reference component (same as solver: max weight)
+    a = int(np.argmax(w))
+
+    log_ratio_sol = np.log(s / s[a])
+    log_ratio_ref = np.log(w / w[a])
+
+    # remove reference component
+    mask = np.arange(C) != a
+
+    ratio_err = log_ratio_sol[mask] - log_ratio_ref[mask]
+
+    ratio_l2 = float(np.sqrt(np.mean(ratio_err**2)))
+    ratio_linf = float(np.max(np.abs(ratio_err)))
+
+    print(f"[ratio penalty diagnostics]")
+    print(f"  RMS log-ratio error : {ratio_l2:.6e}")
+    print(f"  Max log-ratio error : {ratio_linf:.6e}")
+
+
     # Enable penalty and keep your existing knobs
     have_ratio   = True
     _ratio_eta   = 0.02
@@ -2401,44 +2195,6 @@ def compare_orbit_vs_solution(
     # Per-component step scaling (mean -> 1.0), same semantics you had
     m = float(np.mean(w_c)) or 1.0
     w_full = (w_c / m).astype(np.float64, copy=False)
-
-    def _ratio_update_in_place(x_mat: np.ndarray) -> None:
-        s = x_mat.sum(axis=1)
-        eps = 1e-12
-        active = (w_c >= _ratio_minw) | (s > 0)
-        if not np.any(active):
-            return
-        a = int(np.argmax(w_c * active))
-        sa = float(np.max((s[a], eps)))
-        wa = float(np.max((w_c[a], eps)))
-        pool = np.flatnonzero(active & (np.arange(C) != a))
-        if pool.size == 0:
-            return
-        sel = pool[rng.choice(pool.size, size=np.min((_ratio_batch, pool.size)), replace=False)]
-        if sel.size > 1 and _ratio_prob < 1.0:
-            keep_mask = rng.random(sel.size) < _ratio_prob
-            sel = sel[keep_mask]
-            if sel.size == 0:
-                return
-        for c in sel:
-            sc = float(np.max((s[c], eps)))
-            rc = float(np.max((w_c[c], eps)))
-            e = math.log((sc/sa) / (rc/wa))
-            if e == 0.0:
-                continue
-            delta_sc = -_ratio_eta * e * sc
-            delta_sa = +_ratio_eta * e * sa
-            pc = x_mat[c, :] / sc
-            pa = x_mat[a, :] / sa
-            if not np.all(np.isfinite(pc)):
-                pc = np.full(P, 1.0 / P, dtype=np.float64)
-            if not np.all(np.isfinite(pa)):
-                pa = np.full(P, 1.0 / P, dtype=np.float64)
-            x_mat[c, :] += delta_sc * pc
-            x_mat[a, :] += delta_sa * pa
-        if cfg.project_nonneg:
-            np.maximum(x_mat, 0.0, out=x_mat)
-
 
     # --- diagnostics
     l1 = float(np.sum(np.abs(w_in - sol_pdf)))
@@ -2463,26 +2219,26 @@ def compare_orbit_vs_solution(
     ax1.bar(idx + width/2, sol_pdf, width, label="solution ∑_P x[c,p]")
     ax1.set_xlabel("component c")
     ax1.set_ylabel("normalized mass / probability")
-    ttl = title or "Component weights: prior vs solution"
-    ax1.set_title(ttl)
+    ax1.set_title("Component weights: prior vs solution")
     ax1.legend(frameon=False, fontsize=9)
 
     ax2 = fig.add_subplot(1,2,2)
-    ax2.scatter(w_in, sol_pdf, s=14)
-    lim = (0.0, max(1.0/C*5, float(max(w_in.max(), sol_pdf.max()))*1.05))
+    ax2.scatter(log_ratio_ref[mask], log_ratio_sol[mask], s=14)
+    lim = (
+        builtins.min(log_ratio_ref.min(), log_ratio_sol.min()),
+        builtins.max(log_ratio_ref.max(), log_ratio_sol.max()),
+    )
     ax2.plot(lim, lim, lw=1.0)
-    ax2.set_xlim(lim); ax2.set_ylim(lim)
-    ax2.set_xlabel("input prior w_in[c]")
-    ax2.set_ylabel("solution mass fraction")
-    ax2.set_title(f"scatter vs y=x  (cos={cos:.3f}, L1={l1:.3f})")
+    ax2.set_xlabel("log(w_c / w_ref)")
+    ax2.set_ylabel("log(s_c / s_ref)")
+    ax2.set_title(f"log-ratio space (RMS={ratio_l2:.3e})")
+    ax2.set_xlim(lim)
+    ax2.set_ylim(lim)
 
     if save:
         fig.savefig(save, dpi=140)
         print(f"[saved] {save}")
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+    plt.close(fig)
 
     # return raw arrays if you want to post-process
     return dict(

@@ -55,11 +55,14 @@ r"""
 History
 -------
 v1.0:   19 December 2025
+v1.1:   Universally removed all ad-hoc scalings;
+        Added smooth regularisation using orbit prior in
+            `_global_nnls_workingset`. 25 January 2026
 """
 
 
 from __future__ import annotations
-import os, math, pathlib as plp
+import os, math, pathlib as plp, builtins
 from typing import Optional, List, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
@@ -179,12 +182,13 @@ def _predict_spaxel_sparse_from_models(M,
                 in_block = (plist_arr >= p0) & (plist_arr < p1)
                 if not np.any(in_block):
                     continue
-                local_idx = (plist_arr[in_block] - p0).astype(np.int64, copy=False)
+                local_idx = (plist_arr[in_block] - p0).astype(np.int64,
+                    copy=False)
 
                 # Read one storage-aligned block: (1, 1, Pb, L) float32
-                # (This avoids the full (C,P,L) slab.)
                 A32 = M[s_idx:s_idx + 1, c:c + 1, p0:p1, :][...]
-                A32 = np.asarray(A32, dtype=np.float32, order="C")[0, 0, :, :]  # (Pb, L)
+                A32 = np.asarray(A32, dtype=np.float32, order="C")[
+                    0, 0, :, :]  # (Pb, L)
 
                 # Slice to selected populations in this P-block
                 A32 = A32[local_idx, :]  # (Kb, L)
@@ -196,12 +200,6 @@ def _predict_spaxel_sparse_from_models(M,
                 # Weights for this block
                 w64 = x_cp[c, p0:p1][local_idx]
                 w32 = w64.astype(np.float32, copy=False)
-
-                if "/HyperCube/norm/cp_flux_ref" in M.file:
-                    inv_ref = 1.0 / np.asarray(
-                        M.file["/HyperCube/norm/cp_flux_ref"][c, p0:p1],
-                        dtype=np.float64)
-                    w32 = w32 * inv_ref[local_idx].astype(np.float32)
 
                 y_fit += (A32.T @ w32).astype(np.float64, copy=False)
 
@@ -232,7 +230,7 @@ def _pick_spaxels(S: int,
     Otherwise we treat it as a comma-separated list of explicit indices.
     """
     if s_sel is None or s_sel.strip() == "":
-        Ns = int(min(Ns_default, S))
+        Ns = int(builtins.min(Ns_default, S))
         if S <= Ns:
             return np.arange(S, dtype=np.int64)
 
@@ -247,7 +245,7 @@ def _pick_spaxels(S: int,
         start_str, cnt_str = s_sel.split(":", 1)
         start = int(start_str)
         cnt   = int(cnt_str)
-        stop  = min(S, start + cnt)
+        stop  = int(builtins.min(S, start + cnt))
         if start < 0 or start >= S or cnt <= 0:
             raise ValueError(f"Bad s_sel='{s_sel}' for S={S}")
         return np.arange(start, stop, dtype=np.int64)
@@ -261,18 +259,21 @@ def _pick_spaxels(S: int,
         raise ValueError(f"s_sel indices out of range for S={S}: {idx}")
     return np.unique(idx)
 
-def _choose_pops(E: np.ndarray, K_per_comp: int, mode: str = "energy") -> List[np.ndarray]:
-    C, P = map(int, E.shape)
-    K = int(max(1, min(K_per_comp, P)))
+def _choose_pops(#E: np.ndarray,
+    C: int, P: int, K_per_comp: int, mode: str = "random") -> List[np.ndarray]:
+    # C, P = map(int, E.shape)
+    K = int(builtins.max(1, builtins.min(K_per_comp, P)))
     out: List[np.ndarray] = []
     for c in range(C):
-        if mode == "energy":
-            order = np.argsort(E[c, :])[::-1]
-        elif mode == "random":
-            rng = np.random.default_rng(1234 + c)
-            order = np.arange(P); rng.shuffle(order)
-        else:
-            raise ValueError("mode must be 'energy' or 'random'")
+        # if mode == "energy":
+        #     order = np.argsort(E[c, :])[::-1]
+        # elif mode == "random":
+        # print(mode)
+        # if "random" in mode:
+        rng = np.random.default_rng(1234 + c)
+        order = np.arange(P); rng.shuffle(order)
+        # else:
+        #     raise ValueError("mode must be 'energy' or 'random'")
         out.append(np.sort(order[:K].astype(np.int64)))
     return out
 
@@ -348,11 +349,14 @@ def _prune_and_resolve_if_needed(Bw, yw, keep, x, colnorm_all, rho_max,
     print(f"[ws-NNLS] prune: {keep.size} → {new_keep.size} (re-solve)")
     x_new = np.zeros_like(x)
     x_sub = _solve_nnls(Bw[:, new_keep], yw, solver=solver, max_iter=400,
-                        ridge=float(ridge), normalize_columns=bool(normalize_columns))
+        ridge=float(ridge), normalize_columns=bool(normalize_columns))
     x_new[new_keep] = x_sub
     return x_new, new_keep
 
+# ------------------------------------------------------------------------------
+
 def _global_nnls_workingset(Bw, yw, col_map,
+                            orbit_weights=None,
                             k0_per_comp=32, kincr_per_comp=16, rounds=4,
                             solver="nnls", ridge=1e-2, normalize_columns=True,
                             rho_max=0.995):
@@ -360,6 +364,8 @@ def _global_nnls_workingset(Bw, yw, col_map,
     Fast global NNLS via a small working set with coherence control.
     Returns (x_full, keep_idx).
     """
+
+
     K = int(Bw.shape[1])
     colnorm_all = np.linalg.norm(Bw, axis=0)
     comp_of_j = np.array([c for (c, p) in col_map], dtype=np.int64)
@@ -385,9 +391,32 @@ def _global_nnls_workingset(Bw, yw, col_map,
     for r in range(int(rounds)):
         # solve on current working set
         Bw_sub = Bw[:, keep]
-        x_sub = _solve_nnls(Bw_sub, yw, solver=solver, max_iter=400,
-                            ridge=float(ridge), normalize_columns=bool(normalize_columns))
-        x.fill(0.0); x[keep] = x_sub
+
+        if orbit_weights is not None:
+            eps = 1e-15
+
+            # per-orbit Tikhonov: lambda_j = ridge_patch / w_j^2
+            reg = np.sqrt(ridge) / (orbit_weights[keep] + eps)
+
+            Bw_aug = np.vstack([Bw_sub, np.diag(reg)])
+            yw_aug = np.concatenate([yw, np.zeros_like(reg)])
+
+            x_sub = _solve_nnls(
+                Bw_aug, yw_aug,
+                solver=solver, max_iter=500,
+                ridge=0.0,                      # already handled explicitly
+                normalize_columns=bool(normalize_columns)
+            )
+        else:
+            x_sub = _solve_nnls(
+                Bw_sub, yw,
+                solver=solver, max_iter=500,
+                ridge=float(ridge),
+                normalize_columns=bool(normalize_columns)
+            )
+
+        x.fill(0.0)
+        x[keep] = x_sub
 
         # residual & gradient
         r_w = Bw @ x - yw
@@ -421,150 +450,31 @@ def _global_nnls_workingset(Bw, yw, col_map,
 
     # optional prune and re-solve if coherence still high
     x, keep = _prune_and_resolve_if_needed(Bw, yw, keep, x, colnorm_all,
-                                           rho_max, solver, ridge, normalize_columns)
+        rho_max, solver, ridge, normalize_columns)
 
-    res_w = float(np.linalg.norm(Bw @ x - yw))
-    print(f"[ws-NNLS] rounds={r+1} support={keep.size}/{K}  ||Bw x - yw||={res_w:.3g}")
+    # pre-projection residual (what you already have)
+    res_w_pre = float(np.linalg.norm(Bw @ x - yw))
+    print(f"[ws-NNLS] rounds={r+1} support={keep.size}/{K}  "
+        f"||Bw x - yw||(pre)={res_w_pre:.3g}")
+
+    # ---- amplitude projection (UNWEIGHTED) ----
+    m = Bw @ x # model prediction on masked wavelengths
+    num = float(np.dot(m, yw))
+    den = float(np.dot(m, m))
+
+    if den > 0.0:
+        alpha = num / den
+    else:
+        alpha = 0.0
+
+    x *= alpha
+
+    # post-projection residual (what the downstream pipeline will see)
+    res_w_post = float(np.linalg.norm(Bw @ x - yw))
+    print(f"[ws-NNLS] amplitude alpha={alpha:.6g}  "
+        f"||Bw x - yw||(post)={res_w_post:.3g}")
+
     return x, keep
-
-# ------------------------------------------------------------------------------
-
-def apply_orbit_prior_to_seed(Xcp: np.ndarray,
-                              orbit_weights,
-                              *,
-                              E_cp: np.ndarray | None = None,
-                              preserve_total: bool = True,
-                              min_w_frac: float = 1e-4) -> np.ndarray:
-    """
-    Rescale rows of Xcp (C,P) so row usage matches orbit_weights fractions.
-
-    If E_cp is provided (C,P), usage is energy-weighted: s_c = sum_p X[c,p]*E[c,p].
-    Otherwise usage is plain row sums: s_c = sum_p X[c,p].
-
-    This is a fast, closed-form, mass-preserving projection; O(C*P).
-    """
-    X = np.nan_to_num(np.asarray(Xcp, np.float64), nan=0.0, posinf=0.0,
-                      neginf=0.0, copy=True)
-    if X.ndim != 2:
-        raise ValueError("Xcp must be 2-D (C,P).")
-    C, P = X.shape
-
-    w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
-    if w.size not in (C, C * P):
-        raise ValueError(f"orbit_weights has size {w.size}, expected {C} or {C*P}")
-    if w.size == C * P:
-        w = w.reshape(C, P, order="C").sum(axis=1)
-
-    w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
-    Wsum = float(w.sum())
-    if Wsum <= 0.0:
-        return X  # no prior to enforce
-    t = w / Wsum  # target fractions per component in [0,1]
-
-    # Current usage per component
-    if E_cp is not None:
-        E = np.asarray(E_cp, np.float64, order="C")
-        if E.shape != (C, P):
-            raise ValueError(f"E_cp shape {E.shape} != (C,P) {(C,P)}")
-        s = (X * E).sum(axis=1)  # energy-weighted usage
-    else:
-        s = X.sum(axis=1)        # plain usage
-    S = float(s.sum())
-
-    # If a component has zero usage but positive target, sprinkle tiny mass
-    need = (s <= 0.0) & (t > 0.0)
-    if np.any(need):
-        eps = 1e-12 * (S if S > 0.0 else 1.0)
-        X[need, :] = (eps / P)
-        # recompute s/S in the same metric
-        if E_cp is not None:
-            s = (X * E).sum(axis=1)
-        else:
-            s = X.sum(axis=1)
-        S = float(s.sum())
-
-    # Row scale factors so that new usage ∝ target t
-    s_safe = np.maximum(s, 1e-30)
-    scale = t / s_safe
-    X *= scale[:, None]
-
-    if preserve_total:
-        # Keep overall mass in the same metric as before
-        if E_cp is not None:
-            Sp = float((X * E).sum())
-        else:
-            Sp = float(X.sum())
-        if Sp > 0.0 and S > 0.0:
-            X *= (S / Sp)
-
-    np.maximum(X, 0.0, out=X)
-    np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-    return X
-
-# ------------------------------------------------------------------------------
-
-def _normalize_losvd_kernels(losvd_kernels, keep_idx=None, logger=None):
-    """
-    Normalize LOSVD kernels in-place so each kernel sums to 1 over the
-    wavelength axis (last axis). Safe against zero-sum kernels.
-    """
-    if logger is None:
-        def _log(msg): print(msg)
-    else:
-        _log = logger.debug
-
-    # Force float64 for stable division, do in-place on a copy if dtype differs.
-    if losvd_kernels.dtype != np.float64:
-        losvd_kernels = losvd_kernels.astype(np.float64, copy=False)
-
-    # If a wavelength mask/keep_idx is used, we must sum only over those
-    # wavelengths so the kernel integrates to unity over the solved domain.
-    if keep_idx is not None:
-        # Extract the masked slice (this creates a view/temporary)
-        summed = np.sum(losvd_kernels[..., keep_idx], axis=-1, keepdims=True)
-    else:
-        summed = np.sum(losvd_kernels, axis=-1, keepdims=True)
-
-    # Summed shape is losvd_kernels.shape[:-1] + (1,)
-    # Compute median before for diagnostics
-    summed_flat = np.ravel(summed)
-    print(f"[nnls_patch] losvd_amp_sum (pre-normalize): min={float(summed_flat.min()):.3e} "
-         f"med={float(np.median(summed_flat)):.3e} max={float(summed_flat.max()):.3e}")
-
-    # Avoid dividing by zero: where sum <= eps, leave kernel unchanged (or set to zero).
-    eps = np.finfo(losvd_kernels.dtype).eps * losvd_kernels.shape[-1] * 1e2
-    safe = (summed > eps)
-
-    if keep_idx is not None:
-        # Normalize only the masked wavelengths in-place
-        # Create a view to the masked wavelengths for elementwise division
-        view = losvd_kernels[..., keep_idx]
-        # Broadcast safe (shape (...,1)) over last axis
-        view[safe[..., 0]] /= summed[safe]
-        # Note: above indexing selects those kernel-elements with safe True
-    else:
-        # Divide full kernels by their sums, only where safe is True
-        # Use in-place division for performance
-        # To broadcast, reshape summed to (...,1) already done via keepdims=True
-        # For kernels that are not safe (sum too small), set kernel to zero to avoid
-        # leaving pathological distributions.
-        losvd_kernels[safe[..., 0], :] /= summed[safe]
-        if not np.all(safe):
-            # set zero-sum kernels explicitly to zero
-            losvd_kernels[~safe[..., 0], :] = 0.0
-
-    # Recompute sums for diagnostics
-    if keep_idx is not None:
-        summed_after = np.sum(losvd_kernels[..., keep_idx], axis=-1)
-    else:
-        summed_after = np.sum(losvd_kernels, axis=-1)
-
-    summed_after_flat = np.ravel(summed_after)
-    print(f"[nnls_patch] losvd_amp_sum (post-normalize): min={float(summed_after_flat.min()):.3e} "
-         f"med={float(np.median(summed_after_flat)):.3e} max={float(summed_after_flat.max()):.3e}")
-
-    # Return the (possibly new) array reference so caller can assign if dtype was changed.
-    return losvd_kernels
 
 # ------------------------------------------------------------------------------
 
@@ -657,7 +567,7 @@ def _solve_nnls(Bw: np.ndarray, yw: np.ndarray, solver="nnls", max_iter=200, rid
 def run_patch(h5_path: str,
               s_sel: Optional[str] = None,
               k_per_comp: int = 12,
-              pick_mode: str = "energy",
+              pick_mode: str = "random",
               solver: str = "nnls",
               ridge: float = 0.0,
               use_mask: bool = True,
@@ -688,15 +598,6 @@ def run_patch(h5_path: str,
         obs = f["/ObsPix"][...] if "/ObsPix" in f else np.arange(L, dtype=np.float64)
         lam_plot = obs[keep_idx] if keep_idx is not None else obs
 
-    if use_lambda:
-        try:
-            w_full = read_lambda_weights(h5_path, dset_name=lam_dset, floor=1e-6)
-        except Exception:
-            w_full = ensure_lambda_weights(h5_path, dset_name=lam_dset)
-    else:
-        w_full = np.ones(L, dtype=np.float64)
-    w_lam = w_full if keep_idx is None else w_full[keep_idx]
-
     s_idx = _pick_spaxels(S, s_sel, Ns_default=32)
     s_idx = np.sort(np.asarray(s_idx, dtype=int))
     if s_idx.size < 1:
@@ -705,7 +606,8 @@ def run_patch(h5_path: str,
     # ---- quick triage (paste right after w_lam and s_idx) ----
     print(f"[triage] S_sel={s_idx.size}")
 
-    Lk = int(keep_idx.size) if keep_idx is not None else int(len(w_full))
+    # Lk = int(keep_idx.size) if keep_idx is not None else int(len(w_full))
+    Lk = int(keep_idx.size) if keep_idx is not None else int(L)
     print(f"[triage] Lk (masked wavelengths) = {Lk}")
     if Lk == 0:
         raise SystemExit("[triage] /Mask removes all wavelengths for this run "
@@ -719,7 +621,7 @@ def run_patch(h5_path: str,
             spec = np.asarray(DC[s, :], dtype=np.float64)
             spec = spec[keep_idx] if keep_idx is not None else spec
             finite_counts.append(int(np.count_nonzero(np.isfinite(spec))))
-        binCounts = np.asarray(f['/BinCounts'][...], dtype=int)
+        # binCounts = np.asarray(f['/BinCounts'][...], dtype=int)
     finite_counts = np.asarray(finite_counts, int)
     print(f"[triage] finite pixels per spaxel (min/med/max): "
         f"{finite_counts.min()}/{int(np.median(finite_counts))}/{finite_counts.max()}")
@@ -729,11 +631,6 @@ def run_patch(h5_path: str,
             "will contribute zero rows. If they are ALL zero, "
             "Bw==0 and you’ll see the 'all columns ~zero' message. "
             "Try --no-mask or pick spaxels with finite data.")
-
-    # λ-weights sanity
-    w_masked = w_lam
-    print(f"[triage] lambda weights on mask min/med/max: "
-        f"{w_masked.min():.3g}/{np.median(w_masked):.3g}/{w_masked.max():.3g}")
 
     # Subsample the selected spaxels for this expensive check
     if s_idx.size > 12:
@@ -746,33 +643,10 @@ def run_patch(h5_path: str,
 
     with open_h5(h5_path, role="reader") as f:
         mode = str(f["/HyperCube"].attrs.get("norm.mode", "model"))
-        df   = (np.asarray(f["/HyperCube/data_flux"][s_idx], float)
-                if "/HyperCube/data_flux" in f else None)
-        la   = (np.asarray(f["/HyperCube/norm/losvd_amp_sum"][s_idx], float)
-                if "/HyperCube/norm/losvd_amp_sum" in f else None)
-
-        E_cp = np.asarray(f["/HyperCube/col_energy"][...], float)  # (C,P)
         S, L = map(int, f["/DataCube"].shape)
-        rms_cp = np.sqrt(E_cp / max(1, S * L)) # RMS amplitude
 
-    print(f"[triage] norm.mode={mode}")
-    print(
-        "[triage] model RMS amplitude per (c,p) column (min/med/max): "
-        f"{rms_cp.min():.3g}/{np.median(rms_cp):.3g}/{rms_cp.max():.3g}"
-    )
-    if df is not None:
-        print(
-            "[triage] data_flux (min/med/max): "
-            f"{df.min():.3g}/{np.median(df):.3g}/{df.max():.3g}"
-        )
-    if la is not None:
-        print(
-            "[triage] losvd_amp_sum (min/med/max): "
-            f"{la.min():.3g}/{np.median(la):.3g}/{la.max():.3g}"
-        )
-    
-    E = read_global_column_energy(h5_path)  # (C,P)
-    picks = _choose_pops(E, k_per_comp, pick_mode)
+    print(pick_mode)
+    picks = _choose_pops(C, P, k_per_comp, 'random')
 
     # --- Build RHS y and per-row weights (spaxel-wise finite mask)
     rows = int(s_idx.size * Lk)
@@ -794,16 +668,8 @@ def run_patch(h5_path: str,
             # store y with NaNs → 0 (they get zero weight)
             spec_sanit = np.where(good, spec, 0.0)
             y[pos:pos+Lk] = spec_sanit
-            # per-row weights: √w_lambda * 1[finite]
-            # per-row weights: √w_lambda * 1[finite] * 1/√binCounts[s]
-            bs = float(binCounts[s])
-            if not np.isfinite(bs) or bs <= 0.0:
-                raise RuntimeError(f"[nnls_patch] invalid binCounts[{s}] = {bs}")
-            sqrt_w_rows[pos:pos+Lk] = (
-                np.sqrt(w_lam)
-                * good.astype(np.float64)
-                # / np.sqrt(bs)
-            )
+
+            sqrt_w_rows[pos:pos+Lk] = good.astype(np.float64)
             finite_counts.append(int(np.count_nonzero(good)))
             pos += Lk
     finite_counts = np.asarray(finite_counts, int)
@@ -836,9 +702,6 @@ def run_patch(h5_path: str,
     with open_h5(h5_path, role="reader") as f:
         M = f["/HyperCube/models"]  # (S, C, P, L)
 
-        cp_flux_ref = np.asarray(f['/HyperCube/norm/cp_flux_ref'][...],
-            dtype=np.float64)  # (C,P)
-
         for c, plist in enumerate(
             tqdm(
                 picks,
@@ -863,8 +726,6 @@ def run_patch(h5_path: str,
             A_c = np.nan_to_num(
                 A_c, nan=0.0, posinf=0.0, neginf=0.0, copy=False
             )
-            inv_ref = 1.0 / cp_flux_ref[c, :]
-            A_c *= inv_ref[None, :, None]
 
             A_c *= row_mask[:, None, :]   # (Ns, P, Lk)
 
@@ -924,13 +785,6 @@ def run_patch(h5_path: str,
     x_CP = np.zeros((C, P), dtype=np.float64)
     for j, (c, p) in enumerate(col_map):
         x_CP[c, p] = x_patch[j]
-    # --- Enforce orbit prior on the seed (energy metric) --- FAST and strict
-    if orbit_weights is not None:
-        s = np.sum(x_CP, axis=1)
-        tot = float(np.sum(s))
-        if tot > 0:
-            target = orbit_weights / np.sum(orbit_weights)
-            x_CP *= (target[:, None] * tot) / np.maximum(s[:, None], 1e-30)
 
     # --- Reconstruct + diagnostics per spaxel
     rmse = np.zeros(s_idx.size, dtype=np.float64)
@@ -1015,8 +869,7 @@ def run_patch(h5_path: str,
                 x_dset=seed_path, # e.g. "/Seeds/x0_nnls_patch"
                 normalize="unit_sum",
                 out_png=usage_png,
-                usage_metric="energy", # use energy–weighted usage
-                E_cp=E, # (C,P) from read_global_column_energy
+                usage_metric="sum"
             )
         except Exception as e:
             print(f"[nnls_patch] usage-vs-prior (seed) failed: {e}")
@@ -1035,7 +888,7 @@ def run_patch(h5_path: str,
             import h5py
             with h5py.File(tmp_sidecar, "w") as G:
                 G.create_dataset("/Fit/x_best", data=x_CP.astype("f8"),
-                                 dtype="f8",)
+                    dtype="f8",)
 
             metrics = compare_usage_to_orbit_weights(
                 h5_path,
@@ -1043,8 +896,7 @@ def run_patch(h5_path: str,
                 x_dset="/Fit/x_best",
                 normalize="unit_sum",
                 out_png=usage_png,
-                usage_metric="energy",
-                E_cp=E,
+                usage_metric="sum"
             )
         except Exception as e:
             print(f"[nnls_patch] usage-vs-prior (temp sidecar) failed: {e}")

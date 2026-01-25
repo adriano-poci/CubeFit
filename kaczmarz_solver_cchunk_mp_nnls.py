@@ -85,6 +85,11 @@ v3.8:   Added additional acceptance guard in SPG solver based on `step_cos`
 v3.9:   Added variational orbit-mass prior to break rank-1 degeneracy;
         Softened freeze criteria to include `orbit_weights` prior gradient. 16
             January 2026
+v3.10:  Universally removed all ad-hoc scalings;
+        Compute dynamic Barzilai–Borwein step length in
+            `solve_global_kaczmarz_global_step_mp`;
+        Include orbit prior completely in the cost function of the solver in
+            `solve_global_kaczmarz_global_step_mp`. 25 January 2026
 """
 
 from __future__ import annotations, print_function
@@ -123,41 +128,6 @@ class MPConfig:
     pixels_per_aperture: int = 256
     max_tiles: Optional[int] = None
 
-# ------------------------- Norm mode guard ----------------------------
-
-def _assert_norm_mode(h5_path: str, expect: Optional[str] = None) -> str:
-    r"""
-    Read /HyperCube/norm.mode and optionally assert a specific mode.
-
-    Parameters
-    ----------
-    h5_path : str
-        Path to HDF5 file.
-    expect : str, optional
-        If given ('data' or 'model'), raise if the stored mode differs.
-
-    Returns
-    -------
-    str
-        The stored normalization mode ('data' or 'model').
-
-    Exceptions
-    ----------
-    RuntimeError
-        If the attribute is missing or does not match `expect`.
-    """
-    with open_h5(h5_path, role="reader") as f:
-        g = f["/HyperCube"]
-        mode = str(g.attrs.get("norm.mode", "model")).lower()
-    if expect and mode != expect:
-        raise RuntimeError(
-            f"Hypercube is in norm.mode='{mode}', but solver expects "
-            f"'{expect}'. Convert first with convert_hypercube_norm(...)."
-        )
-    if mode not in ("data", "model"):
-        raise RuntimeError(f"Unexpected norm.mode='{mode}'.")
-    return mode
-
 # ---------------------- Small pool utilities --------------------------
 
 def _pool_ping() -> int:
@@ -180,24 +150,6 @@ def _worker_init(blas_threads: int) -> None:
     os.environ["MKL_NUM_THREADS"] = str(blas_threads)
     os.environ["NUMEXPR_NUM_THREADS"] = str(np.max((1, blas_threads // 2)))
     os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
-
-# ---------------------- Optional shift diagnostic ---------------------
-
-def _xcorr_int_shift(a: np.ndarray, b: np.ndarray) -> int:
-    """
-    Integer-lag that best aligns b to a by full cross correlation.
-    Positive → b is to the right.
-    """
-    aa = np.asarray(a, np.float64).ravel()
-    bb = np.asarray(b, np.float64).ravel()
-    n = int(aa.size)
-    fa = np.fft.rfft(aa, n=2*n)
-    fb = np.fft.rfft(bb, n=2*n)
-    cc = np.fft.irfft(fa * np.conj(fb))
-    j = int(np.argmax(cc))
-    if j > n:
-        j -= 2*n
-    return j
 
 # ------------------------------------------------------------------------------
 
@@ -574,42 +526,42 @@ def solve_global_kaczmarz_global_step_mp(
         flush=True,
     )
 
-    # ------------------------------------------------------------
-    # Load spatial component support masks (LOSVD + ENERGY)
-    # ------------------------------------------------------------
-    with open_h5(h5_path, role="reader") as f:
-        supp_losvd = None
-        supp_energy = None
+    # # ------------------------------------------------------------
+    # # Load spatial component support masks (LOSVD + ENERGY)
+    # # ------------------------------------------------------------
+    # with open_h5(h5_path, role="reader") as f:
+    #     supp_losvd = None
+    #     supp_energy = None
 
-        if "/HyperCube/component_support" in f:
-            ds = f["/HyperCube/component_support"]
-            supp_losvd = np.asarray(ds[...], dtype=bool)
-            if int(ds.attrs.get("S_chunk", s_tile)) != s_tile:
-                raise RuntimeError(
-                    "component_support S_chunk mismatch with solver tile size"
-                )
-            print("[SPG] Using LOSVD-based component support.", flush=True)
+    #     if "/HyperCube/component_support" in f:
+    #         ds = f["/HyperCube/component_support"]
+    #         supp_losvd = np.asarray(ds[...], dtype=bool)
+    #         if int(ds.attrs.get("S_chunk", s_tile)) != s_tile:
+    #             raise RuntimeError(
+    #                 "component_support S_chunk mismatch with solver tile size"
+    #             )
+    #         print("[SPG] Using LOSVD-based component support.", flush=True)
 
-        if "/HyperCube/component_support_energy" in f:
-            ds = f["/HyperCube/component_support_energy"]
-            supp_energy = np.asarray(ds[...], dtype=bool)
-            if int(ds.attrs.get("S_chunk", s_tile)) != s_tile:
-                raise RuntimeError(
-                    "component_support_energy S_chunk mismatch with solver tile size"
-                )
-            print("[SPG] Using ENERGY-based component support.", flush=True)
+    #     if "/HyperCube/component_support_energy" in f:
+    #         ds = f["/HyperCube/component_support_energy"]
+    #         supp_energy = np.asarray(ds[...], dtype=bool)
+    #         if int(ds.attrs.get("S_chunk", s_tile)) != s_tile:
+    #             raise RuntimeError(
+    #                 "component_support_energy S_chunk mismatch with solver tile size"
+    #             )
+    #         print("[SPG] Using ENERGY-based component support.", flush=True)
 
-        if supp_losvd is not None and supp_energy is not None:
-            component_support = supp_losvd & supp_energy
-            print("[SPG] Combined LOSVD ∧ ENERGY component support.", flush=True)
-        elif supp_losvd is not None:
-            component_support = supp_losvd
-        elif supp_energy is not None:
-            component_support = supp_energy
-        else:
-            component_support = None
-            print("[SPG] No component support masks found; using all components.",
-                  flush=True)
+    #     if supp_losvd is not None and supp_energy is not None:
+    #         component_support = supp_losvd & supp_energy
+    #         print("[SPG] Combined LOSVD ∧ ENERGY component support.", flush=True)
+    #     elif supp_losvd is not None:
+    #         component_support = supp_losvd
+    #     elif supp_energy is not None:
+    #         component_support = supp_energy
+    #     else:
+    #         component_support = None
+    #         print("[SPG] No component support masks found; using all components.",
+    #               flush=True)
 
     # ------------------------------------------------------------
     # Global ||Y|| for trust region (compute once)
@@ -627,7 +579,7 @@ def solve_global_kaczmarz_global_step_mp(
                     Yt, nan=0.0, posinf=0.0, neginf=0.0, copy=False
                 )
             Y_glob_norm2 += float(np.sum(Yt * Yt))
-        binCounts = np.asarray(f['/BinCounts'][...], dtype=int)
+        # binCounts = np.asarray(f['/BinCounts'][...], dtype=int)
 
     Y_glob_norm = float(np.sqrt(Y_glob_norm2))
     print(
@@ -635,26 +587,26 @@ def solve_global_kaczmarz_global_step_mp(
         flush=True,
     )
 
-    # ------------------------------------------------------------
-    # λ-weights (optional)
-    # ------------------------------------------------------------
-    w_lam_sqrt = None
-    if os.environ.get("CUBEFIT_LAMBDA_WEIGHTS_ENABLE", "1").lower() not in (
-        "0", "false", "no", "off"
-    ):
-        try:
-            w_full = cu.read_lambda_weights(h5_path)
-            w_use = w_full[keep_idx] if keep_idx is not None else w_full
-            w_lam_sqrt = np.sqrt(np.maximum(w_use, 1e-6)).astype(np.float64)
-            print("[SPG] λ-weights enabled.", flush=True)
-        except Exception:
-            w_lam_sqrt = None
-            print("[SPG] λ-weights unavailable; unweighted LS.", flush=True)
+    # # ------------------------------------------------------------
+    # # λ-weights (optional)
+    # # ------------------------------------------------------------
+    # w_lam_sqrt = None
+    # if os.environ.get("CUBEFIT_LAMBDA_WEIGHTS_ENABLE", "1").lower() not in (
+    #     "0", "false", "no", "off"
+    # ):
+    #     try:
+    #         w_full = cu.read_lambda_weights(h5_path)
+    #         w_use = w_full[keep_idx] if keep_idx is not None else w_full
+    #         w_lam_sqrt = np.sqrt(np.maximum(w_use, 1e-6)).astype(np.float64)
+    #         print("[SPG] λ-weights enabled.", flush=True)
+    #     except Exception:
+    #         w_lam_sqrt = None
+    #         print("[SPG] λ-weights unavailable; unweighted LS.", flush=True)
 
-    # ------------------------------------------------------------
-    # Global column energy (for preconditioning + orbit projection)
-    # ------------------------------------------------------------
-    E_global = read_global_column_energy(h5_path)  # (C,P)
+    # # ------------------------------------------------------------
+    # # Global column energy (for preconditioning + orbit projection)
+    # # ------------------------------------------------------------
+    # E_global = read_global_column_energy(h5_path)  # (C,P)
 
     # ------------------------------------------------------------
     # Orbit-weight prior (spaxel independent)
@@ -714,14 +666,17 @@ def solve_global_kaczmarz_global_step_mp(
     eps = float(os.environ.get("CUBEFIT_EPS", "1e-12"))
     lr = float(cfg.lr)
 
+    # --- BB history ---
+    x_prev = None
+    g_prev = None
+    alpha_bb = float(cfg.lr)   # initial BB step guess
+
     best_x = x.copy()
     best_proxy = np.inf
 
     # --- Active set bookkeeping ---
     active_orbits = np.arange(C, dtype=np.int32)
     min_active = int(os.environ.get("CUBEFIT_MIN_ACTIVE_ORBITS", "8"))
-
-    rmse_prev = None
 
     # ------------------------------------------------------------
     # Population shapes
@@ -758,10 +713,10 @@ def solve_global_kaczmarz_global_step_mp(
                 inactive[active_orbits] = False
                 x_eff[inactive, :] = 0.0
 
-                bs = np.asarray(binCounts[s0:s1], dtype=np.float64)
-                if np.any(bs <= 0.0):
-                    raise RuntimeError(f"Invalid binCounts in tile {s0}:{s1}")
-                w_s = (1.0 / np.sqrt(bs)).astype(np.float64)     # (Sblk,)
+                # bs = np.asarray(binCounts[s0:s1], dtype=np.float64)
+                # if np.any(bs <= 0.0):
+                #     raise RuntimeError(f"Invalid binCounts in tile {s0}:{s1}")
+                # w_s = (1.0 / np.sqrt(bs)).astype(np.float64)     # (Sblk,)
                 with open_h5(h5_path, role="reader") as f:
                     DC = f["/DataCube"]
                     M  = f["/HyperCube/models"]
@@ -784,26 +739,26 @@ def solve_global_kaczmarz_global_step_mp(
                     # ------------------------------------------------------------
                     # Determine components to iterate for this tile
                     # ------------------------------------------------------------
-                    if component_support is not None:
-                        # tile index from s0 (tiles are aligned to s_tile)
-                        tile_idx = s0 // s_tile
+                    # if component_support is not None:
+                    #     # tile index from s0 (tiles are aligned to s_tile)
+                    #     tile_idx = s0 // s_tile
 
-                        # components supported in this tile
-                        spatial_active = np.nonzero(component_support[tile_idx])[0]
+                    #     # components supported in this tile
+                    #     spatial_active = np.nonzero(component_support[tile_idx])[0]
 
-                        # intersect with globally active orbits
-                        c_iter = np.intersect1d(
-                            active_orbits,
-                            spatial_active,
-                            assume_unique=True
-                        )
+                    #     # intersect with globally active orbits
+                    #     c_iter = np.intersect1d(
+                    #         active_orbits,
+                    #         spatial_active,
+                    #         assume_unique=True
+                    #     )
 
-                        # safety fallback: never allow empty iteration
-                        if c_iter.size == 0:
-                            c_iter = active_orbits
-                    else:
+                    #     # safety fallback: never allow empty iteration
+                    #     if c_iter.size == 0:
+                    #         c_iter = active_orbits
+                    # else:
                         # no spatial support masks
-                        c_iter = active_orbits
+                    c_iter = active_orbits
                     for c in c_iter:
                         A = np.asarray(M[s0:s1, c, :, :], dtype=np.float64)
                         # (Sblk, P, L)
@@ -868,15 +823,6 @@ def solve_global_kaczmarz_global_step_mp(
             # ---------------- Assemble gradient (data term) ----------------
             g = -g_tot
 
-            # ---- orbit-mass prior ----
-            if w_target is not None and lambda_orbit > 0.0:
-                s_orb = np.sum(x, axis=1)
-                r_orb = s_orb - w_target
-                g += lambda_orbit * r_orb[:, None]
-                g_prior = np.abs(lambda_orbit * r_orb[:, None])
-            else:
-                g_prior = None
-
             # ---- population curvature prior ----
             lambda_pop = float(os.environ.get("CUBEFIT_LAMBDA_POP", "0.0"))
             if lambda_pop > 0.0:
@@ -909,10 +855,6 @@ def solve_global_kaczmarz_global_step_mp(
             # ---------------- Freeze logic (respect priors) ----------------
             freeze = (D <= 0.0) | (~np.isfinite(D))
 
-            if g_prior is not None:
-                prior_eps = 1e-12 * max(np.max(g_prior), 1.0)
-                freeze &= (g_prior <= prior_eps)
-
             if g_pop is not None:
                 pop_eps = 1e-12 * max(np.max(np.abs(g_pop)), 1.0)
                 freeze &= (np.abs(g_pop) <= pop_eps)
@@ -933,17 +875,46 @@ def solve_global_kaczmarz_global_step_mp(
             if np.isfinite(max_inv_d) and (max_inv_d > 0.0):
                 invD = np.minimum(invD, max_inv_d)
 
-            # ---------------- compute step (safe) ----------------
-            lr *= 0.99  # anneal
-            dx = -lr * (g * invD)
+            # ---- orbit-mass prior (explicit objective + preconditioned gradient) ----
+            f_orbit = 0.0
+            g_prior = None
+            if w_target is not None and lambda_orbit > 0.0:
+                # compute per-orbit mass residuals
+                s_orb = np.sum(x, axis=1)               # (C,)
+                r_orb = s_orb - w_target                # (C,)
 
-            # ---------------- rescale step if you have an E_global heuristic -------------
-            # NOTE: you previously divided dx by E_global which double-counts curvature.
-            # If you want that effect, re-enable here; default is NOT to rescale.
-            # dx /= np.maximum(E_global, 1e-12)
+                # scalar objective contribution (half-squared)
+                f_orbit = 0.5 * float(lambda_orbit) * float(np.dot(r_orb, r_orb))
 
-            # Ensure descent
-            if np.vdot(dx, g) > 0:
+                # compute gradient: currently g += lambda * r_orb[:,None]
+                # but precondition it (scale by invD) to make strength scale-free:
+                g_prior_mat = (lambda_orbit / P) * (r_orb[:, None] * invD)
+                # ensure frozen components receive no orbit push
+                g_prior_mat[freeze] = 0.0
+
+                # add to gradient
+                g += g_prior_mat
+                # store magnitude for diagnostics (absolute values)
+                g_prior = np.abs(g_prior_mat)
+
+            # ---------------- BB step (diagonal-preconditioned) ----------------
+            # Barzilai–Borwein step length
+            if (x_prev is not None) and (g_prev is not None):
+                s = (x - x_prev).ravel()
+                y = (g - g_prev).ravel()
+                sy = float(np.dot(s, y))
+
+                if sy > 1e-16:
+                    alpha_bb = float(np.dot(s, s) / sy)
+                    # safety clamp
+                    alpha_bb = float(np.clip(alpha_bb, 1e-8, 1e8))
+                print(f"[BB] alpha={alpha_bb:.3e}, sy={sy:.3e}", flush=True)
+
+            # diagonal-preconditioned step
+            dx = -alpha_bb * (g * invD)
+
+            # ensure descent
+            if np.vdot(dx, g) > 0.0:
                 dx = -dx
 
             dx_norm = np.linalg.norm(dx)
@@ -960,17 +931,21 @@ def solve_global_kaczmarz_global_step_mp(
             if dx_norm > dx_cap and dx_cap > 0:
                 dx *= dx_cap / dx_norm
 
+            # --- update BB history ---
+            x_prev = x.copy()
+            g_prev = g.copy()
             # Apply step
             x += dx
             if cfg.project_nonneg:
                 np.maximum(x, 0.0, out=x)
 
+
             # ---------------- Active orbit update (CRITICAL) ----------------
             x_row_l1 = np.sum(x, axis=1)
             g_row_inf = np.max(np.abs(g), axis=1)
 
-            eps_mass = 1e-12 * max(np.sum(x_row_l1), 1.0)
-            eps_grad = 1e-10 * max(np.max(g_row_inf), 1.0)
+            eps_mass = 1e-12 * builtins.max(np.sum(x_row_l1), 1.0)
+            eps_grad = 1e-10 * builtins.max(np.max(g_row_inf), 1.0)
 
             new_active = np.nonzero(
                 (x_row_l1 > eps_mass) | (g_row_inf > eps_grad)
@@ -986,12 +961,30 @@ def solve_global_kaczmarz_global_step_mp(
             pg_norm = np.linalg.norm(g[np.isfinite(g)])
             D_pos = D[np.isfinite(D) & (D < np.inf)]
 
+            # compute data proxy (you have ssq normalized earlier)
+            data_proxy = 0.5 * ssq / max(nres, 1)  # or whichever proxy you use for data term
+            total_proxy = data_proxy + f_orbit
+
+            # use total_proxy when comparing best_proxy / saving best_x
+            if total_proxy < best_proxy:
+                best_proxy = total_proxy
+                best_x = x.copy()
+
             print(
-                f"[SPG] epoch {ep+1} "
+                f"[SPG] epoch {ep+1}  "
                 f"RMSE={rmse:.4e}  "
-                f"||x||={x_norm:.3e}  "
+                f"||x||={x_norm:.3e}"
+            )
+            print(
                 f"||dx||={dx_norm:.3e}  "
-                f"||g||={pg_norm:.3e}  "
+                f"||g||={pg_norm:.3e}"
+            )
+            print(
+                f"f_orbit={f_orbit:.3e}  "
+                f"total_proxy={total_proxy:.3e}"
+            )
+            print(
+                f"alpha_bb={alpha_bb:.2e}  "
                 f"active={active_orbits.size}/{C}",
                 flush=True,
             )

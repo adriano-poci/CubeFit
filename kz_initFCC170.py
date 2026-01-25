@@ -50,5 +50,5 @@ v1.0:	12 November 2021
 props = dict(galaxy='FCC170', mPath='hd170', SN=100, nCuts=3, lOrder=12,
     specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI', nProcs=1,
     band='r', genSwitch=None, kind='SMILES', cont=True,
-    smask=[[5530, 5555], [6255, 6270], [6320, 6335], [7580, 7700], [8775, 9000]],
+    smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],
     lam=1e-12)

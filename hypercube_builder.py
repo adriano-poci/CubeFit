@@ -28,7 +28,7 @@ v1.3:   Improved speed of `col_energy` computation, switching from `einsum` to
             `square`. 4 December 2025
 v1.4:   Compute and apply a global scale to the Hypercube model to improve
             numerical stability during fitting. 8 January 2026
-v1.5:   Removed global scale. 10 January 2026
+v1.5:   Universally removed all ad-hoc scalings. 26 January 2026
 
 
 Hypercube builder (LOSVD convolution in log-λ, then rebin to observed grid)
@@ -318,6 +318,7 @@ def _losvd_to_unit_kernel(H_native: np.ndarray, km: _KM) -> np.ndarray:
     Hk = (1.0 - km.t) * H[km.il] + km.t * H[km.ir]
     Hk[km.out_mask] = 0.0
     np.maximum(Hk, 0.0, out=Hk)
+
     s = float(np.sum(Hk))
     if s == 0.0:
         Hk.fill(0.0)
@@ -947,22 +948,6 @@ def build_hypercube(
             if m.size == L and np.any(m):
                 keep_idx = np.flatnonzero(m)
 
-        # Optional λ-weights for energy/statistics (apply same floor, use √w)
-        w_lam_sqrt = None
-        lamw_floor = 1e-6
-        if "/HyperCube/lambda_weights" in f_rd:
-            _w = np.asarray(f_rd["/HyperCube/lambda_weights"][...],
-                            dtype=np.float64).ravel()
-            if _w.size == L:
-                _w = np.clip(_w, lamw_floor, None)
-                if keep_idx is not None:
-                    _w = _w[keep_idx]
-                w_lam_sqrt = np.sqrt(_w).astype(np.float64, copy=False)  # (Lk,) or (L,)
-        binCounts = np.asarray(f_rd['/BinCounts'][...], dtype=int)
-
-    # Safety: empty bins should not occur, but guard anyway
-    if np.any(binCounts <= 0):
-        raise RuntimeError("Found empty bins in BinCounts; HyperCube build cannot proceed.")
     
     # Precompute velocity→pixel mapping (shared for all (s,c))
     km = _kernel_map_from_grids(tem_loglam, vel_pix)
@@ -1013,13 +998,13 @@ def build_hypercube(
         A = f[A_path] # (S,C) float64
         A_sum = f[A_sum_path] # (S,)  float64
 
+        # Number of spatial tiles (must match solver tiling)
+        n_tiles = math.ceil(S / S_chunk)
+
         # ------------------------------------------------------------
         # Build spatial component support mask (tile-based)
         # Uses LOSVD amplitudes: if A[s,c] == 0 then models[s,c,:,:] == 0
         # ------------------------------------------------------------
-
-        # Number of spatial tiles (must match solver tiling)
-        n_tiles = math.ceil(S / S_chunk)
 
         # Create /HyperCube/component_support : (n_tiles, C) uint8
         if "/HyperCube/component_support" in f:
@@ -1069,10 +1054,10 @@ def build_hypercube(
         except Exception:
             pass
 
-        # record attributes once
+        # # record attributes once
         g.attrs["norm.mode"] = norm_mode
         g.attrs["losvd_amplitude_mode"] = amp_mode
-        g.attrs["kernel_unit_area"] = True
+        # g.attrs["kernel_unit_area"] = True
 
         done, grid = _make_done_bitmap(f, S, C, P, S_chunk, C_chunk, P_chunk)
 
@@ -1093,37 +1078,7 @@ def build_hypercube(
         losvd_ds = f["/LOSVD"]
 
         masked_flag = bool(keep_idx is not None)
-        # create dataset & attrs up front (metadata writes pre-SWMR)
-        if "/HyperCube/col_energy" in f:
-            del f["/HyperCube/col_energy"]
-        E_ds = g.create_dataset("col_energy", shape=(C, P), dtype="f8",
-            chunks=(min(C,256), min(P,1024)), compression="gzip")
-        # set attrs before swmr_mode
-        E_ds.attrs["masked"] = bool(masked_flag)
-        E_ds.attrs["lambda_weights"] = bool(w_lam_sqrt is not None)
-        E_ds.attrs["lambda_weights_floor"] = 1e-6
-        E_ds.attrs["shape"] = (int(C), int(P))
-        E_ds.attrs["provenance"] = "sum_{s,λ} models^2 (mask applied)" if masked_flag else "sum_{s,λ} models^2"
-        if masked_flag and (w_lam_sqrt is not None):
-            E_ds.attrs["provenance"] = "sum_{s,λ} (√w·models)^2 over masked λ"
-        elif masked_flag:
-            E_ds.attrs["provenance"] = "sum_{s,λ} models^2 over masked λ"
-        elif (w_lam_sqrt is not None):
-            E_ds.attrs["provenance"] = "sum_{s,λ} (√w·models)^2 over all λ"
-        else:
-            E_ds.attrs["provenance"] = "sum_{s,λ} models^2 over all λ"
 
-        # --- cp_flux_ref accumulators
-        do_ref = (cp_flux_ref_mode != "off")
-        if do_ref:
-            if cp_flux_ref_mode == "mean":
-                ref_sum = np.zeros((C, P), dtype=np.float64)
-                ref_cnt = np.zeros((C, P), dtype=np.int64)
-            else:  # "median"
-                ref_acc = np.empty((C, P), dtype=object)
-                for c_ in range(C):
-                    for p_ in range(P):
-                        ref_acc[c_, p_] = _P2Median()
 
         # --- SWMR writer mode
         try:
@@ -1133,16 +1088,15 @@ def build_hypercube(
         except Exception as e:
             print(f"[SWMR] could not enable writer mode: {e}")
 
-        # Initialize global column energy accumulator E[c,p] float64
-        E_acc = np.zeros((C, P), dtype=np.float64)
+        # # Initialize global column energy accumulator E[c,p] float64
+        # E_acc = np.zeros((C, P), dtype=np.float64)
         # ------------------------------------------------------------
         # Tile-wise component energy for spatial support (ENERGY-based)
         # ------------------------------------------------------------
-        n_tiles = math.ceil(S / S_chunk)
 
-        # Accumulate energy per (tile, component)
-        # float64 but very small: (n_tiles, C)
-        E_tile_comp = np.zeros((n_tiles, C), dtype=np.float64)
+        # # Accumulate energy per (tile, component)
+        # # float64 but very small: (n_tiles, C)
+        # E_tile_comp = np.zeros((n_tiles, C), dtype=np.float64)
 
         # --- iterate tiles; skip ones marked done
         def _iter_all_tiles():
@@ -1173,33 +1127,16 @@ def build_hypercube(
             # For each (s,c) in this tile:
             for s_idx in range(s0, s1):
 
-                # --------------------------------------------
-                # GLOBAL SCALE: per-spaxel model accumulator
-                # --------------------------------------------
-                if norm_mode == "model":
-                    if masked_flag:
-                        model_sum = np.zeros((keep_idx.size,), dtype=np.float64)
-                        data_vec = np.asarray(
-                            f["/DataCube"][s_idx, keep_idx],
-                            dtype=np.float64
-                        )
-                    else:
-                        model_sum = np.zeros((L,), dtype=np.float64)
-                        data_vec = np.asarray(
-                            f["/DataCube"][s_idx, :],
-                            dtype=np.float64
-                        )
-
                 a_sum = float(A_sum[s_idx])  # scalar
                 for c_idx in range(c0, c1):
                     # 1) build unit-area kernel for (s,c)
                     H_native = np.asarray(losvd_ds[s_idx, :, c_idx],
                                          dtype=np.float64, order="C")
-                    Hk_unit = _losvd_to_unit_kernel(H_native, km)
+                    # Hk_unit = _losvd_to_unit_kernel(H_native, km)
 
                     # 2) FFT conv (centered 'same' crop on template grid)
-                    conv_td = _fft_conv_centered(T_fft_slice, Hk_unit, km, n_fft, int(T),
-                             phase_shift=phase_shift)
+                    conv_td = _fft_conv_centered(T_fft_slice, H_native, km,
+                        n_fft, int(T), phase_shift=phase_shift)
 
                     # 3) rebin AFTER convolution
                     Ycp = conv_td @ R_T  # (ΔP, L)
@@ -1210,76 +1147,18 @@ def build_hypercube(
                         # model-mode: A already encodes the desired per-(s,c) column amplitude
                         scale = float(A[s_idx, c_idx])
                     else:
-                        # data-mode: L_vec stores per-spaxel SURFACE-BRIGHTNESS (SB)
-                        # but the HyperCube models are constructed in raw detector-pixel flux units.
-                        # Convert L_vec (SB) → total raw flux by multiplying by binCounts[s_idx].
-                        # `binCounts` was read in preflight and is available here.
                         if a_sum <= 0.0 or L_vec[s_idx] <= 0.0:
                             scale = 0.0
                         else:
                             frac = float(A[s_idx, c_idx]) / np.maximum(a_sum, 1.0e-30)
                             # guard: if binCounts missing fall back to 1
-                            bs = int(binCounts[s_idx]) if ("binCounts" in locals() or "binCounts" in globals()) else 1
-                            scale = float(L_vec[s_idx]) * float(bs) * frac
+                            scale = float(L_vec[s_idx]) * frac
 
                     if scale != 0.0:
                         Ycp *= np.float32(scale)
                     else:
                         Ycp.fill(0.0)
-
-                    if scale != 0.0:
-                        Ycp *= np.float32(scale)
-                    else:
-                        Ycp.fill(0.0)
-                    # ----------------------------------------------------------
-                    # CONVERT SB → RAW FLUX PER BIN
-                    # ----------------------------------------------------------
-                    Ycp *= np.float32(binCounts[s_idx])
-
-                    # 6b) accumulate global energy E[c,p] with same λ-view:
-                    # mask if present, and apply √w if lambda_weights exist.
-                    if masked_flag:
-                        Yv = Ycp[:, keep_idx]  # (ΔP, Lk)
-                    else:
-                        Yv = Ycp               # (ΔP, L or Lk)
-
-                    if norm_mode == "model":
-                        # Sum over populations for this component
-                        model_sum += np.sum(Yv, axis=0)
-
-                    # Compute per-population contribution for this (s_idx, c_idx, P-block)
-                    if w_lam_sqrt is not None:
-                        # weighted: sum_λ (√w·Y)^2 = sum_λ (w * Y^2)
-                        e_local = np.sum(
-                            np.square(Yv, dtype=np.float64) * w_lam_sqrt[None, :],
-                            axis=1
-                        )  # (ΔP,)
-                    else:
-                        # unweighted: sum_λ Y^2
-                        e_local = np.sum(
-                            np.square(Yv, dtype=np.float64),
-                            axis=1
-                        )  # (ΔP,)
-
-                    E_acc[c_idx, p0:p1] += e_local
-                    # --- accumulate tile-wise component energy ---
-                    tile_idx = s_idx // S_chunk
-                    E_tile_comp[tile_idx, c_idx] += float(np.sum(e_local))
-
-                    # --- cp_flux_ref: per-(c,p) masked λ-sum, one sample per spaxel
-                    if do_ref:
-                        if masked_flag:
-                            s_lambda = np.sum(Ycp[:, keep_idx], axis=1, dtype=np.float64)  # (ΔP,)
-                        else:
-                            s_lambda = np.sum(Ycp, axis=1, dtype=np.float64)              # (ΔP,)
-                        if cp_flux_ref_mode == "mean":
-                            ref_sum[c_idx, p0:p1] += s_lambda
-                            ref_cnt[c_idx, p0:p1] += 1
-                        else:
-                            # median: update sketches per p
-                            for dp, val in enumerate(s_lambda):
-                                ref_acc[c_idx, p0 + dp].update(float(val))
-
+                    
                     # 7) write
                     models[s_idx, c_idx, p0:p1, 0:L] = Ycp
 
@@ -1303,78 +1182,6 @@ def build_hypercube(
             pbar.update(1)
 
         pbar.close()
-
-        E_ds[...] = E_acc
-
-        # ------------------------------------------------------------
-        # Build ENERGY-based component support mask
-        # ------------------------------------------------------------
-        if "/HyperCube/component_support_energy" in f:
-            del f["/HyperCube/component_support_energy"]
-
-        eps_energy = 1e-6   # conservative
-
-        suppE = g.create_dataset(
-            "component_support_energy",
-            shape=(n_tiles, C),
-            dtype="u1",
-            chunks=(1, min(C, 256)),
-            compression="gzip",
-            compression_opts=1,
-        )
-
-        suppE.attrs["definition"] = (
-            "component_support_energy[t,c]=1 iff "
-            "tile_energy[t,c] > eps_energy * median_c(tile_energy[t,:])"
-        )
-        suppE.attrs["eps_energy"] = float(eps_energy)
-        suppE.attrs["S_chunk"] = int(S_chunk)
-        suppE.attrs["source"] = "models energy"
-        suppE.attrs["shape"] = (int(n_tiles), int(C))
-
-        for t in range(n_tiles):
-            row = E_tile_comp[t, :]
-            pos = row[row > 0.0]
-            if pos.size == 0:
-                suppE[t, :] = 0
-                continue
-
-            med = float(np.median(pos))
-            thresh = eps_energy * med
-            suppE[t, :] = (row > thresh).astype(np.uint8)
-
-        try:
-            suppE.id.flush()
-            f.flush()
-        except Exception:
-            pass
-
-        # --- finalize cp_flux_ref
-        if do_ref:
-            if "/HyperCube/norm/cp_flux_ref" in f:
-                del f["/HyperCube/norm/cp_flux_ref"]
-            if cp_flux_ref_mode == "mean":
-                ref = np.divide(ref_sum, np.maximum(ref_cnt, 1, dtype=np.int64),
-                    dtype=np.float64)
-            else:
-                ref = np.empty((C, P), dtype=np.float64)
-                for c_ in range(C):
-                    for p_ in range(P):
-                        ref[c_, p_] = ref_acc[c_, p_].median()
-            # sanitize + floor
-            ref = np.where(np.isfinite(ref), ref, 0.0)
-            ref = np.maximum(ref, float(floor))
-            g_norm = f.require_group("/HyperCube/norm")
-            g_norm.create_dataset(
-                "cp_flux_ref", data=ref.astype(np.float64),
-                chunks=(min(C,256), min(P,1024)), compression="gzip"
-            )
-            g_norm.attrs["cp_flux_ref.mode"] = cp_flux_ref_mode
-            g_norm.attrs["masked"] = bool(masked_flag)
-            g_norm.attrs["definition"] = (
-                "per-(c,p) statistic of sum_λ models[s,c,p,λ] over spaxels; "
-                "mask applied to λ if present"
-            )
         
         g.attrs["complete"] = True
         if vel_bias_kms is not None:
@@ -1382,10 +1189,9 @@ def build_hypercube(
             g.attrs["vel_bias_note"] = "global LOSVD shift applied at build"
         g.attrs["shape"] = (S, C, P, L)
         g.attrs["chunks"] = models.chunks
-        g.attrs["cp_flux_ref_mode"] = cp_flux_ref_mode
 
         # help h5py close cleanly
-        del models, losvd_ds, done, g, E_ds
+        del models, losvd_ds, done, g, # E_ds
         try: f.flush()
         except: pass
 

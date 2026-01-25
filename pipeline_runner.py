@@ -36,16 +36,19 @@ v1.5:   Wrap `solve_global_kaczmarz_cchunk_mp` in `logger.capture_all_output`
             in `PipelineRunner.solve_all_mp_batched`. 4 December 2025
 v1.6:   Updated `solve_all_mp_batched` `warm_start` options to match `solve_all`.
             12 December 2025
-v1.7:   Read in NNLs `L2` ridge from environment variable in
+v1.7:   Read in NNLS `L2` ridge from environment variable in
             `solve_all_mp_batched`. 13 December 2025
 v1.8:   Implemented mtime-based decision for sidecar vs main file loading in
             `solve_all*` resume logic. 18 December 2025
-v1.9:   Added final elapsed time logging in `solve_all_mp_batched`. 1 January
+v1.9:   Added final elapsed time logging in `PipelineRunner.solve_all_mp_batched`. 1 January
             2026
 v1.10:  Implemented SPG to Kaczmarz workflow. 7 January 2026
 v1.11:  Store `/X_global` as 2D array always. 10 January 2026
-v1.12:  Corrected Kaczmarz polish logic in `solve_all_mp_batched`. 11 January
-            2026
+v1.12:  Corrected Kaczmarz polish logic in `PipelineRunner.solve_all_mp_batched`.
+            11 January 2026
+v1.13:  Universally removed all ad-hoc scalings;
+        Scale the NNLS ridge to the orbit prior strength in
+            `PipelineRunner.solve_all_mp_batched`. 25 January 2026
 """
 
 from __future__ import annotations
@@ -56,17 +59,15 @@ import numpy as np
 from dataclasses import dataclass
 
 from CubeFit.hdf5_manager import H5Manager, H5Dims, open_h5
-from CubeFit.hypercube_builder import build_hypercube, read_global_column_energy
+from CubeFit.hypercube_builder import build_hypercube
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
 from CubeFit.kaczmarz_solver import solve_global_kaczmarz, SolverCfg
 from CubeFit.kaczmarz_solver_cchunk_mp_nnls import (
     MPConfig, solve_global_kaczmarz_global_step_mp, solve_kaczmarz_nnls)
-    # solve_global_kaczmarz_cchunk_mp)
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
 )
-from CubeFit.nnls_patch import run_patch as _nnls_patch_run,\
-    apply_orbit_prior_to_seed
+from CubeFit.nnls_patch import run_patch as _nnls_patch_run
 from CubeFit.fit_tracker import FitTracker, NullTracker, TrackerConfig
 import CubeFit.cube_utils as cu
 from CubeFit.cube_utils import RatioCfg
@@ -325,13 +326,11 @@ class PipelineRunner:
             self.nPop   = int(dims.get("nPop",   f["/Templates"].shape[0]))
             self.nVel   = int(dims.get("nVel",   f["/LOSVD"].shape[1]))
             self.nTSpec = int(dims.get("nTSpec",
-                                 f["/Templates"].shape[1])) if "/Templates" \
-                                 in f else None
+                f["/Templates"].shape[1])) if "/Templates" in f else None
             self.has_mask = ("/Mask" in f)
             self.has_models = ("/HyperCube/models" in f)
-            self.complete = bool(f["/HyperCube"].attrs.get("complete",
-                                                           False)) \
-                            if "/HyperCube" in f else False
+            self.complete = bool(f["/HyperCube"].attrs.get(
+                "complete", False)) if "/HyperCube" in f else False
 
         logger.log(
             "[Pipeline] Initialized from HDF5: "
@@ -736,14 +735,14 @@ class PipelineRunner:
 
         elif warm_start == "nnls":
             if verbose:
-                logger.log("[Pipeline] Warm-start mode: nnls_patch seed (exact semantics)")
+                logger.log("[Pipeline] Warm-start mode: nnls_patch seed")
 
             # Mirror nnls_patch defaults: mask+lambda on, nnls solver, normalized columns, zero ridge
             res = _nnls_patch_run(
                 h5_path=self.h5_path,
                 s_sel=None,# like nnls_patch default: first min(32, S) spaxels
                 k_per_comp=24, # same default as CLI
-                pick_mode="energy",
+                pick_mode="random",
                 solver="nnls",
                 ridge=0.0,
                 use_mask=True,
@@ -753,7 +752,8 @@ class PipelineRunner:
                 write_seed=True,
                 seed_path="/Seeds/x0_nnls_patch",
                 normalize_columns=True,
-                orbit_weights=orbit_weights,
+                orbit_weights=None, # Not for the seed
+                # orbit_weights=orbit_weights,
             )
             Xcp = np.asarray(res["x_CP"], np.float64, order="C")
 
@@ -1054,16 +1054,17 @@ class PipelineRunner:
                 logger.log("[Pipeline] Warm-start mode: nnls_patch seed (exact semantics)")
 
             with logger.capture_all_output():
-                nnls_l2 = float(os.environ.get("CUBEFIT_NNLS_L2", "0.0"))
-                if not np.isfinite(nnls_l2) or nnls_l2 < 0.0:
-                    nnls_l2 = 0.0
+                lambda_orbit = float(os.environ.get("CUBEFIT_LAMBDA_ORBIT", "0.0"))
+                nnls_ridge = 0.0
+                if np.isfinite(lambda_orbit) and (lambda_orbit > 0.0):
+                    nnls_ridge = lambda_orbit * 0.25
                 res = _nnls_patch_run(
                     h5_path=self.h5_path,
                     s_sel=None, # first min(32, S) spaxels
-                    k_per_comp=24,
+                    k_per_comp=32,
                     pick_mode="energy",
                     solver="nnls",
-                    ridge=float(nnls_l2),
+                    ridge=float(nnls_ridge),
                     use_mask=True,
                     use_lambda=True,
                     lam_dset="/HyperCube/lambda_weights",

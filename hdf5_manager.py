@@ -25,6 +25,7 @@ v1.0:   Initial HDF5 design and validation. 7 September 2025
 v1.1:   Normalise all LOSVD kernels to unity on write in `populate_from_arrays`.
             10 January 2026
 v1.2:   Fixed non-flux-conservation in `_build_R_T_dense`. 22 January 2026
+v1.3:   Universally removed all ad-hoc scalings. 25 January 2026
 
 
 HDF5 manager for CubeFit.
@@ -741,19 +742,6 @@ class H5Manager:
         R_T[j,  cols] += w0
         R_T[j1, cols] += w1
 
-        # normalize columns to unity
-        colsum = np.sum(R_T, axis=0)
-        bad = (colsum == 0.0)
-        if np.any(bad):
-            # nearest-neighbour fallback
-            for l in np.where(bad)[0]:
-                jj = np.searchsorted(tem_pix, obs_pix[l], side="right") - 1
-                jj = np.clip(jj, 0, T - 1)
-                R_T[:, l] = 0.0
-                R_T[jj, l] = 1.0
-            colsum = np.sum(R_T, axis=0)
-
-        R_T /= colsum[None, :]
         return R_T.astype(np.float32)
 
     def get_spectral_grids(self) -> tuple[np.ndarray, np.ndarray]:
@@ -1134,48 +1122,48 @@ class H5Manager:
                 dtype=np.float64)  # (S,L)
             # --- Normalize LOSVD kernels to unit integral and persist norms ---
             # losvd_in has shape (S, V, C)
-            losvd_norm = losvd_in.astype(np.float64, copy=False)
+            # losvd_norm = losvd_in.astype(np.float64, copy=False)
 
-            # Sum over velocity axis (axis=1)
-            # Result shape: (S, C)
-            losvd_amp_sum = np.sum(losvd_norm, axis=1)
+            # # Sum over velocity axis (axis=1)
+            # # Result shape: (S, C)
+            # losvd_amp_sum = np.sum(losvd_norm, axis=1)
 
-            # Persist normalization factors
-            if "/HyperCube/losvd_norm" in f:
-                del f["/HyperCube/losvd_norm"]
-            ds_norm = f.create_dataset(
-                "/HyperCube/losvd_norm",
-                data=losvd_amp_sum.astype(np.float64),
-                dtype=np.float64,
-            )
-            ds_norm.attrs["semantic"] = "LOSVD integral over velocity (pre-normalization)"
-            ds_norm.attrs["normalized_to_unity"] = True
-            ds_norm.attrs["source"] = "H5Manager.populate_from_arrays"
+            # # Persist normalization factors
+            # if "/HyperCube/losvd_norm" in f:
+            #     del f["/HyperCube/losvd_norm"]
+            # ds_norm = f.create_dataset(
+            #     "/HyperCube/losvd_norm",
+            #     data=losvd_amp_sum.astype(np.float64),
+            #     dtype=np.float64,
+            # )
+            # ds_norm.attrs["semantic"] = "LOSVD integral over velocity (pre-normalization)"
+            # ds_norm.attrs["normalized_to_unity"] = True
+            # ds_norm.attrs["source"] = "H5Manager.populate_from_arrays"
 
-            # Normalize LOSVDs in-place (protect against zero mass)
-            safe = losvd_amp_sum > 0.0
-            # Expand denominator to (S, 1, C)
-            denom = losvd_amp_sum[:, None, :]
+            # # Normalize LOSVDs in-place (protect against zero mass)
+            # safe = losvd_amp_sum > 0.0
+            # # Expand denominator to (S, 1, C)
+            # denom = losvd_amp_sum[:, None, :]
 
-            # Normalize where denom > 0, else zero
-            losvd_norm = np.where(
-                denom > 0.0,
-                losvd_norm / denom,
-                0.0,
-            )
+            # # Normalize where denom > 0, else zero
+            # losvd_norm = np.where(
+            #     denom > 0.0,
+            #     losvd_norm / denom,
+            #     0.0,
+            # )
 
-            # Optional sanity check (cheap and decisive)
-            if not np.allclose(
-                np.sum(losvd_norm, axis=1)[safe],
-                1.0,
-                rtol=1e-6,
-            ):
-                raise RuntimeError("LOSVD normalization failed in populate_from_arrays")
+            # # Optional sanity check (cheap and decisive)
+            # if not np.allclose(
+            #     np.sum(losvd_in, axis=1)[safe],
+            #     1.0,
+            #     rtol=1e-6,
+            # ):
+            #     raise RuntimeError("LOSVD normalization failed in populate_from_arrays")
 
             # Write normalized LOSVDs
             _write(
                 "/LOSVD",
-                losvd_norm.astype(np.float64, copy=False),
+                losvd_in.astype(np.float64, copy=False),
                 dtype=np.float64,
             )  # (S,V,C)
 
@@ -1227,7 +1215,7 @@ class H5Manager:
             )
             self._write_guard_attrs(f, guard_info)
 
-            # ---------- NEW: write per-pixel metadata (only if provided) ----------
+            # ---------- write per-pixel metadata (only if provided) ----------
             if xpix is not None:
                 self._write_1d(
                     f, "/XPix", xpix, np.float64,
@@ -2193,9 +2181,9 @@ def live_prefit_snapshot_from_models(
             t = (v_for_k - V[il]) / denom
             Hk = (1.0 - t) * los_row[il] + t * los_row[ir]
             Hk[oob] = 0.0
-            s = Hk.sum()
-            if s > 0:
-                Hk /= s  # unit-area kernel for shape-only view
+            # s = Hk.sum()
+            # if s > 0:
+            #     Hk /= s  # unit-area kernel for shape-only view
             return v_for_k, Hk
 
         los_handles = []
@@ -2217,23 +2205,23 @@ def live_prefit_snapshot_from_models(
 
             v_for_k, Hk = _kernel_from_losvd(los, vel_pix)
             # actual per-(s,c) scale used in /HyperCube/models
-            scale_sc, mode_used, frac = _component_scale(f, int(s_idx), int(c_idx))
+            # scale_sc, mode_used, frac = _component_scale(f, int(s_idx), int(c_idx))
 
-            # native LOSVD (solid)
-            if norm_mode == "data":
-                lbl = f"(s={int(s_idx)}, c={int(c_idx)})  frac={frac:.3e}"
-            else:
-                lbl = f"(s={int(s_idx)}, c={int(c_idx)})"
+            # # native LOSVD (solid)
+            # if norm_mode == "data":
+            #     lbl = f"(s={int(s_idx)}, c={int(c_idx)})  frac={frac:.3e}"
+            # else:
+            lbl = f"(s={int(s_idx)}, c={int(c_idx)})"
             line_los, = ax_los.plot(vel_pix, los, lw=1.5, label=lbl)
             los_handles.append(line_los)
 
             # unit-area resampled kernel (dashed) — same color as LOSVD
             ax_los.plot(v_for_k, Hk, lw=1.0, ls="--", color=line_los.get_color())
 
-            # amplitude-scaled kernel on twin axis (dotted) — same color
-            if scale_sc > 0.0:
-                ax_kflux.plot(v_for_k, scale_sc * Hk, lw=1.0, ls=":",
-                            alpha=0.9, color=line_los.get_color())
+            # # amplitude-scaled kernel on twin axis (dotted) — same color
+            # if scale_sc > 0.0:
+            #     ax_kflux.plot(v_for_k, scale_sc * Hk, lw=1.0, ls=":",
+            #                 alpha=0.9, color=line_los.get_color())
 
         ax_los.set_title(f"LOSVD (native) and resampled kernel  [mode={norm_mode}]")
         ax_los.set_xlabel("velocity (km/s)")
