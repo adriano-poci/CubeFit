@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-    kaczmarz_solver_cchunk_mp_nnls.py
+    spg_nnls_solver.py
     Adriano Poci
     University of Oxford
     2025
@@ -90,6 +90,14 @@ v3.10:  Universally removed all ad-hoc scalings;
             `solve_global_kaczmarz_global_step_mp`;
         Include orbit prior completely in the cost function of the solver in
             `solve_global_kaczmarz_global_step_mp`. 25 January 2026
+v3.11:  Scale `w_target` to match total mass before applying prior in
+            `solve_global_kaczmarz_global_step_mp`;
+        Trim final `best_x` with zero-flooring in
+            `solve_global_kaczmarz_global_step_mp`. 26 January 2026
+v3.12:  Renamed module to represent change in architecture;
+        Renamed `solve_global_kaczmarz_global_step_mp` to `solve_global_spg`;
+        Added age curvature prior gradient in `solve_global_spg`. 27 January
+            2026
 """
 
 from __future__ import annotations, print_function
@@ -427,6 +435,33 @@ def softbox_params_smooth(eq: int, E: int) -> tuple[float, float]:
 
 # ------------------------------------------------------------------------------
 
+def orbit_age_smoothness_grad(x: np.ndarray) -> np.ndarray:
+    """
+    Per-orbit age smoothness gradient.
+    x has shape (C, P).
+    Returns gradient with same shape.
+    Penalizes (x[c,p+1] - x[c,p])^2 for each orbit c.
+    """
+    C, P = x.shape
+    g = np.zeros_like(x)
+
+    # forward differences along age axis
+    d = x[:, 1:] - x[:, :-1]    # shape (C, P-1)
+
+    # left boundary
+    g[:, 0] -= d[:, 0]
+
+    # interior
+    if P > 2:
+        g[:, 1:-1] += d[:, :-1] - d[:, 1:]
+
+    # right boundary
+    g[:, -1] += d[:, -1]
+
+    return g
+
+# ------------------------------------------------------------------------------
+
 def population_age_curvature_grad(
     x_cp: np.ndarray,
     pop_shape: tuple[int, int, int],
@@ -481,7 +516,7 @@ def population_age_curvature_grad(
 
 # ------------------------------------------------------------------------------
 
-def solve_global_kaczmarz_global_step_mp(
+def solve_global_spg(
     h5_path: str,
     cfg: MPConfig,
     *,
@@ -634,6 +669,17 @@ def solve_global_kaczmarz_global_step_mp(
 
     if cfg.project_nonneg:
         np.maximum(x, 0.0, out=x)
+
+
+    if w_target is not None:
+        # scale prior to match the current total mass scale in x
+        total_mass_est = float(np.sum(x))
+        # if x is all zeros at start, use a safe proxy: global ||Y|| or 1.0
+        if total_mass_est <= 0.0:
+            # fallback: scale to total observed flux (or 1.0)
+            total_mass_est = max(1.0, Y_glob_norm)  # Y_glob_norm computed earlier
+        w_target = w_target * total_mass_est
+        print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)
 
     # ------------------------------------------------------------
     # Multiprocessing bands
@@ -830,6 +876,13 @@ def solve_global_kaczmarz_global_step_mp(
                 g += lambda_pop * g_pop
             else:
                 g_pop = None
+            # ---- per-orbit age smoothness prior ----
+            lambda_age = float(os.environ.get("CUBEFIT_LAMBDA_AGE", "0.0"))
+            if lambda_age > 0.0:
+                g_age = orbit_age_smoothness_grad(x)
+                g += lambda_age * g_age
+            else:
+                g_age = None
 
             # ---------------- Build safe diagonal preconditioner ----------------
             D_raw = D_tot.copy()  # per-col denom (may have zeros)
@@ -856,8 +909,11 @@ def solve_global_kaczmarz_global_step_mp(
             freeze = (D <= 0.0) | (~np.isfinite(D))
 
             if g_pop is not None:
-                pop_eps = 1e-12 * max(np.max(np.abs(g_pop)), 1.0)
+                pop_eps = 1e-12 * builtins.max(np.max(np.abs(g_pop)), 1.0)
                 freeze &= (np.abs(g_pop) <= pop_eps)
+            if g_age is not None:
+                age_eps = 1e-12 * builtins.max(np.max(np.abs(g_age)), 1.0)
+                freeze &= (np.abs(g_age) <= age_eps)
 
             if np.any(freeze):
                 g = g.copy()
@@ -988,6 +1044,9 @@ def solve_global_kaczmarz_global_step_mp(
                 f"active={active_orbits.size}/{C}",
                 flush=True,
             )
+        
+        th = cu.zero_floor_inplace(best_x, rel_tol=1e-25, abs_tol=0.0)
+        print(f"[SPG] zero-floor applied: threshold={th:.3e}", flush=True)
 
         elapsed = time.perf_counter() - t0
         return best_x, dict(

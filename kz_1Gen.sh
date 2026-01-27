@@ -12,10 +12,10 @@
 #SBATCH -D "/data/phys-gal-dynamics/phys2603/muse"
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_1Gen.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_1Gen.log" --open-mode=append
-#SBATCH -p short
+#SBATCH -p medium
 
 #SBATCH --job-name="CubeFit_1Gen"
-#SBATCH --time=0-12:00
+#SBATCH --time=0-24:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=150G
@@ -37,8 +37,8 @@ export OMP_DYNAMIC=FALSE
 export OMP_PROC_BIND=false
 unset GOMP_CPU_AFFINITY
 export KMP_AFFINITY=disabled
-export MKL_NUM_THREADS=1            # harmless, prevents surprise MKL use elsewhere
-export NUMEXPR_NUM_THREADS=1        # avoid hidden extra threads
+export MKL_NUM_THREADS=1 # harmless, prevents surprise MKL use elsewhere
+export NUMEXPR_NUM_THREADS=1 # avoid hidden extra threads
 
 # File descriptors
 ulimit -n 8192

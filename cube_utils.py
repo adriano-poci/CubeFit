@@ -11,6 +11,7 @@ v1.1:   Added `apply_global_hypercube_scale_inplace` to compute and store a
             during fitting. 8 January 2026
 v1.2:   Defined all the useful `muse` functions including `_oneTimeSpec` for
             self-containment. 25 January 2026
+v1.3:   Added `zero_floor_inplace`. 26 January 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -2971,5 +2972,16 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     return [decDir, cDirs, cKeys, nComp, teLL, cLnGrid, histBinSize,
         vScale, RZ, spLL, cLaGrid, lmin, lmax, umetals, uages, ualphas, pixOff]
+
+# ------------------------------------------------------------------------------
+
+def zero_floor_inplace(x_arr, rel_tol=1e-12, abs_tol=0.0):
+    """
+    Zero out entries of x_arr that are < max(abs_tol, rel_tol*max(|x|)).
+    """
+    maxv = float(np.max(np.abs(x_arr))) if x_arr.size else 0.0
+    thresh = max(abs_tol, rel_tol * max(1.0, maxv))
+    x_arr[np.abs(x_arr) <= thresh] = 0.0
+    return thresh
 
 # ------------------------------------------------------------------------------

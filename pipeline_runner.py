@@ -49,6 +49,7 @@ v1.12:  Corrected Kaczmarz polish logic in `PipelineRunner.solve_all_mp_batched`
 v1.13:  Universally removed all ad-hoc scalings;
         Scale the NNLS ridge to the orbit prior strength in
             `PipelineRunner.solve_all_mp_batched`. 25 January 2026
+v1.14:  Use renamed module. 27 January 2026
 """
 
 from __future__ import annotations
@@ -62,8 +63,8 @@ from CubeFit.hdf5_manager import H5Manager, H5Dims, open_h5
 from CubeFit.hypercube_builder import build_hypercube
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
 from CubeFit.kaczmarz_solver import solve_global_kaczmarz, SolverCfg
-from CubeFit.kaczmarz_solver_cchunk_mp_nnls import (
-    MPConfig, solve_global_kaczmarz_global_step_mp, solve_kaczmarz_nnls)
+from CubeFit.spg_nnls_solver import (
+    MPConfig, solve_global_spg, solve_kaczmarz_nnls)
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
 )
@@ -1184,7 +1185,7 @@ class PipelineRunner:
 
         try:
             with logger.capture_all_output():
-                x_solver, stats = solve_global_kaczmarz_global_step_mp(
+                x_solver, stats = solve_global_spg(
                     self.h5_path,
                     cfg,
                     orbit_weights=orbit_weights,

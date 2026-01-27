@@ -608,7 +608,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=6,
+        epochs=4,
         # x0=x0,
         lr=0.1,
         project_nonneg=True,
