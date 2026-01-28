@@ -85,6 +85,7 @@ def main():
     os.environ["CUBEFIT_LAMBDA_ORBIT"] = str(5e-5)
     os.environ["CUBEFIT_LAMBDA_POP"] = str(5e-5)
     os.environ["CUBEFIT_LAMBDA_AGE"] = str(5e-5)
+    os.environ["CUBEFIT_SEED_JITTER"] = str(1)
 
     if args.ncomp is not None:
         props['nCuts'] = args.ncomp

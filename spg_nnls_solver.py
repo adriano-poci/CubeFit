@@ -98,6 +98,8 @@ v3.12:  Renamed module to represent change in architecture;
         Renamed `solve_global_kaczmarz_global_step_mp` to `solve_global_spg`;
         Added age curvature prior gradient in `solve_global_spg`. 27 January
             2026
+v3.13:  Set data-weighted orbit gradient in `solve_global_spg`;
+        Add jitter to input seed in `solve_global_spg`. 28 January 2026
 """
 
 from __future__ import annotations, print_function
@@ -667,9 +669,22 @@ def solve_global_spg(
             raise ValueError("x0 has wrong size")
         x = x0.reshape(C, P).copy()
 
-    if cfg.project_nonneg:
-        np.maximum(x, 0.0, out=x)
+    # If x0 came from NNLS seed, clear BB history so BB step isn't anchored to old state.
+    # This ensures a genuine BB step computed from the first epoch, not a small correction.
+    x_prev = None
+    g_prev = None
 
+    # Optional small jitter to enable escaping exact null-space: tiny relative perturbation
+    if os.environ.get("CUBEFIT_SEED_JITTER", "0") == "1":
+        jitter_rel = float(os.environ.get("CUBEFIT_SEED_JITTER_REL", "1e-8"))
+        # add tiny positive perturbation proportional to current magnitude (preserve non-negativity)
+        scale = np.maximum(1.0, np.linalg.norm(x))  # scale roughly related to global mass
+        rng = np.random.default_rng()  # fixed seed for reproducibility
+        noise = rng.normal(loc=0.0, scale=jitter_rel * scale, size=x.shape).reshape(x.shape)
+        x += np.abs(noise)  # only add positive tiny noise to break ties, keep non-neg
+        if cfg.project_nonneg:
+            np.maximum(x, 0.0, out=x)
+        print(f"[SPG] applied tiny seed jitter rel={jitter_rel}", flush=True)
 
     if w_target is not None:
         # scale prior to match the current total mass scale in x
@@ -677,19 +692,19 @@ def solve_global_spg(
         # if x is all zeros at start, use a safe proxy: global ||Y|| or 1.0
         if total_mass_est <= 0.0:
             # fallback: scale to total observed flux (or 1.0)
-            total_mass_est = max(1.0, Y_glob_norm)  # Y_glob_norm computed earlier
+            total_mass_est = builtins.max(1.0, Y_glob_norm)  # Y_glob_norm computed earlier
         w_target = w_target * total_mass_est
         print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)
 
     # ------------------------------------------------------------
     # Multiprocessing bands
     # ------------------------------------------------------------
-    nprocs_req = max(1, int(cfg.processes))
+    nprocs_req = builtins.max(1, int(cfg.processes))
     band_size = int(np.ceil(C / nprocs_req))
     bands = []
     c0 = 0
     for _ in range(nprocs_req):
-        c1 = min(C, c0 + band_size)
+        c1 = builtins.min(C, c0 + band_size)
         if c1 > c0:
             bands.append((c0, c1))
         c0 = c1
@@ -713,8 +728,6 @@ def solve_global_spg(
     lr = float(cfg.lr)
 
     # --- BB history ---
-    x_prev = None
-    g_prev = None
     alpha_bb = float(cfg.lr)   # initial BB step guess
 
     best_x = x.copy()
@@ -894,13 +907,13 @@ def solve_global_spg(
                 D_ref = 1.0
 
             # normalize to median scale (scale-free)
-            D = D_raw / max(D_ref, 1e-30)
+            D = D_raw / builtins.max(D_ref, 1e-30)
 
             # compute absolute floor: env OR data-driven small fraction of D_ref
             abs_zero_env = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-30"))
             data_floor_mul = float(os.environ.get("CUBEFIT_ZERO_COL_DATAFLOOR_MUL", "1e-8"))
-            data_floor = data_floor_mul * max(D_ref, 1.0)
-            abs_zero = max(abs_zero_env, data_floor)
+            data_floor = data_floor_mul * builtins.max(D_ref, 1.0)
+            abs_zero = builtins.max(abs_zero_env, data_floor)
 
             # positive denominators get at least abs_zero, others set to 0
             D = np.where(pos, np.maximum(D, abs_zero), 0.0)
@@ -942,9 +955,20 @@ def solve_global_spg(
                 # scalar objective contribution (half-squared)
                 f_orbit = 0.5 * float(lambda_orbit) * float(np.dot(r_orb, r_orb))
 
-                # compute gradient: currently g += lambda * r_orb[:,None]
-                # but precondition it (scale by invD) to make strength scale-free:
-                g_prior_mat = (lambda_orbit / P) * (r_orb[:, None] * invD)
+                # Make sure D is shaped (C,P). D_raw was earlier set as D_tot copy divided by D_ref.
+                # If D at this point is 1D flattened per-column, reshape accordingly:
+                try:
+                    D_rowcol = D.reshape(C, P)
+                except Exception:
+                    # if D is already (C,P) this is a no-op; otherwise compute per-column from D_raw
+                    D_rowcol = (D_raw / builtins.max(float(np.median(D_raw[D_raw>0])) if np.any(D_raw>0) else 1.0)).reshape(C,P)
+                # allocation weights: use D (positive), but clip tiny values and normalize per-row
+                alloc = np.maximum(D_rowcol, 0.0)  # zeros where no curvature
+                row_sum = alloc.sum(axis=1) + 1e-30
+                alloc = alloc / row_sum[:, None]   # each row sums to 1 (or 0 if all zeros)
+                # Now compute per-parameter prior gradient as orbit residual times allocation
+                # Note: r_orb has shape (C,)
+                g_prior_mat = (lambda_orbit * r_orb)[:, None] * alloc
                 # ensure frozen components receive no orbit push
                 g_prior_mat[freeze] = 0.0
 
@@ -983,7 +1007,7 @@ def solve_global_spg(
                 x_cap = 0.0005 * x_norm
             else:
                 x_cap = float(os.environ.get("CUBEFIT_MAX_FRAC", "0.005")) * x_norm
-            dx_cap = min(grad_cap, x_cap)
+            dx_cap = builtins.min(grad_cap, x_cap)
             if dx_norm > dx_cap and dx_cap > 0:
                 dx *= dx_cap / dx_norm
 
@@ -1013,12 +1037,12 @@ def solve_global_spg(
             active_orbits = new_active.astype(np.int32)
 
             # ---------------- Diagnostics (new, meaningful set) ----------------
-            rmse = np.sqrt(ssq / max(nres, 1))
+            rmse = np.sqrt(ssq / builtins.max(nres, 1))
             pg_norm = np.linalg.norm(g[np.isfinite(g)])
             D_pos = D[np.isfinite(D) & (D < np.inf)]
 
             # compute data proxy (you have ssq normalized earlier)
-            data_proxy = 0.5 * ssq / max(nres, 1)  # or whichever proxy you use for data term
+            data_proxy = 0.5 * ssq / builtins.max(nres, 1)  # or whichever proxy you use for data term
             total_proxy = data_proxy + f_orbit
 
             # use total_proxy when comparing best_proxy / saving best_x

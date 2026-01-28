@@ -1023,6 +1023,7 @@ class PipelineRunner:
 
             # Fallback: seed (optional but robust).
             seed_used = False
+            x0_effective = None
             if x0_effective is None:
                 seed_path = os.environ.get("CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch")
                 x_seed, src_seed = self._read_seed_from_h5(
