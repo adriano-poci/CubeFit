@@ -2225,8 +2225,8 @@ def compare_orbit_vs_solution(
     ax2 = fig.add_subplot(1,2,2)
     ax2.scatter(log_ratio_ref[mask], log_ratio_sol[mask], s=14)
     lim = (
-        builtins.min(log_ratio_ref.min(), log_ratio_sol.min()),
-        builtins.max(log_ratio_ref.max(), log_ratio_sol.max()),
+        builtins.min(log_ratio_ref[mask].min(), log_ratio_sol[mask].min()),
+        builtins.max(log_ratio_ref[mask].max(), log_ratio_sol[mask].max()),
     )
     ax2.plot(lim, lim, lw=1.0)
     ax2.set_xlabel("log(w_c / w_ref)")

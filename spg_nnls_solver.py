@@ -99,7 +99,10 @@ v3.12:  Renamed module to represent change in architecture;
         Added age curvature prior gradient in `solve_global_spg`. 27 January
             2026
 v3.13:  Set data-weighted orbit gradient in `solve_global_spg`;
-        Add jitter to input seed in `solve_global_spg`. 28 January 2026
+        Add jitter to input seed in `solve_global_spg`;
+        Added `diffuse_seed_full_CP` to diffuse NNLS seed;
+        Added soft projection to avoid flooring SFH in `solve_global_spg`. 28
+            January 2026
 """
 
 from __future__ import annotations, print_function
@@ -518,6 +521,64 @@ def population_age_curvature_grad(
 
 # ------------------------------------------------------------------------------
 
+def diffuse_seed_full_CP(
+    seed_cp: np.ndarray,
+    sigma_c: float,
+    sigma_p: float,
+    *,
+    eps: float = 1e-30,
+) -> np.ndarray:
+    """
+    Diffuse a sparse NNLS seed on the full (C,P) grid using a separable
+    Gaussian kernel in orbit (c) and population (p).
+
+    Parameters
+    ----------
+    seed_cp : ndarray (C,P)
+        NNLS seed with zeros in non-sampled locations.
+    sigma_c : float
+        Gaussian width in orbit index units.
+    sigma_p : float
+        Gaussian width in population index units.
+
+    Returns
+    -------
+    seed_support : ndarray (C,P)
+        Smooth, positive field encoding proximity to NNLS seed support.
+        Normalized per-row to max=1.
+    """
+    C, P = seed_cp.shape
+
+    # Early exit: no seed information
+    if not np.any(seed_cp > 0):
+        return np.zeros_like(seed_cp)
+
+    # Orbit kernel
+    c_idx = np.arange(C, dtype=np.float64)
+    dc = c_idx[:, None] - c_idx[None, :]
+    Kc = np.exp(-0.5 * (dc / max(sigma_c, eps)) ** 2)
+
+    # Population kernel
+    p_idx = np.arange(P, dtype=np.float64)
+    dp = p_idx[:, None] - p_idx[None, :]
+    Kp = np.exp(-0.5 * (dp / max(sigma_p, eps)) ** 2)
+
+    # Convolution: Kc @ seed @ Kp
+    seed_support = Kc @ seed_cp @ Kp
+
+    # Normalize per orbit so max=1 (scale-free gating)
+    row_max = seed_support.max(axis=1, keepdims=True)
+    seed_support = np.divide(
+        seed_support,
+        row_max,
+        out=np.zeros_like(seed_support),
+        where=row_max > eps,
+    )
+
+    return seed_support
+
+# ------------------------------------------------------------------------------
+
 def solve_global_spg(
     h5_path: str,
     cfg: MPConfig,
@@ -695,6 +756,23 @@ def solve_global_spg(
             total_mass_est = builtins.max(1.0, Y_glob_norm)  # Y_glob_norm computed earlier
         w_target = w_target * total_mass_est
         print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)
+    # ------------------------------------------------------------
+    # Build seed-support field for SPG update gating
+    # ------------------------------------------------------------
+    seed_support = None
+    if x0 is not None:
+        x_seed_cp = x.copy()   # x currently holds the NNLS seed
+        sigma_c = float(os.environ.get("CUBEFIT_SEED_SIGMA_C", "2.0"))
+        sigma_p = float(os.environ.get("CUBEFIT_SEED_SIGMA_P", "2.0"))
+        seed_support = diffuse_seed_full_CP(
+            x_seed_cp,
+            sigma_c=sigma_c,
+            sigma_p=sigma_p,
+        )
+        print(
+            f"[SPG] built seed-support (sigma_c={sigma_c}, sigma_p={sigma_p})",
+            flush=True,
+        )
 
     # ------------------------------------------------------------
     # Multiprocessing bands
@@ -968,7 +1046,7 @@ def solve_global_spg(
                 alloc = alloc / row_sum[:, None]   # each row sums to 1 (or 0 if all zeros)
                 # Now compute per-parameter prior gradient as orbit residual times allocation
                 # Note: r_orb has shape (C,)
-                g_prior_mat = (lambda_orbit * r_orb)[:, None] * alloc
+                g_prior_mat = (lambda_orbit * r_orb / float(P))[:, None] * alloc
                 # ensure frozen components receive no orbit push
                 g_prior_mat[freeze] = 0.0
 
@@ -996,6 +1074,41 @@ def solve_global_spg(
             # ensure descent
             if np.vdot(dx, g) > 0.0:
                 dx = -dx
+
+            # ------------------------------------------------------------
+            # Soft seed- and data-aware projection of SPG step
+            # ------------------------------------------------------------
+            dx_mat = dx.reshape(C, P)
+
+            # Data support from curvature (already computed as D)
+            D_rowcol = D.reshape(C, P)
+            D_ref_local = builtins.max(D_ref, 1e-30)
+            support_data = D_rowcol / D_ref_local
+            support_data /= (support_data.max(axis=1, keepdims=True) + 1e-30)
+
+            # Combine with seed support (if available)
+            if seed_support is not None:
+                # trust weights (both dimensionless, scale-free)
+                seed_trust = float(os.environ.get("CUBEFIT_SEED_TRUST", "1.0"))
+                data_trust = float(os.environ.get("CUBEFIT_DATA_TRUST", "1.0"))
+
+                support = np.maximum(
+                    seed_trust * seed_support,
+                    data_trust * support_data,
+                )
+            else:
+                support = support_data
+
+            # Normalize per row to [0,1]
+            support /= (support.max(axis=1, keepdims=True) + 1e-30)
+
+            # Soft attenuation (never fully zero unless both supports zero)
+            min_allow = float(os.environ.get("CUBEFIT_PROJ_SOFT_MIN", "0.05"))
+            atten = min_allow + (1.0 - min_allow) * support
+
+            dx_mat *= atten
+            dx_mat[freeze] = 0.0   # frozen bins stay frozen
+            dx = dx_mat
 
             dx_norm = np.linalg.norm(dx)
             g_norm = np.linalg.norm(g)

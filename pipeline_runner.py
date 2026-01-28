@@ -1064,7 +1064,7 @@ class PipelineRunner:
                     h5_path=self.h5_path,
                     s_sel=None, # first min(32, S) spaxels
                     k_per_comp=32,
-                    pick_mode="energy",
+                    pick_mode="random",
                     solver="nnls",
                     ridge=float(nnls_ridge),
                     use_mask=True,
