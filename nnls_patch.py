@@ -58,6 +58,8 @@ v1.0:   19 December 2025
 v1.1:   Universally removed all ad-hoc scalings;
         Added smooth regularisation using orbit prior in
             `_global_nnls_workingset`. 25 January 2026
+v2.0:   Refactored to use OSQP QP solver for exact equality constraints. 31
+            January 2026
 """
 
 
@@ -66,6 +68,8 @@ import os, math, pathlib as plp, builtins
 from typing import Optional, List, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
+import scipy.sparse as sps
+import osqp
 from tqdm import tqdm
 import argparse
 
@@ -312,59 +316,24 @@ def _filter_by_coherence(Bw, colnorm_all, keep_idx, cand_idx, rho_max=0.995):
     ok = np.all(coh <= float(rho_max), axis=0)                # (Kcand,)
     return np.array(cand_idx, dtype=np.int64)[ok]
 
-def _prune_and_resolve_if_needed(Bw, yw, keep, x, colnorm_all, rho_max,
-                                 solver, ridge, normalize_columns):
-    """
-    If the kept set is still highly coherent, prune greedily (keep big coeffs,
-    drop new ones that exceed rho_max w.r.t. already-kept), then re-solve.
-    """
-    if len(keep) <= 1:
-        return x, keep
-
-    A = Bw[:, keep] / colnorm_all[keep]
-    G = np.abs(A.T @ A)
-    np.fill_diagonal(G, 0.0)
-    mu = float(np.max(G))
-    print(f"[ws-NNLS] max coherence among kept = {mu:.6f}")
-    if mu <= float(rho_max):
-        return x, keep
-
-    # Greedy prune by descending coefficient magnitude
-    order = np.argsort(x[keep])[::-1]
-    keep_sorted = np.array(keep, dtype=np.int64)[order]
-    new_keep = []
-    for j in keep_sorted:
-        if len(new_keep) == 0:
-            new_keep.append(j)
-            continue
-        # test coherence vs new_keep
-        j_ok = _filter_by_coherence(Bw, colnorm_all, new_keep, [j], rho_max=rho_max)
-        if j_ok.size == 1:
-            new_keep.append(j)
-
-    new_keep = np.array(sorted(set(new_keep)), dtype=np.int64)
-    if new_keep.size == keep.size:
-        return x, keep
-
-    print(f"[ws-NNLS] prune: {keep.size} → {new_keep.size} (re-solve)")
-    x_new = np.zeros_like(x)
-    x_sub = _solve_nnls(Bw[:, new_keep], yw, solver=solver, max_iter=400,
-        ridge=float(ridge), normalize_columns=bool(normalize_columns))
-    x_new[new_keep] = x_sub
-    return x_new, new_keep
-
 # ------------------------------------------------------------------------------
 
-def _global_nnls_workingset(Bw, yw, col_map,
-                            orbit_weights=None,
-                            k0_per_comp=32, kincr_per_comp=16, rounds=4,
-                            solver="nnls", ridge=1e-2, normalize_columns=True,
-                            rho_max=0.995):
+def _global_nnls_workingset(Bw, yw, col_map, orbit_weights=None,
+        k0_per_comp=32, kincr_per_comp=16, rounds=4, rho_max=0.995):
     """
     Fast global NNLS via a small working set with coherence control.
     Returns (x_full, keep_idx).
     """
-
+    # Orbit target must be provided for exact-constraint NNLS
+    if orbit_weights is not None:
+        w_target = np.asarray(orbit_weights, dtype=np.float64).ravel()
+        w_sum = w_target.sum()
+        if w_sum <= 0:
+            raise ValueError("orbit_weights sum must be > 0")
+        # scale is arbitrary here; use unity mass
+        w_target = w_target / w_sum
+    else:
+        w_target = None
 
     K = int(Bw.shape[1])
     colnorm_all = np.linalg.norm(Bw, axis=0)
@@ -389,32 +358,21 @@ def _global_nnls_workingset(Bw, yw, col_map,
     x = np.zeros(K, dtype=np.float64)
 
     for r in range(int(rounds)):
-        # solve on current working set
         Bw_sub = Bw[:, keep]
+        yw_sub = yw
+        col_map_sub = [col_map[j] for j in keep]
 
-        if orbit_weights is not None:
-            eps = 1e-15
-
-            # per-orbit Tikhonov: lambda_j = ridge_patch / w_j^2
-            reg = np.sqrt(ridge) / (orbit_weights[keep] + eps)
-
-            Bw_aug = np.vstack([Bw_sub, np.diag(reg)])
-            yw_aug = np.concatenate([yw, np.zeros_like(reg)])
-
-            x_sub = _solve_nnls(
-                Bw_aug, yw_aug,
-                solver=solver, max_iter=500,
-                ridge=0.0,                      # already handled explicitly
-                normalize_columns=bool(normalize_columns)
-            )
-        else:
-            x_sub = _solve_nnls(
-                Bw_sub, yw,
-                solver=solver, max_iter=500,
-                ridge=float(ridge),
-                normalize_columns=bool(normalize_columns)
-            )
-
+        x_sub, info = _solve_nnls_with_orbit_equality_qp_osqp(
+            Bw_sub,
+            yw_sub,
+            col_map_sub,
+            w_target=w_target,
+            eps_diag=1e-8,
+            osqp_max_iter=200000,
+            osqp_verbose=False,
+        )
+        print("[ws-NNLS-QP] OSQP status:", info.get("status"),
+            "iter:", info.get("iter"))
         x.fill(0.0)
         x[keep] = x_sub
 
@@ -448,135 +406,150 @@ def _global_nnls_workingset(Bw, yw, col_map,
         if keep.size >= K:
             break  # safety
 
-    # optional prune and re-solve if coherence still high
-    x, keep = _prune_and_resolve_if_needed(Bw, yw, keep, x, colnorm_all,
-        rho_max, solver, ridge, normalize_columns)
-
     # pre-projection residual (what you already have)
     res_w_pre = float(np.linalg.norm(Bw @ x - yw))
     print(f"[ws-NNLS] rounds={r+1} support={keep.size}/{K}  "
-        f"||Bw x - yw||(pre)={res_w_pre:.3g}")
-
-    # ---- amplitude projection (UNWEIGHTED) ----
-    m = Bw @ x # model prediction on masked wavelengths
-    num = float(np.dot(m, yw))
-    den = float(np.dot(m, m))
-
-    if den > 0.0:
-        alpha = num / den
-    else:
-        alpha = 0.0
-
-    x *= alpha
-
-    # post-projection residual (what the downstream pipeline will see)
-    res_w_post = float(np.linalg.norm(Bw @ x - yw))
-    print(f"[ws-NNLS] amplitude alpha={alpha:.6g}  "
-        f"||Bw x - yw||(post)={res_w_post:.3g}")
+        f"||Bw x - yw||={res_w_pre:.3g}")
 
     return x, keep
 
 # ------------------------------------------------------------------------------
 
-def _solve_nnls(Bw: np.ndarray, yw: np.ndarray, solver="nnls", max_iter=200, ridge=0.0,
-                normalize_columns: bool = True) -> np.ndarray:
+def _solve_nnls_with_orbit_equality_qp_osqp(
+    Bw_sub: np.ndarray,
+    yw_sub: np.ndarray,
+    col_map_sub: list[tuple[int,int]],
+    w_target: np.ndarray | None,
+    *,
+    eps_diag: float = 1e-8,
+    osqp_max_iter: int = 200000,
+    osqp_verbose: bool = False,
+    time_limit: float | None = None,
+):
     """
-    Solve min ||Bw x - yw||_2 subject to x>=0.
-    If normalize_columns, solve on Bn = Bw / col_norm, then map back via x = z / col_norm.
+    One-shot QP: minimize 0.5*x'Qx + p'x  s.t.  R x = w_c_sub  and x >= 0
+    where Q = Bw_sub.T Bw_sub, p = -Bw_sub.T yw_sub.
+
+    Parameters
+    ----------
+    Bw_sub : (R, Ksub) float64
+      Weighted design matrix restricted to the working set.
+    yw_sub : (R,) float64
+      Weighted right-hand side.
+    col_map_sub : list of (c,p) pairs, length Ksub
+      Map of each column to its component.
+    w_target : (C_full,) or None
+      Full orbit target array (length C_full) in same mass units as x.
+      Only components appearing in col_map_sub will be constrained.
+    eps_diag : float
+      Small diagonal regularizer added to Q to ensure PDness.
+    osqp_max_iter : int
+      OSQP iteration cap.
+    time_limit : float | None
+      OSQP time limit in seconds (None = disabled).
+
+    Returns
+    -------
+    x : ndarray (Ksub,)
+      Non-negative solution satisfying equality constraints (to solver tolerances).
+    info : dict
+      OSQP solver info dict (objective, status, iterations, solve_time)
     """
-    K = int(Bw.shape[1])
-    if normalize_columns:
-        col_norm = np.linalg.norm(Bw, axis=0)
-        col_norm = np.where(col_norm > 0.0, col_norm, 1.0)
-        Bn = Bw / col_norm
+    # defensive casts
+    Bw_sub = np.asarray(Bw_sub, dtype=np.float64, order="C")
+    yw_sub = np.asarray(yw_sub, dtype=np.float64).ravel()
+    Ksub = int(Bw_sub.shape[1])
+
+    # Build Q and p (use sparse csc for OSQP)
+    # Q = Bw_sub.T @ Bw_sub
+    Q = Bw_sub.T @ Bw_sub
+    # regularize tiny diagonal to ensure PD numerical stability
+    if eps_diag > 0:
+        Q = Q + eps_diag * np.eye(Ksub, dtype=np.float64)
+    P = sps.csc_matrix((Q + Q.T) * 0.5)  # ensure symmetry
+
+    q = - (Bw_sub.T @ yw_sub)  # linear term
+
+    # Build equality constraint matrix R (rows = #constrained components)
+    # Map components in col_map_sub -> unique component list
+    comp_list = np.array([int(c) for (c, p) in col_map_sub], dtype=np.int64)
+    unique_comps, inv_idx = np.unique(comp_list, return_inverse=True)
+    Csub = unique_comps.size
+
+    if (w_target is None) or (Csub == 0):
+        # fallback: no equality constraints; just solve plain NNLS QP with x>=0
+        # Build A = I, bounds 0..+inf
+        A = sps.identity(Ksub, format="csc")
+        l = np.zeros(Ksub, dtype=np.float64)
+        u = np.full(Ksub, np.inf, dtype=np.float64)
     else:
-        col_norm = np.ones(K, dtype=np.float64)
-        Bn = Bw
+        # equality rows: for each component in unique_comps, put ones where
+        # column belongs to that component
+        rows = []
+        cols = []
+        data = []
+        for j in range(Ksub):
+            ri = inv_idx[j]  # row index in 0..Csub-1
+            rows.append(ri)
+            cols.append(j)
+            data.append(1.0)
+        R = sps.csr_matrix((data, (rows, cols)), shape=(Csub, Ksub), dtype=np.float64)
 
-    if solver == "nnls":
-        from scipy.optimize import nnls
-        try:
-            z, _ = nnls(Bn, yw)              # solve on normalized system
-            return z / col_norm               # map back: x = z / ||Bw[:,j]||
-        except Exception as e:
-            # Lawson–Hanson hit a singular AtA[P,P]. Fall back to a stable PG solve on Bn.
-            # Lightweight projected gradient on normalized system -> z, then x = z/col_norm
-            # (same stopping as your PG branch, but inline to avoid re-normalizing twice)
-            K = int(Bn.shape[1])
-            z = np.zeros(K, dtype=np.float64)
-            L_est = float(np.max(np.sum(Bn*Bn, axis=0))) + float(ridge)
-            L_est = L_est if np.isfinite(L_est) and L_est > 0.0 else 1.0
-            step = 1.0 / L_est
-            for _ in range(int(np.minimum(max_iter, 400))):
-                r = Bn @ z - yw
-                g = Bn.T @ r + float(ridge) * z
-                z_try = np.maximum(0.0, z - step * g)
-                r_try = Bn @ z_try - yw
-                f_old = 0.5 * float(r @ r)     + 0.5 * float(ridge) * float(z @ z)
-                f_new = 0.5 * float(r_try @ r_try) + 0.5 * float(ridge) * float(z_try @ z_try)
-                bt = 0
-                while f_new > f_old and bt < 8:
-                    step *= 0.5
-                    z_try = np.maximum(0.0, z - step * g)
-                    r_try = Bn @ z_try - yw
-                    f_new = 0.5 * float(r_try @ r_try) + 0.5 * float(ridge) * float(z_try @ z_try)
-                    bt += 1
-                z = z_try
-                if np.linalg.norm(g, ord=np.inf) * step < 1e-9:
-                    break
-            return z / col_norm
+        # Now append identity rows to enforce x >= 0 via linear constraints:
+        I = sps.identity(Ksub, format="csr", dtype=np.float64)
 
-    if solver == "lsq":
-        from scipy.optimize import lsq_linear
-        if ridge > 0.0:
-            I = np.sqrt(ridge) * np.eye(K, dtype=np.float64)
-            Bw_aug = np.vstack([Bn, I])
-            yw_aug = np.concatenate([yw, np.zeros(K, dtype=np.float64)], axis=0)
-            res = lsq_linear(Bw_aug, yw_aug, bounds=(0.0, np.inf), method="trf",
-                             max_iter=int(max_iter), verbose=0)
-        else:
-            res = lsq_linear(Bn, yw, bounds=(0.0, np.inf), method="trf",
-                             max_iter=int(max_iter), verbose=0)
-        return np.maximum(0.0, res.x) / col_norm
+        # Stack R (eq) on top of I (inequality for bounds)
+        A = sps.vstack([R, I], format="csc")
 
-    # simple PGD with backtracking (supports ridge)
-    xz = np.zeros(K, dtype=np.float64)  # this is 'z' in the normalized space
-    L_est = float((Bn**2).sum(axis=0).max() + ridge) or 1.0
-    step = 1.0 / L_est
-    for _ in range(int(max_iter)):
-        r = Bn @ xz - yw
-        g = Bn.T @ r + ridge * xz
-        z_try = np.maximum(0.0, xz - step * g)
-        r_try = Bn @ z_try - yw
-        f_old = 0.5 * float(r @ r)     + 0.5 * ridge * float(xz @ xz)
-        f_new = 0.5 * float(r_try @ r_try) + 0.5 * ridge * float(z_try @ z_try)
-        bt = 0
-        while f_new > f_old and bt < 8:
-            step *= 0.5
-            z_try = np.maximum(0.0, xz - step * g)
-            r_try = Bn @ z_try - yw
-            f_new = 0.5 * float(r_try @ r_try) + 0.5 * ridge * float(z_try @ z_try)
-            bt += 1
-        xz = z_try
-        if np.linalg.norm(g, ord=np.inf) * step < 1e-9:
-            break
-    return xz / col_norm
+        # build l and u vectors: equality rows have l==u==w_sub
+        w_target = np.asarray(w_target, dtype=np.float64).ravel()
+        # pick the b vector corresponding to unique_comps
+        b_sub = w_target[unique_comps]
 
-# -------------------------- main routine -------------------------------------
+        l_eq = b_sub
+        u_eq = b_sub
+        l_ineq = np.zeros(Ksub, dtype=np.float64)         # x >= 0
+        u_ineq = np.full(Ksub, np.inf, dtype=np.float64) # no upper bound
+
+        l = np.concatenate([l_eq, l_ineq])
+        u = np.concatenate([u_eq, u_ineq])
+
+    # OSQP problem setup
+    prob = osqp.OSQP()
+    prob.setup(P=P, q=q.astype(np.float64), A=A, l=l.astype(np.float64),
+               u=u.astype(np.float64), verbose=osqp_verbose,
+               polish=True, max_iter=int(osqp_max_iter),
+               eps_abs=1e-8, eps_rel=1e-8, time_limit=time_limit)
+
+    res = prob.solve()
+
+    if res.info.status not in ("solved", "solved_inaccurate"):
+        # fallback: return non-negative least-squares solution (without equality)
+        # but warn in info
+        x_fallback = np.maximum(0.0, np.linalg.lstsq(Bw_sub, yw_sub, rcond=None)[0])
+        return x_fallback, dict(status=res.info.status, obj=res.info.obj_val, warn="OSQP failed")
+
+    x = np.asarray(res.x).ravel()
+    # if equality rows present, the solution vector is length Ksub (res.x)
+    # if we had identity-only A, same length.
+
+    info = dict(status=res.info.status,
+                obj=res.info.obj_val if hasattr(res.info, "obj_val") else None,
+                iter=res.info.iter, solve_time=res.info.run_time if hasattr(res.info, "run_time") else None)
+
+    return x, info
+
+# ------------------------------------------------------------------------------
 
 def run_patch(h5_path: str,
               s_sel: Optional[str] = None,
               k_per_comp: int = 12,
               pick_mode: str = "random",
-              solver: str = "nnls",
-              ridge: float = 0.0,
               use_mask: bool = True,
               use_lambda: bool = True,
-              lam_dset: str = "/HyperCube/lambda_weights",
               out_dir: Optional[str | os.PathLike] = None,
               write_seed: bool = False,
               seed_path: str = "/Seeds/x0_nnls_patch",
-              normalize_columns: bool = True,
               orbit_weights: np.ndarray | None = None):
 
     out_dir = None if out_dir is None else str(out_dir)
@@ -772,9 +745,8 @@ def run_patch(h5_path: str,
     # --- Fast working-set GLOBAL NNLS on a pruned basis
     print(f"[patch] Working-set global NNLS (init=32/comp, +16/round, rounds=4)...")
     x_full, keep = _global_nnls_workingset(
-        Bw, yw, col_map,
+        Bw, yw, col_map, orbit_weights=orbit_weights,
         k0_per_comp=32, kincr_per_comp=16, rounds=4,
-        solver=solver, ridge=float(ridge), normalize_columns=bool(normalize_columns)
     )
     # keep col_map aligned with x_patch for the unpack loop
     x_patch = x_full[keep].copy()                # compress to working set
@@ -785,6 +757,20 @@ def run_patch(h5_path: str,
     x_CP = np.zeros((C, P), dtype=np.float64)
     for j, (c, p) in enumerate(col_map):
         x_CP[c, p] = x_patch[j]
+
+    # ------------------------------------------------------------
+    # Project NNLS patch onto per-orbit simplex (y_dist)
+    # ------------------------------------------------------------
+    # Per-orbit simplex (correct and necessary)
+    row_sum = x_CP.sum(axis=1)
+    row_safe = np.where(row_sum > 0.0, row_sum, 1.0)
+
+    y_dist_patch = x_CP / row_safe[:, None]
+    y_dist_patch = np.maximum(y_dist_patch, 0.0)
+    y_dist_patch /= (y_dist_patch.sum(axis=1, keepdims=True) + 1e-30)
+
+    # Final seed (already consistent!)
+    x_CP = row_sum[:, None] * y_dist_patch
 
     # --- Reconstruct + diagnostics per spaxel
     rmse = np.zeros(s_idx.size, dtype=np.float64)
@@ -853,26 +839,23 @@ def run_patch(h5_path: str,
             ds.attrs["s_idx"]  = s_idx
             ds.attrs["k_per_comp"] = int(k_per_comp)
             ds.attrs["pick_mode"]  = str(pick_mode)
-            ds.attrs["solver"]     = str(solver)
-            ds.attrs["ridge"]      = float(ridge)
             ds.attrs["norm.mode_at_fit"] = norm_mode
     
-    usage_png = os.path.join(out_dir, "nnlsPatchUsage.png") if out_dir else None
-
-    metrics = None
-    if write_seed:
-        # Seed is in the main HDF5 at `seed_path`
-        try:
-            metrics = compare_usage_to_orbit_weights(
-                h5_path,
-                sidecar=None,
-                x_dset=seed_path, # e.g. "/Seeds/x0_nnls_patch"
-                normalize="unit_sum",
-                out_png=usage_png,
-                usage_metric="sum"
-            )
-        except Exception as e:
-            print(f"[nnls_patch] usage-vs-prior (seed) failed: {e}")
+    # usage_png = os.path.join(out_dir, "nnlsPatchUsage.png") if out_dir else None
+    # metrics = None
+    # if write_seed:
+    #     # Seed is in the main HDF5 at `seed_path`
+    #     try:
+    #         metrics = compare_usage_to_orbit_weights(
+    #             h5_path,
+    #             sidecar=None,
+    #             x_dset=seed_path, # e.g. "/Seeds/x0_nnls_patch"
+    #             normalize="unit_sum",
+    #             out_png=usage_png,
+    #             usage_metric="sum"
+    #         )
+    #     except Exception as e:
+    #         print(f"[nnls_patch] usage-vs-prior (seed) failed: {e}")
 
     else:
         import tempfile
@@ -890,14 +873,14 @@ def run_patch(h5_path: str,
                 G.create_dataset("/Fit/x_best", data=x_CP.astype("f8"),
                     dtype="f8",)
 
-            metrics = compare_usage_to_orbit_weights(
-                h5_path,
-                sidecar=tmp_sidecar,
-                x_dset="/Fit/x_best",
-                normalize="unit_sum",
-                out_png=usage_png,
-                usage_metric="sum"
-            )
+            # metrics = compare_usage_to_orbit_weights(
+            #     h5_path,
+            #     sidecar=tmp_sidecar,
+            #     x_dset="/Fit/x_best",
+            #     normalize="unit_sum",
+            #     out_png=usage_png,
+            #     usage_metric="sum"
+            # )
         except Exception as e:
             print(f"[nnls_patch] usage-vs-prior (temp sidecar) failed: {e}")
         finally:
@@ -907,21 +890,20 @@ def run_patch(h5_path: str,
                 except OSError:
                     pass
 
-    if metrics is not None:
-        print(
-            "[nnls_patch] usage-vs-prior:"
-            f" L1={metrics.get('l1', float('nan')):.3e}"
-            f"  L∞={metrics.get('linf', float('nan')):.3e}"
-            f"  cos={metrics.get('cosine', float('nan')):.4f}"
-            f"  r={metrics.get('pearson_r', float('nan')):.4f}"
-            f"  plot={metrics.get('plot_path')}"
-        )
+    # if metrics is not None:
+    #     print(
+    #         "[nnls_patch] usage-vs-prior:"
+    #         f" L1={metrics.get('l1', float('nan')):.3e}"
+    #         f"  L∞={metrics.get('linf', float('nan')):.3e}"
+    #         f"  cos={metrics.get('cosine', float('nan')):.4f}"
+    #         f"  r={metrics.get('pearson_r', float('nan')):.4f}"
+    #         f"  plot={metrics.get('plot_path')}"
+    #     )
 
     return dict(
         x_CP=x_CP, picks=picks, s_idx=s_idx, rmse=rmse, chi2=chi2,
         meta=dict(norm_mode=norm_mode, rows=int(rows), cols=int(K),
                   mask_used=bool(use_mask), lambda_used=bool(use_lambda),
-                  solver=solver, ridge=float(ridge),
                   finite_min=int(finite_counts.min()),
                   finite_med=int(np.median(finite_counts)),
                   finite_max=int(finite_counts.max()))
@@ -935,8 +917,6 @@ def main():
     ap.add_argument("--spax", default=None, help="spaxel selection: 'start:count' or 'i,j,k'")
     ap.add_argument("--k-per-comp", type=int, default=12, help="populations per component")
     ap.add_argument("--pick", default="energy", choices=["energy","random"], help="how to pick pops")
-    ap.add_argument("--solver", default="nnls", choices=["nnls","lsq","pg"], help="NNLS solver")
-    ap.add_argument("--ridge", type=float, default=0.0, help="L2 ridge (lsq/pg)")
     ap.add_argument("--no-mask", action="store_true", help="ignore /Mask")
     ap.add_argument("--no-lambda", action="store_true", help="ignore /HyperCube/lambda_weights")
     ap.add_argument("--lam-dset", default="/HyperCube/lambda_weights", help="λ-weights dataset")
@@ -950,11 +930,8 @@ def main():
         s_sel=args.spax,
         k_per_comp=int(args.k_per_comp),
         pick_mode=args.pick,
-        solver=args.solver,
-        ridge=float(args.ridge),
         use_mask=not args.no_mask,
         use_lambda=not args.no_lambda,
-        lam_dset=args.lam_dset,
         out_dir=args.out,
         write_seed=bool(args.write_seed),
         seed_path=args.seed_path,

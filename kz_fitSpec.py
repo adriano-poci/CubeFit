@@ -29,6 +29,9 @@ v1.4:   Universally removed all ad-hoc scalings;
         Converted to `cube_utils` functions instead of `muse`;
         Updated `compare_orbit_vs_solution` to new `orbit_weights` maths
             in the SPG solver. 25 January 2026
+v1.5:   Get `warm_start` from `kwargs` in `genCubeFit`;
+        Converted `compare_orbit_vs_solution` to be diagnostic in the context of
+            the exact Lagrange multiplier orbit prior. 31 January 2026
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -313,6 +316,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         del VB
     else:
         raise RuntimeError(f"No binned spectra.\n{'': <4s}{vbSpec}")
+
+    warm_start = kwargs.pop('warm', 'nnls')
 
     with logger.capture_all_output():
         decDir, cDirs, cKeys, nComp, teLL, lnGrid, histBinSize, dataVelScale,\
@@ -608,7 +613,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=2,
+        epochs=1,
         # x0=x0,
         lr=0.1,
         project_nonneg=True,
@@ -618,7 +623,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         blas_threads=12, # 12 BLAS threads each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
-        warm_start='resume',  # 'zeros', 'resume', 'jacobi', 'nnls'
+        warm_start=warm_start,
+        # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
@@ -1882,11 +1888,14 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             minT, maxT = np.min(uages), np.max(uages)
             minZ, maxZ = np.min(umetals), np.max(umetals)
 
-            wmax = np.max(np.log10(np.array([coSFH, laSFH, boSFH])))
-            sfhMin = np.min(np.log10((
-                np.min(coSFH[coSFH>0]),
-                np.min(laSFH[laSFH>0]),
-                np.min(boSFH[boSFH>0]))))
+            wmax = np.log10(np.max((
+                np.min(coSFH[coSFH>0]) if np.any(coSFH>0) else 1e-1,
+                np.min(laSFH[laSFH>0]) if np.any(laSFH>0) else 1e-1,
+                np.min(boSFH[boSFH>0]) if np.any(boSFH>0) else 1e-1)))
+            sfhMin = np.log10(np.min((
+                np.min(coSFH[coSFH>0]) if np.any(coSFH>0) else 1e10,
+                np.min(laSFH[laSFH>0]) if np.any(laSFH>0) else 1e10,
+                np.min(boSFH[boSFH>0]) if np.any(boSFH>0) else 1e10)))
             wmin = np.max((sfhMin, -12))
             print(f"SFH plot limits: {wmin:.2f} ({sfhMin:.2f}) to {wmax:.2f}")
 
@@ -2130,118 +2139,30 @@ def compare_orbit_vs_solution(
 
     # --- per-component totals and normalization
     eps = 1e-18
-    sol_tot = np.maximum(0.0, x).sum(axis=1)       # (C,)
-    sol_sum = float(sol_tot.sum()) or 1.0
-    sol_pdf = (sol_tot / sol_sum)
+    sol_tot = x.sum(axis=1)
+    # --- exact orbit constraint check ---
+    if orbit_weights is not None:
+        w_in = np.asarray(orbit_weights, dtype=np.float64).ravel()
+        scale = sol_tot.sum() / w_in.sum()
+        w_scaled = w_in * scale
 
-    # ------------------- ratio penalty setup (simple) -------------------
+        err = np.linalg.norm(sol_tot - w_scaled)
+        rel = err / (np.linalg.norm(w_scaled) + 1e-30)
 
-    # If not passed explicitly, read from HDF5 only (no other fallbacks)
-    if orbit_weights is None:
-        ow_dset = os.environ.get("CUBEFIT_ORBIT_WEIGHTS_DSET",
-                                 "/HyperCube/norm/orbit_weights")
-        with open_h5(h5_path, role="reader") as f:
-            if '/CompWeights' not in f:
-                raise RuntimeError(f"orbit_weights requested but dataset "
-                                   f"'/CompWeights' not found in {h5_path}")
-            w_in = np.asarray(f['/CompWeights'][...],
-                dtype=np.float64).ravel(order="C")
-    else:
-        w_in = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
+        print("[orbit constraint check]")
+        print(f"  ||s - w||        = {err:.6e}")
+        print(f"  relative error   = {rel:.6e}")
 
-    if w_in.size != C:
-        raise ValueError(f"orbit_weights length {w_in.size} != C={C}")
-    if not np.all(np.isfinite(w_in)):
-        raise ValueError("orbit_weights contains non-finite values")
-    w_sum = float(np.sum(w_in))
-    if w_sum <= 0.0:
-        raise ValueError("orbit_weights sum must be > 0")
+        # optional identity plot
+        fig, ax = plt.subplots(figsize=(4,4))
+        ax.plot(w_scaled, sol_tot, '.', alpha=0.6)
+        lim = [min(w_scaled.min(), sol_tot.min()),
+            max(w_scaled.max(), sol_tot.max())]
+        ax.plot(lim, lim, 'k-')
+        ax.set_xlabel("orbit prior (scaled)")
+        ax.set_ylabel("solution ∑_p x[c,p]")
+        ax.set_title("Exact orbit constraint")
+        if save:
+            fig.savefig(save, dpi=140)
+        plt.close(fig)
 
-    # Normalized component prior (probabilities)
-    w_c = (w_in / w_sum).astype(np.float64, copy=False)
-
-    # --- ratio-space diagnostics (solver-consistent) ---
-    eps = 1e-12
-    s = np.maximum(sol_tot, eps)
-    w = np.maximum(w_c, eps)
-
-    # choose a reference component (same as solver: max weight)
-    a = int(np.argmax(w))
-
-    log_ratio_sol = np.log(s / s[a])
-    log_ratio_ref = np.log(w / w[a])
-
-    # remove reference component
-    mask = np.arange(C) != a
-
-    ratio_err = log_ratio_sol[mask] - log_ratio_ref[mask]
-
-    ratio_l2 = float(np.sqrt(np.mean(ratio_err**2)))
-    ratio_linf = float(np.max(np.abs(ratio_err)))
-
-    print(f"[ratio penalty diagnostics]")
-    print(f"  RMS log-ratio error : {ratio_l2:.6e}")
-    print(f"  Max log-ratio error : {ratio_linf:.6e}")
-
-
-    # Enable penalty and keep your existing knobs
-    have_ratio   = True
-    _ratio_eta   = 0.02
-    _ratio_prob  = 0.02
-    _ratio_batch = 2
-    _ratio_minw  = 1e-4
-    rng = np.random.default_rng()
-
-    # Per-component step scaling (mean -> 1.0), same semantics you had
-    m = float(np.mean(w_c)) or 1.0
-    w_full = (w_c / m).astype(np.float64, copy=False)
-
-    # --- diagnostics
-    l1 = float(np.sum(np.abs(w_in - sol_pdf)))
-    cos = float(np.dot(w_in, sol_pdf) / (np.linalg.norm(w_in) * np.linalg.norm(sol_pdf) + eps))
-    # KLs with epsilon-smoothing
-    p = np.clip(w_in, eps, 1.0); p /= p.sum()
-    q = np.clip(sol_pdf, eps, 1.0); q /= q.sum()
-    kl_pq = float(np.sum(p * (np.log(p) - np.log(q))))
-    kl_qp = float(np.sum(q * (np.log(q) - np.log(p))))
-    print(f"[ratio vs solution] C={C}, P={P}")
-    print(f"  L1 distance        : {l1:.4f}")
-    print(f"  Cosine similarity  : {cos:.6f}")
-    print(f"  KL(p||q), KL(q||p) : {kl_pq:.6f}, {kl_qp:.6f}")
-
-    # --- plotting
-    idx = np.arange(C)
-    width = 0.45
-
-    fig = plt.figure(figsize=(10, 4.2))
-    ax1 = fig.add_subplot(1,2,1)
-    ax1.bar(idx - width/2, w_in,  width, label="input prior (orbit_weights)")
-    ax1.bar(idx + width/2, sol_pdf, width, label="solution ∑_P x[c,p]")
-    ax1.set_xlabel("component c")
-    ax1.set_ylabel("normalized mass / probability")
-    ax1.set_title("Component weights: prior vs solution")
-    ax1.legend(frameon=False, fontsize=9)
-
-    ax2 = fig.add_subplot(1,2,2)
-    ax2.scatter(log_ratio_ref[mask], log_ratio_sol[mask], s=14)
-    lim = (
-        builtins.min(log_ratio_ref[mask].min(), log_ratio_sol[mask].min()),
-        builtins.max(log_ratio_ref[mask].max(), log_ratio_sol[mask].max()),
-    )
-    ax2.plot(lim, lim, lw=1.0)
-    ax2.set_xlabel("log(w_c / w_ref)")
-    ax2.set_ylabel("log(s_c / s_ref)")
-    ax2.set_title(f"log-ratio space (RMS={ratio_l2:.3e})")
-    ax2.set_xlim(lim)
-    ax2.set_ylim(lim)
-
-    if save:
-        fig.savefig(save, dpi=140)
-        print(f"[saved] {save}")
-    plt.close(fig)
-
-    # return raw arrays if you want to post-process
-    return dict(
-        prior=w_in, solution=sol_pdf, sol_tot=sol_tot,
-        L1=l1, cosine=cos, KL_pq=kl_pq, KL_qp=kl_qp
-    )

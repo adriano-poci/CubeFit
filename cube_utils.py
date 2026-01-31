@@ -12,6 +12,7 @@ v1.1:   Added `apply_global_hypercube_scale_inplace` to compute and store a
 v1.2:   Defined all the useful `muse` functions including `_oneTimeSpec` for
             self-containment. 25 January 2026
 v1.3:   Added `zero_floor_inplace`. 26 January 2026
+v1.4"   Fixed generator addition bug in `_globMILES`. 30 January 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -2353,8 +2354,9 @@ def build_working_template_grid_from_losvd(
 def _fnMILES(dirs):
     metals, ages, alphas = [], [], []
     for lmd in dirs:
-        expr = r'Z([mp][0-9.]+)T([0-9.]+).i.([mp][0-9.]+).{0,2}([mp][0-9.]+|'\
-            'baseFe)'
+        # expr = r'Z([mp][0-9.]+)T([0-9.]+).i.([mp][0-9.]+).{0,2}([mp][0-9.]+|'\
+        #     'baseFe)'
+        expr = r'Z([mp][0-9.]+)T([0-9.]+).i.([mp][0-9.]+).{0,2}([mp][0-9.]+)'
         matches = re.search(expr, lmd.stem).groups()
         metals += [float(matches[0].replace('p', '+').replace('m', '-'))]
         ages += [float(matches[1].replace('p', '+').replace('m', '-'))]
@@ -2434,11 +2436,16 @@ def _globMILES(iso, IMF, slope):
     -------
         glob (str): the glob pattern for the MILES templates
     """
-    tglob = np.sort(np.array(list(dDir.rglob(str(plp.Path(
+    p1 = str(plp.Path(
         f"MILES*{iso.upper()}*{IMF}*",
-        f"M{IMF.lower()}{slope:.2f}*E*0.00.fits")))+\
-        list(dDir.rglob(str(plp.Path(f"MILES*{iso.upper()}*{IMF}*",
-        f"M{IMF.lower()}{slope:.2f}*E*0.40.fits")))))))
+        f"M{IMF.lower()}{slope:.2f}*E*0.00.fits"
+    ))
+    p2 = str(plp.Path(
+        f"MILES*{iso.upper()}*{IMF}*",
+        f"M{IMF.lower()}{slope:.2f}*E*0.40.fits"
+    ))
+    paths = list(dDir.rglob(p1)) + list(dDir.rglob(p2))
+    tglob = np.sort(np.array(paths))
 
     return tglob
 
@@ -2783,19 +2790,6 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # pixOff = int(laGrid.shape[0]*0.01)
     pixOff = 5
 
-    # try:
-    #     lfn = f"out_phot_{IMF}*{iso.upper()}*"
-    #     mfn = f"out_mass_{IMF}*{iso.upper()}*"
-    #     lfn = next((dDir/'MILESPredict').glob(lfn))
-    #     mfn = next((dDir/'MILESPredict').glob(mfn))
-    #     mfn = next((dDir/'MILESPredict').glob(mfn))
-    #     mfn = next((dDir/'MILESPredict').glob(mfn))
-    #     mfn = next((dDir/'MILESPredict').glob(mfn))
-    # except StopIteration:
-    #     logging.exception('Files not found\n'+\
-    #           f"out_phot_{IMF}_*{iso.upper()}*.txt\n"+\
-    #           f"out_mass_{IMF}_*{iso.upper()}*.txt")
-    #     sys.exit()
     gFuncs = dict(MILES=_globMILES, EMILES=_globEMILES, SMILES=_globSMILES)
     fFuncs = dict(MILES=_fnMILES, EMILES=_fnEMILES, SMILES=_fnSMILES)
 
@@ -2831,9 +2825,12 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     if not isinstance(talphas, type(None)):
         talphas = talphas[selIso]
         ualphas = np.unique(talphas)
-        lIdx = np.asarray([np.argmin(np.abs(ualphas-xc)) for xc in
-            [-0.2, 0.0, 0.2, 0.4, 0.6]])
-            # [-0.2, 0.0, 0.4]])
+        if ualphas.size > 5:
+            lIdx = np.asarray([np.argmin(np.abs(ualphas-xc)) for xc in
+                [-0.2, 0.0, 0.2, 0.4, 0.6]])
+                # [-0.2, 0.0, 0.4]])
+        else:
+            lIdx = np.arange(ualphas.size)
     else:
         talphas = np.zeros_like(tages)
         ualphas = np.array([0.0])

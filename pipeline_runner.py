@@ -1053,27 +1053,19 @@ class PipelineRunner:
 
         elif warm_start == "nnls":
             if verbose:
-                logger.log("[Pipeline] Warm-start mode: nnls_patch seed (exact semantics)")
+                logger.log("[Pipeline] Warm-start mode: nnls_patch seed")
 
             with logger.capture_all_output():
-                lambda_orbit = float(os.environ.get("CUBEFIT_LAMBDA_ORBIT", "0.0"))
-                nnls_ridge = 0.0
-                if np.isfinite(lambda_orbit) and (lambda_orbit > 0.0):
-                    nnls_ridge = lambda_orbit * 0.25
                 res = _nnls_patch_run(
                     h5_path=self.h5_path,
                     s_sel=None, # first min(32, S) spaxels
                     k_per_comp=32,
                     pick_mode="random",
-                    solver="nnls",
-                    ridge=float(nnls_ridge),
                     use_mask=True,
                     use_lambda=True,
-                    lam_dset="/HyperCube/lambda_weights",
                     out_dir=plp.Path(self.h5_path).parent/'figures',
                     write_seed=bool((seed_cfg or {}).get("write_seed", True)),
                     seed_path="/Seeds/x0_nnls_patch",
-                    normalize_columns=True,
                     orbit_weights=orbit_weights,
                 )
             Xcp = np.asarray(res["x_CP"], np.float64, order="C")

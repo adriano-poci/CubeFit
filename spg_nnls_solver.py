@@ -103,6 +103,13 @@ v3.13:  Set data-weighted orbit gradient in `solve_global_spg`;
         Added `diffuse_seed_full_CP` to diffuse NNLS seed;
         Added soft projection to avoid flooring SFH in `solve_global_spg`. 28
             January 2026
+v3.14:  Changed soft projection to hard projection in `solve_global_spg`. 29
+            January 2026
+v3.15:  Removed projection in favour of re-parametrisation in `solve_global_spg`.
+            30 January 2026
+v3.16:  Replaced orbit prior with Lagrange multiplier for exact adherence to the
+            orbit weights within the solver in `solve_global_spg`. 31 January
+            2026
 """
 
 from __future__ import annotations, print_function
@@ -710,14 +717,14 @@ def solve_global_spg(
     # Orbit-weight prior (spaxel independent)
     # ------------------------------------------------------------
     w_target = None
-    orbit_beta = float(os.environ.get("CUBEFIT_ORBIT_BETA", "0.2"))
+    # orbit_beta = float(os.environ.get("CUBEFIT_ORBIT_BETA", "0.2"))
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
         print("[SPG] Orbit-weight projection enabled.", flush=True)
-    lambda_orbit = float(os.environ.get("CUBEFIT_LAMBDA_ORBIT", "0.0"))
-    if w_target is not None and lambda_orbit > 0.0:
-        print(f"[SPG] Orbit-mass prior enabled (lambda={lambda_orbit:.3e})",
-            flush=True)
+    # lambda_orbit = float(os.environ.get("CUBEFIT_LAMBDA_ORBIT", "0.0"))
+    # if w_target is not None and lambda_orbit > 0.0:
+    #     print(f"[SPG] Orbit-mass prior enabled (lambda={lambda_orbit:.3e})",
+    #         flush=True)
 
     # ------------------------------------------------------------
     # Initialise x
@@ -729,6 +736,23 @@ def solve_global_spg(
         if x0.size != C * P:
             raise ValueError("x0 has wrong size")
         x = x0.reshape(C, P).copy()
+
+    # ------------------------------------------------------------
+    # Reparameterise x = s * y
+    # ------------------------------------------------------------
+    eps = 1e-30
+    # orbit masses
+    s = x.sum(axis=1)        # shape (C,)
+    # avoid zero-mass orbits
+    s_safe = np.where(s > 0.0, s, 1.0)
+    # per-orbit SFHs (simplex)
+    y_dist = x / s_safe[:, None]  # shape (C,P)
+    # enforce simplex exactly
+    y_dist = np.maximum(y_dist, 0.0)
+    y_dist /= (y_dist.sum(axis=1, keepdims=True) + eps)
+    # reconstruct x exactly
+    x = s[:, None] * y_dist
+
 
     # If x0 came from NNLS seed, clear BB history so BB step isn't anchored to old state.
     # This ensures a genuine BB step computed from the first epoch, not a small correction.
@@ -756,6 +780,17 @@ def solve_global_spg(
             total_mass_est = builtins.max(1.0, Y_glob_norm)  # Y_glob_norm computed earlier
         w_target = w_target * total_mass_est
         print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)
+    # ------------------------------------------------------------
+    # Augmented Lagrangian variables for exact orbit prior
+    # ------------------------------------------------------------
+    # u_orbit = np.zeros_like(w_target) if w_target is not None else None
+    # rho_orbit = float(os.environ.get("CUBEFIT_ORBIT_RHO", "1.0"))
+
+    # if w_target is not None:
+    #     print(
+    #         f"[SPG] Exact orbit prior enabled (rho={rho_orbit:.3e})",
+    #         flush=True,
+    #     )
     # ------------------------------------------------------------
     # Build seed-support field for SPG update gating
     # ------------------------------------------------------------
@@ -1022,115 +1057,194 @@ def solve_global_spg(
             if np.isfinite(max_inv_d) and (max_inv_d > 0.0):
                 invD = np.minimum(invD, max_inv_d)
 
-            # ---- orbit-mass prior (explicit objective + preconditioned gradient) ----
-            f_orbit = 0.0
-            g_prior = None
-            if w_target is not None and lambda_orbit > 0.0:
-                # compute per-orbit mass residuals
-                s_orb = np.sum(x, axis=1)               # (C,)
-                r_orb = s_orb - w_target                # (C,)
+            # # ---- orbit-mass prior (explicit objective + preconditioned gradient) ----
+            # f_orbit = 0.0
+            # g_prior = None
+            # if w_target is not None and lambda_orbit > 0.0:
+            #     # compute per-orbit mass residuals
+            #     s_orb = np.sum(x, axis=1)               # (C,)
+            #     r_orb = s_orb - w_target                # (C,)
 
-                # scalar objective contribution (half-squared)
-                f_orbit = 0.5 * float(lambda_orbit) * float(np.dot(r_orb, r_orb))
+            #     # scalar objective contribution (half-squared)
+            #     f_orbit = 0.5 * float(lambda_orbit) * float(np.dot(r_orb, r_orb))
 
-                # Make sure D is shaped (C,P). D_raw was earlier set as D_tot copy divided by D_ref.
-                # If D at this point is 1D flattened per-column, reshape accordingly:
-                try:
-                    D_rowcol = D.reshape(C, P)
-                except Exception:
-                    # if D is already (C,P) this is a no-op; otherwise compute per-column from D_raw
-                    D_rowcol = (D_raw / builtins.max(float(np.median(D_raw[D_raw>0])) if np.any(D_raw>0) else 1.0)).reshape(C,P)
-                # allocation weights: use D (positive), but clip tiny values and normalize per-row
-                alloc = np.maximum(D_rowcol, 0.0)  # zeros where no curvature
-                row_sum = alloc.sum(axis=1) + 1e-30
-                alloc = alloc / row_sum[:, None]   # each row sums to 1 (or 0 if all zeros)
-                # Now compute per-parameter prior gradient as orbit residual times allocation
-                # Note: r_orb has shape (C,)
-                g_prior_mat = (lambda_orbit * r_orb / float(P))[:, None] * alloc
-                # ensure frozen components receive no orbit push
-                g_prior_mat[freeze] = 0.0
+            #     # Make sure D is shaped (C,P). D_raw was earlier set as D_tot copy divided by D_ref.
+            #     # If D at this point is 1D flattened per-column, reshape accordingly:
+            #     try:
+            #         D_rowcol = D.reshape(C, P)
+            #     except Exception:
+            #         # if D is already (C,P) this is a no-op; otherwise compute per-column from D_raw
+            #         D_rowcol = (D_raw / builtins.max(float(np.median(D_raw[D_raw>0])) if np.any(D_raw>0) else 1.0)).reshape(C,P)
+            #     # allocation weights: use D (positive), but clip tiny values and normalize per-row
+            #     alloc = np.maximum(D_rowcol, 0.0)  # zeros where no curvature
+            #     row_sum = alloc.sum(axis=1) + 1e-30
+            #     alloc = alloc / row_sum[:, None]   # each row sums to 1 (or 0 if all zeros)
+            #     # Now compute per-parameter prior gradient as orbit residual times allocation
+            #     # Note: r_orb has shape (C,)
+            #     g_prior_mat = (lambda_orbit * r_orb / float(P))[:, None] * alloc
+            #     # ensure frozen components receive no orbit push
+            #     g_prior_mat[freeze] = 0.0
 
-                # add to gradient
-                g += g_prior_mat
-                # store magnitude for diagnostics (absolute values)
-                g_prior = np.abs(g_prior_mat)
+            #     # add to gradient
+            #     g += g_prior_mat
+            #     # store magnitude for diagnostics (absolute values)
+            #     g_prior = np.abs(g_prior_mat)
 
             # ---------------- BB step (diagonal-preconditioned) ----------------
             # Barzilai–Borwein step length
             if (x_prev is not None) and (g_prev is not None):
-                s = (x - x_prev).ravel()
-                y = (g - g_prev).ravel()
-                sy = float(np.dot(s, y))
+                dx_flat = (x - x_prev).ravel()
+                dg_flat = (g - g_prev).ravel()
+                sy = float(np.dot(dx_flat, dg_flat))
 
                 if sy > 1e-16:
-                    alpha_bb = float(np.dot(s, s) / sy)
-                    # safety clamp
+                    alpha_bb = float(np.dot(dx_flat, dx_flat) / sy)
                     alpha_bb = float(np.clip(alpha_bb, 1e-8, 1e8))
                 print(f"[BB] alpha={alpha_bb:.3e}, sy={sy:.3e}", flush=True)
 
-            # diagonal-preconditioned step
-            dx = -alpha_bb * (g * invD)
+            # # ------------------------------------------------------------
+            # # SPG step in orbit-mass space (s)
+            # # ------------------------------------------------------------
+            # # gradient wrt s
+            # g_s = np.sum(g * y_dist, axis=1)   # shape (C,)
 
-            # ensure descent
-            if np.vdot(dx, g) > 0.0:
-                dx = -dx
+            # # simple preconditioner for s (collapse D)
+            # D_s = np.sum(D, axis=1)
+            # D_s = np.where(D_s > 0.0, D_s, np.inf)
+
+            # ##### Old orbit prior
+            # # # BB step for s
+            # # ds = -alpha_bb * g_s / D_s
+
+            # # # trust region on s
+            # # s_norm = np.linalg.norm(s)
+            # # ds_norm = np.linalg.norm(ds)
+            # # s_cap = (0.005 if not is_warmup else 0.0005) * max(s_norm, 1.0)
+
+            # # if ds_norm > s_cap and ds_norm > 0:
+            # #     ds *= s_cap / ds_norm
+
+            # # # apply and project
+            # # s += ds
+            # # s = np.maximum(s, 0.0)
+            # # ------------------------------------------------------------
+            # # Augmented Lagrangian update for s (EXACT orbit prior)
+            # # ------------------------------------------------------------
+            # # Gradient of augmented Lagrangian wrt s:
+            # # g_s_data = sum_p y * g   (already computed)
+            # g_s_data = np.sum(g * y_dist, axis=1)   # (C,)
+
+            # if w_target is not None:
+            #     # AL gradient: data + dual + quadratic penalty
+            #     g_s_total = g_s_data + u_orbit + rho_orbit * (s - w_target)
+            # else:
+            #     g_s_total = g_s_data
+
+            # # Preconditioner for s
+            # D_s = np.sum(D, axis=1)
+            # D_s = np.where(D_s > 0.0, D_s, np.inf)
+
+            # # Descent step
+            # ds = -alpha_bb * (g_s_total / D_s)
+
+            # # Trust region on s
+            # s_norm = np.linalg.norm(s)
+            # ds_norm = np.linalg.norm(ds)
+            # s_cap = (0.005 if not is_warmup else 0.0005) * max(s_norm, 1.0)
+
+            # if ds_norm > s_cap and ds_norm > 0:
+            #     ds *= s_cap / ds_norm
+
+            # # Apply and project non-negativity
+            # s += ds
+            # s = np.maximum(s, 0.0)
+            # # ------------------------------------------------------------
+            # # Update Lagrange multiplier for exact orbit prior
+            # # ------------------------------------------------------------
+            # if w_target is not None:
+            #     u_orbit += rho_orbit * (s - w_target)
+
+            #     # Diagnostics
+            #     res = np.linalg.norm(s - w_target)
+            #     print(
+            #         f"[SPG-orbit] ||s - w||={res:.3e}",
+            #         flush=True,
+            #     )
+            # ------------------------------------------------------------
+            # HARD exact orbit constraint (no optimization of s)
+            # ------------------------------------------------------------
+            if w_target is not None:
+                s = w_target.copy()
 
             # ------------------------------------------------------------
-            # Soft seed- and data-aware projection of SPG step
+            # Robust projected update of y (orbit-internal SFH)
+            #   - per-row preconditioning
+            #   - per-orbit L1 step cap
+            #   - exact simplex projection
+            #   - hard support mask from NNLS seed
             # ------------------------------------------------------------
-            dx_mat = dx.reshape(C, P)
+            lambda_y = float(os.environ.get("CUBEFIT_LAMBDA_Y", "5e-4"))
+            if lambda_y > 0.0:
+                # Gradient wrt y (holding s fixed)
+                g_y = s[:, None] * g
 
-            # Data support from curvature (already computed as D)
-            D_rowcol = D.reshape(C, P)
-            D_ref_local = builtins.max(D_ref, 1e-30)
-            support_data = D_rowcol / D_ref_local
-            support_data /= (support_data.max(axis=1, keepdims=True) + 1e-30)
+                # Remove null direction
+                g_y -= (np.sum(g_y, axis=1, keepdims=True) * y_dist)
 
-            # Combine with seed support (if available)
-            if seed_support is not None:
-                # trust weights (both dimensionless, scale-free)
-                seed_trust = float(os.environ.get("CUBEFIT_SEED_TRUST", "1.0"))
-                data_trust = float(os.environ.get("CUBEFIT_DATA_TRUST", "1.0"))
+                # Per-row preconditioning
+                D_rowcol = D.reshape(C, P)
+                row_scale = np.maximum(D_rowcol.sum(axis=1), eps)
 
-                support = np.maximum(
-                    seed_trust * seed_support,
-                    data_trust * support_data,
+                dy_raw = -lambda_y * (g_y / row_scale[:, None])
+
+                # Per-orbit L1 cap
+                max_l1 = float(os.environ.get("CUBEFIT_Y_MAX_L1", "0.05"))
+                l1 = np.sum(np.abs(dy_raw), axis=1)
+                scale = np.minimum(1.0, max_l1 / (l1 + eps))
+                dy = dy_raw * scale[:, None]
+
+                # -------- HARD SUPPORT MASK --------
+                row_max = D_rowcol.max(axis=1, keepdims=True)
+                support_mask = D_rowcol >= (1e-3 * row_max)
+
+                if seed_support is not None:
+                    support_mask |= (seed_support > 1e-3)
+
+                # Apply update ONLY on supported bins
+                y_new = y_dist.copy()
+                y_new[support_mask] += dy[support_mask]
+
+                # Enforce exact zeros outside support
+                y_new[~support_mask] = 0.0
+
+                # Renormalise ONLY over supported bins
+                row_sum = y_new.sum(axis=1, keepdims=True)
+                y_dist = np.divide(
+                    y_new,
+                    row_sum,
+                    out=np.zeros_like(y_new),
+                    where=row_sum > eps,
                 )
-            else:
-                support = support_data
 
-            # Normalize per row to [0,1]
-            support /= (support.max(axis=1, keepdims=True) + 1e-30)
+                # Diagnostics
+                mean_support = float(np.mean(support_mask.sum(axis=1)))
+                mean_l1 = float(np.mean(np.sum(np.abs(y_dist - y_new), axis=1)))
+                print(
+                    f"[SPG-y] mean supported bins/orbit={mean_support:.2f}",
+                    flush=True,
+                )
 
-            # Soft attenuation (never fully zero unless both supports zero)
-            min_allow = float(os.environ.get("CUBEFIT_PROJ_SOFT_MIN", "0.05"))
-            atten = min_allow + (1.0 - min_allow) * support
-
-            dx_mat *= atten
-            dx_mat[freeze] = 0.0   # frozen bins stay frozen
-            dx = dx_mat
-
-            dx_norm = np.linalg.norm(dx)
-            g_norm = np.linalg.norm(g)
-            x_norm = np.linalg.norm(x)
-
-            # trust region / step capping
-            grad_cap = 3.0 * g_norm
-            if is_warmup:
-                x_cap = 0.0005 * x_norm
-            else:
-                x_cap = float(os.environ.get("CUBEFIT_MAX_FRAC", "0.005")) * x_norm
-            dx_cap = builtins.min(grad_cap, x_cap)
-            if dx_norm > dx_cap and dx_cap > 0:
-                dx *= dx_cap / dx_norm
 
             # --- update BB history ---
             x_prev = x.copy()
             g_prev = g.copy()
-            # Apply step
-            x += dx
-            if cfg.project_nonneg:
-                np.maximum(x, 0.0, out=x)
+
+            # ------------------------------------------------------------
+            # Reconstruct x from s and y
+            # ------------------------------------------------------------
+            x = s[:, None] * y_dist
+            g_norm = np.linalg.norm(g)
+            x_norm = np.linalg.norm(x)
 
 
             # ---------------- Active orbit update (CRITICAL) ----------------
@@ -1156,7 +1270,16 @@ def solve_global_spg(
 
             # compute data proxy (you have ssq normalized earlier)
             data_proxy = 0.5 * ssq / builtins.max(nres, 1)  # or whichever proxy you use for data term
-            total_proxy = data_proxy + f_orbit
+            total_proxy = data_proxy# + f_orbit
+            
+            import matplotlib.pyplot as plt
+            plt.clf()
+            plt.hist(np.log10(x[x > 0].flatten()), bins=50, color='blue', alpha=0.7)
+            plt.title(f"Epoch {ep+1} solution histogram")
+            plt.xlabel("x value")
+            plt.ylabel("Count")
+            plt.savefig(f"spg_epoch_{ep+1}_histogram.png")
+            plt.close('all')
 
             # use total_proxy when comparing best_proxy / saving best_x
             if total_proxy < best_proxy:
@@ -1169,11 +1292,7 @@ def solve_global_spg(
                 f"||x||={x_norm:.3e}"
             )
             print(
-                f"||dx||={dx_norm:.3e}  "
-                f"||g||={pg_norm:.3e}"
-            )
-            print(
-                f"f_orbit={f_orbit:.3e}  "
+                f"||g||={pg_norm:.3e}  "
                 f"total_proxy={total_proxy:.3e}"
             )
             print(
@@ -1181,6 +1300,8 @@ def solve_global_spg(
                 f"active={active_orbits.size}/{C}",
                 flush=True,
             )
+            orbit_res = np.linalg.norm(s - w_target) if w_target is not None else 0.0
+            print(f"[SPG-orbit] ||s - w||={orbit_res:.3e}", flush=True)
         
         th = cu.zero_floor_inplace(best_x, rel_tol=1e-25, abs_tol=0.0)
         print(f"[SPG] zero-floor applied: threshold={th:.3e}", flush=True)
