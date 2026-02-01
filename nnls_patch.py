@@ -516,10 +516,21 @@ def _solve_nnls_with_orbit_equality_qp_osqp(
 
     # OSQP problem setup
     prob = osqp.OSQP()
-    prob.setup(P=P, q=q.astype(np.float64), A=A, l=l.astype(np.float64),
-               u=u.astype(np.float64), verbose=osqp_verbose,
-               polish=True, max_iter=int(osqp_max_iter),
-               eps_abs=1e-8, eps_rel=1e-8, time_limit=time_limit)
+    setup_kwargs = dict(
+        P=P,
+        q=q.astype(np.float64),
+        A=A,
+        l=l.astype(np.float64),
+        u=u.astype(np.float64),
+        verbose=osqp_verbose,
+        polish=True,
+        max_iter=int(osqp_max_iter),
+        eps_abs=1e-8,
+        eps_rel=1e-8,
+    )
+    if time_limit is not None:
+        setup_kwargs["time_limit"] = float(time_limit)
+    prob.setup(**setup_kwargs)
 
     res = prob.solve()
 
