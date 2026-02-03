@@ -318,20 +318,28 @@ def _filter_by_coherence(Bw, colnorm_all, keep_idx, cand_idx, rho_max=0.995):
 
 # ------------------------------------------------------------------------------
 
-def _global_nnls_workingset(Bw, yw, col_map, orbit_weights=None,
-        k0_per_comp=32, kincr_per_comp=16, rounds=4, rho_max=0.995):
+def _global_nnls_workingset(
+    Bw, yw, col_map, orbit_weights=None,
+    k0_per_comp=32, kincr_per_comp=16, rounds=4, rho_max=0.995
+):
     """
-    Fast global NNLS via a small working set with coherence control.
-    Returns (x_full, keep_idx).
+    Working-set NNLS patch solver with exact orbit-ratio constraints
+    enforced via OSQP.
+
+    Returns
+    -------
+    x : ndarray, shape (K,)
+        Full coefficient vector (zeros outside working set).
+    keep : ndarray
+        Indices of columns retained in the working set.
     """
-    # Orbit target must be provided for exact-constraint NNLS
+
+    # --- prepare orbit target (ratios only) ---
     if orbit_weights is not None:
         w_target = np.asarray(orbit_weights, dtype=np.float64).ravel()
-        w_sum = w_target.sum()
-        if w_sum <= 0:
+        if np.sum(w_target) <= 0:
             raise ValueError("orbit_weights sum must be > 0")
-        # scale is arbitrary here; use unity mass
-        w_target = w_target / w_sum
+        w_target = w_target / np.sum(w_target)
     else:
         w_target = None
 
@@ -340,16 +348,20 @@ def _global_nnls_workingset(Bw, yw, col_map, orbit_weights=None,
     comp_of_j = np.array([c for (c, p) in col_map], dtype=np.int64)
     C = int(np.max(comp_of_j)) + 1
 
-    # initial keep by local correlation, then de-duplicate by coherence
+    # --- initial working set ---
     keep0 = _topk_by_corr_per_comp(Bw, yw, col_map, k_per_comp_init=int(k0_per_comp))
-    keep0 = np.intersect1d(keep0, np.flatnonzero(colnorm_all > 1e-12), assume_unique=False)
-    # per-component coherence throttling
+    keep0 = np.intersect1d(
+        keep0, np.flatnonzero(colnorm_all > 1e-12), assume_unique=False
+    )
+
     keep = []
     for c in range(C):
         cand_c = keep0[comp_of_j[keep0] == c]
         chosen_c = []
         for j in cand_c:
-            ok = _filter_by_coherence(Bw, colnorm_all, keep + chosen_c, [j], rho_max=rho_max)
+            ok = _filter_by_coherence(
+                Bw, colnorm_all, keep + chosen_c, [j], rho_max=rho_max
+            )
             if ok.size == 1:
                 chosen_c.append(j)
         keep.extend(chosen_c)
@@ -357,45 +369,50 @@ def _global_nnls_workingset(Bw, yw, col_map, orbit_weights=None,
 
     x = np.zeros(K, dtype=np.float64)
 
+    # --- working-set expansion loop ---
     for r in range(int(rounds)):
         Bw_sub = Bw[:, keep]
         yw_sub = yw
         col_map_sub = [col_map[j] for j in keep]
 
         x_sub, info = _solve_nnls_with_orbit_equality_qp_osqp(
-            Bw_sub,
-            yw_sub,
-            col_map_sub,
-            w_target=w_target,
+            Bw_sub=Bw_sub,
+            yw_sub=yw,                # note: yw (full), or yw_sub if you slice rows (safe to pass yw)
+            col_map_sub=[col_map[j] for j in keep],
+            w_target=orbit_weights,   # pass the full prior array (function will pick usable subset)
             eps_diag=1e-8,
             osqp_max_iter=200000,
             osqp_verbose=False,
         )
-        print("[ws-NNLS-QP] OSQP status:", info.get("status"),
-            "iter:", info.get("iter"))
+
+        print(
+            "[ws-NNLS-QP]",
+            "round:", r + 1,
+            "status:", info["status"],
+            "iter:", info["iter"],
+            "usable:", info["usable_components"].size,
+        )
+
         x.fill(0.0)
         x[keep] = x_sub
 
-        # residual & gradient
+        # KKT check for expansion
         r_w = Bw @ x - yw
-        g = Bw.T @ r_w  # weighted gradient
-
-        # KKT satisfied?
+        g = Bw.T @ r_w
         viol = (x == 0.0) & (g < -1e-6)
         if not np.any(viol):
             break
 
-        # candidate adds per component, with coherence gate
         add = []
         for c in range(C):
             mask = (comp_of_j == c) & viol & (colnorm_all > 1e-12)
-            if not np.any(mask): 
+            if not np.any(mask):
                 continue
             j_c = np.flatnonzero(mask)
-            # sort by most negative gradient
             j_c = j_c[np.argsort(g[j_c])]
-            # coherence filter against current keep
-            j_c = _filter_by_coherence(Bw, colnorm_all, keep, j_c, rho_max=rho_max)
+            j_c = _filter_by_coherence(
+                Bw, colnorm_all, keep, j_c, rho_max=rho_max
+            )
             if j_c.size:
                 k_c = int(np.minimum(kincr_per_comp, j_c.size))
                 add.extend(j_c[:k_c].tolist())
@@ -404,12 +421,13 @@ def _global_nnls_workingset(Bw, yw, col_map, orbit_weights=None,
             break
         keep = np.array(sorted(set(keep.tolist() + add)), dtype=np.int64)
         if keep.size >= K:
-            break  # safety
+            break
 
-    # pre-projection residual (what you already have)
-    res_w_pre = float(np.linalg.norm(Bw @ x - yw))
-    print(f"[ws-NNLS] rounds={r+1} support={keep.size}/{K}  "
-        f"||Bw x - yw||={res_w_pre:.3g}")
+    res = float(np.linalg.norm(Bw @ x - yw))
+    print(
+        f"[ws-NNLS] rounds={r+1} support={keep.size}/{K} "
+        f"||Bw x - yw||={res:.3g}"
+    )
 
     return x, keep
 
@@ -418,137 +436,146 @@ def _global_nnls_workingset(Bw, yw, col_map, orbit_weights=None,
 def _solve_nnls_with_orbit_equality_qp_osqp(
     Bw_sub: np.ndarray,
     yw_sub: np.ndarray,
-    col_map_sub: list[tuple[int,int]],
-    w_target: np.ndarray | None,
+    col_map_sub: list[tuple[int, int]],
+    w_target: np.ndarray,
     *,
     eps_diag: float = 1e-8,
     osqp_max_iter: int = 200000,
     osqp_verbose: bool = False,
-    time_limit: float | None = None,
 ):
     """
-    One-shot QP: minimize 0.5*x'Qx + p'x  s.t.  R x = w_c_sub  and x >= 0
-    where Q = Bw_sub.T Bw_sub, p = -Bw_sub.T yw_sub.
+    One-shot NNLS patch solve with exact orbit *ratio* constraints.
 
-    Parameters
-    ----------
-    Bw_sub : (R, Ksub) float64
-      Weighted design matrix restricted to the working set.
-    yw_sub : (R,) float64
-      Weighted right-hand side.
-    col_map_sub : list of (c,p) pairs, length Ksub
-      Map of each column to its component.
-    w_target : (C_full,) or None
-      Full orbit target array (length C_full) in same mass units as x.
-      Only components appearing in col_map_sub will be constrained.
-    eps_diag : float
-      Small diagonal regularizer added to Q to ensure PDness.
-    osqp_max_iter : int
-      OSQP iteration cap.
-    time_limit : float | None
-      OSQP time limit in seconds (None = disabled).
+    Solves:
+        min_{x >= 0} ||Bw_sub x - yw_sub||^2
+        subject to:
+            sum_p x[c,p] / sum_p x[c_ref,p] = w_c / w_c_ref
+        for all usable components c != c_ref.
 
-    Returns
-    -------
-    x : ndarray (Ksub,)
-      Non-negative solution satisfying equality constraints (to solver tolerances).
-    info : dict
-      OSQP solver info dict (objective, status, iterations, solve_time)
+    This enforces orbit ratios exactly on the patch basis, while allowing
+    the data to determine the global normalization.
+
+    No fallback to unconstrained NNLS is provided: infeasible problems
+    raise a RuntimeError.
     """
-    # defensive casts
+
     Bw_sub = np.asarray(Bw_sub, dtype=np.float64, order="C")
     yw_sub = np.asarray(yw_sub, dtype=np.float64).ravel()
-    Ksub = int(Bw_sub.shape[1])
+    Ksub = Bw_sub.shape[1]
 
-    # Build Q and p (use sparse csc for OSQP)
-    # Q = Bw_sub.T @ Bw_sub
-    Q = Bw_sub.T @ Bw_sub
-    # regularize tiny diagonal to ensure PD numerical stability
+    if Ksub == 0:
+        raise RuntimeError("NNLS patch: empty working set")
+
+    # --- orbit prior (ratios only) ---
+    w = np.asarray(w_target, dtype=np.float64).ravel()
+    if w.ndim != 1 or np.sum(w) <= 0:
+        raise ValueError("Invalid orbit_weights")
+    w = w / np.sum(w)
+
+    # --- component bookkeeping ---
+    comp_list = np.array([c for (c, p) in col_map_sub], dtype=np.int64)
+    unique_comps = np.unique(comp_list)
+
+    # usable components: at least one non-zero column
+    col_norms = np.linalg.norm(Bw_sub, axis=0)
+    usable = []
+    for c in unique_comps:
+        cols_c = np.where(comp_list == c)[0]
+        if np.any(col_norms[cols_c] > 0):
+            usable.append(c)
+    usable = np.asarray(usable, dtype=np.int64)
+
+    if usable.size <= 1:
+        raise RuntimeError(
+            "NNLS patch: not enough usable components to enforce ratios"
+        )
+
+    # normalize prior over usable components only
+    w_use = w[usable]
+    w_use = w_use / np.sum(w_use)
+
+    # choose reference component with largest prior weight (stable)
+    ref_i = int(np.argmax(w_use))
+    c_ref = int(usable[ref_i])
+    w_ref = float(w_use[ref_i])
+
+    # map component -> column indices
+    comp_to_cols = {}
+    for j, c in enumerate(comp_list):
+        comp_to_cols.setdefault(int(c), []).append(j)
+
+    cols_ref = np.asarray(comp_to_cols[c_ref], dtype=np.int64)
+
+    # --- build quadratic objective ---
+    Qx = Bw_sub.T @ Bw_sub
     if eps_diag > 0:
-        Q = Q + eps_diag * np.eye(Ksub, dtype=np.float64)
-    P = sps.csc_matrix((Q + Q.T) * 0.5)  # ensure symmetry
+        Qx = Qx + eps_diag * np.eye(Ksub)
+    P = sps.csc_matrix(0.5 * (Qx + Qx.T))
+    q = -(Bw_sub.T @ yw_sub)
 
-    q = - (Bw_sub.T @ yw_sub)  # linear term
+    # --- equality constraints: ratios ---
+    rows, cols, data = [], [], []
+    eq = 0
 
-    # Build equality constraint matrix R (rows = #constrained components)
-    # Map components in col_map_sub -> unique component list
-    comp_list = np.array([int(c) for (c, p) in col_map_sub], dtype=np.int64)
-    unique_comps, inv_idx = np.unique(comp_list, return_inverse=True)
-    Csub = unique_comps.size
+    for i, c in enumerate(usable):
+        if c == c_ref:
+            continue
+        cols_c = np.asarray(comp_to_cols.get(int(c), []), dtype=np.int64)
+        if cols_c.size == 0:
+            continue
+        beta = float(w_use[i] / w_ref)
 
-    if (w_target is None) or (Csub == 0):
-        # fallback: no equality constraints; just solve plain NNLS QP with x>=0
-        # Build A = I, bounds 0..+inf
-        A = sps.identity(Ksub, format="csc")
-        l = np.zeros(Ksub, dtype=np.float64)
-        u = np.full(Ksub, np.inf, dtype=np.float64)
-    else:
-        # equality rows: for each component in unique_comps, put ones where
-        # column belongs to that component
-        rows = []
-        cols = []
-        data = []
-        for j in range(Ksub):
-            ri = inv_idx[j]  # row index in 0..Csub-1
-            rows.append(ri)
+        # +1 * sum_p x[c,p]
+        for j in cols_c:
+            rows.append(eq)
             cols.append(j)
             data.append(1.0)
-        R = sps.csr_matrix((data, (rows, cols)), shape=(Csub, Ksub), dtype=np.float64)
 
-        # Now append identity rows to enforce x >= 0 via linear constraints:
-        I = sps.identity(Ksub, format="csr", dtype=np.float64)
+        # -beta * sum_p x[c_ref,p]
+        for j in cols_ref:
+            rows.append(eq)
+            cols.append(j)
+            data.append(-beta)
 
-        # Stack R (eq) on top of I (inequality for bounds)
-        A = sps.vstack([R, I], format="csc")
+        eq += 1
 
-        # build l and u vectors: equality rows have l==u==w_sub
-        w_target = np.asarray(w_target, dtype=np.float64).ravel()
-        # pick the b vector corresponding to unique_comps
-        b_sub = w_target[unique_comps]
+    if eq == 0:
+        raise RuntimeError("NNLS patch: no valid ratio constraints constructed")
 
-        l_eq = b_sub
-        u_eq = b_sub
-        l_ineq = np.zeros(Ksub, dtype=np.float64)         # x >= 0
-        u_ineq = np.full(Ksub, np.inf, dtype=np.float64) # no upper bound
+    Aeq = sps.csr_matrix((data, (rows, cols)), shape=(eq, Ksub))
 
-        l = np.concatenate([l_eq, l_ineq])
-        u = np.concatenate([u_eq, u_ineq])
+    # --- inequality constraints: x >= 0 ---
+    A = sps.vstack([Aeq, sps.identity(Ksub, format="csr")], format="csc")
+    l = np.concatenate([np.zeros(eq), np.zeros(Ksub)])
+    u = np.concatenate([np.zeros(eq), np.full(Ksub, np.inf)])
 
-    # OSQP problem setup
+    # --- OSQP solve ---
     prob = osqp.OSQP()
-    setup_kwargs = dict(
+    prob.setup(
         P=P,
-        q=q.astype(np.float64),
+        q=q,
         A=A,
-        l=l.astype(np.float64),
-        u=u.astype(np.float64),
+        l=l,
+        u=u,
         verbose=osqp_verbose,
         polish=True,
         max_iter=int(osqp_max_iter),
         eps_abs=1e-8,
         eps_rel=1e-8,
     )
-    if time_limit is not None:
-        setup_kwargs["time_limit"] = float(time_limit)
-    prob.setup(**setup_kwargs)
 
     res = prob.solve()
-
     if res.info.status not in ("solved", "solved_inaccurate"):
-        # fallback: return non-negative least-squares solution (without equality)
-        # but warn in info
-        x_fallback = np.maximum(0.0, np.linalg.lstsq(Bw_sub, yw_sub, rcond=None)[0])
-        return x_fallback, dict(status=res.info.status, obj=res.info.obj_val, warn="OSQP failed")
+        raise RuntimeError(f"OSQP failed: {res.info.status}")
 
-    x = np.asarray(res.x).ravel()
-    # if equality rows present, the solution vector is length Ksub (res.x)
-    # if we had identity-only A, same length.
+    x = np.asarray(res.x, dtype=np.float64)
 
-    info = dict(status=res.info.status,
-                obj=res.info.obj_val if hasattr(res.info, "obj_val") else None,
-                iter=res.info.iter, solve_time=res.info.run_time if hasattr(res.info, "run_time") else None)
-
-    return x, info
+    return x, dict(
+        status=res.info.status,
+        iter=res.info.iter,
+        usable_components=usable,
+        reference_component=c_ref,
+    )
 
 # ------------------------------------------------------------------------------
 
@@ -768,6 +795,25 @@ def run_patch(h5_path: str,
     x_CP = np.zeros((C, P), dtype=np.float64)
     for j, (c, p) in enumerate(col_map):
         x_CP[c, p] = x_patch[j]
+    # ------------------------------------------------------------
+    # Interpret NNLS patch result as SUPPORT information
+    # ------------------------------------------------------------
+    EPS_PATCH = 1e-12
+
+    # Zero-out numerical noise
+    x_CP[np.abs(x_CP) < EPS_PATCH] = 0.0
+
+    # 1) Support mask: bins that were non-zero in patch
+    seed_support_mask = x_CP > 0.0    # shape (C,P)
+
+    # 2) Tested mask: bins that were included in NNLS design
+    seed_tested_mask = np.zeros((C, P), dtype=bool)
+    for (c, p) in col_map:
+        seed_tested_mask[c, p] = True
+
+    # 3) Initial KNOWN_ZERO candidates:
+    #    tested by patch but found unnecessary
+    initial_known_zero_mask = seed_tested_mask & (~seed_support_mask)
 
     # ------------------------------------------------------------
     # Project NNLS patch onto per-orbit simplex (y_dist)
@@ -841,7 +887,7 @@ def run_patch(h5_path: str,
 
     if write_seed:
         with open_h5(h5_path, role="writer") as f:
-            g = f.require_group("/Seeds")
+            grp = f.require_group("/Seeds")
             if seed_path in f:
                 del f[seed_path]
             ds = f.create_dataset(seed_path, data=x_CP.astype(np.float64),
@@ -851,6 +897,45 @@ def run_patch(h5_path: str,
             ds.attrs["k_per_comp"] = int(k_per_comp)
             ds.attrs["pick_mode"]  = str(pick_mode)
             ds.attrs["norm.mode_at_fit"] = norm_mode
+
+            # ------------------------------------------------------------
+            # Write seed support metadata for SPG
+            # ------------------------------------------------------------
+
+            if "seed_support_mask" in grp:
+                del grp["seed_support_mask"]
+            grp.create_dataset(
+                "seed_support_mask",
+                data=seed_support_mask.astype(bool),
+                dtype="bool",
+            )
+
+            if "seed_tested_mask" in grp:
+                del grp["seed_tested_mask"]
+            grp.create_dataset(
+                "seed_tested_mask",
+                data=seed_tested_mask.astype(bool),
+                dtype="bool",
+            )
+
+            # ------------------------------------------------------------
+            # Seed initial KNOWN_ZERO mask (conservative)
+            # ------------------------------------------------------------
+            hg = f.require_group("/HyperCube")
+
+            if "known_zero_mask" in hg:
+                # Merge with existing mask (never un-freeze)
+                kz_old = np.asarray(hg["known_zero_mask"][...], dtype=bool)
+                known_zero_mask = kz_old | initial_known_zero_mask
+                del hg["known_zero_mask"]
+            else:
+                known_zero_mask = initial_known_zero_mask.copy()
+
+            hg.create_dataset(
+                "known_zero_mask",
+                data=known_zero_mask.astype(bool),
+                dtype="bool",
+            )
     
     # usage_png = os.path.join(out_dir, "nnlsPatchUsage.png") if out_dir else None
     # metrics = None

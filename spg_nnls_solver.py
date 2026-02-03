@@ -623,6 +623,39 @@ def solve_global_spg(
         if cfg.s_tile_override is not None:
             s_tile = int(cfg.s_tile_override)
 
+    # ------------------------------------------------------------
+    # Load NNLS patch support and KNOWN_ZERO masks
+    # ------------------------------------------------------------
+    with open_h5(h5_path, role="reader") as f:
+        # Persistent KNOWN_ZERO mask (global)
+        if "/HyperCube/known_zero_mask" in f:
+            known_zero = np.asarray(
+                f["/HyperCube/known_zero_mask"][...], dtype=bool
+            )
+            if known_zero.shape != (C, P):
+                raise RuntimeError("known_zero_mask has wrong shape")
+        else:
+            known_zero = np.zeros((C, P), dtype=bool)
+
+        # Optional NNLS patch metadata
+        if "/Seeds/seed_support_mask" in f:
+            seed_support_mask = np.asarray(
+                f["/Seeds/seed_support_mask"][...], dtype=bool
+            )
+            if seed_support_mask.shape != (C, P):
+                raise RuntimeError("seed_support_mask has wrong shape")
+        else:
+            seed_support_mask = None
+
+        if "/Seeds/seed_tested_mask" in f:
+            seed_tested_mask = np.asarray(
+                f["/Seeds/seed_tested_mask"][...], dtype=bool
+            )
+            if seed_tested_mask.shape != (C, P):
+                raise RuntimeError("seed_tested_mask has wrong shape")
+        else:
+            seed_tested_mask = None
+
     s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
 
     print(
@@ -630,6 +663,12 @@ def solve_global_spg(
         f"s_tile={s_tile}, epochs={cfg.epochs}, lr0={cfg.lr}",
         flush=True,
     )
+
+    # ------------------------------------------------------------
+    # Track irrelevance persistence
+    # ------------------------------------------------------------
+    irrelevant_count = np.zeros((C, P), dtype=np.int32)
+
 
     # # ------------------------------------------------------------
     # # Load spatial component support masks (LOSVD + ENERGY)
@@ -858,12 +897,14 @@ def solve_global_spg(
             raise RuntimeError("Missing /Templates group in HDF5")
         pop_shape = tuple(f["/Templates"].attrs["pop_shape"])
 
+    orbit_prior_active = False
+
+
     # ============================================================
     # Main epochs
     # ============================================================
     try:
         for ep in range(cfg.epochs):
-            is_warmup = (ep == 0)
 
             g_tot = np.zeros_like(x)
             D_tot = np.zeros_like(x)
@@ -876,6 +917,11 @@ def solve_global_spg(
                 mininterval=2.0,
                 dynamic_ncols=True,
             )
+            if ep == 0 and seed_support_mask is not None:
+                # Freeze bins that patch tested and found zero,
+                # but only if they are not already ACTIVE
+                initial_freeze = seed_tested_mask & (~seed_support_mask)
+                known_zero[initial_freeze] = True
 
             # ---------------- Gradient accumulation (PARALLEL) ----------------
             for (s0, s1) in s_ranges:
@@ -1032,7 +1078,11 @@ def solve_global_spg(
             D = np.where(pos, np.maximum(D, abs_zero), 0.0)
 
             # ---------------- Freeze logic (respect priors) ----------------
-            freeze = (D <= 0.0) | (~np.isfinite(D))
+            freeze = (
+                (D <= 0.0)
+                | (~np.isfinite(D))
+                | known_zero
+            )
 
             if g_pop is not None:
                 pop_eps = 1e-12 * builtins.max(np.max(np.abs(g_pop)), 1.0)
@@ -1175,6 +1225,27 @@ def solve_global_spg(
             # ------------------------------------------------------------
             if w_target is not None:
                 s = w_target.copy()
+            # ------------------------------------------------------------
+            # Immediate structural freeze once orbit prior is active
+            # ------------------------------------------------------------
+            if w_target is not None and not orbit_prior_active:
+                orbit_prior_active = True
+
+                EPS_COEF = 1e-14
+                EPS_GRAD = 1e-10
+
+                zero_coef = x <= EPS_COEF
+                zero_grad = np.abs(g) <= EPS_GRAD
+
+                newly_zero = zero_coef & zero_grad & (~known_zero)
+
+                if np.any(newly_zero):
+                    known_zero[newly_zero] = True
+                    print(
+                        f"[SPG] Structural freeze after orbit prior: "
+                        f"{np.count_nonzero(newly_zero)} bins promoted to KNOWN_ZERO",
+                        flush=True,
+                    )
 
             # ------------------------------------------------------------
             # Robust projected update of y (orbit-internal SFH)
@@ -1305,6 +1376,20 @@ def solve_global_spg(
         
         th = cu.zero_floor_inplace(best_x, rel_tol=1e-25, abs_tol=0.0)
         print(f"[SPG] zero-floor applied: threshold={th:.3e}", flush=True)
+
+        # ------------------------------------------------------------
+        # Persist KNOWN_ZERO mask to HyperCube
+        # ------------------------------------------------------------
+        print("[SPG] saving KNOWN_ZERO mask to /HyperCube/known_zero_mask", flush=True)
+        with open_h5(h5_path, role="writer") as f:
+            grp = f.require_group("/HyperCube")
+            if "known_zero_mask" in grp:
+                del grp["known_zero_mask"]
+            grp.create_dataset(
+                "known_zero_mask",
+                data=known_zero.astype(bool),
+                dtype="bool",
+            )
 
         elapsed = time.perf_counter() - t0
         return best_x, dict(

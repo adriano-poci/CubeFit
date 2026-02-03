@@ -477,9 +477,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     hdf5Path = (hdf5Dir/f"{galaxy}_{nComp}_{lOrder:02d}").with_suffix('.h5')
 
     # --- Initialize and load data ---
-    # mgr = H5Manager(hdf5Path, tem_pix=copy(teLL), obs_pix=copy(spLL))
     mgr = H5Manager(hdf5Path)
-    # mgr.set_velocity_grid(copy(vbins))
     arDims = mgr.populate_from_arrays(
         losvd=nApHists,
         datacube=laGrid,
@@ -574,31 +572,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     print("[env] SLURM_JOB_ID=", os.environ.get("SLURM_JOB_ID"),
         " SLURM_STEP_ID=", os.environ.get("SLURM_STEP_ID"))
 
-    ########################
-    # Non-batched Kaczmarz #
-    ########################
-    # x_global, stats = runner.solve_all(
-    #     epochs=1,
-    #     pixels_per_aperture=4096,
-    #     lr=0.25,
-    #     project_nonneg=True,
-    #     # orbit_weights=cWeights,
-    #     orbit_weights=None,
-    #     ratio_use=False,
-    #     reader_s_tile=nS, reader_c_tile=nC, reader_p_tile=nP,
-    #     verbose=True,
-    #     warm_start='jacobi',  # 'zeros', 'random', 'jacobi'
-    #     row_order='sequential',
-    #     block_rows=2048,
-    #     blas_threads=48,
-    #     progress_interval_sec=900,
-    #     tracker_mode='off',
-    # # Optional ratio controls
-    # # ratio_use=True, ratio_anchor="auto", ratio_eta=0.05, ratio_prob=0.02,
-    # # ratio_batch=2, ratio_min_weight=1e-4,
-    # # progress_interval_sec=60,  # if you want periodic on_progress ticks
-    # )
-
     # sidecar = cu._find_latest_sidecar(hdf5Path)
     # ridx = 95
     # x0 = load_xring_best(
@@ -629,23 +602,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     )
 
     logger.log("[CubeFit] Global fit completed.")
-    # # --- Save the global solution vector
-    # logger.log("[CubeFit] Saving fit results...")
-    # with open_h5(hdf5Path, role="writer") as f:
-    #     ds = f.get("/X_global", None)
-    #     if ds is not None and ds.shape == (x_global.size,):
-    #         ds[...] = np.asarray(x_global, np.float64)
-    #         logger.log("[CubeFit] Dataset already exists; overwritten.")
-    #     else:
-    #         if "/X_global" in f:
-    #             del f["/X_global"]
-    #         f.create_dataset(
-    #             "/X_global",
-    #             data=np.asarray(x_global, np.float64),
-    #             chunks=(min(8192, x_global.size),),
-    #             compression="gzip", compression_opts=4, shuffle=True,
-    #         )
-    #         logger.log("[CubeFit] Results stored.")
 
 # ------------------------------------------------------------------------------
 # HDF5 helpers (added)

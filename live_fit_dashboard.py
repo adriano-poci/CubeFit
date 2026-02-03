@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import argparse, glob, os
+import argparse, glob, os, builtins
 from pathlib import Path
 import h5py
 import numpy as np
@@ -244,6 +244,7 @@ def render_sfh_from_x(h5_path: str,
         C = int(f["/HyperCube/models"].shape[1])
         T = f["/Templates"]
         pop_shape = T.attrs.get("pop_shape", None)
+        print(f"[SFH] Templates pop_shape: {pop_shape}")
         if pop_shape is None:
             # fallback: treat templates as 1-D population axis
             P = int(T.shape[0])
@@ -267,13 +268,15 @@ def render_sfh_from_x(h5_path: str,
         nZ, nT, nA = pop_shape
         W = X.sum(axis=0) # (nZ, nT, nA)
         vmax = float(np.max(np.log10(W))) if np.isfinite(W).any() else 1.0
+        vmin = float(np.min(np.log10(W))) if np.isfinite(W).any() else 0.0
+        vmin = builtins.min(vmin, vmax - 6.0)  # at most 3 dex dynamic range
 
         fig, axes = plt.subplots(1, nA, figsize=(3.0*nA, 3.4), squeeze=False)
         axes = axes[0]
         for a in range(nA):
             ax = axes[a]
             im = ax.imshow(np.log10(W[:, :, a]), origin="lower", aspect="auto",
-                cmap=moncmapr, norm=Normalize(vmin=0.0, vmax=vmax))
+                cmap=moncmapr, norm=Normalize(vmin=vmin, vmax=vmax))
             ax.set_title(f"α index {a}")
             ax.set_xlabel("Age index")
             if a == 0:
