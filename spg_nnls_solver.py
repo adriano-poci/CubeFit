@@ -110,6 +110,8 @@ v3.15:  Removed projection in favour of re-parametrisation in `solve_global_spg`
 v3.16:  Replaced orbit prior with Lagrange multiplier for exact adherence to the
             orbit weights within the solver in `solve_global_spg`. 31 January
             2026
+v3.17:  Added bookkeeping to determine if components should be zeroed, and remove
+            them from the solver in `solve_global_spg`. 3 February 2026
 """
 
 from __future__ import annotations, print_function
@@ -1377,26 +1379,13 @@ def solve_global_spg(
         th = cu.zero_floor_inplace(best_x, rel_tol=1e-25, abs_tol=0.0)
         print(f"[SPG] zero-floor applied: threshold={th:.3e}", flush=True)
 
-        # ------------------------------------------------------------
-        # Persist KNOWN_ZERO mask to HyperCube
-        # ------------------------------------------------------------
-        print("[SPG] saving KNOWN_ZERO mask to /HyperCube/known_zero_mask", flush=True)
-        with open_h5(h5_path, role="writer") as f:
-            grp = f.require_group("/HyperCube")
-            if "known_zero_mask" in grp:
-                del grp["known_zero_mask"]
-            grp.create_dataset(
-                "known_zero_mask",
-                data=known_zero.astype(bool),
-                dtype="bool",
-            )
-
         elapsed = time.perf_counter() - t0
         return best_x, dict(
             epochs=cfg.epochs,
             elapsed_sec=elapsed,
             rmse_proxy_best=float(best_proxy),
             active_orbits=active_orbits.copy(),
+            known_zero_mask=known_zero.copy(),
         )
 
     finally:

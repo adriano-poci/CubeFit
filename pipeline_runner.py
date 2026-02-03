@@ -50,6 +50,8 @@ v1.13:  Universally removed all ad-hoc scalings;
         Scale the NNLS ridge to the orbit prior strength in
             `PipelineRunner.solve_all_mp_batched`. 25 January 2026
 v1.14:  Use renamed module. 27 January 2026
+v1.15:  Persist `known_zero_mask` after SPG in `solve_all_mp_batched`. 3 February
+            2026
 """
 
 from __future__ import annotations
@@ -1185,6 +1187,8 @@ class PipelineRunner:
                     x0=x0_effective,
                     tracker=tracker,
                 )
+                # Use active set from SPG (rows only)
+                active_orbits = stats.get("active_orbits", None)
                 
                 # # ------------------------------------------------------------
                 # # Final Kaczmarz NNLS polish (true row-action)
@@ -1194,8 +1198,6 @@ class PipelineRunner:
                 # C = self.nComp
                 # P = self.nPop
 
-                # # Use active set from SPG (rows only)
-                # active_orbits = stats.get("active_orbits", None)
 
                 # logger.log(f"PRE-KACZ ||x_solver|| = {float(np.linalg.norm(x_solver))}")
 
@@ -1240,7 +1242,20 @@ class PipelineRunner:
 
             f_wr["/X_global"].attrs["layout"] = "C_P"
             f_wr["/X_global"].attrs["P"] = x_solver.shape[1]
-            # f_wr["/X_global"].attrs["active_orbits"] = np.asarray(active_orbits, dtype=int)
+            f_wr["/X_global"].attrs["active_orbits"] = np.asarray(active_orbits,
+                dtype=int)
+
+            if "known_zero_mask" in stats:
+                print("[pipeline] writing KNOWN_ZERO mask to /HyperCube/known_zero_mask",
+                    flush=True)
+                grp = f_wr.require_group("/HyperCube")
+                if "known_zero_mask" in grp:
+                    del grp["known_zero_mask"]
+                grp.create_dataset(
+                    "known_zero_mask",
+                    data=stats["known_zero_mask"].astype(bool),
+                    dtype="bool",
+                )
         if tracker is not None:
             try: tracker.close()
             except Exception: pass

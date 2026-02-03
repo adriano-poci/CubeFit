@@ -60,6 +60,20 @@ v1.1:   Universally removed all ad-hoc scalings;
             `_global_nnls_workingset`. 25 January 2026
 v2.0:   Refactored to use OSQP QP solver for exact equality constraints. 31
             January 2026
+v2.1:   Implemented `known_zero_mask` to exclude components from the patch fit
+            in `run_patch`;
+        Normalize each spaxel spectrum independently before stacking to ensure
+            patch NNLS solves for spectral shape rather than absolute flux;
+        Remove all orbit-prior constraints from the NNLS patch to avoid over
+            constraining an underdetermined local problem;
+        Record `seed_support_mask` for `(c,p)` bins activated by the patch NNLS
+            solve;
+        Record `seed_tested_mask` for `(c,p)` bins explicitly evaluated in the
+            patch design matrix;
+        Initialize `known_zero_mask` conservatively from patch-tested but
+            inactive bins to reduce SPG nullspace exploration;
+        Stop projecting patch outputs onto per-orbit simplices, delegating all
+            mass normalization to the SPG solver. 3 February 2026
 """
 
 
@@ -377,9 +391,9 @@ def _global_nnls_workingset(
 
         x_sub, info = _solve_nnls_with_orbit_equality_qp_osqp(
             Bw_sub=Bw_sub,
-            yw_sub=yw,                # note: yw (full), or yw_sub if you slice rows (safe to pass yw)
-            col_map_sub=[col_map[j] for j in keep],
-            w_target=orbit_weights,   # pass the full prior array (function will pick usable subset)
+            yw_sub=yw_sub, # note: yw (full), or yw_sub if you slice rows (safe to pass yw)
+            col_map_sub=col_map_sub,
+            w_target=w_target,   # pass the full prior array (function will pick usable subset)
             eps_diag=1e-8,
             osqp_max_iter=200000,
             osqp_verbose=False,
@@ -590,9 +604,9 @@ def run_patch(h5_path: str,
               seed_path: str = "/Seeds/x0_nnls_patch",
               orbit_weights: np.ndarray | None = None):
 
-    out_dir = None if out_dir is None else str(out_dir)
+    out_dir = None if out_dir is None else plp.Path(out_dir)
     if out_dir:
-        plp.Path(out_dir).mkdir(parents=True, exist_ok=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- read dims, global mask, λ-weights, picks
     with open_h5(h5_path, role="reader") as f:
@@ -674,15 +688,20 @@ def run_patch(h5_path: str,
             spec = np.asarray(DC[s, :], dtype=np.float64)
             if keep_idx is not None:
                 spec = spec[keep_idx]
-            # per-spaxel finite mask
-            good = np.isfinite(spec)
-            # store y with NaNs → 0 (they get zero weight)
-            spec_sanit = np.where(good, spec, 0.0)
-            y[pos:pos+Lk] = spec_sanit
 
+            good = np.isfinite(spec)
+            spec_sanit = np.where(good, spec, 0.0)
+
+            # -------- NEW: per-spaxel normalization (shape only) --------
+            norm = np.linalg.norm(spec_sanit)
+            if norm > 0:
+                spec_sanit /= norm
+            # ------------------------------------------------------------
+
+            y[pos:pos+Lk] = spec_sanit
             sqrt_w_rows[pos:pos+Lk] = good.astype(np.float64)
-            finite_counts.append(int(np.count_nonzero(good)))
             pos += Lk
+            finite_counts.append(int(np.count_nonzero(good)))
     finite_counts = np.asarray(finite_counts, int)
     print(f"[patch] finite pixels per spaxel (min/median/max): "
           f"{finite_counts.min()}/{int(np.median(finite_counts))}/{finite_counts.max()}")
@@ -783,7 +802,7 @@ def run_patch(h5_path: str,
     # --- Fast working-set GLOBAL NNLS on a pruned basis
     print(f"[patch] Working-set global NNLS (init=32/comp, +16/round, rounds=4)...")
     x_full, keep = _global_nnls_workingset(
-        Bw, yw, col_map, orbit_weights=orbit_weights,
+        Bw, yw, col_map, orbit_weights=None,
         k0_per_comp=32, kincr_per_comp=16, rounds=4,
     )
     # keep col_map aligned with x_patch for the unpack loop
@@ -814,20 +833,6 @@ def run_patch(h5_path: str,
     # 3) Initial KNOWN_ZERO candidates:
     #    tested by patch but found unnecessary
     initial_known_zero_mask = seed_tested_mask & (~seed_support_mask)
-
-    # ------------------------------------------------------------
-    # Project NNLS patch onto per-orbit simplex (y_dist)
-    # ------------------------------------------------------------
-    # Per-orbit simplex (correct and necessary)
-    row_sum = x_CP.sum(axis=1)
-    row_safe = np.where(row_sum > 0.0, row_sum, 1.0)
-
-    y_dist_patch = x_CP / row_safe[:, None]
-    y_dist_patch = np.maximum(y_dist_patch, 0.0)
-    y_dist_patch /= (y_dist_patch.sum(axis=1, keepdims=True) + 1e-30)
-
-    # Final seed (already consistent!)
-    x_CP = row_sum[:, None] * y_dist_patch
 
     # --- Reconstruct + diagnostics per spaxel
     rmse = np.zeros(s_idx.size, dtype=np.float64)
@@ -865,8 +870,8 @@ def run_patch(h5_path: str,
                 ax.set_xlabel("λ (ObsPix)")
                 ax.set_ylabel("flux")
                 ax.legend(loc="best", fontsize=8)
-                fig.savefig(os.path.join(out_dir,
-                    f"patch_spax{int(s):05d}.png"), dpi=120)
+                fig.savefig(out_dir/\
+                    f"patch_spax{int(s):05d}.png", dpi=120)
                 plt.close(fig)
 
     if out_dir:
@@ -882,7 +887,7 @@ def run_patch(h5_path: str,
             ax.bar(np.arange(order.size), flat[order])
             ax.set_title("x_CP top coefficients (sorted)")
             ax.set_xlabel("rank"); ax.set_ylabel("weight")
-            fig.savefig(os.path.join(out_dir, "xcp_bar.png"), dpi=120)
+            fig.savefig(out_dir / 'xcp_bar.png', dpi=120)
             plt.close(fig)
 
     if write_seed:
@@ -919,7 +924,7 @@ def run_patch(h5_path: str,
             )
 
             # ------------------------------------------------------------
-            # Seed initial KNOWN_ZERO mask (conservative)
+            # Seed initial KNOWN_ZERO mask
             # ------------------------------------------------------------
             hg = f.require_group("/HyperCube")
 
@@ -937,22 +942,6 @@ def run_patch(h5_path: str,
                 dtype="bool",
             )
     
-    # usage_png = os.path.join(out_dir, "nnlsPatchUsage.png") if out_dir else None
-    # metrics = None
-    # if write_seed:
-    #     # Seed is in the main HDF5 at `seed_path`
-    #     try:
-    #         metrics = compare_usage_to_orbit_weights(
-    #             h5_path,
-    #             sidecar=None,
-    #             x_dset=seed_path, # e.g. "/Seeds/x0_nnls_patch"
-    #             normalize="unit_sum",
-    #             out_png=usage_png,
-    #             usage_metric="sum"
-    #         )
-    #     except Exception as e:
-    #         print(f"[nnls_patch] usage-vs-prior (seed) failed: {e}")
-
     else:
         import tempfile
         tmp_sidecar = None
@@ -969,14 +958,6 @@ def run_patch(h5_path: str,
                 G.create_dataset("/Fit/x_best", data=x_CP.astype("f8"),
                     dtype="f8",)
 
-            # metrics = compare_usage_to_orbit_weights(
-            #     h5_path,
-            #     sidecar=tmp_sidecar,
-            #     x_dset="/Fit/x_best",
-            #     normalize="unit_sum",
-            #     out_png=usage_png,
-            #     usage_metric="sum"
-            # )
         except Exception as e:
             print(f"[nnls_patch] usage-vs-prior (temp sidecar) failed: {e}")
         finally:
@@ -985,16 +966,6 @@ def run_patch(h5_path: str,
                     os.remove(tmp_sidecar)
                 except OSError:
                     pass
-
-    # if metrics is not None:
-    #     print(
-    #         "[nnls_patch] usage-vs-prior:"
-    #         f" L1={metrics.get('l1', float('nan')):.3e}"
-    #         f"  L∞={metrics.get('linf', float('nan')):.3e}"
-    #         f"  cos={metrics.get('cosine', float('nan')):.4f}"
-    #         f"  r={metrics.get('pearson_r', float('nan')):.4f}"
-    #         f"  plot={metrics.get('plot_path')}"
-    #     )
 
     return dict(
         x_CP=x_CP, picks=picks, s_idx=s_idx, rmse=rmse, chi2=chi2,
