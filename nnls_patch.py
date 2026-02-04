@@ -82,6 +82,7 @@ import os, math, pathlib as plp, builtins
 from typing import Optional, List, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import scipy.sparse as sps
 import osqp
 from tqdm import tqdm
@@ -389,22 +390,19 @@ def _global_nnls_workingset(
         yw_sub = yw
         col_map_sub = [col_map[j] for j in keep]
 
-        x_sub, info = _solve_nnls_with_orbit_equality_qp_osqp(
-            Bw_sub=Bw_sub,
-            yw_sub=yw_sub, # note: yw (full), or yw_sub if you slice rows (safe to pass yw)
-            col_map_sub=col_map_sub,
-            w_target=w_target,   # pass the full prior array (function will pick usable subset)
-            eps_diag=1e-8,
-            osqp_max_iter=200000,
-            osqp_verbose=False,
+        x_sub = _solve_nnls(
+            Bw_sub,
+            yw_sub,
+            solver="nnls",
+            ridge=0.0,
+            normalize_columns=True,
         )
+        info = dict(status="unconstrained")
 
         print(
-            "[ws-NNLS-QP]",
+            "[ws-NNLS]",
             "round:", r + 1,
             "status:", info["status"],
-            "iter:", info["iter"],
-            "usable:", info["usable_components"].size,
         )
 
         x.fill(0.0)
@@ -590,6 +588,150 @@ def _solve_nnls_with_orbit_equality_qp_osqp(
         usable_components=usable,
         reference_component=c_ref,
     )
+
+# ------------------------------------------------------------------------------
+
+def _solve_nnls(Bw: np.ndarray,
+                yw: np.ndarray,
+                solver: str = "nnls",
+                max_iter: int = 200,
+                ridge: float = 0.0,
+                normalize_columns: bool = True) -> np.ndarray:
+    """
+    Solve the non-negative least-squares problem
+
+        min_x 0.5 * ||Bw x - yw||_2^2 + 0.5 * ridge * ||x||_2^2
+        s.t.  x >= 0
+
+    The implementation solves on a column-normalized system when
+    ``normalize_columns=True`` for numerical stability and speed, and maps
+    the solution back to the original column scaling.
+
+    Parameters
+    ----------
+    Bw : ndarray (R, K)
+        Weighted design matrix (rows already incorporate row-weights).
+    yw : ndarray (R,)
+        Weighted right-hand side vector.
+    solver : {'nnls','lsq','pg'}
+        Backend solver to use. 'nnls' prefers scipy.optimize.nnls on a
+        normalized system (fast); 'lsq' uses lsq_linear (bounds); 'pg'
+        uses an internal projected-gradient solver (robust fallback).
+    max_iter : int
+        Maximum iterations for iterative solvers (pg or lsq_linear).
+    ridge : float
+        L2 ridge regularizer applied to the quadratic term.
+    normalize_columns : bool
+        If True, solve on Bw / col_norm to remove per-column scale and
+        then return x in the original scale.
+
+    Returns
+    -------
+    x : ndarray (K,)
+        Non-negative solution vector in the original column scaling.
+
+    Raises
+    ------
+    ValueError
+        If input shapes are inconsistent or solver argument is unknown.
+
+    Examples
+    --------
+    >>> x = _solve_nnls(Bw, yw, solver='nnls', ridge=1e-4)
+    """
+
+    Bw = np.asarray(Bw, dtype=np.float64, order="C")
+    yw = np.asarray(yw, dtype=np.float64).ravel()
+    if Bw.ndim != 2:
+        raise ValueError("Bw must be 2-D (R,K)")
+    R, K = Bw.shape
+    if yw.size != R:
+        raise ValueError("yw length must match Bw.shape[0]")
+
+    # ---- Normalise columns if requested ---------------------------------
+    if normalize_columns:
+        col_norm = np.linalg.norm(Bw, axis=0)
+        # avoid division by zero -> set tiny norms to 1.0 for scaling only
+        col_norm_safe = np.where(col_norm > 0.0, col_norm, 1.0)
+        Bn = Bw / col_norm_safe[None, :]
+    else:
+        col_norm_safe = np.ones(K, dtype=np.float64)
+        Bn = Bw.copy()
+
+    # incorporate ridge in objective: for normalized solver we add it to grad
+    # For lsq we augment; for nnls we rely on PG fallback if needed.
+
+    # ---- NNLS via scipy.nnls on normalized columns -----------------------
+    if solver == "nnls":
+        try:
+            from scipy.optimize import nnls as _scipy_nnls
+            # nnls expects 2-D (M,N), b of length M. Use Bn and yw.
+            z, _ = _scipy_nnls(Bn, yw)
+            x = z / col_norm_safe
+            # ensure non-negative and finite
+            x = np.maximum(0.0, np.asarray(x, dtype=np.float64))
+            return x
+        except Exception:
+            # fallback: use projected gradient on normalized system
+            solver = "pg"
+
+    # ---- LSQ_LINEAR (bounded least-squares) ------------------------------
+    if solver == "lsq":
+        try:
+            from scipy.optimize import lsq_linear as _lsq_linear
+            if ridge > 0.0:
+                # augment to implement ridge: [Bn; sqrt(ridge)*I] x = [yw; 0]
+                sqrt_r = np.sqrt(float(ridge))
+                B_aug = np.vstack([Bn, sqrt_r * np.eye(K)])
+                y_aug = np.concatenate([yw, np.zeros(K, dtype=np.float64)])
+                res = _lsq_linear(B_aug, y_aug, bounds=(0.0, np.inf),
+                                  max_iter=int(max_iter), verbose=0, lsmr_tol='auto')
+            else:
+                res = _lsq_linear(Bn, yw, bounds=(0.0, np.inf),
+                                  max_iter=int(max_iter), verbose=0, lsmr_tol='auto')
+            z = np.asarray(res.x, dtype=np.float64)
+            x = z / col_norm_safe
+            x = np.maximum(0.0, x)
+            return x
+        except Exception as e:
+            # fallback to PG if lsq_linear is not available or fails
+            solver = "pg"
+
+    # ---- Projected Gradient (works on normalized system) ---------------
+    if solver == "pg":
+        z = np.zeros(K, dtype=np.float64)   # solution in normalized space
+        # estimate Lipschitz (per-column quadratic diag)
+        L_est = float(np.max(np.sum(Bn * Bn, axis=0))) + float(ridge)
+        if not np.isfinite(L_est) or L_est <= 0.0:
+            L_est = 1.0
+        step = 1.0 / L_est
+        for it in range(int(max_iter)):
+            r = Bn @ z - yw
+            g = Bn.T @ r + float(ridge) * z
+            # gradient step + projection
+            z_try = np.maximum(0.0, z - step * g)
+            # backtracking on quadratic objective (sufficient decrease)
+            r_try = Bn @ z_try - yw
+            f_old = 0.5 * float(r @ r) + 0.5 * float(ridge) * float(z @ z)
+            f_new = 0.5 * float(r_try @ r_try) + 0.5 * float(ridge) * float(z_try @ z_try)
+            bt = 0
+            while f_new > f_old and bt < 10:
+                step *= 0.5
+                z_try = np.maximum(0.0, z - step * g)
+                r_try = Bn @ z_try - yw
+                f_new = 0.5 * float(r_try @ r_try) + 0.5 * float(ridge) * float(z_try @ z_try)
+                bt += 1
+            z = z_try
+            # stopping criterion (inf-norm of projected gradient)
+            pg = z - np.maximum(0.0, z - g * step)
+            if np.linalg.norm(pg, ord=np.inf) * step < 1e-9:
+                break
+        x = z / col_norm_safe
+        x = np.maximum(0.0, x)
+        return x
+
+    # ---- Unknown solver option ------------------------------------------
+    raise ValueError(f"Unknown solver='{solver}'")
 
 # ------------------------------------------------------------------------------
 
@@ -851,7 +993,12 @@ def run_patch(h5_path: str,
                 picks=picks,
                 keep_idx=keep_idx,
             )
+
             y_obs = y[pos:pos+Lk]
+            #  Renormalize to observed spectrum norm
+            scale = np.dot(y_obs, y_fit) / (np.dot(y_fit, y_fit) + 1e-30)
+            y_fit *= scale
+
             wrow  = sqrt_w_rows[pos:pos+Lk]
             pos += Lk
             r = y_obs - y_fit
@@ -880,14 +1027,21 @@ def run_patch(h5_path: str,
         if nnz == 0:
             print("[plot] x_CP is all zeros (no bars to draw).")
         else:
-            # (optional) plot only the top 1000 by magnitude to make the bars visible
-            order = np.argsort(flat)[::-1][:int(np.minimum(1000, nnz))]
-            fig = plt.figure(figsize=(10, 3))
-            ax = fig.add_subplot(111)
-            ax.bar(np.arange(order.size), flat[order])
-            ax.set_title("x_CP top coefficients (sorted)")
-            ax.set_xlabel("rank"); ax.set_ylabel("weight")
-            fig.savefig(out_dir / 'xcp_bar.png', dpi=120)
+            fig = plt.figure(figsize=plt.figaspect(0.5)*0.9)
+            gs = gridspec.GridSpec(1, 2, hspace=0.0, wspace=0.1)
+
+            ax = fig.add_subplot(gs[0, 0])
+            ax.bar(np.arange(flat.size), flat)
+            ax.set_xlabel('component populations')
+            ax.set_ylabel('weight')
+
+            ax2 = fig.add_subplot(gs[0, 1])
+            ax2.imshow(seed_support_mask, aspect="auto", interpolation="nearest")
+            ax2.set_xlabel("population p")
+            ax2.set_ylabel("component c")
+            ax2.set_title("NNLS patch support mask")
+
+            fig.savefig(out_dir / 'xcp.png', dpi=120)
             plt.close(fig)
 
     if write_seed:
@@ -966,6 +1120,10 @@ def run_patch(h5_path: str,
                     os.remove(tmp_sidecar)
                 except OSError:
                     pass
+    
+    # NOTE:
+    # x_CP amplitudes from the NNLS patch are NOT physically meaningful.
+    # They encode support only; SPG will overwrite amplitudes completely.
 
     return dict(
         x_CP=x_CP, picks=picks, s_idx=s_idx, rmse=rmse, chi2=chi2,

@@ -171,4 +171,4 @@ fi
 
 # run your job as a Slurm step (gives you the full cpuset)
 srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python -m IPython kz_rio.py -- --galaxy "$GALAXY" --redraw ${NCOMP:+--ncomp="$NCOMP"}
+  python -m IPython --colors=NoColor kz_rio.py -- --galaxy "$GALAXY" --redraw ${NCOMP:+--ncomp="$NCOMP"}

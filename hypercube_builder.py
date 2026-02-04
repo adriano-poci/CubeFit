@@ -948,6 +948,18 @@ def build_hypercube(
             if m.size == L and np.any(m):
                 keep_idx = np.flatnonzero(m)
 
+        # Optional λ-weights for energy/statistics (apply same floor, use √w)
+        w_lam_sqrt = None
+        lamw_floor = 1e-6
+        if "/HyperCube/lambda_weights" in f_rd:
+            _w = np.asarray(f_rd["/HyperCube/lambda_weights"][...],
+                            dtype=np.float64).ravel()
+            if _w.size == L:
+                _w = np.clip(_w, lamw_floor, None)
+                if keep_idx is not None:
+                    _w = _w[keep_idx]
+                w_lam_sqrt = np.sqrt(_w).astype(np.float64, copy=False)  # (Lk,) or (L,)
+
     
     # Precompute velocity→pixel mapping (shared for all (s,c))
     km = _kernel_map_from_grids(tem_loglam, vel_pix)
@@ -1078,6 +1090,25 @@ def build_hypercube(
         losvd_ds = f["/LOSVD"]
 
         masked_flag = bool(keep_idx is not None)
+        # create dataset & attrs up front (metadata writes pre-SWMR)
+        if "/HyperCube/col_energy" in f:
+            del f["/HyperCube/col_energy"]
+        E_ds = g.create_dataset("col_energy", shape=(C, P), dtype="f8",
+            chunks=(min(C,256), min(P,1024)), compression="gzip")
+        # set attrs before swmr_mode
+        E_ds.attrs["masked"] = bool(masked_flag)
+        E_ds.attrs["lambda_weights"] = bool(w_lam_sqrt is not None)
+        E_ds.attrs["lambda_weights_floor"] = 1e-6
+        E_ds.attrs["shape"] = (int(C), int(P))
+        E_ds.attrs["provenance"] = "sum_{s,λ} models^2 (mask applied)" if masked_flag else "sum_{s,λ} models^2"
+        if masked_flag and (w_lam_sqrt is not None):
+            E_ds.attrs["provenance"] = "sum_{s,λ} (√w·models)^2 over masked λ"
+        elif masked_flag:
+            E_ds.attrs["provenance"] = "sum_{s,λ} models^2 over masked λ"
+        elif (w_lam_sqrt is not None):
+            E_ds.attrs["provenance"] = "sum_{s,λ} (√w·models)^2 over all λ"
+        else:
+            E_ds.attrs["provenance"] = "sum_{s,λ} models^2 over all λ"
 
 
         # --- SWMR writer mode
@@ -1088,15 +1119,16 @@ def build_hypercube(
         except Exception as e:
             print(f"[SWMR] could not enable writer mode: {e}")
 
-        # # Initialize global column energy accumulator E[c,p] float64
-        # E_acc = np.zeros((C, P), dtype=np.float64)
+        # Initialize global column energy accumulator E[c,p] float64
+        E_acc = np.zeros((C, P), dtype=np.float64)
         # ------------------------------------------------------------
         # Tile-wise component energy for spatial support (ENERGY-based)
         # ------------------------------------------------------------
+        n_tiles = math.ceil(S / S_chunk)
 
-        # # Accumulate energy per (tile, component)
-        # # float64 but very small: (n_tiles, C)
-        # E_tile_comp = np.zeros((n_tiles, C), dtype=np.float64)
+        # Accumulate energy per (tile, component)
+        # float64 but very small: (n_tiles, C)
+        E_tile_comp = np.zeros((n_tiles, C), dtype=np.float64)
 
         # --- iterate tiles; skip ones marked done
         def _iter_all_tiles():
@@ -1158,6 +1190,32 @@ def build_hypercube(
                         Ycp *= np.float32(scale)
                     else:
                         Ycp.fill(0.0)
+
+                    # 6b) accumulate global energy E[c,p] with same λ-view:
+                    # mask if present, and apply √w if lambda_weights exist.
+                    if masked_flag:
+                        Yv = Ycp[:, keep_idx]  # (ΔP, Lk)
+                    else:
+                        Yv = Ycp               # (ΔP, L or Lk)
+
+                    # Compute per-population contribution for this (s_idx, c_idx, P-block)
+                    if w_lam_sqrt is not None:
+                        # weighted: sum_λ (√w·Y)^2 = sum_λ (w * Y^2)
+                        e_local = np.sum(
+                            np.square(Yv, dtype=np.float64) * w_lam_sqrt[None, :],
+                            axis=1
+                        )  # (ΔP,)
+                    else:
+                        # unweighted: sum_λ Y^2
+                        e_local = np.sum(
+                            np.square(Yv, dtype=np.float64),
+                            axis=1
+                        )  # (ΔP,)
+
+                    E_acc[c_idx, p0:p1] += e_local
+                    # --- accumulate tile-wise component energy ---
+                    tile_idx = s_idx // S_chunk
+                    E_tile_comp[tile_idx, c_idx] += float(np.sum(e_local))
                     
                     # 7) write
                     models[s_idx, c_idx, p0:p1, 0:L] = Ycp
@@ -1182,6 +1240,8 @@ def build_hypercube(
             pbar.update(1)
 
         pbar.close()
+
+        E_ds[...] = E_acc
         
         g.attrs["complete"] = True
         if vel_bias_kms is not None:

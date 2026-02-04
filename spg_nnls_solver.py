@@ -112,6 +112,9 @@ v3.16:  Replaced orbit prior with Lagrange multiplier for exact adherence to the
             2026
 v3.17:  Added bookkeeping to determine if components should be zeroed, and remove
             them from the solver in `solve_global_spg`. 3 February 2026
+v3.18:  Added column-energy scaling to the gradient and the diagonal
+            preconditioner only, not the forward model, in `solve_global_spg`. 4
+            February 2026
 """
 
 from __future__ import annotations, print_function
@@ -260,38 +263,22 @@ def rmse_proxy_subset(
 
 # ------------------------------------------------------------------------------
 
-def _tiny_col_freeze_inplace(col_denom, grad, rel_zero, abs_zero):
+def project_orbit_ratios(s: np.ndarray, w_target: np.ndarray) -> np.ndarray:
     """
-    Freeze numerically tiny / unsupported columns for a given tile-band.
+    Project per-orbit masses s onto the ray spanned by w_target:
+        s <- alpha * w_target
+    where alpha preserves total mass.
 
-    Parameters
-    ----------
-    col_denom : (P,) float array
-        Per-column denominator computed on the SAME weighted/scaled A used for
-        the gradient (e.g. after cp_flux_ref scaling and λ-weighting).
-    grad : (P,) float array
-        Per-column gradient/numerator (same space as col_denom).
-    rel_zero : float
-        Relative threshold multiplier applied to median positive denom.
-    abs_zero : float
-        Absolute floor threshold.
+    Both s and w_target must be non-negative.
     """
-    # robust median on strictly-positive finite entries
-    good = np.isfinite(col_denom) & (col_denom > 0.0)
-    if np.any(good):
-        med_energy = float(np.median(col_denom[good]))
-    else:
-        med_energy = 0.0
+    s_sum = float(np.sum(s))
+    w_sum = float(np.sum(w_target))
 
-    tiny_col = float(max(abs_zero, rel_zero * med_energy))
+    if s_sum <= 0.0 or w_sum <= 0.0:
+        return s  # nothing sensible to do
 
-    # freeze non-finite or tiny denom
-    freeze = (~np.isfinite(col_denom)) | (col_denom <= tiny_col)
-    if np.any(freeze):
-        grad[freeze] = 0.0
-        col_denom[freeze] = np.inf
-
-    return freeze, tiny_col, med_energy
+    alpha = s_sum / w_sum
+    return alpha * w_target
 
 # ---------------------------- Worker ---------------------------------
 
@@ -316,7 +303,7 @@ def _worker_tile_grad_band_single_metric(args):
         keep_idx,
         c0, c1,
         R_tile, # shape (Sblk, Lk), already weighted by 1/sqrt(binCounts)
-        # w_s, # shape (Sblk,), = 1/sqrt(binCounts[s0:s1])
+        col_scale, # shape (C, P), column scaling factors
         dset_slots,
         dset_bytes,
         dset_w0,
@@ -360,8 +347,7 @@ def _worker_tile_grad_band_single_metric(args):
             if keep_idx is not None:
                 A = A[:, :, keep_idx]  # (Sblk, P, Lk)
 
-            # Apply the single spatial weighting
-            # A *= w_s[:, None, None]
+            # A = A / col_scale[c][None, :, None]
 
             # Diagonal term (cheap, no BLAS needed)
             # D[p] = sum_{s,λ} A[s,p,λ]^2
@@ -626,6 +612,28 @@ def solve_global_spg(
             s_tile = int(cfg.s_tile_override)
 
     # ------------------------------------------------------------
+    # Column-energy normalisation
+    # ------------------------------------------------------------
+    E_global = read_global_column_energy(h5_path)  # shape (C, P)
+
+    # Robust reference scale
+    E_ref = np.median(E_global[E_global > 0.0])
+    if not np.isfinite(E_ref) or E_ref <= 0.0:
+        raise RuntimeError("Invalid global column energy scale")
+
+    # Column scaling factors (sqrt because curvature ~ A^2)
+    col_scale = np.sqrt(E_global / E_ref)
+
+    # Safety: avoid divide-by-zero
+    col_scale = np.where(col_scale > 0.0, col_scale, 1.0)
+
+    print(
+        f"[SPG] Column-energy normalisation enabled: "
+        f"E_ref={E_ref:.3e}",
+        flush=True,
+    )
+
+    # ------------------------------------------------------------
     # Load NNLS patch support and KNOWN_ZERO masks
     # ------------------------------------------------------------
     with open_h5(h5_path, role="reader") as f:
@@ -667,49 +675,6 @@ def solve_global_spg(
     )
 
     # ------------------------------------------------------------
-    # Track irrelevance persistence
-    # ------------------------------------------------------------
-    irrelevant_count = np.zeros((C, P), dtype=np.int32)
-
-
-    # # ------------------------------------------------------------
-    # # Load spatial component support masks (LOSVD + ENERGY)
-    # # ------------------------------------------------------------
-    # with open_h5(h5_path, role="reader") as f:
-    #     supp_losvd = None
-    #     supp_energy = None
-
-    #     if "/HyperCube/component_support" in f:
-    #         ds = f["/HyperCube/component_support"]
-    #         supp_losvd = np.asarray(ds[...], dtype=bool)
-    #         if int(ds.attrs.get("S_chunk", s_tile)) != s_tile:
-    #             raise RuntimeError(
-    #                 "component_support S_chunk mismatch with solver tile size"
-    #             )
-    #         print("[SPG] Using LOSVD-based component support.", flush=True)
-
-    #     if "/HyperCube/component_support_energy" in f:
-    #         ds = f["/HyperCube/component_support_energy"]
-    #         supp_energy = np.asarray(ds[...], dtype=bool)
-    #         if int(ds.attrs.get("S_chunk", s_tile)) != s_tile:
-    #             raise RuntimeError(
-    #                 "component_support_energy S_chunk mismatch with solver tile size"
-    #             )
-    #         print("[SPG] Using ENERGY-based component support.", flush=True)
-
-    #     if supp_losvd is not None and supp_energy is not None:
-    #         component_support = supp_losvd & supp_energy
-    #         print("[SPG] Combined LOSVD ∧ ENERGY component support.", flush=True)
-    #     elif supp_losvd is not None:
-    #         component_support = supp_losvd
-    #     elif supp_energy is not None:
-    #         component_support = supp_energy
-    #     else:
-    #         component_support = None
-    #         print("[SPG] No component support masks found; using all components.",
-    #               flush=True)
-
-    # ------------------------------------------------------------
     # Global ||Y|| for trust region (compute once)
     # ------------------------------------------------------------
     Y_glob_norm2 = 0.0
@@ -733,27 +698,6 @@ def solve_global_spg(
         flush=True,
     )
 
-    # # ------------------------------------------------------------
-    # # λ-weights (optional)
-    # # ------------------------------------------------------------
-    # w_lam_sqrt = None
-    # if os.environ.get("CUBEFIT_LAMBDA_WEIGHTS_ENABLE", "1").lower() not in (
-    #     "0", "false", "no", "off"
-    # ):
-    #     try:
-    #         w_full = cu.read_lambda_weights(h5_path)
-    #         w_use = w_full[keep_idx] if keep_idx is not None else w_full
-    #         w_lam_sqrt = np.sqrt(np.maximum(w_use, 1e-6)).astype(np.float64)
-    #         print("[SPG] λ-weights enabled.", flush=True)
-    #     except Exception:
-    #         w_lam_sqrt = None
-    #         print("[SPG] λ-weights unavailable; unweighted LS.", flush=True)
-
-    # # ------------------------------------------------------------
-    # # Global column energy (for preconditioning + orbit projection)
-    # # ------------------------------------------------------------
-    # E_global = read_global_column_energy(h5_path)  # (C,P)
-
     # ------------------------------------------------------------
     # Orbit-weight prior (spaxel independent)
     # ------------------------------------------------------------
@@ -762,10 +706,6 @@ def solve_global_spg(
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
         print("[SPG] Orbit-weight projection enabled.", flush=True)
-    # lambda_orbit = float(os.environ.get("CUBEFIT_LAMBDA_ORBIT", "0.0"))
-    # if w_target is not None and lambda_orbit > 0.0:
-    #     print(f"[SPG] Orbit-mass prior enabled (lambda={lambda_orbit:.3e})",
-    #         flush=True)
 
     # ------------------------------------------------------------
     # Initialise x
@@ -822,16 +762,16 @@ def solve_global_spg(
         w_target = w_target * total_mass_est
         print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)
     # ------------------------------------------------------------
-    # Augmented Lagrangian variables for exact orbit prior
+    # Augmented Lagrangian state for exact orbit ratios
     # ------------------------------------------------------------
-    # u_orbit = np.zeros_like(w_target) if w_target is not None else None
-    # rho_orbit = float(os.environ.get("CUBEFIT_ORBIT_RHO", "1.0"))
+    if w_target is not None:
+        u_orbit = np.zeros(C, dtype=np.float64)
 
-    # if w_target is not None:
-    #     print(
-    #         f"[SPG] Exact orbit prior enabled (rho={rho_orbit:.3e})",
-    #         flush=True,
-    #     )
+        rho0 = float(os.environ.get("CUBEFIT_ORBIT_RHO0", "1e-3"))
+        rho_growth = float(os.environ.get("CUBEFIT_ORBIT_RHO_GROWTH", "2.0"))
+        rho_max = float(os.environ.get("CUBEFIT_ORBIT_RHO_MAX", "1e6"))
+    else:
+        u_orbit = None
     # ------------------------------------------------------------
     # Build seed-support field for SPG update gating
     # ------------------------------------------------------------
@@ -919,7 +859,7 @@ def solve_global_spg(
                 mininterval=2.0,
                 dynamic_ncols=True,
             )
-            if ep == 0 and seed_support_mask is not None:
+            if ep == 0 and seed_support_mask is not None and w_target is None:
                 # Freeze bins that patch tested and found zero,
                 # but only if they are not already ACTIVE
                 initial_freeze = seed_tested_mask & (~seed_support_mask)
@@ -933,10 +873,6 @@ def solve_global_spg(
                 inactive[active_orbits] = False
                 x_eff[inactive, :] = 0.0
 
-                # bs = np.asarray(binCounts[s0:s1], dtype=np.float64)
-                # if np.any(bs <= 0.0):
-                #     raise RuntimeError(f"Invalid binCounts in tile {s0}:{s1}")
-                # w_s = (1.0 / np.sqrt(bs)).astype(np.float64)     # (Sblk,)
                 with open_h5(h5_path, role="reader") as f:
                     DC = f["/DataCube"]
                     M  = f["/HyperCube/models"]
@@ -948,36 +884,11 @@ def solve_global_spg(
                     if keep_idx is not None:
                         Y = Y[:, keep_idx]                           # (Sblk, Lk)
 
-                    # apply weighting to data rows
-                    # Y *= w_s[:, None]
-
                     # ------------------------------------------------------------
                     # 3) Build prediction in the SAME weighted space
                     # ------------------------------------------------------------
                     yhat = np.zeros_like(Y)
 
-                    # ------------------------------------------------------------
-                    # Determine components to iterate for this tile
-                    # ------------------------------------------------------------
-                    # if component_support is not None:
-                    #     # tile index from s0 (tiles are aligned to s_tile)
-                    #     tile_idx = s0 // s_tile
-
-                    #     # components supported in this tile
-                    #     spatial_active = np.nonzero(component_support[tile_idx])[0]
-
-                    #     # intersect with globally active orbits
-                    #     c_iter = np.intersect1d(
-                    #         active_orbits,
-                    #         spatial_active,
-                    #         assume_unique=True
-                    #     )
-
-                    #     # safety fallback: never allow empty iteration
-                    #     if c_iter.size == 0:
-                    #         c_iter = active_orbits
-                    # else:
-                        # no spatial support masks
                     c_iter = active_orbits
                     for c in c_iter:
                         A = np.asarray(M[s0:s1, c, :, :], dtype=np.float64)
@@ -985,9 +896,7 @@ def solve_global_spg(
                         if keep_idx is not None:
                             A = A[:, :, keep_idx] # (Sblk, P, Lk)
 
-                        # apply SAME weighting to model rows
-                        # A *= w_s[:, None, None]
-
+                        # A = A / col_scale[c][None, :, None]
                         yhat += x_eff[c] @ A
 
                 # ------------------------------------------------------------
@@ -1017,7 +926,7 @@ def solve_global_spg(
                         keep_idx,
                         c0, c1,
                         R.copy(order="C"),
-                        # w_s.copy(order="C"),
+                        col_scale,
                         cfg.dset_slots,
                         cfg.dset_bytes,
                         cfg.dset_w0,
@@ -1041,7 +950,11 @@ def solve_global_spg(
                 D_tot /= float(nres)
 
             # ---------------- Assemble gradient (data term) ----------------
-            g = -g_tot
+            # Data gradient ONLY
+            g_data = -g_tot
+
+            # Add data-shape priors only
+            g = g_data.copy()
 
             # ---- population curvature prior ----
             lambda_pop = float(os.environ.get("CUBEFIT_LAMBDA_POP", "0.0"))
@@ -1058,8 +971,32 @@ def solve_global_spg(
             else:
                 g_age = None
 
+            # ------------------------------------------------------------
+            # Augmented Lagrangian orbit constraint (A1)
+            # ------------------------------------------------------------
+            if w_target is not None:
+                # penalty schedule
+                rho_orbit = min(rho0 * (rho_growth ** ep), rho_max)
+
+                # per-orbit mass
+                s = np.sum(x, axis=1)          # (C,)
+                r = s - w_target               # (C,)
+
+                # gradient contribution (broadcast to populations)
+                g_orbit = (u_orbit + rho_orbit * r)[:, None]
+
+                # add to total gradient
+                g += g_orbit
+
+            # --- capture raw (pre-freeze) gradient for orbit-mass updates / diagnostics
+            # This is the key: compute orbit-level gradient BEFORE any freeze mutates g.
+            g_raw = g.copy()
+            g_s_data = np.sum(g_raw * y_dist, axis=1)   # (C,)
+
             # ---------------- Build safe diagonal preconditioner ----------------
             D_raw = D_tot.copy()  # per-col denom (may have zeros)
+            # Balance curvature using column energy
+            D_raw /= (col_scale ** 2)
             pos = np.isfinite(D_raw) & (D_raw > 0.0)
 
             if np.any(pos):
@@ -1071,7 +1008,7 @@ def solve_global_spg(
             D = D_raw / builtins.max(D_ref, 1e-30)
 
             # compute absolute floor: env OR data-driven small fraction of D_ref
-            abs_zero_env = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-30"))
+            abs_zero_env = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-12"))
             data_floor_mul = float(os.environ.get("CUBEFIT_ZERO_COL_DATAFLOOR_MUL", "1e-8"))
             data_floor = data_floor_mul * builtins.max(D_ref, 1.0)
             abs_zero = builtins.max(abs_zero_env, data_floor)
@@ -1109,41 +1046,9 @@ def solve_global_spg(
             if np.isfinite(max_inv_d) and (max_inv_d > 0.0):
                 invD = np.minimum(invD, max_inv_d)
 
-            # # ---- orbit-mass prior (explicit objective + preconditioned gradient) ----
-            # f_orbit = 0.0
-            # g_prior = None
-            # if w_target is not None and lambda_orbit > 0.0:
-            #     # compute per-orbit mass residuals
-            #     s_orb = np.sum(x, axis=1)               # (C,)
-            #     r_orb = s_orb - w_target                # (C,)
-
-            #     # scalar objective contribution (half-squared)
-            #     f_orbit = 0.5 * float(lambda_orbit) * float(np.dot(r_orb, r_orb))
-
-            #     # Make sure D is shaped (C,P). D_raw was earlier set as D_tot copy divided by D_ref.
-            #     # If D at this point is 1D flattened per-column, reshape accordingly:
-            #     try:
-            #         D_rowcol = D.reshape(C, P)
-            #     except Exception:
-            #         # if D is already (C,P) this is a no-op; otherwise compute per-column from D_raw
-            #         D_rowcol = (D_raw / builtins.max(float(np.median(D_raw[D_raw>0])) if np.any(D_raw>0) else 1.0)).reshape(C,P)
-            #     # allocation weights: use D (positive), but clip tiny values and normalize per-row
-            #     alloc = np.maximum(D_rowcol, 0.0)  # zeros where no curvature
-            #     row_sum = alloc.sum(axis=1) + 1e-30
-            #     alloc = alloc / row_sum[:, None]   # each row sums to 1 (or 0 if all zeros)
-            #     # Now compute per-parameter prior gradient as orbit residual times allocation
-            #     # Note: r_orb has shape (C,)
-            #     g_prior_mat = (lambda_orbit * r_orb / float(P))[:, None] * alloc
-            #     # ensure frozen components receive no orbit push
-            #     g_prior_mat[freeze] = 0.0
-
-            #     # add to gradient
-            #     g += g_prior_mat
-            #     # store magnitude for diagnostics (absolute values)
-            #     g_prior = np.abs(g_prior_mat)
-
-            # ---------------- BB step (diagonal-preconditioned) ----------------
-            # Barzilai–Borwein step length
+            # ----------------------------
+            # BB step (diagonal-preconditioned) - same as before
+            # ----------------------------
             if (x_prev is not None) and (g_prev is not None):
                 dx_flat = (x - x_prev).ravel()
                 dg_flat = (g - g_prev).ravel()
@@ -1154,100 +1059,46 @@ def solve_global_spg(
                     alpha_bb = float(np.clip(alpha_bb, 1e-8, 1e8))
                 print(f"[BB] alpha={alpha_bb:.3e}, sy={sy:.3e}", flush=True)
 
-            # # ------------------------------------------------------------
-            # # SPG step in orbit-mass space (s)
-            # # ------------------------------------------------------------
-            # # gradient wrt s
-            # g_s = np.sum(g * y_dist, axis=1)   # shape (C,)
-
-            # # simple preconditioner for s (collapse D)
-            # D_s = np.sum(D, axis=1)
-            # D_s = np.where(D_s > 0.0, D_s, np.inf)
-
-            # ##### Old orbit prior
-            # # # BB step for s
-            # # ds = -alpha_bb * g_s / D_s
-
-            # # # trust region on s
-            # # s_norm = np.linalg.norm(s)
-            # # ds_norm = np.linalg.norm(ds)
-            # # s_cap = (0.005 if not is_warmup else 0.0005) * max(s_norm, 1.0)
-
-            # # if ds_norm > s_cap and ds_norm > 0:
-            # #     ds *= s_cap / ds_norm
-
-            # # # apply and project
-            # # s += ds
-            # # s = np.maximum(s, 0.0)
-            # # ------------------------------------------------------------
-            # # Augmented Lagrangian update for s (EXACT orbit prior)
-            # # ------------------------------------------------------------
-            # # Gradient of augmented Lagrangian wrt s:
-            # # g_s_data = sum_p y * g   (already computed)
-            # g_s_data = np.sum(g * y_dist, axis=1)   # (C,)
-
-            # if w_target is not None:
-            #     # AL gradient: data + dual + quadratic penalty
-            #     g_s_total = g_s_data + u_orbit + rho_orbit * (s - w_target)
-            # else:
-            #     g_s_total = g_s_data
-
-            # # Preconditioner for s
-            # D_s = np.sum(D, axis=1)
-            # D_s = np.where(D_s > 0.0, D_s, np.inf)
-
-            # # Descent step
-            # ds = -alpha_bb * (g_s_total / D_s)
-
-            # # Trust region on s
-            # s_norm = np.linalg.norm(s)
-            # ds_norm = np.linalg.norm(ds)
-            # s_cap = (0.005 if not is_warmup else 0.0005) * max(s_norm, 1.0)
-
-            # if ds_norm > s_cap and ds_norm > 0:
-            #     ds *= s_cap / ds_norm
-
-            # # Apply and project non-negativity
-            # s += ds
-            # s = np.maximum(s, 0.0)
-            # # ------------------------------------------------------------
-            # # Update Lagrange multiplier for exact orbit prior
-            # # ------------------------------------------------------------
-            # if w_target is not None:
-            #     u_orbit += rho_orbit * (s - w_target)
-
-            #     # Diagnostics
-            #     res = np.linalg.norm(s - w_target)
-            #     print(
-            #         f"[SPG-orbit] ||s - w||={res:.3e}",
-            #         flush=True,
-            #     )
             # ------------------------------------------------------------
-            # HARD exact orbit constraint (no optimization of s)
+            # SPG step in orbit-mass space (s)
+            # Use the pre-freeze orbit gradient (g_s_data) so freezing does not
+            # zero out the orbit-level descent direction.
             # ------------------------------------------------------------
+
+            # simple preconditioner for s (collapse D)
+            D_s = np.sum(D, axis=1)
+            D_s = np.where(D_s > 0.0, D_s, np.inf)
+
+            # BB step for s (use g_s_data computed from g_raw)
             if w_target is not None:
-                s = w_target.copy()
-            # ------------------------------------------------------------
-            # Immediate structural freeze once orbit prior is active
-            # ------------------------------------------------------------
-            if w_target is not None and not orbit_prior_active:
-                orbit_prior_active = True
+                # Pure AL-driven orbit descent (A1)
+                r = s - w_target
+                ds = -alpha_bb * (u_orbit + rho_orbit * r)
+            else:
+                ds = -alpha_bb * (g_s_data / D_s)
 
-                EPS_COEF = 1e-14
-                EPS_GRAD = 1e-10
+            # trust region on s
+            s_norm = np.linalg.norm(s)
+            ds_norm = np.linalg.norm(ds)
+            s_cap = (0.005 if ep == 0 else 0.005) * builtins.max(s_norm, 1.0)
 
-                zero_coef = x <= EPS_COEF
-                zero_grad = np.abs(g) <= EPS_GRAD
+            if ds_norm > s_cap and ds_norm > 0:
+                ds *= s_cap / ds_norm
 
-                newly_zero = zero_coef & zero_grad & (~known_zero)
+            # apply and project (keep non-neg)
+            s += ds
+            s = np.maximum(s, 0.0)
 
-                if np.any(newly_zero):
-                    known_zero[newly_zero] = True
-                    print(
-                        f"[SPG] Structural freeze after orbit prior: "
-                        f"{np.count_nonzero(newly_zero)} bins promoted to KNOWN_ZERO",
-                        flush=True,
-                    )
+            # after computing D and D_ref and D_s
+            print(f"[SPG-DBG] D_ref={D_ref:.3e}, D.min={float(np.min(D)):.3e}, D.max={float(np.max(D)):.3e}", flush=True)
+            print(f"[SPG-DBG] D_s min/max = {float(np.min(D_s)):.3e}/{float(np.max(D_s)):.3e}", flush=True)
+            frac_finite = np.sum(np.isfinite(D)) / float(D.size)
+            print(f"[SPG-DBG] fraction finite denominators = {frac_finite:.3f}", flush=True)
+            print(f"[SPG-DBG] ||w_target||={0.0 if w_target is None else np.linalg.norm(w_target):.3e}, sum(s)={np.sum(s):.3e}", flush=True)
+            if w_target is not None:
+                # show a few orbit-level values to eyeball scale
+                print("[SPG-DBG] sample w_target, s, D_s for first 8 orbits:",
+                    np.vstack([w_target[:8], s[:8], D_s[:8]]).T, flush=True)
 
             # ------------------------------------------------------------
             # Robust projected update of y (orbit-internal SFH)
@@ -1259,7 +1110,7 @@ def solve_global_spg(
             lambda_y = float(os.environ.get("CUBEFIT_LAMBDA_Y", "5e-4"))
             if lambda_y > 0.0:
                 # Gradient wrt y (holding s fixed)
-                g_y = s[:, None] * g
+                g_y = s[:, None] * g_data
 
                 # Remove null direction
                 g_y -= (np.sum(g_y, axis=1, keepdims=True) * y_dist)
@@ -1318,6 +1169,16 @@ def solve_global_spg(
             x = s[:, None] * y_dist
             g_norm = np.linalg.norm(g)
             x_norm = np.linalg.norm(x)
+
+            # ------------------------------------------------------------
+            # Augmented Lagrangian multiplier update (A1)
+            # ------------------------------------------------------------
+            if w_target is not None:
+                s = np.sum(x, axis=1)
+                u_orbit += rho_orbit * (s - w_target)
+
+                orbit_err = np.linalg.norm(s - w_target) / np.linalg.norm(w_target)
+                print(f"[SPG-AL] epoch {ep+1}  ||s-w||/||w|| = {orbit_err:.3e}", flush=True)
 
 
             # ---------------- Active orbit update (CRITICAL) ----------------

@@ -168,4 +168,4 @@ fi
 
 # run your job as a Slurm step (gives you the full cpuset)
 srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python -m IPython kz_run.py -- --galaxy "$GALAXY" --run-switch fit ${NCOMP:+--ncomp="$NCOMP"}
+  python -m IPython --colors=NoColor kz_run.py -- --galaxy "$GALAXY" --run-switch fit ${NCOMP:+--ncomp="$NCOMP"}

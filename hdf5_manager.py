@@ -1900,8 +1900,8 @@ def live_prefit_snapshot_from_models(
     max_spaxels: int = 6,
     max_components: int = 2,
     max_templates: int = 4,         # used in TR panel
-    max_sc_pairs: int = 3,          # NEW: number of (s,c) pairs in BR
-    templates_per_pair: int = 2,    # NEW: curves per (s,c) in BR
+    max_sc_pairs: int = 3,          # number of (s,c) pairs in BR
+    templates_per_pair: int = 2,    # curves per (s,c) in BR
     out_png: str = "prefit_live.png",
     shade_alpha: float = 0.28,
     q_lo: float = 0.02,
@@ -2055,6 +2055,7 @@ def live_prefit_snapshot_from_models(
 
         # TR: choose some templates (global)
         TDS = f["/Templates"]
+        print(f"Templates shape: {TDS.shape}")
         p_pool = np.arange(P)
         rng.shuffle(p_pool)
         p_sel_tr = np.array(sorted(p_pool[:min(max_templates, P)]), dtype=int)
