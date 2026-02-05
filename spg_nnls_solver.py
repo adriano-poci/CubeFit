@@ -115,6 +115,8 @@ v3.17:  Added bookkeeping to determine if components should be zeroed, and remov
 v3.18:  Added column-energy scaling to the gradient and the diagonal
             preconditioner only, not the forward model, in `solve_global_spg`. 4
             February 2026
+v3.19:  Reverted to unscaled gradient and preconditioner to avoid instability. 5
+            February 2026
 """
 
 from __future__ import annotations, print_function
@@ -132,7 +134,6 @@ import h5py
 from tqdm.auto import tqdm
 
 from CubeFit.hdf5_manager import open_h5
-from CubeFit.hypercube_builder import read_global_column_energy
 from CubeFit import cube_utils as cu
 
 # ----------------------------- Config ---------------------------------
@@ -263,25 +264,6 @@ def rmse_proxy_subset(
 
 # ------------------------------------------------------------------------------
 
-def project_orbit_ratios(s: np.ndarray, w_target: np.ndarray) -> np.ndarray:
-    """
-    Project per-orbit masses s onto the ray spanned by w_target:
-        s <- alpha * w_target
-    where alpha preserves total mass.
-
-    Both s and w_target must be non-negative.
-    """
-    s_sum = float(np.sum(s))
-    w_sum = float(np.sum(w_target))
-
-    if s_sum <= 0.0 or w_sum <= 0.0:
-        return s  # nothing sensible to do
-
-    alpha = s_sum / w_sum
-    return alpha * w_target
-
-# ---------------------------- Worker ---------------------------------
-
 def _worker_tile_grad_band_single_metric(args):
     """
     Minimal, single-metric gradient worker.
@@ -303,7 +285,6 @@ def _worker_tile_grad_band_single_metric(args):
         keep_idx,
         c0, c1,
         R_tile, # shape (Sblk, Lk), already weighted by 1/sqrt(binCounts)
-        col_scale, # shape (C, P), column scaling factors
         dset_slots,
         dset_bytes,
         dset_w0,
@@ -346,8 +327,6 @@ def _worker_tile_grad_band_single_metric(args):
             A = np.asarray(M[s0:s1, c, :, :], dtype=np.float64, order="C")
             if keep_idx is not None:
                 A = A[:, :, keep_idx]  # (Sblk, P, Lk)
-
-            # A = A / col_scale[c][None, :, None]
 
             # Diagonal term (cheap, no BLAS needed)
             # D[p] = sum_{s,λ} A[s,p,λ]^2
@@ -718,23 +697,6 @@ def solve_global_spg(
             raise ValueError("x0 has wrong size")
         x = x0.reshape(C, P).copy()
 
-    # ------------------------------------------------------------
-    # Reparameterise x = s * y
-    # ------------------------------------------------------------
-    eps = 1e-30
-    # orbit masses
-    s = x.sum(axis=1)        # shape (C,)
-    # avoid zero-mass orbits
-    s_safe = np.where(s > 0.0, s, 1.0)
-    # per-orbit SFHs (simplex)
-    y_dist = x / s_safe[:, None]  # shape (C,P)
-    # enforce simplex exactly
-    y_dist = np.maximum(y_dist, 0.0)
-    y_dist /= (y_dist.sum(axis=1, keepdims=True) + eps)
-    # reconstruct x exactly
-    x = s[:, None] * y_dist
-
-
     # If x0 came from NNLS seed, clear BB history so BB step isn't anchored to old state.
     # This ensures a genuine BB step computed from the first epoch, not a small correction.
     x_prev = None
@@ -761,17 +723,6 @@ def solve_global_spg(
             total_mass_est = builtins.max(1.0, Y_glob_norm)  # Y_glob_norm computed earlier
         w_target = w_target * total_mass_est
         print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)
-    # ------------------------------------------------------------
-    # Augmented Lagrangian state for exact orbit ratios
-    # ------------------------------------------------------------
-    if w_target is not None:
-        u_orbit = np.zeros(C, dtype=np.float64)
-
-        rho0 = float(os.environ.get("CUBEFIT_ORBIT_RHO0", "1e-3"))
-        rho_growth = float(os.environ.get("CUBEFIT_ORBIT_RHO_GROWTH", "2.0"))
-        rho_max = float(os.environ.get("CUBEFIT_ORBIT_RHO_MAX", "1e6"))
-    else:
-        u_orbit = None
     # ------------------------------------------------------------
     # Build seed-support field for SPG update gating
     # ------------------------------------------------------------
@@ -896,7 +847,6 @@ def solve_global_spg(
                         if keep_idx is not None:
                             A = A[:, :, keep_idx] # (Sblk, P, Lk)
 
-                        # A = A / col_scale[c][None, :, None]
                         yhat += x_eff[c] @ A
 
                 # ------------------------------------------------------------
@@ -926,7 +876,6 @@ def solve_global_spg(
                         keep_idx,
                         c0, c1,
                         R.copy(order="C"),
-                        col_scale,
                         cfg.dset_slots,
                         cfg.dset_bytes,
                         cfg.dset_w0,
@@ -1058,106 +1007,25 @@ def solve_global_spg(
                     alpha_bb = float(np.dot(dx_flat, dx_flat) / sy)
                     alpha_bb = float(np.clip(alpha_bb, 1e-8, 1e8))
                 print(f"[BB] alpha={alpha_bb:.3e}, sy={sy:.3e}", flush=True)
-
-            # ------------------------------------------------------------
-            # SPG step in orbit-mass space (s)
-            # Use the pre-freeze orbit gradient (g_s_data) so freezing does not
-            # zero out the orbit-level descent direction.
-            # ------------------------------------------------------------
-
-            # simple preconditioner for s (collapse D)
-            D_s = np.sum(D, axis=1)
-            D_s = np.where(D_s > 0.0, D_s, np.inf)
-
-            # BB step for s (use g_s_data computed from g_raw)
-            if w_target is not None:
-                # Pure AL-driven orbit descent (A1)
-                r = s - w_target
-                ds = -alpha_bb * (u_orbit + rho_orbit * r)
-            else:
-                ds = -alpha_bb * (g_s_data / D_s)
-
-            # trust region on s
-            s_norm = np.linalg.norm(s)
-            ds_norm = np.linalg.norm(ds)
-            s_cap = (0.005 if ep == 0 else 0.005) * builtins.max(s_norm, 1.0)
-
-            if ds_norm > s_cap and ds_norm > 0:
-                ds *= s_cap / ds_norm
-
-            # apply and project (keep non-neg)
-            s += ds
-            s = np.maximum(s, 0.0)
+            
+            dx = -alpha_bb * (g * invD)
+            x += dx
+            x = np.maximum(x, 0.0)
 
             # after computing D and D_ref and D_s
             print(f"[SPG-DBG] D_ref={D_ref:.3e}, D.min={float(np.min(D)):.3e}, D.max={float(np.max(D)):.3e}", flush=True)
-            print(f"[SPG-DBG] D_s min/max = {float(np.min(D_s)):.3e}/{float(np.max(D_s)):.3e}", flush=True)
             frac_finite = np.sum(np.isfinite(D)) / float(D.size)
             print(f"[SPG-DBG] fraction finite denominators = {frac_finite:.3f}", flush=True)
-            print(f"[SPG-DBG] ||w_target||={0.0 if w_target is None else np.linalg.norm(w_target):.3e}, sum(s)={np.sum(s):.3e}", flush=True)
+
             if w_target is not None:
-                # show a few orbit-level values to eyeball scale
-                print("[SPG-DBG] sample w_target, s, D_s for first 8 orbits:",
-                    np.vstack([w_target[:8], s[:8], D_s[:8]]).T, flush=True)
+                # Enforce orbit weights exactly by projection
+                s = np.sum(x, axis=1)
+                s_safe = np.where(s > 0.0, s, 1.0)
 
-            # ------------------------------------------------------------
-            # Robust projected update of y (orbit-internal SFH)
-            #   - per-row preconditioning
-            #   - per-orbit L1 step cap
-            #   - exact simplex projection
-            #   - hard support mask from NNLS seed
-            # ------------------------------------------------------------
-            lambda_y = float(os.environ.get("CUBEFIT_LAMBDA_Y", "5e-4"))
-            if lambda_y > 0.0:
-                # Gradient wrt y (holding s fixed)
-                g_y = s[:, None] * g_data
+                alpha = np.sum(s) / np.sum(w_target)
+                s_proj = alpha * w_target
 
-                # Remove null direction
-                g_y -= (np.sum(g_y, axis=1, keepdims=True) * y_dist)
-
-                # Per-row preconditioning
-                D_rowcol = D.reshape(C, P)
-                row_scale = np.maximum(D_rowcol.sum(axis=1), eps)
-
-                dy_raw = -lambda_y * (g_y / row_scale[:, None])
-
-                # Per-orbit L1 cap
-                max_l1 = float(os.environ.get("CUBEFIT_Y_MAX_L1", "0.05"))
-                l1 = np.sum(np.abs(dy_raw), axis=1)
-                scale = np.minimum(1.0, max_l1 / (l1 + eps))
-                dy = dy_raw * scale[:, None]
-
-                # -------- HARD SUPPORT MASK --------
-                row_max = D_rowcol.max(axis=1, keepdims=True)
-                support_mask = D_rowcol >= (1e-3 * row_max)
-
-                if seed_support is not None:
-                    support_mask |= (seed_support > 1e-3)
-
-                # Apply update ONLY on supported bins
-                y_new = y_dist.copy()
-                y_new[support_mask] += dy[support_mask]
-
-                # Enforce exact zeros outside support
-                y_new[~support_mask] = 0.0
-
-                # Renormalise ONLY over supported bins
-                row_sum = y_new.sum(axis=1, keepdims=True)
-                y_dist = np.divide(
-                    y_new,
-                    row_sum,
-                    out=np.zeros_like(y_new),
-                    where=row_sum > eps,
-                )
-
-                # Diagnostics
-                mean_support = float(np.mean(support_mask.sum(axis=1)))
-                mean_l1 = float(np.mean(np.sum(np.abs(y_dist - y_new), axis=1)))
-                print(
-                    f"[SPG-y] mean supported bins/orbit={mean_support:.2f}",
-                    flush=True,
-                )
-
+                x *= (s_proj / s_safe)[:, None]
 
             # --- update BB history ---
             x_prev = x.copy()
@@ -1166,7 +1034,6 @@ def solve_global_spg(
             # ------------------------------------------------------------
             # Reconstruct x from s and y
             # ------------------------------------------------------------
-            x = s[:, None] * y_dist
             g_norm = np.linalg.norm(g)
             x_norm = np.linalg.norm(x)
 
@@ -1621,11 +1488,6 @@ def probe_kaczmarz_tile(
         if np.any(freeze):
             g[freeze] = 0.0
             col_denom = np.where(freeze, np.inf, col_denom)
-
-        # --- global energy blend
-        E_global = read_global_column_energy(h5_path)  # (C,P)
-        Eg_row = np.asarray(E_global[int(c), :], np.float64)  # (P,)
-        col_denom = np.maximum(col_denom, float(beta_blend) * Eg_row)
 
         invD = 1.0 / np.maximum(col_denom, eps)
         dx_c = float(lr) * (g * invD)  # (P,)
