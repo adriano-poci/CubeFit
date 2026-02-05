@@ -591,28 +591,6 @@ def solve_global_spg(
             s_tile = int(cfg.s_tile_override)
 
     # ------------------------------------------------------------
-    # Column-energy normalisation
-    # ------------------------------------------------------------
-    E_global = read_global_column_energy(h5_path)  # shape (C, P)
-
-    # Robust reference scale
-    E_ref = np.median(E_global[E_global > 0.0])
-    if not np.isfinite(E_ref) or E_ref <= 0.0:
-        raise RuntimeError("Invalid global column energy scale")
-
-    # Column scaling factors (sqrt because curvature ~ A^2)
-    col_scale = np.sqrt(E_global / E_ref)
-
-    # Safety: avoid divide-by-zero
-    col_scale = np.where(col_scale > 0.0, col_scale, 1.0)
-
-    print(
-        f"[SPG] Column-energy normalisation enabled: "
-        f"E_ref={E_ref:.3e}",
-        flush=True,
-    )
-
-    # ------------------------------------------------------------
     # Load NNLS patch support and KNOWN_ZERO masks
     # ------------------------------------------------------------
     with open_h5(h5_path, role="reader") as f:
@@ -723,6 +701,7 @@ def solve_global_spg(
             total_mass_est = builtins.max(1.0, Y_glob_norm)  # Y_glob_norm computed earlier
         w_target = w_target * total_mass_est
         print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)
+
     # ------------------------------------------------------------
     # Build seed-support field for SPG update gating
     # ------------------------------------------------------------
@@ -920,32 +899,8 @@ def solve_global_spg(
             else:
                 g_age = None
 
-            # ------------------------------------------------------------
-            # Augmented Lagrangian orbit constraint (A1)
-            # ------------------------------------------------------------
-            if w_target is not None:
-                # penalty schedule
-                rho_orbit = min(rho0 * (rho_growth ** ep), rho_max)
-
-                # per-orbit mass
-                s = np.sum(x, axis=1)          # (C,)
-                r = s - w_target               # (C,)
-
-                # gradient contribution (broadcast to populations)
-                g_orbit = (u_orbit + rho_orbit * r)[:, None]
-
-                # add to total gradient
-                g += g_orbit
-
-            # --- capture raw (pre-freeze) gradient for orbit-mass updates / diagnostics
-            # This is the key: compute orbit-level gradient BEFORE any freeze mutates g.
-            g_raw = g.copy()
-            g_s_data = np.sum(g_raw * y_dist, axis=1)   # (C,)
-
             # ---------------- Build safe diagonal preconditioner ----------------
             D_raw = D_tot.copy()  # per-col denom (may have zeros)
-            # Balance curvature using column energy
-            D_raw /= (col_scale ** 2)
             pos = np.isfinite(D_raw) & (D_raw > 0.0)
 
             if np.any(pos):
@@ -1036,16 +991,6 @@ def solve_global_spg(
             # ------------------------------------------------------------
             g_norm = np.linalg.norm(g)
             x_norm = np.linalg.norm(x)
-
-            # ------------------------------------------------------------
-            # Augmented Lagrangian multiplier update (A1)
-            # ------------------------------------------------------------
-            if w_target is not None:
-                s = np.sum(x, axis=1)
-                u_orbit += rho_orbit * (s - w_target)
-
-                orbit_err = np.linalg.norm(s - w_target) / np.linalg.norm(w_target)
-                print(f"[SPG-AL] epoch {ep+1}  ||s-w||/||w|| = {orbit_err:.3e}", flush=True)
 
 
             # ---------------- Active orbit update (CRITICAL) ----------------
