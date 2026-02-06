@@ -693,12 +693,24 @@ def solve_global_spg(
         print(f"[SPG] applied tiny seed jitter rel={jitter_rel}", flush=True)
 
     if w_target is not None:
-        # scale prior to match the current total mass scale in x
         total_mass_est = float(np.sum(x))
-        # if x is all zeros at start, use a safe proxy: global ||Y|| or 1.0
-        if total_mass_est <= 0.0:
-            # fallback: scale to total observed flux (or 1.0)
-            total_mass_est = builtins.max(1.0, Y_glob_norm)  # Y_glob_norm computed earlier
+        # Detect NNLS patch seed via HDF5 metadata
+        seed_origin = None
+        try:
+            with open_h5(h5_path, role="reader") as f:
+                if "/Seeds/x0_nnls_patch" in f:
+                    seed_origin = f["/Seeds/x0_nnls_patch"].attrs.get("origin", None)
+        except Exception:
+            pass
+        if seed_origin and ("nnls_patch" in seed_origin):
+            # Trust the NNLS patch mass scale
+            if total_mass_est <= 0.0:
+                raise RuntimeError("NNLS patch seed has zero total mass.")
+        else:
+            # Untrusted seed (zeros, resume, etc.)
+            if total_mass_est <= 0.0:
+                total_mass_est = max(1.0, Y_glob_norm)
+
         w_target = w_target * total_mass_est
         print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)
 

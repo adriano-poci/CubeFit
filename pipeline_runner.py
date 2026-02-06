@@ -1078,6 +1078,13 @@ class PipelineRunner:
                 logger.log(f"[Pipeline] nnls_patch seed: rows={meta.get('rows')}, cols={meta.get('cols')}, "
                         f"mask={meta.get('mask_used')}, lambda={meta.get('lambda_used')}, "
                         f"solver={meta.get('solver')}, normcols={True}")
+            logger.log(f"[Pipeline] seed: ||x||_1={float(np.sum(x0_effective)):.3e}, "
+                f"max={float(np.max(x0_effective)):.3e}, min={float(np.min(x0_effective)):.3e}")
+            with open_h5(self.h5_path, role="reader") as f:
+                if "/Seeds/x0_nnls_patch" in f:
+                    ds = f["/Seeds/x0_nnls_patch"]
+                    logger.log(f"[Pipeline] seed_model_flux={ds.attrs.get('seed_model_flux', None)}, "
+                        f"data_flux={ds.attrs.get('data_flux', None)}")
 
         elif warm_start == "jacobi":
             if verbose:

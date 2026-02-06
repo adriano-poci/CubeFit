@@ -76,7 +76,8 @@ v2.1:   Implemented `known_zero_mask` to exclude components from the patch fit
             mass normalization to the SPG solver. 3 February 2026
 v2.2:   Scaled out the normalisation  of `x_CP` before returning it to ensure
             consistent physical basis with the solver, and persistent the
-            normalisation. 6 February 2026
+            normalisation;
+        Converted NNLS seed. 6 February 2026
 """
 
 
@@ -299,6 +300,24 @@ def _choose_pops(#E: np.ndarray,
         out.append(np.sort(order[:K].astype(np.int64)))
     return out
 
+def _choose_alpha(Bw: np.ndarray, yw: np.ndarray, Ns: int, Lk: int) -> float:
+    """
+    Choose alpha so the flux anchor competes with the full data term.
+    """
+    # Typical per-row norm
+    row_norms = np.linalg.norm(Bw, axis=1)
+    med_row = float(np.median(row_norms[row_norms > 0]))
+
+    # Norm of the flux functional
+    r_norm = float(np.linalg.norm(np.sum(Bw, axis=0)))
+
+    if not np.isfinite(med_row) or not np.isfinite(r_norm) or r_norm == 0.0:
+        raise RuntimeError("Cannot determine alpha: degenerate Bw.")
+
+    # Scale anchor to ~Ns rows worth of weight
+    alpha = np.sqrt(Ns * Lk) * med_row / r_norm
+    return alpha
+
 def _weighted_system(B: np.ndarray, y: np.ndarray, sqrt_w_rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return B * sqrt_w_rows[:, None], y * sqrt_w_rows
 
@@ -403,7 +422,7 @@ def _global_nnls_workingset(
             yw_sub,
             solver="nnls",
             ridge=0.0,
-            normalize_columns=True,
+            normalize_columns=False,
         )
         # --- map normalized column scales back to full (C,P) grid ---
         for jj, j in enumerate(keep):
@@ -829,7 +848,9 @@ def run_patch(h5_path: str,
         S, L = map(int, f["/DataCube"].shape)
 
     print(pick_mode)
-    picks = _choose_pops(C, P, k_per_comp, 'random')
+    # picks = _choose_pops(C, P, k_per_comp, 'random')
+    # FULL-P NNLS patch: include all populations for patch spaxels
+    picks = [np.arange(P, dtype=np.int64) for _ in range(C)]
 
     # --- Build RHS y and per-row weights (spaxel-wise finite mask)
     rows = int(s_idx.size * Lk)
@@ -849,12 +870,6 @@ def run_patch(h5_path: str,
 
             good = np.isfinite(spec)
             spec_sanit = np.where(good, spec, 0.0)
-
-            # -------- NEW: per-spaxel normalization (shape only) --------
-            norm = np.linalg.norm(spec_sanit)
-            if norm > 0:
-                spec_sanit /= norm
-            # ------------------------------------------------------------
 
             y[pos:pos+Lk] = spec_sanit
             sqrt_w_rows[pos:pos+Lk] = good.astype(np.float64)
@@ -941,7 +956,62 @@ def run_patch(h5_path: str,
               "hypercube normalization and LOSVD amplitudes for these spaxels.")
 
     # --- Apply row weights (λ and finite mask) to (B,y)
-    Bw, yw = _weighted_system(B, y, sqrt_w_rows)
+    Bw0, yw0 = _weighted_system(B, y, sqrt_w_rows)
+
+    # ----- per-spaxel optimal-scale diagnostic and adaptive anchors -----
+    Ns = int(s_idx.size)
+    Lk = int(Lk)  # keep existing Lk name
+
+    # compute stacked model per-column with current unscaled x_vec (will be zero
+    # before solve) — instead we derive per-spaxel model from tentative x_vec
+    # after the NNLS solve we will recompute s_s for final diagnostics; here we
+    # use a cheap diagnostic based on the top-K columns local projection.
+    # BUT simplest robust diagnostic: use Bw0,yw0 and a provisional x from unconstrained least-squares
+    try:
+        # small ridge LS to get a dense approximate x_vec for diagnostic only
+        K = Bw0.shape[1]
+        sqrt_r = 1e-6
+        A_aug = np.vstack([Bw0, sqrt_r * np.eye(K)])
+        b_aug = np.concatenate([yw0, np.zeros(K)])
+        z_diag, *_ = np.linalg.lstsq(A_aug, b_aug, rcond=None)
+        x_diag = np.maximum(0.0, z_diag)   # non-neg projection for diagnostics
+    except Exception:
+        x_diag = np.ones(Bw0.shape[1], dtype=np.float64)
+
+    # build per-spaxel stacked model and data: shapes (Ns, Lk)
+    m_stack = (Bw0 @ x_diag).reshape(Ns, Lk)
+    y_stack = yw0.reshape(Ns, Lk)
+
+    # per-spaxel best-fit scalar s_s = (y·m)/(m·m)
+    num = np.einsum("ij,ij->i", y_stack, m_stack)
+    den = np.einsum("ij,ij->i", m_stack, m_stack) + 1e-30
+    s_s = num / den
+    s_mean = float(np.mean(s_s))
+    s_std  = float(np.std(s_s))
+    cv = s_std / (abs(s_mean) + 1e-30)
+
+    print(f"[patch] per-spaxel scale: mean={s_mean:.3g}, std={s_std:.3g}, cv={cv:.3g}")
+
+    alpha = _choose_alpha(Bw0, yw0, Ns=Ns, Lk=Lk)   # use the robust chooser from earlier
+    # grouped anchors: partition spaxels by s_s quantiles into 3 groups
+    groups = np.array_split(np.argsort(s_s), 3)
+    Bw_rows = [Bw0]
+    yw_vals  = [yw0]
+    for g in groups:
+        rows_g = np.concatenate([np.arange(i*Lk, (i+1)*Lk) for i in g])
+        r_g = np.sum(Bw0[rows_g, :], axis=0)
+        t_g = float(np.sum(yw0[rows_g]))
+        Bw_rows.append(alpha * r_g[None, :])
+        yw_vals.append(np.array([alpha * t_g]))
+    Bw = np.vstack(Bw_rows)
+    yw = np.concatenate(yw_vals)
+    print(f"[patch] using GROUPED anchors G=3 alpha={alpha:.3e}  groupsizes={[len(g) for g in groups]}")
+
+    # Log per-spaxel extremes to help localize failures
+    i_min = int(np.argmin(s_s)); i_max = int(np.argmax(s_s))
+    print(f"[patch] per-spaxel scale min/max = {s_s[i_min]:.3g}/{s_s[i_max]:.3g} "
+        f"(spaxels {i_min}/{i_max})")
+    # -------------------------------------------------------------------
 
     # --- column/target sanity on the weighted system
     colnorm_all = np.linalg.norm(Bw, axis=0)
@@ -968,12 +1038,89 @@ def run_patch(h5_path: str,
     col_map  = [col_map[j] for j in keep]        # now 1:1 aligned
     K = int(len(col_map))  # (optional) if you print/return K later
 
+
     # --- Unpack to full (C,P)
     x_CP = np.zeros((C, P), dtype=np.float64)
     for j, (c, p) in enumerate(col_map):
         x_CP[c, p] = x_patch[j]
-    # --- map NNLS solution back to physical column scaling ---
-    x_CP /= col_norm_full
+
+    # ---------- DIAGNOSTIC: per-column and per-(c,p) flux contributions ----------
+    # B is (rows, K) and x_patch is the compressed vector for keep
+    # compute per-column flux on the unweighted system for interpretability
+    col_flux = np.sum(np.abs(B), axis=0)            # (K,)
+    # map to full (C,P) ordering using col_map (keep-aligned)
+    col_flux_dict = {}
+    for jj, (c,p) in enumerate(col_map):
+        col_flux_dict[(c,p)] = float(col_flux[jj] * x_patch[jj])
+    # report top contributors
+    sorted_cols = sorted(col_flux_dict.items(), key=lambda kv: kv[1], reverse=True)
+    print("[patch] top 8 column flux contributions (c,p) -> flux:")
+    for (c,p), val in sorted_cols[:8]:
+        print(f"   ({c},{p}) -> {val:.3e}")
+    # Also print total model flux from B @ x_patch for cross-check
+    # col_flux_full is length K (all columns)
+    # x_patch is length len(keep); restrict col_flux to kept columns
+    tot_model_flux_cols = float(np.sum(col_flux[keep] * x_patch))
+    print(f"[patch] tot_model_flux_from_cols = {tot_model_flux_cols:.3e}")
+    # ---------------------------------------------------------------------------
+
+    # ============================================================
+    # Global-scale anchoring for NNLS patch seed
+    # ============================================================
+
+    # Purpose:
+    # The patch solution x_CP is locally normalized (fits patch spaxels),
+    # but may not extrapolate to the full cube. We correct this by matching
+    # the global flux using a sparse, representative spaxel sample.
+
+    N_GLOBAL = 32   # small, cheap; 16–64 is fine
+
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M  = f["/HyperCube/models"]
+
+        S_full = int(DC.shape[0])
+
+        rng = np.random.default_rng(12345)
+        s_glob = rng.choice(S_full, size=min(N_GLOBAL, S_full), replace=False)
+
+        y_glob = 0.0
+        m_glob = 0.0
+
+        for s in s_glob:
+            # observed flux (masked wavelengths only)
+            spec = np.asarray(DC[s, :], dtype=np.float64)
+            if keep_idx is not None:
+                spec = spec[keep_idx]
+            y_glob += float(np.sum(spec))
+
+            # model prediction using full hypercube
+            y_fit = _predict_spaxel_sparse_from_models(
+                M=M,
+                s_idx=int(s),
+                x_cp=x_CP,
+                picks=picks,
+                keep_idx=keep_idx,
+            )
+            m_glob += float(np.sum(y_fit))
+
+    # Guard against pathological cases
+    if m_glob <= 0.0 or not np.isfinite(m_glob):
+        raise RuntimeError(
+            "[patch] Global anchoring failed: model flux is zero or invalid."
+        )
+
+    scale_global = y_glob / m_glob
+
+    print(
+        f"[patch] GLOBAL anchor: "
+        f"y_glob={y_glob:.3e}, m_glob={m_glob:.3e}, "
+        f"scale={scale_global:.3e}"
+    )
+
+    # Apply global correction
+    x_CP *= scale_global
+
     # ------------------------------------------------------------
     # Interpret NNLS patch result as SUPPORT information
     # ------------------------------------------------------------
@@ -1013,9 +1160,6 @@ def run_patch(h5_path: str,
             )
 
             y_obs = y[pos:pos+Lk]
-            #  Renormalize to observed spectrum norm
-            scale = np.dot(y_obs, y_fit) / (np.dot(y_fit, y_fit) + 1e-30)
-            y_fit *= scale
 
             wrow  = sqrt_w_rows[pos:pos+Lk]
             pos += Lk
@@ -1074,6 +1218,18 @@ def run_patch(h5_path: str,
             ds.attrs["k_per_comp"] = int(k_per_comp)
             ds.attrs["pick_mode"]  = str(pick_mode)
             ds.attrs["norm.mode_at_fit"] = norm_mode
+
+            # x_vec in column order (same code used earlier)
+            x_vec = np.zeros(B.shape[1], dtype=np.float64)
+            for jj, (cc, pp) in enumerate(col_map):
+                x_vec[jj] = x_CP[cc, pp]
+            # compute model mass on the (unweighted) system for diagnostics
+            m_full = B @ x_vec             # B already built above (rows,K)
+            seed_model_flux = float(np.sum(m_full))
+            data_flux = float(np.sum(y))
+            # attach attrs
+            ds.attrs["seed_model_flux"] = seed_model_flux
+            ds.attrs["data_flux"] = data_flux
 
             # ------------------------------------------------------------
             # Write seed support metadata for SPG
@@ -1140,20 +1296,17 @@ def run_patch(h5_path: str,
                     pass
     
     # NOTE:
-    # x_CP amplitudes from the NNLS patch are NOT physically meaningful.
-    # They encode support only; SPG will overwrite amplitudes completely.
+    # x_CP amplitudes from the NNLS patch ARE physically meaningful.
+    # They define a valid absolute-mass warm start for SPG.
 
-    # --- persist column normalization for downstream solvers (SPG) ---
-    # This guarantees NNLS and SPG operate in the same physical basis.
-    with open_h5(h5_path, role="writer") as f:
-        grp = f.require_group("/HyperCube")
-        if "col_norm" in grp:
-            del grp["col_norm"]
-        grp.create_dataset(
-            "col_norm",
-            data=col_norm_full,
-            dtype="f8",
-        )
+    x_vec = np.zeros(B.shape[1])
+    for j, (c, p) in enumerate(col_map):
+        x_vec[j] = x_CP[c, p]
+
+    m = Bw0 @ x_vec
+    rel_flux_err = abs(np.sum(m) - np.sum(yw0)) / np.sum(yw0)
+
+    print(f"[patch] relative flux error = {rel_flux_err:.3e}")
 
     return dict(
         x_CP=x_CP, picks=picks, s_idx=s_idx, rmse=rmse, chi2=chi2,
