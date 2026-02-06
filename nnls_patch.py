@@ -74,6 +74,9 @@ v2.1:   Implemented `known_zero_mask` to exclude components from the patch fit
             inactive bins to reduce SPG nullspace exploration;
         Stop projecting patch outputs onto per-orbit simplices, delegating all
             mass normalization to the SPG solver. 3 February 2026
+v2.2:   Scaled out the normalisation  of `x_CP` before returning it to ensure
+            consistent physical basis with the solver, and persistent the
+            normalisation. 6 February 2026
 """
 
 
@@ -363,6 +366,11 @@ def _global_nnls_workingset(
     comp_of_j = np.array([c for (c, p) in col_map], dtype=np.int64)
     C = int(np.max(comp_of_j)) + 1
 
+    # --- persistent column-norm accumulator (full grid) ---
+    # Default = 1.0 means "never normalized / untouched"
+    col_norm_full = np.ones((C, np.max([p for (_, p) in col_map]) + 1),
+        dtype=np.float64)
+
     # --- initial working set ---
     keep0 = _topk_by_corr_per_comp(Bw, yw, col_map, k_per_comp_init=int(k0_per_comp))
     keep0 = np.intersect1d(
@@ -390,13 +398,18 @@ def _global_nnls_workingset(
         yw_sub = yw
         col_map_sub = [col_map[j] for j in keep]
 
-        x_sub = _solve_nnls(
+        x_sub, col_norm_1d = _solve_nnls(
             Bw_sub,
             yw_sub,
             solver="nnls",
             ridge=0.0,
             normalize_columns=True,
         )
+        # --- map normalized column scales back to full (C,P) grid ---
+        for jj, j in enumerate(keep):
+            c, p = col_map[j]     # original (C,P) index
+            col_norm_full[c, p] = col_norm_1d[jj]
+
         info = dict(status="unconstrained")
 
         print(
@@ -441,7 +454,7 @@ def _global_nnls_workingset(
         f"||Bw x - yw||={res:.3g}"
     )
 
-    return x, keep
+    return x, keep, col_norm_full
 
 # ------------------------------------------------------------------------------
 
@@ -629,6 +642,9 @@ def _solve_nnls(Bw: np.ndarray,
     -------
     x : ndarray (K,)
         Non-negative solution vector in the original column scaling.
+    col_norm_safe : ndarray (K,)
+        The safe column norms used to normalize columns (so callers can
+        persist them or undo/redo scalings consistently).
 
     Raises
     ------
@@ -670,7 +686,7 @@ def _solve_nnls(Bw: np.ndarray,
             x = z / col_norm_safe
             # ensure non-negative and finite
             x = np.maximum(0.0, np.asarray(x, dtype=np.float64))
-            return x
+            return x, col_norm_safe
         except Exception:
             # fallback: use projected gradient on normalized system
             solver = "pg"
@@ -692,7 +708,7 @@ def _solve_nnls(Bw: np.ndarray,
             z = np.asarray(res.x, dtype=np.float64)
             x = z / col_norm_safe
             x = np.maximum(0.0, x)
-            return x
+            return x, col_norm_safe
         except Exception as e:
             # fallback to PG if lsq_linear is not available or fails
             solver = "pg"
@@ -728,7 +744,7 @@ def _solve_nnls(Bw: np.ndarray,
                 break
         x = z / col_norm_safe
         x = np.maximum(0.0, x)
-        return x
+        return x, col_norm_safe
 
     # ---- Unknown solver option ------------------------------------------
     raise ValueError(f"Unknown solver='{solver}'")
@@ -943,7 +959,7 @@ def run_patch(h5_path: str,
 
     # --- Fast working-set GLOBAL NNLS on a pruned basis
     print(f"[patch] Working-set global NNLS (init=32/comp, +16/round, rounds=4)...")
-    x_full, keep = _global_nnls_workingset(
+    x_full, keep, col_norm_full = _global_nnls_workingset(
         Bw, yw, col_map, orbit_weights=None,
         k0_per_comp=32, kincr_per_comp=16, rounds=4,
     )
@@ -956,6 +972,8 @@ def run_patch(h5_path: str,
     x_CP = np.zeros((C, P), dtype=np.float64)
     for j, (c, p) in enumerate(col_map):
         x_CP[c, p] = x_patch[j]
+    # --- map NNLS solution back to physical column scaling ---
+    x_CP /= col_norm_full
     # ------------------------------------------------------------
     # Interpret NNLS patch result as SUPPORT information
     # ------------------------------------------------------------
@@ -1124,6 +1142,18 @@ def run_patch(h5_path: str,
     # NOTE:
     # x_CP amplitudes from the NNLS patch are NOT physically meaningful.
     # They encode support only; SPG will overwrite amplitudes completely.
+
+    # --- persist column normalization for downstream solvers (SPG) ---
+    # This guarantees NNLS and SPG operate in the same physical basis.
+    with open_h5(h5_path, role="writer") as f:
+        grp = f.require_group("/HyperCube")
+        if "col_norm" in grp:
+            del grp["col_norm"]
+        grp.create_dataset(
+            "col_norm",
+            data=col_norm_full,
+            dtype="f8",
+        )
 
     return dict(
         x_CP=x_CP, picks=picks, s_idx=s_idx, rmse=rmse, chi2=chi2,

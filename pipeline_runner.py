@@ -1225,6 +1225,12 @@ class PipelineRunner:
             except Exception:
                 pass
 
+        if tracker is not None:
+            try:
+                tracker.close()
+            except Exception:
+                pass
+
         logger.log("[Pipeline] Writing final /X_global to main HDF5...")
         with open_h5(self.h5_path, role="writer") as f_wr:
 
@@ -1256,9 +1262,6 @@ class PipelineRunner:
                     data=stats["known_zero_mask"].astype(bool),
                     dtype="bool",
                 )
-        if tracker is not None:
-            try: tracker.close()
-            except Exception: pass
         
         logger.log(
             "[Pipeline] ===================================================")
