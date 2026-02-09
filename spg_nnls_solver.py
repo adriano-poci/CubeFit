@@ -117,6 +117,7 @@ v3.18:  Added column-energy scaling to the gradient and the diagonal
             February 2026
 v3.19:  Reverted to unscaled gradient and preconditioner to avoid instability. 5
             February 2026
+v3.20:  Established correct scaling for the seed `x0`. 9 February 2026
 """
 
 from __future__ import annotations, print_function
@@ -135,6 +136,7 @@ from tqdm.auto import tqdm
 
 from CubeFit.hdf5_manager import open_h5
 from CubeFit import cube_utils as cu
+from CubeFit.hypercube_builder import read_global_column_energy
 
 # ----------------------------- Config ---------------------------------
 
@@ -622,6 +624,8 @@ def solve_global_spg(
                 raise RuntimeError("seed_tested_mask has wrong shape")
         else:
             seed_tested_mask = None
+    seed_tested_mask = None
+    known_zero = np.zeros((C, P), dtype=bool)
 
     s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
 
@@ -675,6 +679,23 @@ def solve_global_spg(
             raise ValueError("x0 has wrong size")
         x = x0.reshape(C, P).copy()
 
+    # ------------------------------------------------------------
+    # Cheap global amplitude alignment using precomputed energies
+    # ------------------------------------------------------------
+    if x0 is not None:
+        E_cp = read_global_column_energy(h5_path)  # (C,P)
+        if E_cp is not None:
+            model_power = float(np.sum((x * x) * E_cp))
+            if model_power > 0.0:
+                gamma = np.sqrt(Y_glob_norm2 / model_power)
+                if np.isfinite(gamma) and gamma > 0.0:
+                    x *= gamma
+                    print(
+                        f"[SPG] amplitude aligned from col_energy: "
+                        f"gamma={gamma:.3e}",
+                        flush=True,
+                    )
+
     # If x0 came from NNLS seed, clear BB history so BB step isn't anchored to old state.
     # This ensures a genuine BB step computed from the first epoch, not a small correction.
     x_prev = None
@@ -693,38 +714,38 @@ def solve_global_spg(
         print(f"[SPG] applied tiny seed jitter rel={jitter_rel}", flush=True)
 
     if w_target is not None:
+        # If seed came from nnls_patch we treat it as shape-only:
+        # do NOT trust sum(x) as a total-mass estimator. Instead derive
+        # a sensible global mass scale from the data (||Y||) so the orbit
+        # prior uses a comparable scale to the gradient objective.
         total_mass_est = float(np.sum(x))
-        # Detect NNLS patch seed via HDF5 metadata
         seed_origin = None
         try:
             with open_h5(h5_path, role="reader") as f:
                 if "/Seeds/x0_nnls_patch" in f:
                     seed_origin = f["/Seeds/x0_nnls_patch"].attrs.get("origin", None)
         except Exception:
-            pass
+            seed_origin = None
+
         if seed_origin and ("nnls_patch" in seed_origin):
-            total_mass_est = 1.0
+            # seed is shape-only: derive scale from data norm, not seed sum
+            # Use global Y norm (computed above as Y_glob_norm) if available
+            try:
+                total_mass_est = builtins.max(1.0, float(Y_glob_norm))
+            except NameError:
+                # fallback: total data sum
+                with open_h5(h5_path, role="reader") as f:
+                    DC = f["/DataCube"]
+                    total_mass_est = float(np.sqrt(float(np.sum(np.asarray(DC[...], np.float64)**2))))
+            # log for traceability
+            print(f"[SPG] nnls_patch seed detected: deriving total_mass_est from data = {total_mass_est:.3e}", flush=True)
+        else:
+            # trusted seed (not nnls_patch) -> use seed mass if positive
+            if total_mass_est <= 0.0:
+                total_mass_est = builtins.max(1.0, Y_glob_norm)
 
         w_target = w_target * total_mass_est
         print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)
-
-    # ------------------------------------------------------------
-    # Build seed-support field for SPG update gating
-    # ------------------------------------------------------------
-    seed_support = None
-    if x0 is not None:
-        x_seed_cp = x.copy()   # x currently holds the NNLS seed
-        sigma_c = float(os.environ.get("CUBEFIT_SEED_SIGMA_C", "2.0"))
-        sigma_p = float(os.environ.get("CUBEFIT_SEED_SIGMA_P", "2.0"))
-        seed_support = diffuse_seed_full_CP(
-            x_seed_cp,
-            sigma_c=sigma_c,
-            sigma_p=sigma_p,
-        )
-        print(
-            f"[SPG] built seed-support (sigma_c={sigma_c}, sigma_p={sigma_p})",
-            flush=True,
-        )
 
     # ------------------------------------------------------------
     # Multiprocessing bands
@@ -796,10 +817,21 @@ def solve_global_spg(
                 dynamic_ncols=True,
             )
             if ep == 0 and seed_support_mask is not None and w_target is None:
-                # Freeze bins that patch tested and found zero,
-                # but only if they are not already ACTIVE
-                initial_freeze = seed_tested_mask & (~seed_support_mask)
-                known_zero[initial_freeze] = True
+                # only freeze if seed carries amplitude information
+                seed_origin = None
+                try:
+                    with open_h5(h5_path, role="reader") as f:
+                        if "/Seeds/x0_nnls_patch" in f:
+                            seed_origin = f["/Seeds/x0_nnls_patch"].attrs.get("origin", None)
+                except Exception:
+                    seed_origin = None
+
+                if seed_origin and ("nnls_patch" not in seed_origin):
+                    initial_freeze = seed_tested_mask & (~seed_support_mask)
+                    known_zero[initial_freeze] = True
+                else:
+                    # nnls_patch -> do not freeze; allow SPG to find amplitude
+                    print("[SPG] nnls_patch detected: skipping initial freeze of patch-tested zeros", flush=True)
 
             # ---------------- Gradient accumulation (PARALLEL) ----------------
             for (s0, s1) in s_ranges:
@@ -881,7 +913,7 @@ def solve_global_spg(
             # ---------------- Normalize to mean-squared objective ----------------
             if nres > 0:
                 g_tot /= float(nres)
-                D_tot /= float(nres)
+                # DO NOT scale D_tot by nres — keep physical curvature
 
             # ---------------- Assemble gradient (data term) ----------------
             # Data gradient ONLY
@@ -978,7 +1010,10 @@ def solve_global_spg(
             frac_finite = np.sum(np.isfinite(D)) / float(D.size)
             print(f"[SPG-DBG] fraction finite denominators = {frac_finite:.3f}", flush=True)
 
-            if w_target is not None:
+            # Delay orbit-mass projection until amplitude is established
+            ORBIT_WARM_EPOCHS = 2   # 1–2 is enough
+
+            if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
                 # Enforce orbit weights exactly by projection
                 s = np.sum(x, axis=1)
                 s_safe = np.where(s > 0.0, s, 1.0)
@@ -1052,7 +1087,8 @@ def solve_global_spg(
                 f"active={active_orbits.size}/{C}",
                 flush=True,
             )
-            orbit_res = np.linalg.norm(s - w_target) if w_target is not None else 0.0
+            orbit_res = np.linalg.norm(s - w_target) if (w_target is not None) \
+                and ((ep + 1) > ORBIT_WARM_EPOCHS) else 0.0
             print(f"[SPG-orbit] ||s - w||={orbit_res:.3e}", flush=True)
         
         th = cu.zero_floor_inplace(best_x, rel_tol=1e-25, abs_tol=0.0)

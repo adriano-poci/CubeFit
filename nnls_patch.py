@@ -78,6 +78,8 @@ v2.2:   Scaled out the normalisation  of `x_CP` before returning it to ensure
             consistent physical basis with the solver, and persistent the
             normalisation;
         Converted NNLS seed. 6 February 2026
+v2.3:   Made seed fit shape only, and produce relative diagnostics, in order to
+            avoid scaling issues. 9 February 2026
 """
 
 
@@ -1134,6 +1136,11 @@ def run_patch(h5_path: str,
             # attach attrs
             ds.attrs["seed_model_flux"] = seed_model_flux
             ds.attrs["data_flux"] = data_flux
+            ds.attrs["patch_weighting"] = "sqrt_w_rows"   # or "finite+mask" (text)
+            ds.attrs["patch_lambda_used"] = bool(use_lambda)
+            # persist representative Y_glob_norm and m_glob used in scaling
+            # optionally persist column normalization snapshot (small sample)
+            ds.attrs["patch_col_norm_example"] = np.asarray(col_norm_full).ravel()[:min(8, col_norm_full.size)].tolist()
 
             # ------------------------------------------------------------
             # Write seed support metadata for SPG
