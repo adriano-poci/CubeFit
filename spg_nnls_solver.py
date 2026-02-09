@@ -703,13 +703,7 @@ def solve_global_spg(
         except Exception:
             pass
         if seed_origin and ("nnls_patch" in seed_origin):
-            # Trust the NNLS patch mass scale
-            if total_mass_est <= 0.0:
-                raise RuntimeError("NNLS patch seed has zero total mass.")
-        else:
-            # Untrusted seed (zeros, resume, etc.)
-            if total_mass_est <= 0.0:
-                total_mass_est = max(1.0, Y_glob_norm)
+            total_mass_est = 1.0
 
         w_target = w_target * total_mass_est
         print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)

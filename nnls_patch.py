@@ -871,6 +871,11 @@ def run_patch(h5_path: str,
             good = np.isfinite(spec)
             spec_sanit = np.where(good, spec, 0.0)
 
+            # per-spaxel data normalization (shape-only)
+            nrm = np.linalg.norm(spec_sanit)
+            if nrm > 0.0:
+                spec_sanit /= nrm
+
             y[pos:pos+Lk] = spec_sanit
             sqrt_w_rows[pos:pos+Lk] = good.astype(np.float64)
             pos += Lk
@@ -935,7 +940,18 @@ def run_patch(h5_path: str,
             for p_idx in plist_iter:
                 p_int = int(p_idx)
                 j = cp_to_col[(c, p_int)]
-                B[:, j] = A_c[:, p_int, :].reshape(rows, order="C")
+
+                col = A_c[:, p_int, :].reshape(rows, order="C")
+
+                # OPTION 1: per-spaxel model normalization (shape-only)
+                for i in range(Ns):
+                    r0 = i * Lk
+                    r1 = (i + 1) * Lk
+                    nrm = np.linalg.norm(col[r0:r1])
+                    if nrm > 0.0:
+                        col[r0:r1] /= nrm
+
+                B[:, j] = col
 
 
     # final sanitation guard (paranoia)
@@ -956,76 +972,7 @@ def run_patch(h5_path: str,
               "hypercube normalization and LOSVD amplitudes for these spaxels.")
 
     # --- Apply row weights (λ and finite mask) to (B,y)
-    Bw0, yw0 = _weighted_system(B, y, sqrt_w_rows)
-
-    # ----- per-spaxel optimal-scale diagnostic and adaptive anchors -----
-    Ns = int(s_idx.size)
-    Lk = int(Lk)  # keep existing Lk name
-
-    # compute stacked model per-column with current unscaled x_vec (will be zero
-    # before solve) — instead we derive per-spaxel model from tentative x_vec
-    # after the NNLS solve we will recompute s_s for final diagnostics; here we
-    # use a cheap diagnostic based on the top-K columns local projection.
-    # BUT simplest robust diagnostic: use Bw0,yw0 and a provisional x from unconstrained least-squares
-    try:
-        # small ridge LS to get a dense approximate x_vec for diagnostic only
-        K = Bw0.shape[1]
-        sqrt_r = 1e-6
-        A_aug = np.vstack([Bw0, sqrt_r * np.eye(K)])
-        b_aug = np.concatenate([yw0, np.zeros(K)])
-        z_diag, *_ = np.linalg.lstsq(A_aug, b_aug, rcond=None)
-        x_diag = np.maximum(0.0, z_diag)   # non-neg projection for diagnostics
-    except Exception:
-        x_diag = np.ones(Bw0.shape[1], dtype=np.float64)
-
-    # build per-spaxel stacked model and data: shapes (Ns, Lk)
-    m_stack = (Bw0 @ x_diag).reshape(Ns, Lk)
-    y_stack = yw0.reshape(Ns, Lk)
-
-    # per-spaxel best-fit scalar s_s = (y·m)/(m·m)
-    num = np.einsum("ij,ij->i", y_stack, m_stack)
-    den = np.einsum("ij,ij->i", m_stack, m_stack) + 1e-30
-    s_s = num / den
-    s_mean = float(np.mean(s_s))
-    s_std  = float(np.std(s_s))
-    cv = s_std / (abs(s_mean) + 1e-30)
-
-    print(f"[patch] per-spaxel scale: mean={s_mean:.3g}, std={s_std:.3g}, cv={cv:.3g}")
-
-    alpha = _choose_alpha(Bw0, yw0, Ns=Ns, Lk=Lk)   # use the robust chooser from earlier
-    # grouped anchors: partition spaxels by s_s quantiles into 3 groups
-    groups = np.array_split(np.argsort(s_s), 3)
-    Bw_rows = [Bw0]
-    yw_vals  = [yw0]
-    for g in groups:
-        rows_g = np.concatenate([np.arange(i*Lk, (i+1)*Lk) for i in g])
-        r_g = np.sum(Bw0[rows_g, :], axis=0)
-        t_g = float(np.sum(yw0[rows_g]))
-        Bw_rows.append(alpha * r_g[None, :])
-        yw_vals.append(np.array([alpha * t_g]))
-    Bw = np.vstack(Bw_rows)
-    yw = np.concatenate(yw_vals)
-    print(f"[patch] using GROUPED anchors G=3 alpha={alpha:.3e}  groupsizes={[len(g) for g in groups]}")
-
-    # Log per-spaxel extremes to help localize failures
-    i_min = int(np.argmin(s_s)); i_max = int(np.argmax(s_s))
-    print(f"[patch] per-spaxel scale min/max = {s_s[i_min]:.3g}/{s_s[i_max]:.3g} "
-        f"(spaxels {i_min}/{i_max})")
-    # -------------------------------------------------------------------
-
-    # --- column/target sanity on the weighted system
-    colnorm_all = np.linalg.norm(Bw, axis=0)
-    nz_cols = int(np.count_nonzero(colnorm_all > 0))
-    print(f"[patch] weighted col-norms: nz={nz_cols}/{colnorm_all.size}")
-
-    # raw correlations; if all <= 0 then NNLS optimum is x=0
-    corr = Bw.T @ yw
-    pos_corr = int(np.count_nonzero(corr > 0))
-    print(f"[patch] corr>0 = {pos_corr}/{corr.size}  min/med/max = "
-        f"{float(np.min(corr)):.3g}/{float(np.median(corr)):.3g}/{float(np.max(corr)):.3g}")
-
-    if nz_cols == 0:
-        raise RuntimeError("[patch] All columns are zero after masking/weighting for these spaxels.")
+    Bw, yw = _weighted_system(B, y, sqrt_w_rows)
 
     # --- Fast working-set GLOBAL NNLS on a pruned basis
     print(f"[patch] Working-set global NNLS (init=32/comp, +16/round, rounds=4)...")
@@ -1033,93 +980,20 @@ def run_patch(h5_path: str,
         Bw, yw, col_map, orbit_weights=None,
         k0_per_comp=32, kincr_per_comp=16, rounds=4,
     )
-    # keep col_map aligned with x_patch for the unpack loop
-    x_patch = x_full[keep].copy()                # compress to working set
-    col_map  = [col_map[j] for j in keep]        # now 1:1 aligned
-    K = int(len(col_map))  # (optional) if you print/return K later
+    # Compress to working set
+    x_patch = x_full[keep].copy()
+    col_map = [col_map[j] for j in keep]
 
-
-    # --- Unpack to full (C,P)
+    # Build full (C, P) array with shape-only weights
     x_CP = np.zeros((C, P), dtype=np.float64)
     for j, (c, p) in enumerate(col_map):
         x_CP[c, p] = x_patch[j]
 
-    # ---------- DIAGNOSTIC: per-column and per-(c,p) flux contributions ----------
-    # B is (rows, K) and x_patch is the compressed vector for keep
-    # compute per-column flux on the unweighted system for interpretability
-    col_flux = np.sum(np.abs(B), axis=0)            # (K,)
-    # map to full (C,P) ordering using col_map (keep-aligned)
-    col_flux_dict = {}
-    for jj, (c,p) in enumerate(col_map):
-        col_flux_dict[(c,p)] = float(col_flux[jj] * x_patch[jj])
-    # report top contributors
-    sorted_cols = sorted(col_flux_dict.items(), key=lambda kv: kv[1], reverse=True)
-    print("[patch] top 8 column flux contributions (c,p) -> flux:")
-    for (c,p), val in sorted_cols[:8]:
-        print(f"   ({c},{p}) -> {val:.3e}")
-    # Also print total model flux from B @ x_patch for cross-check
-    # col_flux_full is length K (all columns)
-    # x_patch is length len(keep); restrict col_flux to kept columns
-    tot_model_flux_cols = float(np.sum(col_flux[keep] * x_patch))
-    print(f"[patch] tot_model_flux_from_cols = {tot_model_flux_cols:.3e}")
-    # ---------------------------------------------------------------------------
-
-    # ============================================================
-    # Global-scale anchoring for NNLS patch seed
-    # ============================================================
-
-    # Purpose:
-    # The patch solution x_CP is locally normalized (fits patch spaxels),
-    # but may not extrapolate to the full cube. We correct this by matching
-    # the global flux using a sparse, representative spaxel sample.
-
-    N_GLOBAL = 32   # small, cheap; 16–64 is fine
-
-    with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
-        M  = f["/HyperCube/models"]
-
-        S_full = int(DC.shape[0])
-
-        rng = np.random.default_rng(12345)
-        s_glob = rng.choice(S_full, size=min(N_GLOBAL, S_full), replace=False)
-
-        y_glob = 0.0
-        m_glob = 0.0
-
-        for s in s_glob:
-            # observed flux (masked wavelengths only)
-            spec = np.asarray(DC[s, :], dtype=np.float64)
-            if keep_idx is not None:
-                spec = spec[keep_idx]
-            y_glob += float(np.sum(spec))
-
-            # model prediction using full hypercube
-            y_fit = _predict_spaxel_sparse_from_models(
-                M=M,
-                s_idx=int(s),
-                x_cp=x_CP,
-                picks=picks,
-                keep_idx=keep_idx,
-            )
-            m_glob += float(np.sum(y_fit))
-
-    # Guard against pathological cases
-    if m_glob <= 0.0 or not np.isfinite(m_glob):
-        raise RuntimeError(
-            "[patch] Global anchoring failed: model flux is zero or invalid."
-        )
-
-    scale_global = y_glob / m_glob
-
-    print(
-        f"[patch] GLOBAL anchor: "
-        f"y_glob={y_glob:.3e}, m_glob={m_glob:.3e}, "
-        f"scale={scale_global:.3e}"
-    )
-
-    # Apply global correction
-    x_CP *= scale_global
+    # Enforce strict shape-only semantics:
+    # remove any residual global scale (numerical only)
+    norm_x = np.linalg.norm(x_CP)
+    if norm_x > 0.0:
+        x_CP /= norm_x
 
     # ------------------------------------------------------------
     # Interpret NNLS patch result as SUPPORT information
@@ -1141,16 +1015,42 @@ def run_patch(h5_path: str,
     #    tested by patch but found unnecessary
     initial_known_zero_mask = seed_tested_mask & (~seed_support_mask)
 
-    # --- Reconstruct + diagnostics per spaxel
-    rmse = np.zeros(s_idx.size, dtype=np.float64)
-    chi2 = np.zeros_like(rmse)
-    pos = 0
-    print("[patch] Reconstructing and plotting spectra...")
+    # ------------------------------------------------------------
+    # support diagnostics (scale-free)
+    # ------------------------------------------------------------
+    active_per_comp = seed_support_mask.sum(axis=1)
+
+    print(
+        "[patch] support per component (active P): "
+        + ", ".join(str(int(v)) for v in active_per_comp)
+    )
+
+    print(
+        "[patch] total active (c,p) bins = "
+        f"{int(seed_support_mask.sum())}"
+    )
+
+    # ------------------------------------------------------------
+    # diagnostics: shape-only, scale-free
+    # ------------------------------------------------------------
+    cos_sim = np.zeros(s_idx.size, dtype=np.float64)
+    nrms    = np.zeros_like(cos_sim)
+
+    print("[patch] Computing shape-only diagnostics...")
+
     with open_h5(h5_path, role="reader") as f:
         M = f["/HyperCube/models"]
-        for i, s in enumerate(tqdm(s_idx, desc="[patch] plots", mininterval=0.5, dynamic_ncols=True)):
-            y_fit = np.zeros(Lk, dtype=np.float64)
-            # weighted least-squares sense: compare on masked/log grid unweighted
+
+        pos = 0
+        for i, s in enumerate(
+            tqdm(s_idx, desc="[patch] shape diagnostics",
+                mininterval=0.5, dynamic_ncols=True)
+        ):
+            # observed (already masked)
+            y_obs = y[pos:pos + Lk].copy()
+            pos += Lk
+
+            # model prediction (shape-only x_CP)
             y_fit = _predict_spaxel_sparse_from_models(
                 M=M,
                 s_idx=int(s),
@@ -1159,52 +1059,56 @@ def run_patch(h5_path: str,
                 keep_idx=keep_idx,
             )
 
-            y_obs = y[pos:pos+Lk]
+            # normalize both
+            ny = np.linalg.norm(y_obs)
+            nm = np.linalg.norm(y_fit)
 
-            wrow  = sqrt_w_rows[pos:pos+Lk]
-            pos += Lk
+            if ny > 0.0:
+                y_obs /= ny
+            if nm > 0.0:
+                y_fit /= nm
+
+            # cosine similarity
+            cos_sim[i] = float(np.dot(y_obs, y_fit))
+
+            # normalized residual RMS
             r = y_obs - y_fit
-            # RMSE (unweighted) and χ² (λ-weighted on finite)
-            w2 = wrow * wrow
-            den = float(np.sum(w2)) or 1.0
-            chi2[i] = float(np.sum((r * wrow)**2) / den)
-            rmse[i] = np.sqrt(chi2[i])
+            nrms[i] = float(np.sqrt(np.mean(r * r)))
 
+            # optional per-spaxel plot (shape-only)
             if out_dir:
                 fig = plt.figure(figsize=(9.5, 3.2))
                 ax = fig.add_subplot(111)
-                ax.plot(lam_plot, y_obs, lw=1.0, label="data")
-                ax.plot(lam_plot, y_fit, lw=1.0, label="model")
-                ax.set_title(f"spaxel {int(s)}  rmse={rmse[i]:.3f}")
+                ax.plot(lam_plot, y_obs, lw=1.0, label="data (norm)")
+                ax.plot(lam_plot, y_fit, lw=1.0, label="model (norm)")
+                ax.set_title(
+                    f"spaxel {int(s)}  cos={cos_sim[i]:.3f}  "
+                    f"nrms={nrms[i]:.3e}"
+                )
                 ax.set_xlabel("λ (ObsPix)")
-                ax.set_ylabel("flux")
+                ax.set_ylabel("normalized flux")
                 ax.legend(loc="best", fontsize=8)
-                fig.savefig(out_dir/\
-                    f"patch_spax{int(s):05d}.png", dpi=120)
+                fig.savefig(
+                    out_dir / f"patch_shape_spax{int(s):05d}.png",
+                    dpi=120,
+                )
                 plt.close(fig)
 
-    if out_dir:
-        flat = x_CP.ravel(order="C")
-        nnz = int(np.count_nonzero(flat))
-        if nnz == 0:
-            print("[plot] x_CP is all zeros (no bars to draw).")
-        else:
-            fig = plt.figure(figsize=plt.figaspect(0.5)*0.9)
-            gs = gridspec.GridSpec(1, 2, hspace=0.0, wspace=0.1)
+    print(
+        "[patch] shape summary: "
+        f"cos_sim min/med/max = "
+        f"{cos_sim.min():.3f}/"
+        f"{np.median(cos_sim):.3f}/"
+        f"{cos_sim.max():.3f}"
+    )
 
-            ax = fig.add_subplot(gs[0, 0])
-            ax.bar(np.arange(flat.size), flat)
-            ax.set_xlabel('component populations')
-            ax.set_ylabel('weight')
-
-            ax2 = fig.add_subplot(gs[0, 1])
-            ax2.imshow(seed_support_mask, aspect="auto", interpolation="nearest")
-            ax2.set_xlabel("population p")
-            ax2.set_ylabel("component c")
-            ax2.set_title("NNLS patch support mask")
-
-            fig.savefig(out_dir / 'xcp.png', dpi=120)
-            plt.close(fig)
+    print(
+        "[patch] shape summary: "
+        f"nrms min/med/max = "
+        f"{nrms.min():.3e}/"
+        f"{np.median(nrms):.3e}/"
+        f"{nrms.max():.3e}"
+    )
 
     if write_seed:
         with open_h5(h5_path, role="writer") as f:
@@ -1294,22 +1198,9 @@ def run_patch(h5_path: str,
                     os.remove(tmp_sidecar)
                 except OSError:
                     pass
-    
-    # NOTE:
-    # x_CP amplitudes from the NNLS patch ARE physically meaningful.
-    # They define a valid absolute-mass warm start for SPG.
-
-    x_vec = np.zeros(B.shape[1])
-    for j, (c, p) in enumerate(col_map):
-        x_vec[j] = x_CP[c, p]
-
-    m = Bw0 @ x_vec
-    rel_flux_err = abs(np.sum(m) - np.sum(yw0)) / np.sum(yw0)
-
-    print(f"[patch] relative flux error = {rel_flux_err:.3e}")
 
     return dict(
-        x_CP=x_CP, picks=picks, s_idx=s_idx, rmse=rmse, chi2=chi2,
+        x_CP=x_CP, picks=picks, s_idx=s_idx,
         meta=dict(norm_mode=norm_mode, rows=int(rows), cols=int(K),
                   mask_used=bool(use_mask), lambda_used=bool(use_lambda),
                   finite_min=int(finite_counts.min()),
