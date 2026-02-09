@@ -12,7 +12,10 @@ v1.1:   Added `apply_global_hypercube_scale_inplace` to compute and store a
 v1.2:   Defined all the useful `muse` functions including `_oneTimeSpec` for
             self-containment. 25 January 2026
 v1.3:   Added `zero_floor_inplace`. 26 January 2026
-v1.4"   Fixed generator addition bug in `_globMILES`. 30 January 2026
+v1.4:   Fixed generator addition bug in `_globMILES`. 30 January 2026
+v1.5:   Fixed bug in `_glob*MILES` where the metallicity parsing was not
+            correctly sorting the templates, so added `parseMetallicityFromPath`
+            and sorting logic. 9 February 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -2403,6 +2406,22 @@ def _readSSP(fn):
 
 # ------------------------------------------------------------------------------
 
+def parseMetallicityFromPath(pth: plp.Path) -> float:
+    """
+    Parse metallicity token like 'Zm1.26' or 'Zp0.06' from the filename and
+    return a signed float (e.g. -1.26 or +0.06). Raises ValueError if not found.
+    """
+    s = pth.name
+    # Look for Z then either p or m, then a number (integer or decimal)
+    m = re.search(r"Z([pm])(\d+(?:\.\d+)?)", s)
+    if not m:
+        raise ValueError(f"Could not parse metallicity from '{s}'")
+    sign, val = m.group(1), m.group(2)
+    val_f = float(val)
+    return -val_f if sign == "m" else val_f
+
+# ------------------------------------------------------------------------------
+
 def _globEMILES(iso, IMF, slope):
     """
     This function generates the glob pattern for the EMILES templates
@@ -2416,10 +2435,15 @@ def _globEMILES(iso, IMF, slope):
     -------
         glob (str): the glob pattern for the EMILES templates
     """
-    tglob = np.sort(np.array(list(dDir.rglob(str(plp.Path(
-        f"EMILES*{iso.upper()}*{IMF}*", f"E{IMF.lower()}{slope:.2f}*.fits"))))))
+    tglob = np.array(list(dDir.rglob(str(plp.Path(
+        f"EMILES*{iso.upper()}*{IMF}*", f"E{IMF.lower()}{slope:.2f}*.fits")))))
 
-    return tglob
+    mpairs = [(parseMetallicityFromPath(tpath), tpath) for tpath in tglob]
+    sortMpairs = sorted(mpairs, key=lambda x: x[0])
+
+    sortedTemplates = np.array([t[1] for t in sortMpairs])
+
+    return sortedTemplates
 
 # ------------------------------------------------------------------------------
 
@@ -2445,9 +2469,14 @@ def _globMILES(iso, IMF, slope):
         f"M{IMF.lower()}{slope:.2f}*E*0.40.fits"
     ))
     paths = list(dDir.rglob(p1)) + list(dDir.rglob(p2))
-    tglob = np.sort(np.array(paths))
+    tglob = np.array(paths)
 
-    return tglob
+    mpairs = [(parseMetallicityFromPath(tpath), tpath) for tpath in tglob]
+    sortMpairs = sorted(mpairs, key=lambda x: x[0])
+
+    sortedTemplates = np.array([t[1] for t in sortMpairs])
+
+    return sortedTemplates
 
 # ------------------------------------------------------------------------------
 
@@ -2466,10 +2495,15 @@ def _globSMILES(iso, IMF, slope):
     """
     imfDict = dict(KB='Revised_Kroupa', KU='Universal_Kroupa', BI='Bimodal',
         CH='Chabrier_1.3', UN='Unimodel')
-    tglob = np.sort(np.array(list(dDir.rglob(str(plp.Path('sMILES_SSPs',
-        imfDict[IMF], 'aFe*', f"M{IMF.lower()}{slope:.2f}*.fits"))))))
+    tglob = np.array(list(dDir.rglob(str(plp.Path('sMILES_SSPs',
+        imfDict[IMF], 'aFe*', f"M{IMF.lower()}{slope:.2f}*.fits")))))
 
-    return tglob
+    mpairs = [(parseMetallicityFromPath(tpath), tpath) for tpath in tglob]
+    sortMpairs = sorted(mpairs, key=lambda x: x[0])
+
+    sortedTemplates = np.array([t[1] for t in sortMpairs])
+
+    return sortedTemplates
 
 # ------------------------------------------------------------------------------
 
@@ -2800,8 +2834,8 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     # Get the template library
     teDir = gFunc(iso, IMF, slope)
-
     tmetals, tages, talphas = fFunc(teDir)
+
     # Template library trimming
     if iso == 'pad':
         selIso = np.where((tages >= 0.1) & (tages <= 14.2) &\
