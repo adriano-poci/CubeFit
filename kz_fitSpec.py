@@ -32,6 +32,8 @@ v1.4:   Universally removed all ad-hoc scalings;
 v1.5:   Get `warm_start` from `kwargs` in `genCubeFit`;
         Converted `compare_orbit_vs_solution` to be diagnostic in the context of
             the exact Lagrange multiplier orbit prior. 31 January 2026
+v1.6:   Remove existing spectral fit plots before regenerating, to avoid
+            confusion with stale files. 10 February 2026
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -586,14 +588,14 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=4,
+        epochs=6,
         # x0=x0,
         lr=0.1,
         project_nonneg=True,
         # orbit_weights=None, # or None for “free” fit
         orbit_weights=cWeights,
-        processes=2, # 4 workers
-        blas_threads=1, # 12 BLAS threads each → 48 total
+        processes=4, # 4 workers
+        blas_threads=12, # 12 BLAS threads each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
         warm_start=warm_start,
@@ -1619,6 +1621,13 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     plt.savefig(figDir/"chi2_hist.png")
     plt.close()
 
+    print(f"Mean reduced χ²: {np.mean(rms_resid_raw):.2f} ± {np.std(rms_resid_raw):.2f}")
+    worst = np.argmax(rms_resid_raw)
+    best = np.argmin(rms_resid_raw)
+    print(f"Worst fit: aperture {worst} (χ² = {rms_resid_raw[worst]:.2f})")
+    print(f"Best fit:  aperture {best} (χ² = {rms_resid_raw[best]:.2f})")
+    print(f"[CubeFit] All plots and maps saved in {str(figDir)}")
+
     # ---------------------------------------------
     # Plot
     # ---------------------------------------------
@@ -1800,6 +1809,10 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     if 'spec' in pplots:
         logger.log("Generating spectrum plots...")
         with logger.capture_all_output():
+            if figDir.exists():
+                for prefix in ("best", "worst"):
+                    for f in figDir.glob(f"{prefix}_{tag}_spax*.png"):
+                        f.unlink()
             parallel_spectrum_plots(
                 h5_or_path=str(hdf5Path),
                 chi2=rms_resid_raw,
@@ -1931,14 +1944,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 f"orbitSFH_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
         except AssertionError as e:
             print(f"Could not make orbital SFH plot: {e}")
-
-    # 7. Print summary
-    print(f"Mean reduced χ²: {np.mean(rms_resid_raw):.2f} ± {np.std(rms_resid_raw):.2f}")
-    worst = np.argmax(rms_resid_raw)
-    best = np.argmin(rms_resid_raw)
-    print(f"Worst fit: aperture {worst} (χ² = {rms_resid_raw[worst]:.2f})")
-    print(f"Best fit:  aperture {best} (χ² = {rms_resid_raw[best]:.2f})")
-    print(f"[CubeFit] All plots and maps saved in {str(figDir)}")
 
 # ------------------------------------------------------------------------------
 

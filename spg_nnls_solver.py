@@ -118,6 +118,12 @@ v3.18:  Added column-energy scaling to the gradient and the diagonal
 v3.19:  Reverted to unscaled gradient and preconditioner to avoid instability. 5
             February 2026
 v3.20:  Established correct scaling for the seed `x0`. 9 February 2026
+v3.21:  Scale `x` amplitude once per epoch in `solve_global_spg`;
+        Added anti-flatness heuristic to penalise flat SFH, using
+            `orbit_population_variance_grad`;
+        Implemented rank-1 projection of the orbit prior in order to avoid
+            introducing flat SFH by re-distributing mass among all populations of
+            an orbit in `solve_global_spg`. 10 February 2026
 """
 
 from __future__ import annotations, print_function
@@ -497,6 +503,17 @@ def population_age_curvature_grad(
 
 # ------------------------------------------------------------------------------
 
+def orbit_population_variance_grad(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    Gradient that penalises flat SFHs per orbit, invariant to total mass.
+    """
+    mean = np.mean(x, axis=1, keepdims=True)   # (C,1)
+    s = np.sum(x, axis=1, keepdims=True)       # (C,1)
+    s_eps = np.maximum(s, eps)
+    return (mean - x) / s_eps
+
+# ------------------------------------------------------------------------------
+
 def diffuse_seed_full_CP(
     seed_cp: np.ndarray,
     sigma_c: float,
@@ -796,8 +813,10 @@ def solve_global_spg(
             raise RuntimeError("Missing /Templates group in HDF5")
         pop_shape = tuple(f["/Templates"].attrs["pop_shape"])
 
-    orbit_prior_active = False
-
+    # Delay orbit-mass projection until amplitude is established
+    ORBIT_WARM_EPOCHS = builtins.max(0, builtins.min(2, cfg.epochs - 1))
+    # always project final epoch, regardless of `cfg.epochs`
+    print(f"[SPG] orbit-weight projection will start at epoch {ORBIT_WARM_EPOCHS + 1}", flush=True)
 
     # ============================================================
     # Main epochs
@@ -809,6 +828,9 @@ def solve_global_spg(
             D_tot = np.zeros_like(x)
             ssq = 0.0
             nres = 0
+            # --- amplitude accumulators ---
+            dot_AxY = 0.0
+            dot_AxAx = 0.0
 
             pbar = tqdm(
                 total=len(s_ranges),
@@ -845,26 +867,30 @@ def solve_global_spg(
                     DC = f["/DataCube"]
                     M  = f["/HyperCube/models"]
 
-                    # ------------------------------------------------------------
+                    # ----------------------------------------------------------
                     # 1) Read RAW bin flux (no SB conversion)
-                    # ------------------------------------------------------------
+                    # ----------------------------------------------------------
                     Y = np.asarray(DC[s0:s1, :], dtype=np.float64)  # (Sblk, L)
                     if keep_idx is not None:
                         Y = Y[:, keep_idx]                           # (Sblk, Lk)
 
-                    # ------------------------------------------------------------
+                    # ----------------------------------------------------------
                     # 3) Build prediction in the SAME weighted space
-                    # ------------------------------------------------------------
+                    # ----------------------------------------------------------
                     yhat = np.zeros_like(Y)
 
                     c_iter = active_orbits
                     for c in c_iter:
                         A = np.asarray(M[s0:s1, c, :, :], dtype=np.float64)
-                        # (Sblk, P, L)
                         if keep_idx is not None:
-                            A = A[:, :, keep_idx] # (Sblk, P, Lk)
+                            A = A[:, :, keep_idx]
 
                         yhat += x_eff[c] @ A
+
+                    # --- accumulate exact amplitude statistics ---
+                    # These two scalars are sufficient to optimally rescale x
+                    dot_AxY += float(np.sum(yhat * Y))
+                    dot_AxAx += float(np.sum(yhat * yhat))
 
                 # ------------------------------------------------------------
                 # 4) Residual (already weighted)
@@ -927,15 +953,34 @@ def solve_global_spg(
             if lambda_pop > 0.0:
                 g_pop = population_age_curvature_grad(x, pop_shape)
                 g += lambda_pop * g_pop
+                print(f"[SPG-DBG] ||g_pop|| = {np.linalg.norm(g_pop):.3e}",
+                    flush=True)
             else:
                 g_pop = None
-            # ---- per-orbit age smoothness prior ----
+            # ---- per-orbit age smoothness prior (amplitude-normalised / per-mass) ----
             lambda_age = float(os.environ.get("CUBEFIT_LAMBDA_AGE", "0.0"))
             if lambda_age > 0.0:
                 g_age = orbit_age_smoothness_grad(x)
-                g += lambda_age * g_age
+
+                # per-orbit mass (with safe epsilon)
+                s = np.sum(x, axis=1)                        # (C,)
+                eps = float(os.environ.get("CUBEFIT_AGE_SMOOTH_EPS", "1e-12"))
+                # scale eps to meaningful magnitude
+                eps = builtins.max(eps, 1e-12 * builtins.max(np.max(s), 1.0))
+                inv_mass = 1.0 / (s + eps)                   # (C,)
+
+                # apply per-orbit normalisation (prevents small-mass orbits having tiny absolute penalty)
+                g += lambda_age * (inv_mass[:, None] * g_age)
+                print(f"[SPG-DBG] ||g_age|| = {np.linalg.norm(g_age):.3e}",
+                    flush=True)
             else:
                 g_age = None
+            # ---- per-orbit anti-flatness prior (scale-free) ----
+            lambda_asmooth_env = float(os.environ.get("CUBEFIT_LAMBDA_ASMOOTH", "0.0"))
+            if lambda_asmooth_env > 0.0:
+                g_asmooth_raw = orbit_population_variance_grad(x)
+            else:
+                g_asmooth_raw = None
 
             # ---------------- Build safe diagonal preconditioner ----------------
             D_raw = D_tot.copy()  # per-col denom (may have zeros)
@@ -971,6 +1016,8 @@ def solve_global_spg(
             if g_age is not None:
                 age_eps = 1e-12 * builtins.max(np.max(np.abs(g_age)), 1.0)
                 freeze &= (np.abs(g_age) <= age_eps)
+                print(f"[SPG-DBG] ||g_age|| = {np.linalg.norm(g_age):.3e}",
+                    flush=True)
 
             if np.any(freeze):
                 g = g.copy()
@@ -982,6 +1029,34 @@ def solve_global_spg(
             invD = np.zeros_like(D, dtype=np.float64)
             finite_mask = np.isfinite(D) & (D > 0.0)
             invD[finite_mask] = 1.0 / D[finite_mask]
+
+            # ---- apply anti-flatness prior with correct scaling ----
+            if g_asmooth_raw is not None:
+
+                # effective step contribution
+                eff_vec = alpha_bb * invD * g_asmooth_raw
+                eff_norm = np.linalg.norm(eff_vec[np.isfinite(eff_vec)])
+
+                gdata_norm = np.linalg.norm(g_data[np.isfinite(g_data)])
+
+                target_ratio = float(os.environ.get("CUBEFIT_ASMOOTH_REL", "1e-3"))
+
+                lambda_auto = 0.0
+                if eff_norm > 0.0 and gdata_norm > 0.0:
+                    lambda_auto = target_ratio * gdata_norm / eff_norm
+
+                # final lambda: max(env, auto)
+                lambda_asmooth = builtins.max(lambda_asmooth_env, lambda_auto)
+
+                g += lambda_asmooth * g_asmooth_raw
+
+                print(
+                    f"[SPG-DBG] asmooth λ={lambda_asmooth:.3e}  "
+                    f"||g_as||={np.linalg.norm(g_asmooth_raw):.3e}  "
+                    f"eff_norm={eff_norm:.3e}  "
+                    f"||g_data||={gdata_norm:.3e}",
+                    flush=True,
+                )
 
             # cap invD to avoid enormous steps in low-curvature directions
             max_inv_d = float(os.environ.get("CUBEFIT_MAX_INV_D", "1e6"))
@@ -1010,18 +1085,49 @@ def solve_global_spg(
             frac_finite = np.sum(np.isfinite(D)) / float(D.size)
             print(f"[SPG-DBG] fraction finite denominators = {frac_finite:.3f}", flush=True)
 
-            # Delay orbit-mass projection until amplitude is established
-            ORBIT_WARM_EPOCHS = 2   # 1–2 is enough
+            # ============================================================
+            # exact global amplitude rescaling (epoch-wise)
+            # ============================================================
+            if dot_AxAx > 0.0 and dot_AxY > 0.0:
+                gamma = dot_AxY / dot_AxAx
+
+                if np.isfinite(gamma) and gamma > 0.0:
+                    x *= gamma
 
             if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
-                # Enforce orbit weights exactly by projection
-                s = np.sum(x, axis=1)
-                s_safe = np.where(s > 0.0, s, 1.0)
 
-                alpha = np.sum(s) / np.sum(w_target)
-                s_proj = alpha * w_target
+                # Determine which orbits are actually movable
+                known_zero_orbit = np.all(known_zero, axis=1)      # (C,)
+                D_orbit = np.sum(D_tot, axis=1)                     # (C,)
+                active = (~known_zero_orbit) & (D_orbit > 0.0)
 
-                x *= (s_proj / s_safe)[:, None]
+                if np.any(active):
+
+                    # --- rank-1 orbit-mass projection (mean-only) ---
+                    P = x.shape[1]
+
+                    s = np.sum(x[active, :], axis=1)          # (n_active,)
+                    w = w_target[active]                      # (n_active,)
+
+                    alpha = np.sum(s) / np.sum(w)
+                    s_proj = alpha * w                        # target per-orbit mass
+
+                    # mean-only correction
+                    delta = (s_proj - s) / float(P)           # (n_active,)
+
+                    x[active, :] += delta[:, None]
+
+                    # enforce non-negativity after projection
+                    np.maximum(x, 0.0, out=x)
+
+            # ------------------------------------------------------------
+            # Orbit mismatch metric (only meaningful after projection)
+            # ------------------------------------------------------------
+            if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
+                s_all = np.sum(x, axis=1)
+                orbit_mis = np.linalg.norm(s_all - w_target * np.sum(s_all))
+            else:
+                orbit_mis = 0.0
 
             # --- update BB history ---
             x_prev = x.copy()
@@ -1055,9 +1161,19 @@ def solve_global_spg(
             pg_norm = np.linalg.norm(g[np.isfinite(g)])
             D_pos = D[np.isfinite(D) & (D < np.inf)]
 
-            # compute data proxy (you have ssq normalized earlier)
-            data_proxy = 0.5 * ssq / builtins.max(nres, 1)  # or whichever proxy you use for data term
-            total_proxy = data_proxy# + f_orbit
+            data_proxy = 0.5 * ssq / builtins.max(nres, 1)
+
+            # ------------------------------------------------------------
+            # Composite acceptance metric
+            # ------------------------------------------------------------
+            if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
+                # Scale orbit penalty to data term (dimensionless, conservative)
+                scale = builtins.max(data_proxy, 1.0)
+                beta = float(os.environ.get("CUBEFIT_ORBIT_ACCEPT_BETA", "1e-6"))
+
+                total_proxy = data_proxy + beta * (orbit_mis / scale) ** 2
+            else:
+                total_proxy = data_proxy
             
             import matplotlib.pyplot as plt
             plt.clf()
@@ -1069,10 +1185,18 @@ def solve_global_spg(
             plt.close('all')
 
             # use total_proxy when comparing best_proxy / saving best_x
-            if total_proxy < best_proxy:
-                best_proxy = total_proxy
-                best_x = x.copy()
+            # After orbit projection is active, ONLY accept projected states
+            if (w_target is None) or ((ep + 1) > ORBIT_WARM_EPOCHS):
+                if total_proxy < best_proxy:
+                    best_proxy = total_proxy
+                    best_x = x.copy()
 
+            print(
+                f"[SPG-AMP] gamma={gamma:.3e}  "
+                f"<Ax,Y>={dot_AxY:.3e}  "
+                f"<Ax,Ax>={dot_AxAx:.3e}",
+                flush=True,
+            )
             print(
                 f"[SPG] epoch {ep+1}  "
                 f"RMSE={rmse:.4e}  "
