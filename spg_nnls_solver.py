@@ -124,6 +124,9 @@ v3.21:  Scale `x` amplitude once per epoch in `solve_global_spg`;
         Implemented rank-1 projection of the orbit prior in order to avoid
             introducing flat SFH by re-distributing mass among all populations of
             an orbit in `solve_global_spg`. 10 February 2026
+v3.22:  Fixed bug when computing `orbit_res` in `solve_global_spg` by using the
+            full per-orbit mass `s_full` instead of only active `s`. 11 February
+            2026
 """
 
 from __future__ import annotations, print_function
@@ -1211,8 +1214,11 @@ def solve_global_spg(
                 f"active={active_orbits.size}/{C}",
                 flush=True,
             )
-            orbit_res = np.linalg.norm(s - w_target) if (w_target is not None) \
-                and ((ep + 1) > ORBIT_WARM_EPOCHS) else 0.0
+            if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
+                s_full = np.sum(x, axis=1)
+                orbit_res = np.linalg.norm(s_full - w_target)
+            else:
+                orbit_res = 0.0
             print(f"[SPG-orbit] ||s - w||={orbit_res:.3e}", flush=True)
         
         th = cu.zero_floor_inplace(best_x, rel_tol=1e-25, abs_tol=0.0)
