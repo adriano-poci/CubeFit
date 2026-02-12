@@ -124,6 +124,9 @@ v3.21:  Scale `x` amplitude once per epoch in `solve_global_spg`;
         Implemented rank-1 projection of the orbit prior in order to avoid
             introducing flat SFH by re-distributing mass among all populations of
             an orbit in `solve_global_spg`. 10 February 2026
+v3.22:  Fixed bug when computing `orbit_res` in `solve_global_spg` by using the
+            full per-orbit mass `s_full` instead of only active `s`. 11 February
+            2026
 """
 
 from __future__ import annotations, print_function
@@ -505,11 +508,19 @@ def population_age_curvature_grad(
 
 def orbit_population_variance_grad(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """
-    Gradient that penalises flat SFHs per orbit, invariant to total mass.
+    Per-orbit anti-flatness gradient (encourages non-flat SFH).
+
+    Returns a gradient that points away from the per-orbit mean:
+        ~ (x - mean) / (per-orbit-mass + eps)
+
+    Using (x - mean) makes the gradient increase the objective
+    when the SFH is *peaked* and decrease it when the SFH becomes flat,
+    i.e. it penalizes flatness as intended.
     """
-    mean = np.mean(x, axis=1, keepdims=True)   # (C,1)
-    s = np.sum(x, axis=1, keepdims=True)       # (C,1)
+    mean = np.mean(x, axis=1, keepdims=True)  # (C,1)
+    s = np.sum(x, axis=1, keepdims=True)      # (C,1)
     s_eps = np.maximum(s, eps)
+    # return (x - mean) normalized by per-orbit mass
     return (mean - x) / s_eps
 
 # ------------------------------------------------------------------------------
@@ -1029,6 +1040,10 @@ def solve_global_spg(
             invD = np.zeros_like(D, dtype=np.float64)
             finite_mask = np.isfinite(D) & (D > 0.0)
             invD[finite_mask] = 1.0 / D[finite_mask]
+            # cap invD to avoid enormous steps in low-curvature directions
+            max_inv_d = float(os.environ.get("CUBEFIT_MAX_INV_D", "1e6"))
+            if np.isfinite(max_inv_d) and (max_inv_d > 0.0):
+                invD = np.minimum(invD, max_inv_d)
 
             # ---- apply anti-flatness prior with correct scaling ----
             if g_asmooth_raw is not None:
@@ -1037,7 +1052,8 @@ def solve_global_spg(
                 eff_vec = alpha_bb * invD * g_asmooth_raw
                 eff_norm = np.linalg.norm(eff_vec[np.isfinite(eff_vec)])
 
-                gdata_norm = np.linalg.norm(g_data[np.isfinite(g_data)])
+                data_mask = np.isfinite(g_data)
+                gdata_norm = np.linalg.norm(g_data[data_mask]) if np.any(data_mask) else 0.0
 
                 target_ratio = float(os.environ.get("CUBEFIT_ASMOOTH_REL", "1e-3"))
 
@@ -1048,7 +1064,9 @@ def solve_global_spg(
                 # final lambda: max(env, auto)
                 lambda_asmooth = builtins.max(lambda_asmooth_env, lambda_auto)
 
-                g += lambda_asmooth * g_asmooth_raw
+                # Apply prior (if non-zero)
+                if lambda_asmooth > 0.0:
+                    g += lambda_asmooth * g_asmooth_raw
 
                 print(
                     f"[SPG-DBG] asmooth λ={lambda_asmooth:.3e}  "
@@ -1057,11 +1075,6 @@ def solve_global_spg(
                     f"||g_data||={gdata_norm:.3e}",
                     flush=True,
                 )
-
-            # cap invD to avoid enormous steps in low-curvature directions
-            max_inv_d = float(os.environ.get("CUBEFIT_MAX_INV_D", "1e6"))
-            if np.isfinite(max_inv_d) and (max_inv_d > 0.0):
-                invD = np.minimum(invD, max_inv_d)
 
             # ----------------------------
             # BB step (diagonal-preconditioned) - same as before
@@ -1211,8 +1224,11 @@ def solve_global_spg(
                 f"active={active_orbits.size}/{C}",
                 flush=True,
             )
-            orbit_res = np.linalg.norm(s - w_target) if (w_target is not None) \
-                and ((ep + 1) > ORBIT_WARM_EPOCHS) else 0.0
+            if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
+                s_full = np.sum(x, axis=1)
+                orbit_res = np.linalg.norm(s_full - w_target)
+            else:
+                orbit_res = 0.0
             print(f"[SPG-orbit] ||s - w||={orbit_res:.3e}", flush=True)
         
         th = cu.zero_floor_inplace(best_x, rel_tol=1e-25, abs_tol=0.0)
