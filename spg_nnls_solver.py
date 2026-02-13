@@ -127,6 +127,9 @@ v3.21:  Scale `x` amplitude once per epoch in `solve_global_spg`;
 v3.22:  Fixed bug when computing `orbit_res` in `solve_global_spg` by using the
             full per-orbit mass `s_full` instead of only active `s`. 11 February
             2026
+v3.23:  Implemented Tikhonov (Levenberg–Marquardt–type) damping of the
+            diagonal Gauss–Newton preconditioner (`invD`) in `solve_global_spg`.
+            13 February 2026
 """
 
 from __future__ import annotations, print_function
@@ -993,86 +996,112 @@ def solve_global_spg(
             else:
                 g_asmooth_raw = None
 
-            # ---------------- Build safe diagonal preconditioner ----------------
-            D_raw = D_tot.copy()  # per-col denom (may have zeros)
+            # ============================================================
+            # Robust diagonal preconditioner (consistent & degeneracy-safe)
+            # ============================================================
+
+            D_raw = D_tot.copy()
             pos = np.isfinite(D_raw) & (D_raw > 0.0)
 
+            # Robust curvature scale (median positive curvature)
             if np.any(pos):
-                D_ref = float(np.median(D_raw[pos]))
+                D_med = float(np.median(D_raw[pos]))
             else:
-                D_ref = 1.0
+                D_med = 1.0
 
-            # normalize to median scale (scale-free)
-            D = D_raw / builtins.max(D_ref, 1e-30)
+            # --- Conservative damping ---
+            # Make damping a non-negligible fraction of D_med so D_damped isn't
+            # orders-of-magnitude smaller than the "typical" curvature.
+            DELTA_FRAC = 1e-1 # 0.1 × D_med (stronger than previously used 1e-2)
+            MIN_DELTA_ABS = 1e-12  # absolute lower floor on delta (guards pathological zeros)
+            delta = builtins.max(DELTA_FRAC * builtins.max(D_med, 0.0), MIN_DELTA_ABS)
 
-            # compute absolute floor: env OR data-driven small fraction of D_ref
-            abs_zero_env = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-12"))
-            data_floor_mul = float(os.environ.get("CUBEFIT_ZERO_COL_DATAFLOOR_MUL", "1e-8"))
-            data_floor = data_floor_mul * builtins.max(D_ref, 1.0)
-            abs_zero = builtins.max(abs_zero_env, data_floor)
+            # Damped curvature (use D_raw + delta where D_raw>0, else inf)
+            D_damped = np.where(pos, D_raw + delta, np.inf)
 
-            # positive denominators get at least abs_zero, others set to 0
-            D = np.where(pos, np.maximum(D, abs_zero), 0.0)
+            # Compute inverse diagonal safely
+            invD = np.zeros_like(D_damped, dtype=np.float64)
+            finite = np.isfinite(D_damped) & (D_damped > 0.0)
+            if np.any(finite):
+                invD[finite] = 1.0 / D_damped[finite]
 
-            # ---------------- Freeze logic (respect priors) ----------------
+            # --- Cap inverse amplification ---
+            # Two-fold cap: (a) relative to median invD, (b) absolute hard cap.
+            # This prevents catastrophic amplification in near-null directions.
+            INV_CAP_REL = 50.0           # at most 50× median amplification
+            INV_CAP_ABS = 1.0e6          # absolute cap (step units), conservative default
+
+            if np.any(finite):
+                invD_med = float(np.median(invD[finite]))
+            else:
+                invD_med = 1.0
+
+            invD_cap = builtins.min(INV_CAP_ABS, INV_CAP_REL * invD_med)
+            invD = np.minimum(invD, invD_cap)
+
+            # ------------------------------------------------------------
+            # Freeze logic (based on raw curvature)
+            # ------------------------------------------------------------
             freeze = (
-                (D <= 0.0)
-                | (~np.isfinite(D))
+                (~pos)
                 | known_zero
             )
 
             if g_pop is not None:
                 pop_eps = 1e-12 * builtins.max(np.max(np.abs(g_pop)), 1.0)
                 freeze &= (np.abs(g_pop) <= pop_eps)
+
             if g_age is not None:
                 age_eps = 1e-12 * builtins.max(np.max(np.abs(g_age)), 1.0)
                 freeze &= (np.abs(g_age) <= age_eps)
-                print(f"[SPG-DBG] ||g_age|| = {np.linalg.norm(g_age):.3e}",
-                    flush=True)
 
             if np.any(freeze):
+                # Zero the gradient and invD where frozen
                 g = g.copy()
                 g[freeze] = 0.0
-                D = D.copy()
-                D[freeze] = np.inf
+                invD[freeze] = 0.0
 
-            # ---------------- form capped inverse diag (invD) ----------------
-            invD = np.zeros_like(D, dtype=np.float64)
-            finite_mask = np.isfinite(D) & (D > 0.0)
-            invD[finite_mask] = 1.0 / D[finite_mask]
-            # cap invD to avoid enormous steps in low-curvature directions
-            max_inv_d = float(os.environ.get("CUBEFIT_MAX_INV_D", "1e6"))
-            if np.isfinite(max_inv_d) and (max_inv_d > 0.0):
-                invD = np.minimum(invD, max_inv_d)
+            # zero-out NaNs/Infs just in case
+            invD[~np.isfinite(invD)] = 0.0
 
-            # ---- apply anti-flatness prior with correct scaling ----
+            # --- Diagnostics before prior application ---
+            invD_med_post = float(np.median(invD[finite]) if np.any(finite) else 0.0)
+            print(
+                f"[SPG-DBG] D_med={D_med:.3e}  "
+                f"D_eff.min={float(np.min(D_damped[np.isfinite(D_damped)])):.3e}  "
+                f"D_eff.max={float(np.max(D_damped[np.isfinite(D_damped)])):.3e}",
+                flush=True,
+            )
+            print(
+                f"[SPG-DBG] invD_med={invD_med_post:.3e}  invD_cap={invD_cap:.3e}",
+                flush=True,
+            )
+
+            # ---------------- Apply anti-flatness prior (if present) ----------------
             if g_asmooth_raw is not None:
-
-                # effective step contribution
-                eff_vec = alpha_bb * invD * g_asmooth_raw
+                # Compute preconditioned "step" that would result from applying the raw prior
+                eff_vec = alpha_bb * (invD * g_asmooth_raw)
                 eff_norm = np.linalg.norm(eff_vec[np.isfinite(eff_vec)])
+                gdata_mask = np.isfinite(g_data)
+                gdata_norm = np.linalg.norm(g_data[gdata_mask]) if np.any(gdata_mask) else 0.0
 
-                data_mask = np.isfinite(g_data)
-                gdata_norm = np.linalg.norm(g_data[data_mask]) if np.any(data_mask) else 0.0
-
-                target_ratio = float(os.environ.get("CUBEFIT_ASMOOTH_REL", "1e-3"))
+                # target fraction of the data gradient to allocate to the prior
+                TARGET_RATIO = 1e-3
 
                 lambda_auto = 0.0
-                if eff_norm > 0.0 and gdata_norm > 0.0:
-                    lambda_auto = target_ratio * gdata_norm / eff_norm
+                if (eff_norm > 0.0) and (gdata_norm > 0.0):
+                    lambda_auto = TARGET_RATIO * (gdata_norm / eff_norm)
 
-                # final lambda: max(env, auto)
-                lambda_asmooth = builtins.max(lambda_asmooth_env, lambda_auto)
+                lambda_asmooth = builtins.max(1e-12, lambda_auto)
 
-                # Apply prior (if non-zero)
+                # Apply prior in gradient-space (so dx uses invD * (g + lambda * g_asmooth_raw))
                 if lambda_asmooth > 0.0:
                     g += lambda_asmooth * g_asmooth_raw
 
                 print(
                     f"[SPG-DBG] asmooth λ={lambda_asmooth:.3e}  "
                     f"||g_as||={np.linalg.norm(g_asmooth_raw):.3e}  "
-                    f"eff_norm={eff_norm:.3e}  "
-                    f"||g_data||={gdata_norm:.3e}",
+                    f"eff_norm={eff_norm:.3e}  ||g_data||={gdata_norm:.3e}",
                     flush=True,
                 )
 
@@ -1092,11 +1121,6 @@ def solve_global_spg(
             dx = -alpha_bb * (g * invD)
             x += dx
             x = np.maximum(x, 0.0)
-
-            # after computing D and D_ref and D_s
-            print(f"[SPG-DBG] D_ref={D_ref:.3e}, D.min={float(np.min(D)):.3e}, D.max={float(np.max(D)):.3e}", flush=True)
-            frac_finite = np.sum(np.isfinite(D)) / float(D.size)
-            print(f"[SPG-DBG] fraction finite denominators = {frac_finite:.3f}", flush=True)
 
             # ============================================================
             # exact global amplitude rescaling (epoch-wise)
@@ -1172,7 +1196,15 @@ def solve_global_spg(
             # ---------------- Diagnostics (new, meaningful set) ----------------
             rmse = np.sqrt(ssq / builtins.max(nres, 1))
             pg_norm = np.linalg.norm(g[np.isfinite(g)])
-            D_pos = D[np.isfinite(D) & (D < np.inf)]
+            D_eff = D_damped
+            D_pos = D_eff[np.isfinite(D_eff) & (D_eff < np.inf)]
+
+            print(
+                f"[SPG-DBG] D_med={D_med:.3e}  "
+                f"D_eff.min={float(np.min(D_pos)):.3e}  "
+                f"D_eff.max={float(np.max(D_pos)):.3e}",
+                flush=True,
+            )
 
             data_proxy = 0.5 * ssq / builtins.max(nres, 1)
 
