@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-    spg_nnls_solver.py
+    spg_nnls_solver_scaled.py
     Adriano Poci
     University of Oxford
     2025
@@ -21,115 +21,7 @@ r"""
 
 History
 -------
-v1.0:   Fixed bug in computing `nprocs`;
-        Wrapped entire `solve_global_kaczmarz_cchunk_mp` in `try/except`. 4
-            December 2025
-v1.1:   Added column-flux scaling bypass (`cp_flux_ref=None`). 5 December 2025
-v1.2:   Experimenting with RMSE cap. 11 December 2025
-v1.3:   Introduced L2 into Kaczmarz solving to be consistent with NNLS
-            initilisation;
-        Disabled buggy `w_band` which was implemented incorrectly. 12 December
-            2025
-v1.4:   Use the seed vector as a numerical prior during the Kaczmarz solving;
-        Implement global RMSE evaluation, and keep only globally-best solution;
-        Optionally disable seed prior. 13 December 2025
-v1.5:   Use RMSE proxy as guard for epoch solution. 15 December 2025
-v2.0:   Implemented global Kaczmarz gradient instead of per-tile updates; added
-            `_worker_tile_global_grad_band` and
-            `solve_global_kaczmarz_global_step_mp`. 16 December 2025
-v2.1:   Added tiny-column freeze inside `_worker_tile_global_grad_band`. 18
-            December 2025
-v2.2:   Consolidated two tiny-column freeze env var names into one;
-        Added fairer max-tile rather than bias to brighter spaxels. 25 December
-            2025
-v2.3:   Stripped global Kaczmarz solver diagnostics to single gradient and NNLS
-            constraint. 26 December 2025
-v2.4:   Pre-check gradient before each epoch;
-        Pre-check RMSE proxy before each epoch to allow for early exit. 28
-            December 2025
-v2.5:   Implemented backtracking and step-size reduction based on RMSE proxy. 29
-            December 2025
-v2.6:   Replaced expensive backtracking RMSE evaluations with O(1) quadratic
-            coefficients. 30 December 2025
-v3.0:   Switched to diagonal-preconditioned Spectral Projected Gradient method
-            to replace Kaczmarz updates. 31 December 2025
-v3.1:   Added orbit-weight projection step inside SPG loop in 
-            `solve_global_kaczmarz_global_step_mp`. 1 January 2026
-v3.2:   Properly account for active orbits using component support masks during
-            orbit-weight projection;
-        Fixed indentation bug in tile loop in
-            `solve_global_kaczmarz_global_step_mp`. 3 January 2026
-v3.3:   Correctly capped `dx` during SPG step in
-            `solve_global_kaczmarz_global_step_mp`;
-        Implement Armijo backtracking with cheap RMSE proxy in
-            `solve_global_kaczmarz_global_step_mp`;
-        Force small `D` to `np.inf` in `solve_global_kaczmarz_global_step_mp`. 5
-            January 2026
-v3.4:   Implemented SPG to Kaczmarz workflow. 7 January 2026
-v3.5:   Fixed indentation bug for Kaczmarz update in
-            `solve_global_kaczmarz_global_step_mp`. 8 January 2026
-v3.6:   Corrected all diagnostics and solver heuristics for the new scale of the
-            LOSVD. 10 January 2026
-v3.7:   Apply `dx` to the effective `x`, including inactive orbits, in SPG
-            solver `solve_global_kaczmarz_global_step_mp`;
-        Compute a proper `rmse_trial` in the Armijo backtracking step in the SPG
-            solver `solve_global_kaczmarz_global_step_mp` to determine step
-            acceptance --- otherwise shrink `lr`;
-        Corrected Kaczmarz block update accumulation in `solve_kaczmarz_nnls`
-            by normalising by the number of rows and the number of spaxels. 11
-            January 2026
-v3.8:   Added additional acceptance guard in SPG solver based on `step_cos`
-            in `solve_global_kaczmarz_global_step_mp`;
-        Use epoch 1 as a warm-up with softer criteria in SPG solver in
-            `solve_global_kaczmarz_global_step_mp`. 12 January 2026
-v3.9:   Added variational orbit-mass prior to break rank-1 degeneracy;
-        Softened freeze criteria to include `orbit_weights` prior gradient. 16
-            January 2026
-v3.10:  Universally removed all ad-hoc scalings;
-        Compute dynamic Barzilai–Borwein step length in
-            `solve_global_kaczmarz_global_step_mp`;
-        Include orbit prior completely in the cost function of the solver in
-            `solve_global_kaczmarz_global_step_mp`. 25 January 2026
-v3.11:  Scale `w_target` to match total mass before applying prior in
-            `solve_global_kaczmarz_global_step_mp`;
-        Trim final `best_x` with zero-flooring in
-            `solve_global_kaczmarz_global_step_mp`. 26 January 2026
-v3.12:  Renamed module to represent change in architecture;
-        Renamed `solve_global_kaczmarz_global_step_mp` to `solve_global_spg`;
-        Added age curvature prior gradient in `solve_global_spg`. 27 January
-            2026
-v3.13:  Set data-weighted orbit gradient in `solve_global_spg`;
-        Add jitter to input seed in `solve_global_spg`;
-        Added `diffuse_seed_full_CP` to diffuse NNLS seed;
-        Added soft projection to avoid flooring SFH in `solve_global_spg`. 28
-            January 2026
-v3.14:  Changed soft projection to hard projection in `solve_global_spg`. 29
-            January 2026
-v3.15:  Removed projection in favour of re-parametrisation in `solve_global_spg`.
-            30 January 2026
-v3.16:  Replaced orbit prior with Lagrange multiplier for exact adherence to the
-            orbit weights within the solver in `solve_global_spg`. 31 January
-            2026
-v3.17:  Added bookkeeping to determine if components should be zeroed, and remove
-            them from the solver in `solve_global_spg`. 3 February 2026
-v3.18:  Added column-energy scaling to the gradient and the diagonal
-            preconditioner only, not the forward model, in `solve_global_spg`. 4
-            February 2026
-v3.19:  Reverted to unscaled gradient and preconditioner to avoid instability. 5
-            February 2026
-v3.20:  Established correct scaling for the seed `x0`. 9 February 2026
-v3.21:  Scale `x` amplitude once per epoch in `solve_global_spg`;
-        Added anti-flatness heuristic to penalise flat SFH, using
-            `orbit_population_variance_grad`;
-        Implemented rank-1 projection of the orbit prior in order to avoid
-            introducing flat SFH by re-distributing mass among all populations of
-            an orbit in `solve_global_spg`. 10 February 2026
-v3.22:  Fixed bug when computing `orbit_res` in `solve_global_spg` by using the
-            full per-orbit mass `s_full` instead of only active `s`. 11 February
-            2026
-v3.23:  Implemented Tikhonov (Levenberg–Marquardt–type) damping of the
-            diagonal Gauss–Newton preconditioner (`invD`) in `solve_global_spg`.
-            13 February 2026
+v1.0:   Forked from `spg_nnls_solver.py` v3.23. 16 February 2026
 """
 
 from __future__ import annotations, print_function
