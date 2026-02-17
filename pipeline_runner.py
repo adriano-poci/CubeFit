@@ -52,6 +52,9 @@ v1.13:  Universally removed all ad-hoc scalings;
 v1.14:  Use renamed module. 27 January 2026
 v1.15:  Persist `known_zero_mask` after SPG in `solve_all_mp_batched`. 3 February
             2026
+v1.16:  Fixed bug in `PipelineRunner._read_latest_from_main` which incorrectly
+            sliced read-in solutions assuming they were history-like. 17
+            February 2026
 """
 
 from __future__ import annotations
@@ -478,9 +481,12 @@ class PipelineRunner:
                 return None
             ds = f[name]
             try:
-                if ds.ndim == 2 and ds.shape[0] > 0:
+                if name.startswith("/Fit/") and ds.ndim == 2 and \
+                    ds.shape[0] > 0:
+                    # history-like, per epoch
                     v = np.asarray(ds[-1, :], np.float64, order="C")
                 else:
+                    # canonical solution vector
                     v = np.asarray(ds[...], np.float64, order="C")
             except Exception:
                 return None
@@ -963,6 +969,8 @@ class PipelineRunner:
         elif warm_start == "resume":
             sidecar = cu._find_latest_sidecar(self.h5_path)
 
+            logger.log(f"[Pipeline] Warm-start mode: resume; "
+                       f"sidecar found: {sidecar if sidecar else 'none'}")
             # Always define these (avoids UnboundLocalError patterns).
             x_side, src_side = (None, None)
             x_main, src_main = (None, None)
@@ -1018,6 +1026,10 @@ class PipelineRunner:
                 else:
                     choose_side = (_safe_mtime(sidecar) > _safe_mtime(self.h5_path))
 
+            logger.log(f"[Pipeline] Warm-start resume candidates: "
+                       f"sidecar: {src_side if src_side else 'none'}, "
+                       f"main: {src_main if src_main else 'none'}; "
+                       f"choosing {'sidecar' if choose_side else 'main' if (x_main is not None) else 'none'}.")
             x0_effective, src_label, src_file = (
                 (x_side, src_side, sidecar) if choose_side
                 else (x_main, src_main, self.h5_path)
@@ -1025,9 +1037,9 @@ class PipelineRunner:
 
             # Fallback: seed (optional but robust).
             seed_used = False
-            x0_effective = None
             if x0_effective is None:
-                seed_path = os.environ.get("CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch")
+                seed_path = os.environ.get("CUBEFIT_SEED_PATH",
+                    "/Seeds/x0_nnls_patch")
                 x_seed, src_seed = self._read_seed_from_h5(
                     self.h5_path, N_expected, dset=seed_path
                 )

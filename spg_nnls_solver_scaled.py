@@ -29,7 +29,8 @@ v1.0:   Forked from `spg_nnls_solver.py` v3.23;
             16 February 2026
 v1.1:   Introduced re-scaled solver coordinates (s, y) to eliminate per-orbit
             mass degeneracy and improve BB step quality in `solve_global_spg`;
-        Corrected orbit projection in `solve_global_spg`. 17 February 2026
+        Corrected orbit projection in `solve_global_spg`;
+        Fixed bug where global amplitude scaling was applied to `x` not `s` in `solve_global_spg`. 17 February 2026
 """
 
 from __future__ import annotations, print_function
@@ -1162,8 +1163,8 @@ def solve_global_spg(
             # ------------------------------------------------------------
             # Logit stabilisation: prevent softmax saturation
             # ------------------------------------------------------------
-            LOGIT_CLIP = float(os.environ.get("CUBEFIT_LOGIT_CLIP", "30.0"))
-            np.clip(y, -LOGIT_CLIP, LOGIT_CLIP, out=y)
+            # LOGIT_CLIP = float(os.environ.get("CUBEFIT_LOGIT_CLIP", "30.0"))
+            # np.clip(y, -LOGIT_CLIP, LOGIT_CLIP, out=y)
 
             # Enforce non-negativity of s
             s = np.maximum(s, 0.0)
@@ -1182,7 +1183,7 @@ def solve_global_spg(
             if dot_AxAx > 0.0 and dot_AxY > 0.0:
                 gamma = dot_AxY / dot_AxAx
                 if np.isfinite(gamma) and gamma > 0.0:
-                    x *= gamma
+                    s *= gamma
 
             # ============================================================
             # Orbit mass projection (exact, mass-only)
@@ -1198,11 +1199,16 @@ def solve_global_spg(
                     s = s_proj.copy()
 
                     orbit_mis = np.linalg.norm(s - s_proj)
-
                 else:
                     orbit_mis = 0.0
             else:
                 orbit_mis = 0.0
+            
+            # ==========================================================
+            # Reconstruct x after s projection
+            # ==========================================================
+            p = row_softmax(y)
+            x = s[:, None] * p
 
             # --- update BB history ---
             x_prev = x.copy()
