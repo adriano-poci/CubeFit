@@ -21,7 +21,12 @@ r"""
 
 History
 -------
-v1.0:   Forked from `spg_nnls_solver.py` v3.23. 16 February 2026
+v1.0:   Forked from `spg_nnls_solver.py` v3.23;
+        Use simplex projection for orbit weights in `solve_global_spg` instead of rank-1 mean correction;
+        Scale `w_target` by `x`, not `||Y||` in `solve_global_spg`, to keep orbit mass scale consistent with current solution;
+        Implemented mass-aware flatness aversion so components with low total
+            mass get approximately-equivalent penalities in `solve_global_spg`.
+            16 February 2026
 """
 
 from __future__ import annotations, print_function
@@ -424,7 +429,7 @@ def orbit_population_variance_grad(x: np.ndarray,
     s = np.sum(x, axis=1, keepdims=True)           # (C,1)
     s_safe = np.maximum(s, eps)
 
-    return (mean - x) / s_safe
+    return (x - mean) / s_safe
 
 # ------------------------------------------------------------------------------
 
@@ -530,6 +535,48 @@ def _factored_step(x, g, D_raw, alpha_bb, freeze_mask):
         dx[c] = -alpha_bb * (g_orth * invD_c)
 
     return dx
+
+# ------------------------------------------------------------------------------
+
+def project_simplex(v: np.ndarray, z: float) -> np.ndarray:
+    """
+    Project vector v onto the simplex:
+
+        x >= 0
+        sum(x) = z
+
+    Minimizes ||x - v||^2.
+
+    Parameters
+    ----------
+    v : ndarray (P,)
+        Input vector.
+    z : float
+        Target sum.
+
+    Returns
+    -------
+    x : ndarray (P,)
+        Projected vector.
+    """
+
+    if z <= 0.0:
+        return np.zeros_like(v)
+
+    n = v.size
+    u = np.sort(v)[::-1]
+    cssv = np.cumsum(u) - z
+    ind = np.arange(1, n + 1)
+
+    cond = u - cssv / ind > 0
+    if not np.any(cond):
+        return np.zeros_like(v)
+
+    rho = ind[cond][-1]
+    theta = cssv[cond][-1] / rho
+
+    w = np.maximum(v - theta, 0.0)
+    return w
 
 # ------------------------------------------------------------------------------
 
@@ -674,6 +721,25 @@ def solve_global_spg(
                         flush=True,
                     )
 
+    # ------------------------------------------------------------
+    # Choose total_mass_est from the *aligned* x (same amplitude frame)
+    # ------------------------------------------------------------
+    # Use the actual total mass in x after any amplitude alignment.
+    total_mass_est = float(np.sum(x))
+
+    # Fallback: if for any reason sum(x) is nonpositive/invalid, fall back
+    # to the global data norm (last resort).
+    if not (np.isfinite(total_mass_est) and (total_mass_est > 0.0)):
+        total_mass_est = builtins.max(1.0, float(Y_glob_norm))
+
+    # diagnostic: show that the mass scale matches x
+    print(
+        f"[SPG-DBG] sum(x)={float(np.sum(x)):.3e} "
+        f"Y_glob_norm={float(Y_glob_norm):.3e} "
+        f"total_mass_est={total_mass_est:.3e}",
+        flush=True,
+    )
+
     # If x0 came from NNLS seed, clear BB history so BB step isn't anchored to old state.
     # This ensures a genuine BB step computed from the first epoch, not a small correction.
     x_prev = None
@@ -692,38 +758,13 @@ def solve_global_spg(
         print(f"[SPG] applied tiny seed jitter rel={jitter_rel}", flush=True)
 
     if w_target is not None:
-        # If seed came from nnls_patch we treat it as shape-only:
-        # do NOT trust sum(x) as a total-mass estimator. Instead derive
-        # a sensible global mass scale from the data (||Y||) so the orbit
-        # prior uses a comparable scale to the gradient objective.
-        total_mass_est = float(np.sum(x))
-        seed_origin = None
-        try:
-            with open_h5(h5_path, role="reader") as f:
-                if "/Seeds/x0_nnls_patch" in f:
-                    seed_origin = f["/Seeds/x0_nnls_patch"].attrs.get("origin", None)
-        except Exception:
-            seed_origin = None
-
-        if seed_origin and ("nnls_patch" in seed_origin):
-            # seed is shape-only: derive scale from data norm, not seed sum
-            # Use global Y norm (computed above as Y_glob_norm) if available
-            try:
-                total_mass_est = builtins.max(1.0, float(Y_glob_norm))
-            except NameError:
-                # fallback: total data sum
-                with open_h5(h5_path, role="reader") as f:
-                    DC = f["/DataCube"]
-                    total_mass_est = float(np.sqrt(float(np.sum(np.asarray(DC[...], np.float64)**2))))
-            # log for traceability
-            print(f"[SPG] nnls_patch seed detected: deriving total_mass_est from data = {total_mass_est:.3e}", flush=True)
-        else:
-            # trusted seed (not nnls_patch) -> use seed mass if positive
-            if total_mass_est <= 0.0:
-                total_mass_est = builtins.max(1.0, Y_glob_norm)
-
         w_target = w_target * total_mass_est
         print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)
+
+    print(
+        f"[SPG-DBG] sum(w_target)={np.sum(w_target):.3e}",
+        flush=True
+    )
 
     # ------------------------------------------------------------
     # Multiprocessing bands
@@ -906,19 +947,58 @@ def solve_global_spg(
             g = g_data.copy()
 
             # ============================================================
-            # Strong anti-flatness prior (spikiness promotion)
+            # Strong anti-flatness prior (spikiness promotion) - mass aware
             # ============================================================
-            LAMBDA_FLAT = 1e-3   # deterministic, stable across C
+            # Base (global) lambda; keep the old default for backwards compat.
+            lambda_flat_base = float(os.environ.get("CUBEFIT_LAMBDA_FLAT",
+                                                    str(1e-3)))
 
-            g_flat = orbit_population_variance_grad(x)
-            g += LAMBDA_FLAT * g_flat
+            # Maximum per-orbit amplification factor (prevent runaway)
+            max_scale = float(os.environ.get("CUBEFIT_LAMBDA_FLAT_MAX_SCALE",
+                                            str(1e2)))   # recommended: 10..1e3
 
-            print(
-                f"[SPG-DBG] flat λ={LAMBDA_FLAT:.3e}  "
-                f"||g_flat||={np.linalg.norm(g_flat):.3e}  "
-                f"||g_data||={np.linalg.norm(g_data):.3e}",
-                flush=True,
-            )
+            # Small safe epsilon for zero/near-zero w_target entries
+            _w_eps = float(os.environ.get("CUBEFIT_LAMBDA_FLAT_WEPS", "1e-30"))
+
+            g_flat = orbit_population_variance_grad(x)  # shape (C,P)
+
+            if (w_target is not None):
+                # w_target should already be on the solver mass scale (you scale earlier)
+                wt = np.asarray(w_target, dtype=np.float64).ravel()
+                # defensive: same length
+                if wt.size != x.shape[0]:
+                    # fallback to uniform if mismatch
+                    wt = np.ones(x.shape[0], dtype=np.float64)
+                # reference mass (largest orbit) — scale others relative to this
+                w_ref = float(np.max(wt))
+                # prevent division by zero and overly large multipliers
+                denom = np.maximum(wt, _w_eps)
+                per_orbit_scale = w_ref / denom
+                # Clip to stable maximum
+                per_orbit_scale = np.minimum(per_orbit_scale, max_scale)
+                # Compose per-orbit lambda (shape (C,))
+                lambda_per_orbit = lambda_flat_base * per_orbit_scale
+                # Apply per-orbit weighting to g_flat (broadcast to (C,P))
+                g += (lambda_per_orbit[:, None] * g_flat)
+                # Diagnostics (print a small summary)
+                print(
+                    f"[SPG-DBG] flat λ_base={lambda_flat_base:.3e}  "
+                    f"w_ref={w_ref:.3e}  max_scale={max_scale:.3e}  "
+                    f"λ_min={float(lambda_per_orbit.min()):.3e}  "
+                    f"λ_max={float(lambda_per_orbit.max()):.3e}  "
+                    f"||g_flat||={np.linalg.norm(g_flat):.3e}  "
+                    f"||g_data||={np.linalg.norm(g_data):.3e}",
+                    flush=True,
+                )
+            else:
+                # no orbit prior available: fall back to global lambda (original behaviour)
+                g += lambda_flat_base * g_flat
+                print(
+                    f"[SPG-DBG] flat λ={lambda_flat_base:.3e}  "
+                    f"||g_flat||={np.linalg.norm(g_flat):.3e}  "
+                    f"||g_data||={np.linalg.norm(g_data):.3e}",
+                    flush=True,
+                )
 
             # ============================================================
             # Population curvature prior
@@ -976,13 +1056,6 @@ def solve_global_spg(
             delta = 1e-2  # dimensionless damping in normalised space
             D_eff = np.where(pos, D_raw / builtins.max(D_med, 1e-30) + delta, np.inf)
 
-            invD = np.zeros_like(D_eff)
-            finite = np.isfinite(D_eff) & (D_eff > 0.0)
-            invD[finite] = 1.0 / D_eff[finite]
-
-            # Cap amplification (dimensionless)
-            invD = np.minimum(invD, 100.0)
-
             # ============================================================
             # Freeze logic
             # ============================================================
@@ -998,9 +1071,6 @@ def solve_global_spg(
                 freeze &= (np.abs(g_age) <= age_eps)
 
             g[freeze] = 0.0
-            invD[freeze] = 0.0
-
-            invD[~np.isfinite(invD)] = 0.0
 
             # Diagnostics
             D_pos = D_eff[np.isfinite(D_eff)]
@@ -1033,9 +1103,49 @@ def solve_global_spg(
 
                 print(f"[BB] alpha={alpha_bb:.3e}, sy={sy:.3e}", flush=True)
 
-            dx = -alpha_bb * (g * invD)
+            # ============================================================
+            # SCALED FACTORED SPG STEP (mass + shape decomposition)
+            # ============================================================
+
+            dx = np.zeros_like(x)
+            dx_mass_norm = 0.0
+            dx_shape_norm = 0.0
+
+            for c in range(C):
+
+                if np.all(freeze[c]):
+                    continue
+
+                g_c = g[c]
+                D_c = D_eff[c]  # <-- use already damped curvature
+
+                pos_c = np.isfinite(D_c) & (D_c > 0.0)
+                if not np.any(pos_c):
+                    continue
+
+                invD_c = np.zeros_like(D_c)
+                invD_c[pos_c] = 1.0 / D_c[pos_c]
+
+                # --- mass + shape split ---
+                g_mass = np.mean(g_c)
+                g_shape = g_c - g_mass
+
+                dx_mass = -alpha_bb * g_mass
+                dx_shape = -alpha_bb * (g_shape * invD_c)
+
+                dx[c] = dx_mass + dx_shape
+
+                dx_mass_norm += (dx_mass**2) * P
+                dx_shape_norm += np.sum(dx_shape**2)
+
             x += dx
             x = np.maximum(x, 0.0)
+
+            print(
+                f"[SPG-DBG] ||dx_mass||={np.sqrt(dx_mass_norm):.3e} "
+                f"||dx_shape||={np.sqrt(dx_shape_norm):.3e}",
+                flush=True,
+            )
 
             # ============================================================
             # Global amplitude rescaling
@@ -1047,22 +1157,23 @@ def solve_global_spg(
                     x *= gamma
 
             # ============================================================
-            # Orbit mass projection (rank-1 mean correction)
+            # Orbit mass projection (simplex projection)
             # ============================================================
 
             if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
 
                 s_all = np.sum(x, axis=1)
-
                 if s_all.size == w_target.size:
-
                     alpha = np.sum(s_all) / np.sum(w_target)
                     s_proj = alpha * w_target
 
-                    delta = (s_proj - s_all) / float(x.shape[1])
-                    x += delta[:, None]
+                    for c in range(C):
 
-                    np.maximum(x, 0.0, out=x)
+                        if s_proj[c] <= 0.0:
+                            x[c] = 0.0
+                            continue
+
+                        x[c] = project_simplex(x[c], s_proj[c])
 
                     orbit_mis = np.linalg.norm(np.sum(x, axis=1) - s_proj)
                 else:
@@ -1160,7 +1271,8 @@ def solve_global_spg(
             )
             if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
                 s_full = np.sum(x, axis=1)
-                orbit_res = np.linalg.norm(s_full - w_target)
+                alpha = np.sum(s_full) / np.sum(w_target)
+                orbit_res = np.linalg.norm(s_full - alpha * w_target)
             else:
                 orbit_res = 0.0
             print(f"[SPG-orbit] ||s - w||={orbit_res:.3e}", flush=True)

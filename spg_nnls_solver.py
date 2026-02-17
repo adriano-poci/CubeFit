@@ -27,7 +27,7 @@ v1.0:   Fixed bug in computing `nprocs`;
 v1.1:   Added column-flux scaling bypass (`cp_flux_ref=None`). 5 December 2025
 v1.2:   Experimenting with RMSE cap. 11 December 2025
 v1.3:   Introduced L2 into Kaczmarz solving to be consistent with NNLS
-            initilisation;
+            initialisation;
         Disabled buggy `w_band` which was implemented incorrectly. 12 December
             2025
 v1.4:   Use the seed vector as a numerical prior during the Kaczmarz solving;
