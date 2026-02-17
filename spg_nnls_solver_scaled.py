@@ -27,6 +27,9 @@ v1.0:   Forked from `spg_nnls_solver.py` v3.23;
         Implemented mass-aware flatness aversion so components with low total
             mass get approximately-equivalent penalities in `solve_global_spg`.
             16 February 2026
+v1.1:   Introduced re-scaled solver coordinates (s, y) to eliminate per-orbit
+            mass degeneracy and improve BB step quality in `solve_global_spg`;
+        Corrected orbit projection in `solve_global_spg`. 17 February 2026
 """
 
 from __future__ import annotations, print_function
@@ -740,6 +743,31 @@ def solve_global_spg(
         flush=True,
     )
 
+    # ============================================================
+    # Re-parametrisation: x[c,p] = s[c] * softmax(y[c,:])
+    # This removes the per-orbit null direction.
+    # ============================================================
+
+    _softmax_eps = 1e-30
+
+    # Per-orbit mass
+    s = np.sum(x, axis=1).astype(np.float64)  # (C,)
+
+    # Per-orbit shape probabilities
+    p = np.zeros_like(x, dtype=np.float64)
+
+    row_pos = s > _softmax_eps
+    p[~row_pos, :] = 1.0 / float(P)
+    p[row_pos, :] = x[row_pos, :] / s[row_pos, None]
+
+    # Logits (unconstrained variables)
+    y = np.log(np.maximum(p, _softmax_eps))
+
+    def row_softmax(Y):
+        Ym = Y - np.max(Y, axis=1, keepdims=True)
+        e = np.exp(Ym)
+        return e / np.sum(e, axis=1, keepdims=True)
+
     # If x0 came from NNLS seed, clear BB history so BB step isn't anchored to old state.
     # This ensures a genuine BB step computed from the first epoch, not a small correction.
     x_prev = None
@@ -828,6 +856,11 @@ def solve_global_spg(
 
             g_tot = np.zeros_like(x)
             D_tot = np.zeros_like(x)
+            # ------------------------------------------------------------
+            # Reconstruct x from (s, y)
+            # ------------------------------------------------------------
+            p = row_softmax(y)       # (C,P)
+            x = s[:, None] * p       # (C,P)
             ssq = 0.0
             nres = 0
             # --- amplitude accumulators ---
@@ -1104,46 +1137,41 @@ def solve_global_spg(
                 print(f"[BB] alpha={alpha_bb:.3e}, sy={sy:.3e}", flush=True)
 
             # ============================================================
-            # SCALED FACTORED SPG STEP (mass + shape decomposition)
+            # Re-parametrised SPG step in (s, y) coordinates
             # ============================================================
 
-            dx = np.zeros_like(x)
-            dx_mass_norm = 0.0
-            dx_shape_norm = 0.0
+            # g is gradient wrt x
 
-            for c in range(C):
+            # Compute inner product per row
+            g_dot_p = np.sum(g * p, axis=1)[:, None]   # (C,1)
 
-                if np.all(freeze[c]):
-                    continue
+            # Gradient wrt logits y
+            grad_y = s[:, None] * p * (g - g_dot_p)    # (C,P)
 
-                g_c = g[c]
-                D_c = D_eff[c]  # <-- use already damped curvature
+            # Gradient wrt s
+            grad_s = g_dot_p.squeeze()                 # (C,)
 
-                pos_c = np.isfinite(D_c) & (D_c > 0.0)
-                if not np.any(pos_c):
-                    continue
+            # Learning rates
+            lr_y = float(os.environ.get("CUBEFIT_LR_Y", "0.1"))
+            lr_s = alpha_bb
 
-                invD_c = np.zeros_like(D_c)
-                invD_c[pos_c] = 1.0 / D_c[pos_c]
+            # Update
+            y -= lr_y * grad_y
+            s -= lr_s * grad_s
 
-                # --- mass + shape split ---
-                g_mass = np.mean(g_c)
-                g_shape = g_c - g_mass
+            # ------------------------------------------------------------
+            # Logit stabilisation: prevent softmax saturation
+            # ------------------------------------------------------------
+            LOGIT_CLIP = float(os.environ.get("CUBEFIT_LOGIT_CLIP", "30.0"))
+            np.clip(y, -LOGIT_CLIP, LOGIT_CLIP, out=y)
 
-                dx_mass = -alpha_bb * g_mass
-                dx_shape = -alpha_bb * (g_shape * invD_c)
+            # Enforce non-negativity of s
+            s = np.maximum(s, 0.0)
 
-                dx[c] = dx_mass + dx_shape
-
-                dx_mass_norm += (dx_mass**2) * P
-                dx_shape_norm += np.sum(dx_shape**2)
-
-            x += dx
-            x = np.maximum(x, 0.0)
-
+            # Diagnostics
             print(
-                f"[SPG-DBG] ||dx_mass||={np.sqrt(dx_mass_norm):.3e} "
-                f"||dx_shape||={np.sqrt(dx_shape_norm):.3e}",
+                f"[SPG-DBG] ||grad_s||={np.linalg.norm(grad_s):.3e} "
+                f"||grad_y||={np.linalg.norm(grad_y):.3e}",
                 flush=True,
             )
 
@@ -1157,25 +1185,20 @@ def solve_global_spg(
                     x *= gamma
 
             # ============================================================
-            # Orbit mass projection (simplex projection)
+            # Orbit mass projection (exact, mass-only)
             # ============================================================
 
             if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
 
-                s_all = np.sum(x, axis=1)
-                if s_all.size == w_target.size:
-                    alpha = np.sum(s_all) / np.sum(w_target)
+                if s.size == w_target.size:
+
+                    alpha = np.sum(s) / np.sum(w_target)
                     s_proj = alpha * w_target
 
-                    for c in range(C):
+                    s = s_proj.copy()
 
-                        if s_proj[c] <= 0.0:
-                            x[c] = 0.0
-                            continue
+                    orbit_mis = np.linalg.norm(s - s_proj)
 
-                        x[c] = project_simplex(x[c], s_proj[c])
-
-                    orbit_mis = np.linalg.norm(np.sum(x, axis=1) - s_proj)
                 else:
                     orbit_mis = 0.0
             else:
