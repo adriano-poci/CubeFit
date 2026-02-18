@@ -31,6 +31,7 @@ v1.1:   Introduced re-scaled solver coordinates (s, y) to eliminate per-orbit
             mass degeneracy and improve BB step quality in `solve_global_spg`;
         Corrected orbit projection in `solve_global_spg`;
         Fixed bug where global amplitude scaling was applied to `x` not `s` in `solve_global_spg`. 17 February 2026
+v1.2:   Make `y` gradient mass-invariant in `solve_global_spg`. 18 February 2026
 """
 
 from __future__ import annotations, print_function
@@ -658,9 +659,11 @@ def solve_global_spg(
 
     s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
 
+    lr_eff = float(cfg.lr) / np.sqrt(C)
+
     print(
         f"[SPG] S={S}, L={L} (kept {Lk}), C={C}, P={P}, "
-        f"s_tile={s_tile}, epochs={cfg.epochs}, lr0={cfg.lr}",
+        f"s_tile={s_tile}, epochs={cfg.epochs}, lr0={cfg.lr}, lr_eff={lr_eff}",
         flush=True,
     )
 
@@ -823,7 +826,6 @@ def solve_global_spg(
     # ------------------------------------------------------------
     # SPG bookkeeping
     # ------------------------------------------------------------
-    eps = float(os.environ.get("CUBEFIT_EPS", "1e-12"))
     lr = float(cfg.lr)
 
     # --- BB history ---
@@ -1147,13 +1149,14 @@ def solve_global_spg(
             g_dot_p = np.sum(g * p, axis=1)[:, None]   # (C,1)
 
             # Gradient wrt logits y
-            grad_y = s[:, None] * p * (g - g_dot_p)    # (C,P)
+            # grad_y = s[:, None] * p * (g - g_dot_p)    # (C,P)
+            grad_y = p * (g - g_dot_p)
 
             # Gradient wrt s
             grad_s = g_dot_p.squeeze()                 # (C,)
 
             # Learning rates
-            lr_y = float(os.environ.get("CUBEFIT_LR_Y", "0.1"))
+            lr_y = lr_eff
             lr_s = alpha_bb
 
             # Update
