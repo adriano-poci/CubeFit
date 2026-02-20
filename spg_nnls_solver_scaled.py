@@ -659,11 +659,11 @@ def solve_global_spg(
 
     s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
 
-    lr_eff = float(cfg.lr) / np.sqrt(C)
+    lr_eff = float(cfg.lr)
 
     print(
         f"[SPG] S={S}, L={L} (kept {Lk}), C={C}, P={P}, "
-        f"s_tile={s_tile}, epochs={cfg.epochs}, lr0={cfg.lr}, lr_eff={lr_eff}",
+        f"s_tile={s_tile}, epochs={cfg.epochs}, lr0={lr_eff}",
         flush=True,
     )
 
@@ -792,11 +792,10 @@ def solve_global_spg(
     if w_target is not None:
         w_target = w_target * total_mass_est
         print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)
-
-    print(
-        f"[SPG-DBG] sum(w_target)={np.sum(w_target):.3e}",
-        flush=True
-    )
+        print(
+            f"[SPG-DBG] sum(w_target)={np.sum(w_target):.3e}",
+            flush=True
+        )
 
     # ------------------------------------------------------------
     # Multiprocessing bands
@@ -991,7 +990,7 @@ def solve_global_spg(
 
             # Maximum per-orbit amplification factor (prevent runaway)
             max_scale = float(os.environ.get("CUBEFIT_LAMBDA_FLAT_MAX_SCALE",
-                                            str(1e2)))   # recommended: 10..1e3
+                                            str(1e4)))   # recommended: 10..1e3
 
             # Small safe epsilon for zero/near-zero w_target entries
             _w_eps = float(os.environ.get("CUBEFIT_LAMBDA_FLAT_WEPS", "1e-30"))
@@ -1091,6 +1090,13 @@ def solve_global_spg(
 
             delta = 1e-2  # dimensionless damping in normalised space
             D_eff = np.where(pos, D_raw / builtins.max(D_med, 1e-30) + delta, np.inf)
+            # ------------------------------------------------------------
+            # Logit-space diagonal curvature (row-wise)
+            # ------------------------------------------------------------
+            # We approximate curvature per orbit by the mean of D_eff
+            # This stabilises large-C optimisation.
+            D_row = np.mean(D_eff, axis=1)  # shape (C,)
+            D_row = np.maximum(D_row, 1e-8) # avoid divide-by-zero
 
             # ============================================================
             # Freeze logic
@@ -1125,35 +1131,123 @@ def solve_global_spg(
             )
 
             # ============================================================
-            # BB step
+            # BB step (robust fallback + adaptive boost when sy ~ 0)
             # ============================================================
-
             if (x_prev is not None) and (g_prev is not None):
                 dx_flat = (x - x_prev).ravel()
                 dg_flat = (g - g_prev).ravel()
                 sy = float(np.dot(dx_flat, dg_flat))
 
-                if sy > 1e-16:
+                # safe env-configurable knobs (these default to conservative values)
+                BB_FALLBACK = float(os.environ.get("CUBEFIT_ALPHA_BB_FALLBACK", "1.0"))
+                BB_MAX = float(os.environ.get("CUBEFIT_ALPHA_BB_MAX", "1e3"))
+                BB_BOOST = float(os.environ.get("CUBEFIT_ALPHA_BB_BOOST", "10.0"))
+                SY_THRESH = float(os.environ.get("CUBEFIT_ALPHA_BB_SY_THRESH", "1e-12"))
+
+                if sy > SY_THRESH:
+                    # normal BB formula (stable when curvature observed)
                     alpha_bb = float(np.dot(dx_flat, dx_flat) / sy)
-                    alpha_bb = float(np.clip(alpha_bb, 1e-8, 1e8))
+                    # clip to sane range
+                    alpha_bb = float(np.clip(alpha_bb, 1e-8, BB_MAX))
+                else:
+                    # no curvature observed (sy ~ 0): use a larger, but bounded fallback
+                    # rationale: cfg.lr can be *too* small here; boost it a bit so mass moves.
+                    # Use a multiplicative boost to the configured fallback so the user can tune.
+                    # Do not use an unbounded multiplier — keep clipped by BB_MAX.
+                    fallback = float(BB_FALLBACK)
+                    alpha_bb = float(min(fallback * BB_BOOST, BB_MAX))
+
+                # Safety: never allow NaN/inf or negative
+                if not np.isfinite(alpha_bb) or (alpha_bb <= 0.0):
+                    alpha_bb = float(BB_FALLBACK)
 
                 print(f"[BB] alpha={alpha_bb:.3e}, sy={sy:.3e}", flush=True)
+            else:
+                # initial epoch: no history — use fallback
+                alpha_bb = float(os.environ.get("CUBEFIT_ALPHA_BB_FALLBACK", "1.0"))
+                print(f"[BB] no history, alpha={alpha_bb:.3e}", flush=True)
 
             # ============================================================
             # Re-parametrised SPG step in (s, y) coordinates
             # ============================================================
 
-            # g is gradient wrt x
+            # ------------------------------------------------------------
+            # Natural gradient in logit space
+            # ------------------------------------------------------------
 
-            # Compute inner product per row
-            g_dot_p = np.sum(g * p, axis=1)[:, None]   # (C,1)
-
-            # Gradient wrt logits y
-            # grad_y = s[:, None] * p * (g - g_dot_p)    # (C,P)
+            # Inner product per row
+            g_dot_p = np.sum(g * p, axis=1)[:, None]
+            # Natural gradient (mass removed)
             grad_y = p * (g - g_dot_p)
+            # Gradient wrt mass s
+            grad_s = g_dot_p.squeeze()
 
-            # Gradient wrt s
-            grad_s = g_dot_p.squeeze()                 # (C,)
+            # ============================================================
+            # Mixture (entropy) regularisation
+            # Encourages moderate template mixtures per orbit
+            # ============================================================
+
+            lambda_mix = float(os.environ.get("CUBEFIT_LAMBDA_MIX", "0.0"))
+
+            if lambda_mix > 0.0:
+
+                # log(p) safe
+                logp = np.log(np.maximum(p, 1e-30))
+
+                # entropy gradient in logit coordinates
+                h_term = logp + 1.0
+
+                # subtract p-weighted mean per row
+                h_mean = np.sum(p * h_term, axis=1, keepdims=True)
+
+                grad_y += lambda_mix * p * (h_term - h_mean)
+
+                print(
+                    f"[SPG-DBG] λ_mix={lambda_mix:.3e} "
+                    f"||mix_grad||={np.linalg.norm(p * (h_term - h_mean)):.3e}",
+                    flush=True,
+                )
+
+            # Data term (mean-squared objective proxy)
+            data_proxy = 0.5 * ssq / builtins.max(nres, 1)
+
+            # ============================================================
+            # Orbit weight penalty (dimensionless, scale-invariant)
+            # ============================================================
+
+            orbit_mis = 0.0
+
+            if w_target is not None:
+
+                sum_s = np.sum(s)
+                sum_w = np.sum(w_target)
+
+                if (sum_s > 0.0) and (sum_w > 0.0):
+
+                    s_norm = s / sum_s
+                    w_norm = w_target / sum_w
+
+                    r = s_norm - w_norm
+
+                    t = float(ep + 1) / float(cfg.epochs)
+                    lambda_orbit_final = float(
+                        os.environ.get("CUBEFIT_LAMBDA_ORBIT_FINAL", "5.0")
+                    )
+                    lambda_orbit = lambda_orbit_final * t
+
+                    # gradient wrt s
+                    grad_s += lambda_orbit * (
+                        (r / sum_s)
+                        - np.dot(r, s_norm) / sum_s
+                    )
+
+                    orbit_mis = np.linalg.norm(r)
+
+                    print(
+                        f"[SPG-DBG] λ_orbit={lambda_orbit:.3e} "
+                        f"||s_norm - w_norm||={orbit_mis:.3e}",
+                        flush=True,
+                    )
 
             # Learning rates
             lr_y = lr_eff
@@ -1162,12 +1256,6 @@ def solve_global_spg(
             # Update
             y -= lr_y * grad_y
             s -= lr_s * grad_s
-
-            # ------------------------------------------------------------
-            # Logit stabilisation: prevent softmax saturation
-            # ------------------------------------------------------------
-            # LOGIT_CLIP = float(os.environ.get("CUBEFIT_LOGIT_CLIP", "30.0"))
-            # np.clip(y, -LOGIT_CLIP, LOGIT_CLIP, out=y)
 
             # Enforce non-negativity of s
             s = np.maximum(s, 0.0)
@@ -1188,24 +1276,23 @@ def solve_global_spg(
                 if np.isfinite(gamma) and gamma > 0.0:
                     s *= gamma
 
-            # ============================================================
-            # Orbit mass projection (exact, mass-only)
-            # ============================================================
+            # # ============================================================
+            # # Orbit mass projection (exact, mass-only)
+            # # ============================================================
 
-            if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
+            # if w_target is not None and \
+            #     (ep + 1) > builtins.max(cfg.epochs-3, ORBIT_WARM_EPOCHS): 
+            #     # always project in final epochs, even if ORBIT_WARM_EPOCHS is 0
 
-                if s.size == w_target.size:
-
-                    alpha = np.sum(s) / np.sum(w_target)
-                    s_proj = alpha * w_target
-
-                    s = s_proj.copy()
-
-                    orbit_mis = np.linalg.norm(s - s_proj)
-                else:
-                    orbit_mis = 0.0
-            else:
-                orbit_mis = 0.0
+            #     if s.size == w_target.size:
+            #         alpha = np.sum(s) / np.sum(w_target)
+            #         s_proj = alpha * w_target
+            #         s = s_proj.copy()
+            #         orbit_mis = np.linalg.norm(s - s_proj)
+            #     else:
+            #         orbit_mis = 0.0
+            # else:
+            #     orbit_mis = 0.0
             
             # ==========================================================
             # Reconstruct x after s projection
@@ -1244,70 +1331,42 @@ def solve_global_spg(
             pg_norm = np.linalg.norm(g[np.isfinite(g)])
             D_pos = D_eff[np.isfinite(D_eff) & (D_eff < np.inf)]
 
-            print(
-                f"[SPG-DBG] D_med={D_med:.3e}  "
-                f"D_eff.min={float(np.min(D_pos)):.3e}  "
-                f"D_eff.max={float(np.max(D_pos)):.3e}",
-                flush=True,
-            )
-
-            data_proxy = 0.5 * ssq / builtins.max(nres, 1)
-
             # ------------------------------------------------------------
-            # Composite acceptance metric
+            # Composite acceptance metric (penalty-consistent)
             # ------------------------------------------------------------
-            if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
-                # Scale orbit penalty to data term (dimensionless, conservative)
-                scale = builtins.max(data_proxy, 1.0)
-                beta = float(os.environ.get("CUBEFIT_ORBIT_ACCEPT_BETA", "1e-6"))
-
-                total_proxy = data_proxy + beta * (orbit_mis / scale) ** 2
+            # Acceptance metric matches the true objective
+            if w_target is not None:
+                total_proxy = data_proxy + 0.5 * lambda_orbit * orbit_mis**2
             else:
                 total_proxy = data_proxy
-            
-            import matplotlib.pyplot as plt
-            plt.clf()
-            plt.hist(np.log10(x[x > 0].flatten()), bins=50, color='blue', alpha=0.7)
-            plt.title(f"Epoch {ep+1} solution histogram")
-            plt.xlabel("x value")
-            plt.ylabel("Count")
-            plt.savefig(f"spg_epoch_{ep+1}_histogram.png")
-            plt.close('all')
 
-            # use total_proxy when comparing best_proxy / saving best_x
-            # After orbit projection is active, ONLY accept projected states
-            if (w_target is None) or ((ep + 1) > ORBIT_WARM_EPOCHS):
-                if total_proxy < best_proxy:
-                    best_proxy = total_proxy
-                    best_x = x.copy()
+            # Save best solution unconditionally based on full objective
+            if total_proxy < best_proxy:
+                best_proxy = total_proxy
+                best_x = x.copy()
 
-            print(
-                f"[SPG-AMP] gamma={gamma:.3e}  "
-                f"<Ax,Y>={dot_AxY:.3e}  "
-                f"<Ax,Ax>={dot_AxAx:.3e}",
-                flush=True,
-            )
+            # ------------------------------------------------------------
+            # Diagnostics
+            # ------------------------------------------------------------
+
             print(
                 f"[SPG] epoch {ep+1}  "
                 f"RMSE={rmse:.4e}  "
-                f"||x||={x_norm:.3e}"
+                f"||x||={x_norm:.3e}",
+                flush=True,
             )
+
             print(
                 f"||g||={pg_norm:.3e}  "
-                f"total_proxy={total_proxy:.3e}"
+                f"total_proxy={total_proxy:.3e}",
+                flush=True,
             )
+
             print(
                 f"alpha_bb={alpha_bb:.2e}  "
                 f"active={active_orbits.size}/{C}",
                 flush=True,
             )
-            if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
-                s_full = np.sum(x, axis=1)
-                alpha = np.sum(s_full) / np.sum(w_target)
-                orbit_res = np.linalg.norm(s_full - alpha * w_target)
-            else:
-                orbit_res = 0.0
-            print(f"[SPG-orbit] ||s - w||={orbit_res:.3e}", flush=True)
         
         th = cu.zero_floor_inplace(best_x, rel_tol=1e-25, abs_tol=0.0)
         print(f"[SPG] zero-floor applied: threshold={th:.3e}", flush=True)
