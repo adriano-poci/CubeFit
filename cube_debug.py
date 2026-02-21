@@ -263,6 +263,9 @@ def nnls_seed_diagnostics(
           - "apertures" : list[int]
           - "fits_png" : str
           - "sfh_png" : str
+    Execution
+    ---------
+    >>> info = cdbg.nnls_seed_diagnostics("/data/phys-gal-dynamics/phys2603/CubeFit/NGC4365/NGC4365_207_12.h5", n_apertures=1)
     """
 
     if seed_path is None:
