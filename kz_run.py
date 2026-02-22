@@ -85,9 +85,9 @@ def main():
     os.environ["CUBEFIT_LAMBDA_ORBIT"] = str(0.0)
     os.environ["CUBEFIT_LAMBDA_POP"] = str(0.0)
     os.environ["CUBEFIT_LAMBDA_AGE"] = str(0.0)
-    os.environ["CUBEFIT_LAMBDA_MIX"] = str(7e-3)
+    os.environ["CUBEFIT_LAMBDA_MIX"] = str(7e-2)
     os.environ["CUBEFIT_LAMBDA_ASMOOTH"] = str(0.0) # small non-zero
-    os.environ["CUBEFIT_LAMBDA_FLAT"] = str(0.0)
+    os.environ["CUBEFIT_LAMBDA_FLAT"] = str(7e-2)
     os.environ["CUBEFIT_LAMBDA_FLAT_MAX_SCALE"] = str(5e4)
     os.environ["CUBEFIT_LR_Y"] = str(0.05)
     os.environ["CUBEFIT_SEED_JITTER"] = str(1)
