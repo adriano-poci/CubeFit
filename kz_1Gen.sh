@@ -12,10 +12,10 @@
 #SBATCH -D "/data/phys-gal-dynamics/phys2603/muse"
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_1Gen.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_1Gen.log" --open-mode=append
-#SBATCH -p medium
+#SBATCH -p short
 
 #SBATCH --job-name="CubeFit_1Gen"
-#SBATCH --time=0-24:00
+#SBATCH --time=0-12:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=150G

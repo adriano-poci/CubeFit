@@ -83,9 +83,9 @@ def main():
     os.environ["CUBEFIT_ZERO_COL_FREEZE"] = str(1)
     os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-5)
     os.environ["CUBEFIT_LAMBDA_ORBIT"] = str(0.0)
-    os.environ["CUBEFIT_LAMBDA_POP"] = str(7e-2)
-    os.environ["CUBEFIT_LAMBDA_AGE"] = str(7e-2)
-    os.environ["CUBEFIT_LAMBDA_MIX"] = str(7e-1)
+    os.environ["CUBEFIT_LAMBDA_POP"] = str(0.0)
+    os.environ["CUBEFIT_LAMBDA_AGE"] = str(0.0)
+    os.environ["CUBEFIT_LAMBDA_MIX"] = str(7e-3)
     os.environ["CUBEFIT_LAMBDA_ASMOOTH"] = str(0.0) # small non-zero
     os.environ["CUBEFIT_LAMBDA_FLAT"] = str(0.0)
     os.environ["CUBEFIT_LAMBDA_FLAT_MAX_SCALE"] = str(5e4)

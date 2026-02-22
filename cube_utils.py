@@ -2851,11 +2851,11 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     # # thinning
     aIdx = np.asarray([np.argmin(np.abs(uages-xc)) for xc in
-        # [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0]])
-        [4.0, 6.0, 8.0, 10.0, 11.5, 13.0, 14.0]])
+        [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0]])
+        # [4.0, 6.0, 8.0, 10.0, 11.5, 13.0, 14.0]])
     zIdx = np.asarray([np.argmin(np.abs(umetals-xc)) for xc in
-        # [-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26, 0.4]])
-        [-1.0, -0.6, 0.0, 0.15, 0.26, 0.4]])
+        [-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26, 0.4]])
+        # [-1.0, -0.6, 0.0, 0.15, 0.26, 0.4]])
     if not isinstance(talphas, type(None)):
         talphas = talphas[selIso]
         ualphas = np.unique(talphas)
