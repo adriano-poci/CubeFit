@@ -588,12 +588,12 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=11,
+        epochs=21,
         # x0=x0,
-        lr=0.1,
+        lr=0.15,
         project_nonneg=True,
-        orbit_weights=None, # or None for “free” fit
-        # orbit_weights=cWeights,
+        # orbit_weights=None, # or None for “free” fit
+        orbit_weights=cWeights,
         processes=4, # 4 workers
         blas_threads=12, # 12 BLAS threads each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S

@@ -1064,6 +1064,30 @@ def solve_global_spg(
                 g_age = None
 
             # ============================================================
+            # Elastic Net (global sparsity)
+            # ============================================================
+
+            lambda_l1 = float(os.environ.get("CUBEFIT_LAMBDA_L1", "0.0"))
+            lambda_l2 = float(os.environ.get("CUBEFIT_LAMBDA_L2", "0.0"))
+
+            if lambda_l2 > 0.0:
+                # L2 gradient is simply x
+                g += lambda_l2 * x
+
+            if lambda_l1 > 0.0:
+                # L1 subgradient: sign(x)
+                # Since x >= 0 in your model, sign(x) = 1 where x>0
+                l1_grad = np.ones_like(x)
+                l1_grad[x <= 0.0] = 0.0
+                g += lambda_l1 * l1_grad
+
+                print(
+                    f"[SPG-DBG] λ_L1={lambda_l1:.3e} "
+                    f"λ_L2={lambda_l2:.3e}",
+                    flush=True,
+                )
+
+            # ============================================================
             # Scale-invariant curvature normalisation
             # ============================================================
 
