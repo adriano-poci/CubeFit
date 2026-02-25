@@ -825,11 +825,6 @@ def solve_global_spg(
     # ------------------------------------------------------------
     # SPG bookkeeping
     # ------------------------------------------------------------
-    lr = float(cfg.lr)
-
-    # --- BB history ---
-    alpha_bb = float(cfg.lr)   # initial BB step guess
-
     best_x = x.copy()
     best_proxy = np.inf
 
@@ -1154,42 +1149,43 @@ def solve_global_spg(
                 flush=True,
             )
 
-            # ============================================================
-            # BB step (robust fallback + adaptive boost when sy ~ 0)
-            # ============================================================
-            if (x_prev is not None) and (g_prev is not None):
-                dx_flat = (x - x_prev).ravel()
-                dg_flat = (g - g_prev).ravel()
-                sy = float(np.dot(dx_flat, dg_flat))
+            # # ============================================================
+            # # BB step (robust fallback + adaptive boost when sy ~ 0)
+            # # ============================================================
+            # if (x_prev is not None) and (g_prev is not None):
+            #     dx_flat = (x - x_prev).ravel()
+            #     dg_flat = (g - g_prev).ravel()
+            #     sy = float(np.dot(dx_flat, dg_flat))
 
-                # safe env-configurable knobs (these default to conservative values)
-                BB_FALLBACK = float(os.environ.get("CUBEFIT_ALPHA_BB_FALLBACK", "1.0"))
-                BB_MAX = float(os.environ.get("CUBEFIT_ALPHA_BB_MAX", "1e3"))
-                BB_BOOST = float(os.environ.get("CUBEFIT_ALPHA_BB_BOOST", "10.0"))
-                SY_THRESH = float(os.environ.get("CUBEFIT_ALPHA_BB_SY_THRESH", "1e-12"))
+            #     # safe env-configurable knobs (these default to conservative values)
+            #     BB_FALLBACK = float(os.environ.get("CUBEFIT_ALPHA_BB_FALLBACK", "1.0"))
+            #     BB_MAX = float(os.environ.get("CUBEFIT_ALPHA_BB_MAX", "1e3"))
+            #     SY_THRESH = float(os.environ.get("CUBEFIT_ALPHA_BB_SY_THRESH", "1e-12"))
 
-                if sy > SY_THRESH:
-                    # normal BB formula (stable when curvature observed)
-                    alpha_bb = float(np.dot(dx_flat, dx_flat) / sy)
-                    # clip to sane range
-                    alpha_bb = float(np.clip(alpha_bb, 1e-8, BB_MAX))
-                else:
-                    # no curvature observed (sy ~ 0): use a larger, but bounded fallback
-                    # rationale: cfg.lr can be *too* small here; boost it a bit so mass moves.
-                    # Use a multiplicative boost to the configured fallback so the user can tune.
-                    # Do not use an unbounded multiplier — keep clipped by BB_MAX.
-                    fallback = float(BB_FALLBACK)
-                    alpha_bb = float(min(fallback * BB_BOOST, BB_MAX))
+            #     if sy > SY_THRESH:
+            #         # normal BB formula (stable when curvature observed)
+            #         alpha_bb = float(np.dot(dx_flat, dx_flat) / sy)
+            #         alpha_bb = float(np.clip(alpha_bb, 1e-8, BB_MAX))
+            #     else:
+            #         # no curvature observed (sy ~ 0): use conservative fallback
+            #         # Avoid aggressive multiplicative boost which forces large,
+            #         # essentially arbitrary steps that can swamp structured priors.
+            #         fallback = float(BB_FALLBACK)
+            #         # mild heuristic: allow small safe boost up to 2x only if
+            #         # previous alpha_bb exists and was larger than fallback.
+            #         prev_alpha = float(alpha_bb) if ('alpha_bb' in locals() and np.isfinite(alpha_bb)) else fallback
+            #         candidate = max(fallback, min(prev_alpha * 1.2, 2.0 * fallback))
+            #         alpha_bb = float(np.clip(candidate, 1e-8, BB_MAX))
 
-                # Safety: never allow NaN/inf or negative
-                if not np.isfinite(alpha_bb) or (alpha_bb <= 0.0):
-                    alpha_bb = float(BB_FALLBACK)
+            #     # Safety: never allow NaN/inf or negative
+            #     if not np.isfinite(alpha_bb) or (alpha_bb <= 0.0):
+            #         alpha_bb = float(BB_FALLBACK)
 
-                print(f"[BB] alpha={alpha_bb:.3e}, sy={sy:.3e}", flush=True)
-            else:
-                # initial epoch: no history — use fallback
-                alpha_bb = float(os.environ.get("CUBEFIT_ALPHA_BB_FALLBACK", "1.0"))
-                print(f"[BB] no history, alpha={alpha_bb:.3e}", flush=True)
+            #     print(f"[BB] alpha={alpha_bb:.3e}, sy={sy:.3e}", flush=True)
+            # else:
+            #     # initial epoch: no history — use fallback
+            #     alpha_bb = float(os.environ.get("CUBEFIT_ALPHA_BB_FALLBACK", "1.0"))
+            #     print(f"[BB] no history, alpha={alpha_bb:.3e}", flush=True)
 
             # ============================================================
             # Re-parametrised SPG step in (s, y) coordinates
@@ -1241,41 +1237,71 @@ def solve_global_spg(
 
             orbit_mis = 0.0
 
+            # ============================================================
+            # Orbit mass penalty in absolute s-space
+            # ============================================================
+
+            # --- Orbit mass penalty in absolute s-space (scaled adaptively) ---
             if w_target is not None:
+                t = float(ep + 1) / float(cfg.epochs)
+                lambda_orbit_final = float(os.environ.get("CUBEFIT_LAMBDA_ORBIT_FINAL", "5.0"))
+                # base ramp
+                lambda_orbit = lambda_orbit_final * t
 
-                sum_s = np.sum(s)
-                sum_w = np.sum(w_target)
+                # target already scaled earlier: w_target *= total_mass_est
+                s_target = w_target
 
-                if (sum_s > 0.0) and (sum_w > 0.0):
+                # adaptive scale so orbit term competes with data grad in s-space
+                # g_data_s = projection of data term onto s (g_dot_p computed earlier as g_dot_p.squeeze())
+                g_data_s_norm = float(np.linalg.norm(g_dot_p)) if 'g_dot_p' in locals() else float(np.linalg.norm(grad_s))
+                mismatch_norm = float(np.linalg.norm(s - s_target)) + 1e-30
 
-                    s_norm = s / sum_s
-                    w_norm = w_target / sum_w
+                # scale factor: bring orbit gradient magnitude to fraction `orbit_force_frac` of data grad
+                orbit_force_frac = float(os.environ.get("CUBEFIT_ORBIT_FORCE_FRAC", "0.5"))
+                scale = (g_data_s_norm * orbit_force_frac) / mismatch_norm
 
-                    r = s_norm - w_norm
+                grad_s += (lambda_orbit * scale) * (s - s_target)
+                orbit_mis = np.linalg.norm(s - s_target)
 
-                    t = float(ep + 1) / float(cfg.epochs)
-                    lambda_orbit_final = float(
-                        os.environ.get("CUBEFIT_LAMBDA_ORBIT_FINAL", "5.0")
-                    )
-                    lambda_orbit = lambda_orbit_final * t
+                print(
+                    f"[SPG-DBG] λ_orbit={lambda_orbit:.3e} "
+                    f"||s - s_target||={orbit_mis:.3e}",
+                    flush=True,
+                )
 
-                    # gradient wrt s
-                    grad_s += lambda_orbit * (
-                        (r / sum_s)
-                        - np.dot(r, s_norm) / sum_s
-                    )
+            # --- Robust adaptive per-epoch learning rates ---
+            rel_s_target   = float(os.environ.get("CUBEFIT_REL_S_TARGET", "1e-3"))
+            delta_y_target = float(os.environ.get("CUBEFIT_DELTA_Y_TARGET", "1e-2"))
+            _eps = 1e-30
 
-                    orbit_mis = np.linalg.norm(r)
+            # robust gradient scale: use 90th percentile to avoid tiny-max blowups
+            g_s_abs = np.abs(grad_s).ravel()
+            g_y_abs = np.abs(grad_y).ravel()
 
-                    print(
-                        f"[SPG-DBG] λ_orbit={lambda_orbit:.3e} "
-                        f"||s_norm - w_norm||={orbit_mis:.3e}",
-                        flush=True,
-                    )
+            p90_gs = float(np.percentile(g_s_abs, 90)) if g_s_abs.size else 0.0
+            p90_gy = float(np.percentile(g_y_abs, 90)) if g_y_abs.size else 0.0
 
-            # Learning rates
-            lr_y = lr_eff
-            lr_s = alpha_bb
+            max_s = float(np.max(np.abs(s)) if s.size else 1.0)
+
+            # compute tentative rates
+            lr_s = rel_s_target * max_s / max(p90_gs, _eps)
+            lr_y = delta_y_target / max(p90_gy, _eps)
+
+            # hard caps (tunable via env)
+            lr_s_cap = float(os.environ.get("CUBEFIT_LR_S_CAP", "1.0"))   # max relative per-epoch mass change scale
+            lr_y_cap = float(os.environ.get("CUBEFIT_LR_Y_CAP", "5.0"))   # max logit step per epoch
+
+            lr_s = float(min(lr_s, lr_s_cap))
+            lr_y = float(min(lr_y, lr_y_cap))
+
+            # final clipping to safe bounds
+            lr_min = float(os.environ.get("CUBEFIT_LR_MIN", "1e-12"))
+            lr_max = float(os.environ.get("CUBEFIT_LR_MAX", "1e3"))
+            lr_s = float(np.clip(lr_s, lr_min, lr_max))
+            lr_y = float(np.clip(lr_y, lr_min, lr_max))
+
+            print(f"[LR] lr_s={lr_s:.3e} lr_y={lr_y:.3e} "
+                f"p90_gs={p90_gs:.3e} p90_gy={p90_gy:.3e} rel_s_target={rel_s_target}", flush=True)
 
             # Update
             y -= lr_y * grad_y
@@ -1292,13 +1318,15 @@ def solve_global_spg(
             )
 
             # ============================================================
-            # Global amplitude rescaling
+            # GLOBAL AMPLITUDE RESCALING — apply only at initial epoch
             # ============================================================
-
-            if dot_AxAx > 0.0 and dot_AxY > 0.0:
-                gamma = dot_AxY / dot_AxAx
-                if np.isfinite(gamma) and gamma > 0.0:
-                    s *= gamma
+            if ep == 0:
+                if dot_AxAx > 0.0 and dot_AxY > 0.0:
+                    gamma = dot_AxY / dot_AxAx
+                    if np.isfinite(gamma) and gamma > 0.0:
+                        s *= gamma
+                        print(f"[SPG-DBG] initial gamma applied={gamma:.3e}", flush=True)
+            # else: skip per-epoch amplitude rescale to preserve optimizer moves
 
             # # ============================================================
             # # Orbit mass projection (exact, mass-only)
@@ -1334,21 +1362,22 @@ def solve_global_spg(
             g_norm = np.linalg.norm(g)
             x_norm = np.linalg.norm(x)
 
-            # ---------------- Active orbit update (CRITICAL) ----------------
-            x_row_l1 = np.sum(x, axis=1)
-            g_row_inf = np.max(np.abs(g), axis=1)
+            # # ---------------- Active orbit update (CRITICAL) ----------------
+            # x_row_l1 = np.sum(x, axis=1)
+            # g_row_inf = np.max(np.abs(g), axis=1)
 
-            eps_mass = 1e-12 * builtins.max(np.sum(x_row_l1), 1.0)
-            eps_grad = 1e-10 * builtins.max(np.max(g_row_inf), 1.0)
+            # eps_mass = 1e-12 * builtins.max(np.sum(x_row_l1), 1.0)
+            # eps_grad = 1e-10 * builtins.max(np.max(g_row_inf), 1.0)
 
-            new_active = np.nonzero(
-                (x_row_l1 > eps_mass) | (g_row_inf > eps_grad)
-            )[0]
+            # new_active = np.nonzero(
+            #     (x_row_l1 > eps_mass) | (g_row_inf > eps_grad)
+            # )[0]
 
-            if new_active.size < min_active:
-                new_active = np.argsort(g_row_inf)[-min_active:]
+            # if new_active.size < min_active:
+            #     new_active = np.argsort(g_row_inf)[-min_active:]
 
-            active_orbits = new_active.astype(np.int32)
+            # active_orbits = new_active.astype(np.int32)
+            # active_orbits = np.arange(C, dtype=np.int32)
 
             # ---------------- Diagnostics (new, meaningful set) ----------------
             rmse = np.sqrt(ssq / builtins.max(nres, 1))
@@ -1387,7 +1416,6 @@ def solve_global_spg(
             )
 
             print(
-                f"alpha_bb={alpha_bb:.2e}  "
                 f"active={active_orbits.size}/{C}",
                 flush=True,
             )
