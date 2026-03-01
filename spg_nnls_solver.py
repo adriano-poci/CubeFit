@@ -1013,20 +1013,33 @@ def solve_global_spg(
             g_data = -g_tot
             g = g_data.copy()
 
-            # ============================================================
-            # Strong anti-flatness prior (spikiness promotion)
-            # ============================================================
-            LAMBDA_FLAT = 1e-3   # deterministic, stable across C
+            lambda_l1 = float(os.environ.get("CUBEFIT_LAMBDA_L1", "1e-3"))
+            lambda_l2 = float(os.environ.get("CUBEFIT_LAMBDA_L2", "0.0"))
 
-            g_flat = orbit_population_variance_grad(x)
-            g += LAMBDA_FLAT * g_flat
+            if lambda_l2 > 0.0:
+                g += lambda_l2 * x
 
-            print(
-                f"[SPG-DBG] flat λ={LAMBDA_FLAT:.3e}  "
-                f"||g_flat||={np.linalg.norm(g_flat):.3e}  "
-                f"||g_data||={np.linalg.norm(g_data):.3e}",
-                flush=True,
-            )
+            if lambda_l1 > 0.0:
+                l1_grad = np.zeros_like(g)
+                l1_grad[x > 0.0] = 1.0
+                g += lambda_l1 * l1_grad
+
+            print(f"[SPG-DBG] λ_L1={lambda_l1:.3e} λ_L2={lambda_l2:.3e} ||g||={np.linalg.norm(g):.3e}", flush=True)
+
+            # # ============================================================
+            # # Strong anti-flatness prior (spikiness promotion)
+            # # ============================================================
+            # LAMBDA_FLAT = 1e-3   # deterministic, stable across C
+
+            # g_flat = orbit_population_variance_grad(x)
+            # g += LAMBDA_FLAT * g_flat
+
+            # print(
+            #     f"[SPG-DBG] flat λ={LAMBDA_FLAT:.3e}  "
+            #     f"||g_flat||={np.linalg.norm(g_flat):.3e}  "
+            #     f"||g_data||={np.linalg.norm(g_data):.3e}",
+            #     flush=True,
+            # )
 
             # ============================================================
             # Population curvature prior
@@ -1034,8 +1047,15 @@ def solve_global_spg(
             lambda_pop = float(os.environ.get("CUBEFIT_LAMBDA_POP", "0.0"))
             if lambda_pop > 0.0:
                 g_pop = population_age_curvature_grad(x, pop_shape)
-                g += lambda_pop * g_pop
-                print(f"[SPG-DBG] ||g_pop|| = {np.linalg.norm(g_pop):.3e}", flush=True)
+
+                # scale relative to data gradient
+                norm_data = np.linalg.norm(g_data)
+                norm_pop  = np.linalg.norm(g_pop)
+                scale_pop = norm_data / (norm_pop + 1e-30)
+
+                g += lambda_pop * scale_pop * g_pop
+
+                print(f"[SPG-DBG] ||g_pop||={norm_pop:.3e}  scale_pop={scale_pop:.3e}", flush=True)
             else:
                 g_pop = None
 
@@ -1055,6 +1075,26 @@ def solve_global_spg(
                 print(f"[SPG-DBG] ||g_age|| = {np.linalg.norm(g_age):.3e}", flush=True)
             else:
                 g_age = None
+
+            # ============================================================
+            # Strong quadratic orbit-mass prior (soft constraint)
+            # ============================================================
+
+            if w_target is not None:
+
+                # per-orbit mass
+                s_all = np.sum(x, axis=1)
+
+                # residual
+                diff = s_all - w_target
+
+                # strong lambda (tune this)
+                lambda_orbit = float(os.environ.get("CUBEFIT_LAMBDA_ORBIT", "1"))
+
+                # gradient wrt x: each row gets same correction
+                g += lambda_orbit * diff[:, None]
+
+                print(f"[SPG-DBG] ||orbit_diff||={np.linalg.norm(diff):.3e}  λ_orbit={lambda_orbit:.3e}", flush=True)
 
             # ============================================================
             # Scale-invariant curvature normalisation
@@ -1089,7 +1129,7 @@ def solve_global_spg(
             invD[finite] = 1.0 / D_eff[finite]
 
             # Cap amplification (dimensionless)
-            invD = np.minimum(invD, 100.0)
+            invD = np.minimum(invD, 10.0)
 
             # ============================================================
             # Freeze logic
@@ -1135,11 +1175,15 @@ def solve_global_spg(
                 dg_flat = (g - g_prev).ravel()
                 sy = float(np.dot(dx_flat, dg_flat))
 
-                if sy > 1e-16:
-                    alpha_bb = float(np.dot(dx_flat, dx_flat) / sy)
-                    alpha_bb = float(np.clip(alpha_bb, 1e-8, 1e8))
+                print(f"[SPG-DBG] BB history: sy={sy:.3e}", flush=True)
 
-                print(f"[BB] alpha={alpha_bb:.3e}, sy={sy:.3e}", flush=True)
+                if sy > 1e-12:
+                    alpha_bb = float(np.dot(dx_flat, dx_flat) / sy)
+                else:
+                    alpha_bb = lr  # fallback to base lr
+
+            # hard cap to prevent explosions
+            alpha_bb = float(np.clip(alpha_bb, 1e-8, 10.0))
 
             dx = -alpha_bb * (g * invD)
             x += dx
@@ -1154,29 +1198,22 @@ def solve_global_spg(
                 if np.isfinite(gamma) and gamma > 0.0:
                     x *= gamma
 
-            # ============================================================
-            # Orbit mass projection (rank-1 mean correction)
-            # ============================================================
+            # # ============================================================
+            # # Orbit mass projection (rank-1 mean correction)
+            # # ============================================================
 
-            if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
+            # orbit_mis = 0.0
+            # if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
 
-                s_all = np.sum(x, axis=1)
+            #     s_all = np.sum(x, axis=1)
 
-                if s_all.size == w_target.size:
-
-                    alpha = np.sum(s_all) / np.sum(w_target)
-                    s_proj = alpha * w_target
-
-                    delta = (s_proj - s_all) / float(x.shape[1])
-                    x += delta[:, None]
-
-                    np.maximum(x, 0.0, out=x)
-
-                    orbit_mis = np.linalg.norm(np.sum(x, axis=1) - s_proj)
-                else:
-                    orbit_mis = 0.0
-            else:
-                orbit_mis = 0.0
+            #     if s_all.size == w_target.size:
+            #         # multiplicative correction per orbit
+            #         scale = np.divide(w_target, s_all, out=np.ones_like(s_all), where=s_all>0)
+            #         x *= scale[:, None]
+            #         orbit_mis = np.linalg.norm(np.sum(x, axis=1) - w_target)
+            #     else:
+            #         orbit_mis = 0.0
 
             # --- update BB history ---
             x_prev = x.copy()
@@ -1218,17 +1255,16 @@ def solve_global_spg(
 
             data_proxy = 0.5 * ssq / builtins.max(nres, 1)
 
-            # ------------------------------------------------------------
-            # Composite acceptance metric
-            # ------------------------------------------------------------
-            if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
-                # Scale orbit penalty to data term (dimensionless, conservative)
-                scale = builtins.max(data_proxy, 1.0)
-                beta = float(os.environ.get("CUBEFIT_ORBIT_ACCEPT_BETA", "1e-6"))
+            # # ------------------------------------------------------------
+            # # Composite acceptance metric
+            # # ------------------------------------------------------------
+            # if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
+            #     # Scale orbit penalty to data term (dimensionless, conservative)
+            #     beta = float(os.environ.get("CUBEFIT_ORBIT_ACCEPT_BETA", "1e-2"))
 
-                total_proxy = data_proxy + beta * (orbit_mis / scale) ** 2
-            else:
-                total_proxy = data_proxy
+            #     total_proxy = data_proxy + beta * orbit_mis**2
+            # else:
+            total_proxy = data_proxy
             
             import matplotlib.pyplot as plt
             plt.clf()
@@ -1239,12 +1275,10 @@ def solve_global_spg(
             plt.savefig(f"spg_epoch_{ep+1}_histogram.png")
             plt.close('all')
 
-            # use total_proxy when comparing best_proxy / saving best_x
-            # After orbit projection is active, ONLY accept projected states
-            if (w_target is None) or ((ep + 1) > ORBIT_WARM_EPOCHS):
-                if total_proxy < best_proxy:
-                    best_proxy = total_proxy
-                    best_x = x.copy()
+            if total_proxy < best_proxy:
+                print(f"[SPG] New best proxy: {total_proxy:.3e} (previous {best_proxy:.3e})", flush=True)
+                best_proxy = total_proxy
+                best_x = x.copy()
 
             print(
                 f"[SPG-AMP] gamma={gamma:.3e}  "
@@ -1259,6 +1293,7 @@ def solve_global_spg(
             )
             print(
                 f"||g||={pg_norm:.3e}  "
+                f"data_proxy={data_proxy:.3e}  "
                 f"total_proxy={total_proxy:.3e}"
             )
             print(

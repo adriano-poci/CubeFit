@@ -2846,7 +2846,7 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     tmetals = tmetals[selIso]
     teDir = teDir[selIso]
     umetals, uages = np.unique(tmetals), np.unique(tages)
-    ualphas = np.unique(talphas) if not isinstance(talphas, type(None)) else\
+    ualphas = np.unique(talphas) if not isinstance(talphas, type(None)) else \
         np.array([0.0]) # no alphas in EMILES
 
     # # thinning
@@ -2869,7 +2869,7 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         talphas = np.zeros_like(tages)
         ualphas = np.array([0.0])
         lIdx = np.atleast_1d(0)
-    
+
     # Select the templates
     teDir = teDir.reshape(umetals.size, uages.size, ualphas.size)[
         zIdx[:, np.newaxis, np.newaxis], aIdx[np.newaxis, :, np.newaxis],
@@ -2890,7 +2890,6 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         teLL, lnGrid, lnScales = Load.lzma(tfn)
     else:
 
-        # smin, smax = np.asarray([smin, smax]) + [-0.5, 0.5]
         print('Generating SSP template library...')
         try:
             nTemps = teDir.size
