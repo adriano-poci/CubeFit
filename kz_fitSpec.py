@@ -595,7 +595,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         # orbit_weights=None, # or None for “free” fit
         orbit_weights=cWeights,
         processes=4, # 4 workers
-        blas_threads=1, # 12 BLAS threads each → 48 total
+        blas_threads=12, # 12 BLAS threads each → 48 total
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
         warm_start=warm_start,
