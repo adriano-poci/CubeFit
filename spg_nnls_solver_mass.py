@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-    spg_nnls_solver.py
+    spg_nnls_solver_mass.py
     Adriano Poci
     University of Oxford
     2025
@@ -786,6 +786,7 @@ def solve_global_spg(
     # This ensures a genuine BB step computed from the first epoch, not a small correction.
     x_prev = None
     g_prev = None
+    y_prev = None
 
     # Optional small jitter to enable escaping exact null-space: tiny relative perturbation
     if os.environ.get("CUBEFIT_SEED_JITTER", "0") == "1":
@@ -833,6 +834,48 @@ def solve_global_spg(
         w_target = w_target * total_mass_est
         print(f"[SPG] scaled w_target by total_mass_est={total_mass_est:.3e}", flush=True)
 
+
+    # ---------- prepare orbit mass target and y initializer ----------
+    if w_target is not None:
+        w_target = w_target.astype(np.float64)
+        total_mass = float(np.sum(w_target))
+        if total_mass <= 0.0:
+            raise RuntimeError("Invalid orbit weights.")
+    else:
+        # ensure downstream code can test None
+        w_target = None
+
+    # shapes
+    # C and P already defined earlier — re-assert local names
+    # (If earlier C,P were shadowed, ensure these reflect the real values)
+    # Keep using existing C,P
+
+    # initialize y:
+    # if the user supplied x0, convert x0 -> y (shape-only) so seed is preserved.
+    if (x0 is not None) and (x is not None):
+        # x currently holds the seed (C,P) if provided
+        x_seed = x.copy()
+        s_seed = np.sum(x_seed, axis=1, keepdims=True)  # (C,1)
+        s_safe = np.maximum(s_seed, 1e-30)
+        q_seed = x_seed / s_safe
+        q_seed = np.maximum(q_seed, 1e-30)  # avoid log(0)
+        y = np.log(q_seed)
+        # x will be recomputed each epoch as w_target * softmax(y)
+        print("[SPG] y initialised from seed x (shape-only)", flush=True)
+    else:
+        y = np.zeros((C, P), dtype=np.float64)
+
+    # helper softmax
+    def row_softmax(Y):
+        Ym = Y - np.max(Y, axis=1, keepdims=True)
+        e = np.exp(Ym)
+        return e / np.sum(e, axis=1, keepdims=True)
+
+    # bookkeeping defaults
+    best_x = x.copy() if (x is not None) else np.zeros((C, P), dtype=np.float64)
+    best_proxy = np.inf
+    gamma = 1.0
+
     # ------------------------------------------------------------
     # Multiprocessing bands
     # ------------------------------------------------------------
@@ -867,10 +910,7 @@ def solve_global_spg(
     # --- BB history ---
     alpha_bb = float(cfg.lr)   # initial BB step guess
 
-    best_x = x.copy()
-    best_proxy = np.inf
-
-    # --- Active set bookkeeping ---
+    # # --- Active set bookkeeping ---
     active_orbits = np.arange(C, dtype=np.int32)
     min_active = int(os.environ.get("CUBEFIT_MIN_ACTIVE_ORBITS", "8"))
 
@@ -927,10 +967,8 @@ def solve_global_spg(
             # ---------------- Gradient accumulation (PARALLEL) ----------------
             for (s0, s1) in s_ranges:
 
-                x_eff = x.copy()
-                inactive = np.ones(C, dtype=bool)
-                inactive[active_orbits] = False
-                x_eff[inactive, :] = 0.0
+                q = row_softmax(y)               # (C,P)
+                x = w_target[:, None] * q        # exact orbit mass constraint
 
                 with open_h5(h5_path, role="reader") as f:
                     DC = f["/DataCube"]
@@ -954,7 +992,7 @@ def solve_global_spg(
                         if keep_idx is not None:
                             A = A[:, :, keep_idx]
 
-                        yhat += x_eff[c] @ A
+                        yhat += x[c] @ A
 
                     # --- accumulate exact amplitude statistics ---
                     # These two scalars are sufficient to optimally rescale x
@@ -995,7 +1033,11 @@ def solve_global_spg(
                     band_map.append((c0, c1))
 
                 # ---- run workers ----
-                results = pool.map(_worker_tile_grad_band_single_metric, jobs)
+                if pool is not None:
+                    results = pool.map(_worker_tile_grad_band_single_metric, jobs)
+                else:
+                    # serial fallback
+                    results = [ _worker_tile_grad_band_single_metric(j) for j in jobs ]
 
                 for (c0, c1), (g_band, D_band) in zip(band_map, results):
                     g_tot[c0:c1] += g_band
@@ -1025,21 +1067,6 @@ def solve_global_spg(
                 g += lambda_l1 * l1_grad
 
             print(f"[SPG-DBG] λ_L1={lambda_l1:.3e} λ_L2={lambda_l2:.3e} ||g||={np.linalg.norm(g):.3e}", flush=True)
-
-            # # ============================================================
-            # # Strong anti-flatness prior (spikiness promotion)
-            # # ============================================================
-            # LAMBDA_FLAT = 1e-3   # deterministic, stable across C
-
-            # g_flat = orbit_population_variance_grad(x)
-            # g += LAMBDA_FLAT * g_flat
-
-            # print(
-            #     f"[SPG-DBG] flat λ={LAMBDA_FLAT:.3e}  "
-            #     f"||g_flat||={np.linalg.norm(g_flat):.3e}  "
-            #     f"||g_data||={np.linalg.norm(g_data):.3e}",
-            #     flush=True,
-            # )
 
             # ============================================================
             # Population curvature prior
@@ -1076,65 +1103,54 @@ def solve_global_spg(
             else:
                 g_age = None
 
-            # # ============================================================
-            # # Strong quadratic orbit-mass prior (soft constraint)
-            # # ============================================================
-
-            # if w_target is not None:
-
-            #     # per-orbit mass
-            #     s_all = np.sum(x, axis=1)
-
-            #     # residual
-            #     diff = s_all - w_target
-
-            #     # strong lambda
-            #     lambda_orbit = float(os.environ.get("CUBEFIT_LAMBDA_ORBIT", "1"))
-
-            #     # gradient wrt x: each row gets same correction
-            #     g += lambda_orbit * diff[:, None]
-
-            #     print(f"[SPG-DBG] ||orbit_diff||={np.linalg.norm(diff):.3e}  λ_orbit={lambda_orbit:.3e}", flush=True)
-
             # ============================================================
             # Scale-invariant curvature normalisation
             # ============================================================
 
             pos_raw = np.isfinite(D_tot) & (D_tot > 0.0)
-
             if np.any(pos_raw):
                 D_scale = float(np.median(D_tot[pos_raw]))
             else:
                 D_scale = 1.0
-
             D_raw = D_tot / builtins.max(D_scale, 1e-30)
-
-            # Recompute positivity mask after scaling
             pos = np.isfinite(D_raw) & (D_raw > 0.0)
-
             if np.any(pos):
                 D_med = float(np.median(D_raw[pos]))
             else:
                 D_med = 1.0
-
-            # ============================================================
-            # Levenberg–Marquardt (Tikhonov) damping
-            # ============================================================
-
-            delta = 1e-2  # dimensionless damping in normalised space
+            delta = 1e-2
             D_eff = np.where(pos, D_raw / builtins.max(D_med, 1e-30) + delta, np.inf)
 
-            invD = np.zeros_like(D_eff)
-            finite = np.isfinite(D_eff) & (D_eff > 0.0)
-            invD[finite] = 1.0 / D_eff[finite]
+            # ----- compute q,x consistent with current y and w_target -----
+            if w_target is not None:
+                q = row_softmax(y)             # (C,P)
+                x = w_target[:, None] * q      # exact orbit mass enforced
+            else:
+                # fallback to original x-mode: keep x as is, compute q for diagnostics
+                q = np.zeros_like(x)
+                q[x.sum(axis=1, keepdims=True) > 0] = (
+                    x[x.sum(axis=1, keepdims=True) > 0] /
+                    np.sum(x, axis=1, keepdims=True)[x.sum(axis=1, keepdims=True) > 0]
+                )
 
-            # Cap amplification (dimensionless)
-            invD = np.minimum(invD, 10.0)
+            # ----- convert x-gradient g -> y-gradient grad_y (row-wise softmax transformation) -----
+            # grad_y_c = w_c * q_c * (g_c - (q_c @ g_c))  (vectorized)
+            g_dot_q = np.sum(g * q, axis=1, keepdims=True)  # (C,1)
+            grad_y = (w_target[:, None] if w_target is not None else np.ones((C,1))) * q * (g - g_dot_q)
 
-            # ============================================================
-            # Freeze logic
-            # ============================================================
+            # ----- build D_y and invD_y (diagonal preconditioner in y-space) -----
+            # D_eff is (C,P) effective curvature in x-space; map into y-space
+            if w_target is not None:
+                D_y = q * (1.0 - q) * D_eff
+            else:
+                D_y = D_eff  # best-effort fallback for x-mode
 
+            invD_y = np.zeros_like(D_y)
+            mask = (D_y > 0.0) & np.isfinite(D_y)
+            invD_y[mask] = 1.0 / D_y[mask]
+            invD_y = np.minimum(invD_y, 10.0)
+
+            # ----- freeze logic (apply after grad_y exists) -----
             freeze = (~pos_raw) | known_zero
 
             if g_pop is not None:
@@ -1145,101 +1161,67 @@ def solve_global_spg(
                 age_eps = 1e-12 * builtins.max(np.max(np.abs(g_age)), 1.0)
                 freeze &= (np.abs(g_age) <= age_eps)
 
+            # zero-out frozen directions in both gradient and preconditioner
+            grad_y[freeze] = 0.0
             g[freeze] = 0.0
-            invD[freeze] = 0.0
-
-            invD[~np.isfinite(invD)] = 0.0
-
-            # Diagnostics
-            D_pos = D_eff[np.isfinite(D_eff)]
-            if D_pos.size > 0:
-                dmin = float(np.min(D_pos))
-                dmax = float(np.max(D_pos))
-            else:
-                dmin = dmax = 0.0
-
-            print(
-                f"[SPG-DBG] D_scale={D_scale:.3e}  "
-                f"D_med={D_med:.3e}  "
-                f"D_eff.min={dmin:.3e}  "
-                f"D_eff.max={dmax:.3e}",
-                flush=True,
-            )
-
+            invD_y[freeze] = 0.0
+            invD_y[~np.isfinite(invD_y)] = 0.0
             # ============================================================
             # BB step
             # ============================================================
 
-            if (x_prev is not None) and (g_prev is not None):
-                dx_flat = (x - x_prev).ravel()
-                dg_flat = (g - g_prev).ravel()
-                sy = float(np.dot(dx_flat, dg_flat))
-
-                print(f"[SPG-DBG] BB history: sy={sy:.3e}", flush=True)
-
+            # ---------------- BB step in y-space ----------------
+            if y_prev is not None and g_prev is not None:
+                dy_flat = (y - y_prev).ravel()
+                dg_flat = (grad_y - g_prev).ravel()
+                sy = float(np.dot(dy_flat, dg_flat))
                 if sy > 1e-12:
-                    alpha_bb = float(np.dot(dx_flat, dx_flat) / sy)
+                    alpha_bb = float(np.dot(dy_flat, dy_flat) / sy)
                 else:
-                    alpha_bb = lr  # fallback to base lr
+                    alpha_bb = lr
+            else:
+                alpha_bb = lr
 
-            # hard cap to prevent explosions
-            alpha_bb = float(np.clip(alpha_bb, 1e-8, 10.0))
+            alpha_bb = float(np.clip(alpha_bb, 1e-8, 1.0))
 
-            dx = -alpha_bb * (g * invD)
-            x += dx
-            x = np.maximum(x, 0.0)
+            # --- update BB history ---
+            y_prev = y.copy()
+            g_prev = grad_y.copy()
+
+            dy = -alpha_bb * (grad_y * invD_y)
+            y += dy
+            # prevent softmax saturation
+            y -= np.mean(y, axis=1, keepdims=True)
+            y = np.clip(y, -20.0, 20.0)
+
+            # rebuild q/x after y update
+            q = row_softmax(y)
+            if w_target is not None:
+                x = w_target[:, None] * q
 
             # ============================================================
             # Global amplitude rescaling
             # ============================================================
 
-            if dot_AxAx > 0.0 and dot_AxY > 0.0:
-                gamma = dot_AxY / dot_AxAx
-                if np.isfinite(gamma) and gamma > 0.0:
-                    x *= gamma
-
-            # ============================================================
-            # Orbit mass projection (rank-1 mean correction)
-            # ============================================================
-
-            orbit_mis = 0.0
-            if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
-
-                s_all = np.sum(x, axis=1)
-
-                if s_all.size == w_target.size:
-                    # multiplicative correction per orbit
-                    scale = np.divide(w_target, s_all, out=np.ones_like(s_all), where=s_all>0)
-                    x *= scale[:, None]
-                    orbit_mis = np.linalg.norm(np.sum(x, axis=1) - w_target)
-                else:
-                    orbit_mis = 0.0
-
-            # --- update BB history ---
-            x_prev = x.copy()
-            g_prev = g.copy()
+            # safe amplitude alignment using accumulated statistics
+            gamma = 1.0
+            if (dot_AxAx > 0.0) and (dot_AxY > 0.0):
+                gamma_tmp = dot_AxY / dot_AxAx
+                if np.isfinite(gamma_tmp) and gamma_tmp > 0.0:
+                    gamma = float(gamma_tmp)
+                    if w_target is not None:
+                        w_target *= gamma
+                        q = row_softmax(y)
+                        x = w_target[:, None] * q
+                    else:
+                        # when w_target is None scale current x uniformly
+                        x *= gamma
 
             # ------------------------------------------------------------
             # Reconstruct x from s and y
             # ------------------------------------------------------------
             g_norm = np.linalg.norm(g)
             x_norm = np.linalg.norm(x)
-
-            # ---------------- Active orbit update (CRITICAL) ----------------
-            x_row_l1 = np.sum(x, axis=1)
-            g_row_inf = np.max(np.abs(g), axis=1)
-
-            eps_mass = 1e-12 * builtins.max(np.sum(x_row_l1), 1.0)
-            eps_grad = 1e-10 * builtins.max(np.max(g_row_inf), 1.0)
-
-            new_active = np.nonzero(
-                (x_row_l1 > eps_mass) | (g_row_inf > eps_grad)
-            )[0]
-
-            if new_active.size < min_active:
-                new_active = np.argsort(g_row_inf)[-min_active:]
-
-            active_orbits = new_active.astype(np.int32)
 
             # ---------------- Diagnostics (new, meaningful set) ----------------
             rmse = np.sqrt(ssq / builtins.max(nres, 1))
@@ -1265,10 +1247,20 @@ def solve_global_spg(
             #     total_proxy = data_proxy + beta * orbit_mis**2
             # else:
             total_proxy = data_proxy
+
+            # Rebuild final q/x for this epoch (safeguard)
+            q = row_softmax(y)
+            if w_target is not None:
+                x = w_target[:, None] * q
         
+            # histogram + diagnostics
             import matplotlib.pyplot as plt
             plt.clf()
-            plt.hist(np.log10(x[x > 0].flatten()), bins=50, color='blue', alpha=0.7)
+            vals = x[x > 0].flatten()
+            if vals.size > 0:
+                plt.hist(np.log10(vals), bins=50, alpha=0.7)
+            else:
+                plt.hist([], bins=50)
             plt.title(f"Epoch {ep+1} solution histogram")
             plt.xlabel("x value")
             plt.ylabel("Count")
@@ -1301,12 +1293,6 @@ def solve_global_spg(
                 f"active={active_orbits.size}/{C}",
                 flush=True,
             )
-            if w_target is not None and (ep + 1) > ORBIT_WARM_EPOCHS:
-                s_full = np.sum(x, axis=1)
-                orbit_res = np.linalg.norm(s_full - w_target)
-            else:
-                orbit_res = 0.0
-            print(f"[SPG-orbit] ||s - w||={orbit_res:.3e}", flush=True)
         
         th = cu.zero_floor_inplace(best_x, rel_tol=1e-25, abs_tol=0.0)
         print(f"[SPG] zero-floor applied: threshold={th:.3e}", flush=True)
