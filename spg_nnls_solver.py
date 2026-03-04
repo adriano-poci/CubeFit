@@ -131,6 +131,10 @@ v3.23:  Implemented Tikhonov (Levenberg–Marquardt–type) damping of the
             diagonal Gauss–Newton preconditioner (`invD`) in `solve_global_spg`.
             13 February 2026
 v3.24:  Reverted to v3.22. 3 March 2026
+v3.25:  Streamlined `rmse_proxy_subset` to be more efficient and robust, and 
+            added progress bar;
+        Fixed issues with RMSE lag and incorrect acceptance logic in
+            `solve_global_spg`. 4 March 2026
 """
 
 from __future__ import annotations, print_function
@@ -238,44 +242,64 @@ def rmse_proxy_subset(
     Compute RMSE proxy over a subset of tiles in the SAME weighted space
     used by the gradient (i.e. apply √w_λ if present). Returns sqrt(ssq/n).
     """
+
     ssq = 0.0
     nres = 0
+
+    x_flat = x_CP.reshape(-1)
+
+    # Only show tqdm if more than 1 tile
+    use_bar = len(tile_ranges) > 1
 
     with open_h5(h5_path, role="reader") as f:
         DC = f["/DataCube"]
         M  = f["/HyperCube/models"]
 
-        for (s0, s1) in tile_ranges:
-            Y = np.asarray(DC[s0:s1, :], np.float64)
+        iterator = tile_ranges
+        if use_bar:
+            iterator = tqdm(
+                tile_ranges,
+                desc="[RMSE-proxy]",
+                leave=False,
+                dynamic_ncols=True,
+                mininterval=1.0,
+            )
+
+        for (s0, s1) in iterator:
+
+            Y = np.asarray(DC[s0:s1, :], dtype=np.float64)
             if keep_idx is not None:
                 Y = Y[:, keep_idx]
 
-            yhat = np.zeros_like(Y)
-            for c in range(x_CP.shape[0]):
-                A = np.asarray(M[s0:s1, c, :, :], np.float64)
-                if keep_idx is not None:
-                    A = A[:, :, keep_idx]
-                if inv_cp_flux_ref is not None:
-                    A = A * inv_cp_flux_ref[c, :][None, :, None]
+            A = np.asarray(M[s0:s1, :, :, :], dtype=np.float64)
 
-                # x_CP[c,:] shape (P,), A shape (Sblk, P, Lk)
-                # tensordot over population dim -> (Sblk, Lk)
-                yhat += np.tensordot(A, x_CP[c, :], axes=([1], [0]))
+            if keep_idx is not None:
+                A = A[:, :, :, keep_idx]
+
+            if inv_cp_flux_ref is not None:
+                A *= inv_cp_flux_ref[None, :, :, None]
+
+            Sblk, C, P, Lk = A.shape
+
+            # reshape for single BLAS
+            A2 = A.transpose(0, 3, 1, 2).reshape(Sblk * Lk, C * P)
+
+            yhat_flat = A2 @ x_flat
+            yhat = yhat_flat.reshape(Sblk, Lk)
 
             R = Y - yhat
             if not np.all(np.isfinite(R)):
                 R = np.nan_to_num(R, copy=False)
 
-            # --- RMSE proxy must match gradient objective ---
             if w_lam_sqrt is not None:
-                Rw = R * w_lam_sqrt[None, :]
-                ssq += float(np.sum(Rw * Rw))
+                R *= w_lam_sqrt[None, :]
+                ssq += float(np.sum(R * R))
             else:
                 ssq += float(np.sum(R * R))
 
-            nres += int(R.size)
+            nres += R.size
 
-    return float(np.sqrt(ssq / builtins.max(nres, 1)))
+    return float(np.sqrt(ssq / max(nres, 1)))
 
 # ------------------------------------------------------------------------------
 
@@ -1128,13 +1152,13 @@ def solve_global_spg(
 
                 else:
                     alpha_bb = lr  # fallback
+                print(f"[BB] alpha={alpha_bb:.3e}, sy={sy:.3e}", flush=True)
 
             # Safeguards
             alpha_min = float(os.environ.get("CUBEFIT_ALPHA_MIN", "1e-6"))
             alpha_max = float(os.environ.get("CUBEFIT_ALPHA_MAX", "1e2"))
             alpha_bb = float(np.clip(alpha_bb, alpha_min, alpha_max))
 
-            print(f"[BB] alpha={alpha_bb:.3e}, sy={sy:.3e}", flush=True)
             
             # ============================================================
             # Two-prong acceptance guard (sample + optional full)

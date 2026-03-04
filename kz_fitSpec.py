@@ -2034,16 +2034,24 @@ def plot_sparse_spectra_from_x(
         print(f"[DiagSparse] picks={picks.size} → reads per pick ≈ C·ceil(P/P_chunk)={C*math.ceil(P/max(1,P_chunk))}")
 
         def _predict_row(s_idx: int) -> np.ndarray:
+            # produce y = sum_{c,p} x[c,p] * A[s_idx, c, p, :]
             y = np.zeros(L, dtype=np.float64, order="C")
+            # iterate over c blocks
             for c0 in range(0, C, max(1, C_chunk)):
                 c1 = min(C, c0 + max(1, C_chunk))
-                c = c0  # C_chunk==1 in our files
-                for p0 in range(0, P, max(1, P_chunk)):
-                    p1  = min(P, p0 + max(1, P_chunk))
-                    A32 = M[s_idx:s_idx+1, c:c1, p0:p1, :][...].astype(np.float32, copy=False)
-                    A2D = A32[0, 0, :, :]          # (Pb, L)
-                    w32 = x32[c, p0:p1]            # (Pb,)
-                    y  += (A2D.T @ w32).astype(np.float64, copy=False)
+                # read the slab for all p-blocks in one go if memory permits
+                # shape => (1, nC_block, P, L)
+                slab = np.asarray(M[s_idx:s_idx+1, c0:c1, :, :], dtype=np.float32, order="C")
+                # slab[0] shape (nC_block, P, L)
+                # multiply each component block by its x weights
+                for ci in range(c1 - c0):
+                    c_index = c0 + ci
+                    # choose p blocks to respect P_chunk if necessary
+                    # but simple dot over full P is easiest and often fastest
+                    A_cp = slab[0, ci, :, :]    # (P, L) float32
+                    w = x32[c_index, :]         # (P,)
+                    # accumulate: (A_cp.T @ w) => (L,)
+                    y += (A_cp.T @ w).astype(np.float64, copy=False)
             return y
 
         for s in tqdm(picks, desc="[DiagSparse] spaxels", dynamic_ncols=True, mininterval=1.5):
