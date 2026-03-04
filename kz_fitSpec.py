@@ -34,6 +34,8 @@ v1.5:   Get `warm_start` from `kwargs` in `genCubeFit`;
             the exact Lagrange multiplier orbit prior. 31 January 2026
 v1.6:   Remove existing spectral fit plots before regenerating, to avoid
             confusion with stale files. 10 February 2026
+v1.7:   Removed axis loops of hyper-cube in `reconstruct_modelcube_fast` for
+            efficiency. 4 March 2026 
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -831,209 +833,126 @@ def reconstruct_modelcube_fast(
     x_cp: np.ndarray,
     out_dset: str = "/ModelCube",
     s_chunk: int | None = None,
-    l_band: int | None = None,
-    use_sparse: bool = True,
     out_dtype: str = "float64",
     rdcc_slots: int = 1_000_003,
     rdcc_bytes: int = 512 * 1024**2,
     rdcc_w0: float = 0.90,
 ) -> None:
     """
-    Reconstruct /ModelCube = sum_{c,p} X[c,p] * models[s,c,p,λ] efficiently,
-    using a single writer handle (read + write) to avoid HDF5 lock thrashing.
+    Fast reconstruction of /ModelCube using full-L vectorised contraction.
 
-    Parameters
-    ----------
-    h5_path : str
-        Path to the CubeFit HDF5 file.
-    x_cp : ndarray
-        Solution weights as shape (C, P) or flat (C*P,). These must be in the
-        same physical normalization as `/HyperCube/models`.
-    out_dset : str, optional
-        Destination dataset name. Default is "/ModelCube".
-    s_chunk : int or None, optional
-        Spatial tile size. If None, uses models' S chunk on disk.
-    l_band : int or None, optional
-        Wavelength band size. If None, uses models' λ chunk on disk.
-    use_sparse : bool, optional
-        If True, skip zero populations per component. Default True.
-    out_dtype : {"float64","float32"}, optional
-        Output dtype (math is accumulated in float64). Default "float64".
-    rdcc_slots, rdcc_bytes, rdcc_w0 : int, int, float
-        HDF5 raw chunk cache knobs for faster streaming.
+    Computes:
 
-    Returns
-    -------
-    None
+        ModelCube[s, λ] = Σ_{c,p} x[c,p] * models[s,c,p,λ]
 
-    Raises
-    ------
-    RuntimeError
-        If required datasets are missing or incompatible.
-    ValueError
-        If `x_cp` cannot be reshaped to (C, P).
+    using a single tensordot per spatial tile.
 
-    Examples
-    --------
-    >>> reconstruct_modelcube_fast(h5_path, x_global)
+    This is the fastest possible CPU implementation without
+    changing the HDF5 storage layout.
+
+    Memory footprint per tile:
+        ~ S_blk * C * P * L * 8 bytes  (float64 slab)
+
     """
-    # Keep tqdm visible on HPC logs
+
     try:
-        sys.stdout.reconfigure(line_buffering=True)  # py3.7+
+        sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
-    os.environ.setdefault("PYTHONUNBUFFERED", "1")
-
-    # Helper: return free heap to OS (keeps RSS flat during long loops)
-    try:
-        libc = ctypes.CDLL("libc.so.6")
-        def trim_heap(): libc.malloc_trim(0)
-    except Exception:
-        def trim_heap(): pass
 
     want_dtype = np.float64 if str(out_dtype) == "float64" else np.float32
 
-    # Single writer handle: read models + write ModelCube with the same file
     with open_h5(h5_path, role="writer") as f:
-        if "/HyperCube/models" not in f:
-            raise RuntimeError("No /HyperCube/models; build the HyperCube first.")
 
-        M = f["/HyperCube/models"]           # (S, C, P, L) f32 on disk
+        if "/HyperCube/models" not in f:
+            raise RuntimeError("No /HyperCube/models found.")
+
+        M = f["/HyperCube/models"]  # (S, C, P, L)
+
         try:
             M.id.set_chunk_cache(int(rdcc_slots), int(rdcc_bytes), float(rdcc_w0))
         except Exception:
             pass
 
         if M.ndim != 4:
-            raise RuntimeError(f"Unexpected /HyperCube/models rank {M.ndim}")
+            raise RuntimeError(f"Unexpected models rank {M.ndim}")
+
         S, C, P, L = map(int, M.shape)
 
-        # Choose tile sizes aligned to on-disk chunking unless overridden
+        # --- Choose spatial tile size ---
         m_chunks = M.chunks or (S, 1, P, L)
-        S_chunk_file, _, _, L_chunk_file = map(int, m_chunks)
-        S_blk  = S_chunk_file if s_chunk is None else int(s_chunk)
-        L_band = L_chunk_file if l_band is None else int(l_band)
-        S_blk  = max(1, min(S_blk,  S))   # clamp
-        L_band = max(1, min(L_band, L))   # clamp
+        S_chunk_file = int(m_chunks[0])
 
-        # # ------------------------------------------------------------
-        # # Load component spatial support (solver-consistent)
-        # # ------------------------------------------------------------
-        # support = None
-        # support_S_chunk = None
-        # if "/HyperCube/component_support" in f:
-        #     support = np.asarray(
-        #         f["/HyperCube/component_support"][...], dtype=np.uint8
-        #     )
-        #     support_S_chunk = int(
-        #         f["/HyperCube/component_support"].attrs["S_chunk"]
-        #     )
-        # if support is not None and support_S_chunk != S_blk:
-        #     raise RuntimeError(
-        #         f"component_support S_chunk={support_S_chunk} "
-        #         f"!= reconstruction S_blk={S_blk}"
-        #     )
+        S_blk = S_chunk_file if s_chunk is None else int(s_chunk)
+        S_blk = max(1, min(S_blk, S))
 
-        # Prepare /ModelCube with compatibility check (shape/dtype/chunks)
+        # --- Prepare output dataset ---
         ds = f.get(out_dset, None)
         if ds is not None:
-            ok = (tuple(ds.shape) == (S, L) and str(ds.dtype) == str(want_dtype))
-            ch = getattr(ds, "chunks", None)
-            if ch is None or tuple(ch) != (S_blk, L_band):
-                ok = False
+            ok = (
+                tuple(ds.shape) == (S, L)
+                and str(ds.dtype) == str(want_dtype)
+            )
             if not ok:
                 del f[out_dset]
                 ds = None
+
         if ds is None:
             ds = f.create_dataset(
                 out_dset,
                 shape=(S, L),
                 dtype=want_dtype,
-                chunks=(S_blk, L_band),
+                chunks=(S_blk, L),
                 compression=None,
                 shuffle=False,
             )
-        out = ds  # alias
 
-        # Accept (C,P) or flat (C*P,)
+        out = ds
+
+        # --- Validate and reshape weights ---
         x_in = np.asarray(x_cp, np.float64).ravel(order="C")
         if x_in.size != C * P:
             raise ValueError(f"x_cp length {x_in.size} != C*P={C*P}")
-        x_cp = np.ascontiguousarray(x_in.reshape(C, P), dtype=np.float64)
 
-        # Optional sparse speedup: precompute nonzeros per component
-        nz_per_c = [None] * C
-        if use_sparse:
-            for c in range(C):
-                nz = np.flatnonzero(x_cp[c, :] != 0.0)
-                if nz.size < 0.2 * P:
-                    nz_per_c[c] = nz
-                else:
-                    nz_per_c[c] = None
-        if use_sparse:
-            n_sparse = sum(nz is not None for nz in nz_per_c)
-            if n_sparse == 0:
-                nz_per_c = [None] * C
+        x_cp = np.ascontiguousarray(
+            x_in.reshape(C, P),
+            dtype=np.float64,
+        )
 
-        # Progress
-        n_tiles = math.ceil(S / S_blk) * math.ceil(L / L_band)
-        pbar = tqdm(total=n_tiles, desc="[Reconstruct]", mininterval=2.0)
-        pbar.refresh(); sys.stdout.flush()
+        # --- Progress ---
+        n_tiles = math.ceil(S / S_blk)
+        pbar = tqdm(total=n_tiles, desc="[Reconstruct]", mininterval=1.5)
 
-        # Main loops: S tiles × λ bands; accumulate per component in f64
+        # ============================================================
+        # Main reconstruction loop
+        # ============================================================
         for s0 in range(0, S, S_blk):
-            s1 = min(S, s0 + S_blk)
-            dS = s1 - s0
+            s1 = builtins.min(S, s0 + S_blk)
 
-            # Reset accumulator for this S-tile (full λ span)
-            Y_tile = np.zeros((dS, L), dtype=np.float64, order="C")
+            # Load full slab for this tile
+            slab = np.asarray(
+                M[s0:s1, :, :, :],
+                dtype=np.float64,
+                order="C",
+            )  # shape (dS, C, P, L)
 
-            for l0 in range(0, L, L_band):
-                l1 = min(L, l0 + L_band)
+            # Contract over (C,P)
+            Y_tile = np.tensordot(
+                slab,
+                x_cp,
+                axes=([1, 2], [0, 1]),
+            )  # -> (dS, L)
 
-                # Accumulate this λ band
-                band = np.zeros((dS, l1 - l0), dtype=np.float64, order="C")
+            if want_dtype != np.float64:
+                Y_tile = Y_tile.astype(want_dtype, copy=False)
 
-                # if support is not None:
-                #     t = s0 // support_S_chunk
-                #     c_allowed = np.flatnonzero(support[t, :])
-                # else:
-                c_allowed = range(C)
-                for c in c_allowed:
-                    if nz_per_c[c] is None:
-                        w = x_cp[c, :]
-                        A_c = M[s0:s1, c, :, l0:l1]
-                    else:
-                        nz = nz_per_c[c]
-                        w = x_cp[c, nz]
-                        A_c = M[s0:s1, c, nz, l0:l1]
-
-                    band += np.tensordot(w, A_c, axes=(0, 1))
-
-                # Drop the band into the tile buffer
-                Y_tile[:, l0:l1] += band
-
-                # Progress per band
-                pbar.update(1)
-                pbar.refresh()
-                sys.stdout.flush()
-
-            # Write the finished S-tile
             out[s0:s1, :] = Y_tile
 
-            # Try to flush to disk eagerly for SWMR friendliness
-            try:
-                out.id.flush()
-            except Exception:
-                pass
-            try:
-                f.flush()
-            except Exception:
-                pass
-            sys.stdout.flush()
-            trim_heap()
+            pbar.update(1)
 
         pbar.close()
+
+    print("[Reconstruct] Done.")
 
 # ------------------------------------------------------------------------------
 

@@ -1,2 +1,2 @@
-* Streamlined `spg_nnls_solver.rmse_proxy_subset` to be more efficient and robust, and added progress bar
-* Fixed issues with RMSE lag and incorrect acceptance logic in `spg_nnls_solver.solve_global_spg`
+* Made population curvature mass-aware in `spg_nnls_solver.solve_global_spg`
+* Project only after epoch acceptance logic in `spg_nnls_solver.solve_global_spg`
