@@ -1078,32 +1078,6 @@ def solve_global_spg(
                 )
             else:
                 g_age = None
-            # ---- per-orbit anti-flatness prior (scale-free) ----
-            lambda_asmooth = float(os.environ.get("CUBEFIT_LAMBDA_ASMOOTH", "0.0"))
-            if lambda_asmooth > 0.0:
-                g_as = orbit_population_variance_grad(x)
-
-                as_mask = np.isfinite(g_as)
-                norm_as = np.linalg.norm(g_as[as_mask]) if np.any(as_mask) else 0.0
-
-                if norm_as > 0.0 and norm_data > 0.0:
-                    scale_as = norm_data / norm_as
-                else:
-                    scale_as = 1.0
-
-                scale_as = float(np.clip(scale_as, 1e-6, 1e6))
-
-                g += lambda_asmooth * scale_as * g_as
-
-                print(
-                    f"[SPG-DBG] ASMOOTH "
-                    f"||g_as||={norm_as:.3e} "
-                    f"scale={scale_as:.3e} "
-                    f"λ_eff={lambda_asmooth*scale_as:.3e}",
-                    flush=True,
-                )
-            else:
-                g_as = None
 
             # ---------------- Build safe diagonal preconditioner ----------------
             D_raw = D_tot.copy()  # per-col denom (may have zeros)
@@ -1157,36 +1131,77 @@ def solve_global_spg(
             if np.isfinite(max_inv_d) and (max_inv_d > 0.0):
                 invD = np.minimum(invD, max_inv_d)
 
-            # ---- apply anti-flatness prior with correct scaling ----
-            if g_asmooth_raw is not None:
+            # ---------------- per-orbit anti-flatness prior (scale-aware, step-anchored) ----
+            # Compute raw prior gradient once (name: g_asmooth_raw)
+            lambda_asmooth_env = float(os.environ.get("CUBEFIT_LAMBDA_ASMOOTH", "0.0"))
+            if lambda_asmooth_env > 0.0:
+                # raw prior gradient (scale-free / unitless direction)
+                g_asmooth_raw = orbit_population_variance_grad(x)
 
-                # effective step contribution
-                eff_vec = alpha_bb * invD * g_asmooth_raw
-                eff_norm = np.linalg.norm(eff_vec[np.isfinite(eff_vec)])
+                # mask + raw norm for diagnostics
+                as_mask = np.isfinite(g_asmooth_raw)
+                norm_as_raw = np.linalg.norm(g_asmooth_raw[as_mask]) if np.any(as_mask) else 0.0
 
+                # compute data gradient norm (only finite entries)
                 data_mask = np.isfinite(g_data)
                 gdata_norm = np.linalg.norm(g_data[data_mask]) if np.any(data_mask) else 0.0
 
-                target_ratio = float(os.environ.get("CUBEFIT_ASMOOTH_REL", "1e-3"))
+                # compute the *effective* step the prior would cause after preconditioner
+                # and BB scaling: eff_vec = alpha_bb * invD * g_asmooth_raw
+                # (note: invD should already be present; if not, compute a safe approx)
+                try:
+                    invD_local = invD  # use precomputed invD
+                except NameError:
+                    # fallback conservative invD (no division by zero)
+                    D_tmp = np.copy(D_raw)
+                    pos_tmp = np.isfinite(D_tmp) & (D_tmp > 0.0)
+                    Dref_tmp = float(np.median(D_tmp[pos_tmp])) if np.any(pos_tmp) else 1.0
+                    Dtmp = D_raw / builtins.max(Dref_tmp, 1e-30)
+                    abs_zero_env = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-12"))
+                    data_floor_mul = float(os.environ.get("CUBEFIT_ZERO_COL_DATAFLOOR_MUL", "1e-8"))
+                    data_floor = data_floor_mul * builtins.max(Dref_tmp, 1.0)
+                    abs_zero = builtins.max(abs_zero_env, data_floor)
+                    Dtmp = np.where(pos_tmp, np.maximum(Dtmp, abs_zero), 0.0)
+                    invD_local = np.zeros_like(Dtmp)
+                    finite_mask_tmp = np.isfinite(Dtmp) & (Dtmp > 0.0)
+                    invD_local[finite_mask_tmp] = 1.0 / Dtmp[finite_mask_tmp]
+                    max_inv_d = float(os.environ.get("CUBEFIT_MAX_INV_D", "1e6"))
+                    if np.isfinite(max_inv_d) and (max_inv_d > 0.0):
+                        invD_local = np.minimum(invD_local, max_inv_d)
 
+                eff_vec = alpha_bb * invD_local * g_asmooth_raw
+                eff_mask = np.isfinite(eff_vec)
+                eff_norm = np.linalg.norm(eff_vec[eff_mask]) if np.any(eff_mask) else 0.0
+
+                # Compute automatic λ so the prior's effective step is a small fraction of
+                # the data gradient (target_ratio is the fractional influence we allow).
+                target_ratio = float(os.environ.get("CUBEFIT_ASMOOTH_REL", "1e-3"))
                 lambda_auto = 0.0
                 if eff_norm > 0.0 and gdata_norm > 0.0:
                     lambda_auto = target_ratio * gdata_norm / eff_norm
 
-                # final lambda: max(env, auto)
-                lambda_asmooth = builtins.max(lambda_asmooth_env, lambda_auto)
+                # final λ is the user-specified floor or the auto value, whichever is larger
+                lambda_asmooth = float(builtins.max(lambda_asmooth_env, lambda_auto))
 
-                # Apply prior (if non-zero)
+                # clamp lambda to avoid catastrophic amplification
+                lambda_max = float(os.environ.get("CUBEFIT_ASMOOTH_LAMBDA_MAX", "1e6"))
+                lambda_min = float(os.environ.get("CUBEFIT_ASMOOTH_LAMBDA_MIN", "0.0"))
+                lambda_asmooth = float(np.clip(lambda_asmooth, lambda_min, lambda_max))
+
+                # apply prior (if non-zero)
                 if lambda_asmooth > 0.0:
                     g += lambda_asmooth * g_asmooth_raw
 
+                # diagnostics
                 print(
-                    f"[SPG-DBG] asmooth λ={lambda_asmooth:.3e}  "
-                    f"||g_as||={np.linalg.norm(g_asmooth_raw):.3e}  "
-                    f"eff_norm={eff_norm:.3e}  "
-                    f"||g_data||={gdata_norm:.3e}",
+                    f"[SPG-DBG] ASMOOTH ||g_as_raw||={norm_as_raw:.3e} "
+                    f"eff_norm={eff_norm:.3e} gdata_norm={gdata_norm:.3e} "
+                    f"λ_env={lambda_asmooth_env:.3e} λ_auto={lambda_auto:.3e} "
+                    f"λ_use={lambda_asmooth:.3e}",
                     flush=True,
                 )
+            else:
+                g_asmooth_raw = None
 
             # ----------------------------
             # BB step (diagonal-preconditioned) - same as before

@@ -1458,7 +1458,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             reconstruct_modelcube_fast(
                 h5_path=str(hdf5Path),
                 x_cp=x_global,
-                use_sparse=False,
                 # array_name="ModelCube",
                 # blas_threads=nProcs,
             )

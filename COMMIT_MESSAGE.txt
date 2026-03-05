@@ -1,2 +1,0 @@
-* Made population curvature mass-aware in `spg_nnls_solver.solve_global_spg`
-* Project only after epoch acceptance logic in `spg_nnls_solver.solve_global_spg`
