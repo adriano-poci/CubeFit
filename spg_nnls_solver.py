@@ -1022,24 +1022,36 @@ def solve_global_spg(
             if lambda_pop > 0.0:
                 g_pop = population_age_curvature_grad(x, pop_shape=pop_shape)
 
-                pop_mask = np.isfinite(g_pop)
-                norm_pop = np.linalg.norm(g_pop[pop_mask]) if np.any(pop_mask) else 0.0
+                # compute norms in a robust way
+                data_mask = np.isfinite(g_data)
+                norm_data = np.linalg.norm(g_data[data_mask]) if np.any(data_mask) else 0.0
+                norm_pop  = np.linalg.norm(g_pop[np.isfinite(g_pop)]) if np.any(np.isfinite(g_pop)) else 0.0
 
-                if norm_pop > 0.0 and norm_data > 0.0:
-                    scale_pop = norm_data / norm_pop
-                else:
+                # avoid divide-by-zero; if pop has zero norm, leave unchanged
+                if norm_pop <= 0.0 or norm_data <= 0.0:
                     scale_pop = 1.0
+                else:
+                    scale_pop = norm_data / norm_pop
 
-                # Clamp scaling to avoid runaway amplification
-                scale_pop = float(np.clip(scale_pop, 1e-6, 1e6))
+                # allow a modest range around the user lambda:
+                # give a reasonable lower bound so the prior is not clipped to zero.
+                clamp_scale_max = float(os.environ.get("CUBEFIT_POP_SCALE_MAX", "100.0"))
+                # previously 1e-6 — raise to something that keeps the prior meaningful
+                clamp_scale_min = float(os.environ.get("CUBEFIT_POP_SCALE_MIN", "1e-2"))
+                scale_pop = float(np.clip(scale_pop, clamp_scale_min, clamp_scale_max))
 
-                g += lambda_pop * scale_pop * g_pop
+                # robust effective lambda: multiply user lambda by auto scale
+                lambda_pop_eff = lambda_pop * scale_pop
 
+                # apply prior
+                if lambda_pop_eff != 0.0:
+                    g += lambda_pop_eff * g_pop
+
+                # explicit debug print including effective lambda
                 print(
-                    f"[SPG-DBG] POP "
-                    f"||g_pop||={norm_pop:.3e} "
-                    f"scale={scale_pop:.3e} "
-                    f"λ_eff={lambda_pop*scale_pop:.3e}",
+                    f"[SPG-DBG] POP ||g_pop||={np.linalg.norm(g_pop):.3e} "
+                    f"norm_data={norm_data:.3e} scale={scale_pop:.3e} "
+                    f"lambda_pop={lambda_pop:.3e} lambda_pop_eff={lambda_pop_eff:.3e}",
                     flush=True,
                 )
             else:
@@ -1108,10 +1120,16 @@ def solve_global_spg(
             )
 
             if g_pop is not None:
-                pop_eps = 1e-12 * builtins.max(np.max(np.abs(g_pop)), 1.0)
+                # Use a relative freeze fraction of the max-pop gradient
+                gpop_max = builtins.max(np.max(np.abs(g_pop)), 1.0)
+                frac = float(os.environ.get("CUBEFIT_POP_FREEZE_FRAC", "1e-4"))
+                pop_eps = frac * gpop_max
                 freeze &= (np.abs(g_pop) <= pop_eps)
             if g_age is not None:
-                age_eps = 1e-12 * builtins.max(np.max(np.abs(g_age)), 1.0)
+                # Use a relative freeze fraction of the max-age gradient
+                gage_max = builtins.max(np.max(np.abs(g_age)), 1.0)
+                frac = float(os.environ.get("CUBEFIT_AGE_FREEZE_FRAC", "1e-4"))
+                age_eps = frac * gage_max
                 freeze &= (np.abs(g_age) <= age_eps)
                 print(f"[SPG-DBG] ||g_age|| = {np.linalg.norm(g_age):.3e}",
                     flush=True)
