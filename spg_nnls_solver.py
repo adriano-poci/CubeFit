@@ -1017,43 +1017,35 @@ def solve_global_spg(
             data_mask = np.isfinite(g_data)
             norm_data = np.linalg.norm(g_data[data_mask]) if np.any(data_mask) else 0.0
 
-            # ---- population curvature prior (scale-aware) ----
+            # ---- population curvature prior (normalized, user λ is direct) ----
             lambda_pop = float(os.environ.get("CUBEFIT_LAMBDA_POP", "0.0"))
             if lambda_pop > 0.0:
                 g_pop = population_age_curvature_grad(x, pop_shape=pop_shape)
 
-                # compute norms in a robust way
+                # robust norms
                 data_mask = np.isfinite(g_data)
                 norm_data = np.linalg.norm(g_data[data_mask]) if np.any(data_mask) else 0.0
-                norm_pop  = np.linalg.norm(g_pop[np.isfinite(g_pop)]) if np.any(np.isfinite(g_pop)) else 0.0
+                pop_mask = np.isfinite(g_pop)
+                norm_pop = np.linalg.norm(g_pop[pop_mask]) if np.any(pop_mask) else 0.0
 
-                # avoid divide-by-zero; if pop has zero norm, leave unchanged
-                if norm_pop <= 0.0 or norm_data <= 0.0:
-                    scale_pop = 1.0
+                # avoid divide-by-zero
+                eps_norm = 1e-30
+                if norm_pop <= 0.0:
+                    # nothing to add
+                    print(f"[SPG-DBG] POP prior skipped (zero norm)", flush=True)
                 else:
-                    scale_pop = norm_data / norm_pop
+                    # normalize g_pop to have same norm as data gradient (so λ_pop is a direct knob)
+                    scaling = (norm_data + eps_norm) / (norm_pop + eps_norm)
+                    g_pop_normed = g_pop * scaling
 
-                # allow a modest range around the user lambda:
-                # give a reasonable lower bound so the prior is not clipped to zero.
-                clamp_scale_max = float(os.environ.get("CUBEFIT_POP_SCALE_MAX", "100.0"))
-                # previously 1e-6 — raise to something that keeps the prior meaningful
-                clamp_scale_min = float(os.environ.get("CUBEFIT_POP_SCALE_MIN", "1e-2"))
-                scale_pop = float(np.clip(scale_pop, clamp_scale_min, clamp_scale_max))
+                    # apply user λ directly (now λ_pop is interpretable)
+                    g += lambda_pop * g_pop_normed
 
-                # robust effective lambda: multiply user lambda by auto scale
-                lambda_pop_eff = lambda_pop * scale_pop
-
-                # apply prior
-                if lambda_pop_eff != 0.0:
-                    g += lambda_pop_eff * g_pop
-
-                # explicit debug print including effective lambda
-                print(
-                    f"[SPG-DBG] POP ||g_pop||={np.linalg.norm(g_pop):.3e} "
-                    f"norm_data={norm_data:.3e} scale={scale_pop:.3e} "
-                    f"lambda_pop={lambda_pop:.3e} lambda_pop_eff={lambda_pop_eff:.3e}",
-                    flush=True,
-                )
+                    print(
+                        f"[SPG-DBG] POP ||g_pop||={norm_pop:.3e} norm_data={norm_data:.3e} "
+                        f"scale={scaling:.3e} λ_env={lambda_pop:.3e} λ_eff={lambda_pop:.3e}",
+                        flush=True,
+                    )
             else:
                 g_pop = None
             
@@ -1149,77 +1141,31 @@ def solve_global_spg(
             if np.isfinite(max_inv_d) and (max_inv_d > 0.0):
                 invD = np.minimum(invD, max_inv_d)
 
-            # ---------------- per-orbit anti-flatness prior (scale-aware, step-anchored) ----
-            # Compute raw prior gradient once (name: g_asmooth_raw)
+            # ---- per-orbit anti-flatness prior (normalized) ----
             lambda_asmooth_env = float(os.environ.get("CUBEFIT_LAMBDA_ASMOOTH", "0.0"))
+            g_asmooth_raw = None
             if lambda_asmooth_env > 0.0:
-                # raw prior gradient (scale-free / unitless direction)
                 g_asmooth_raw = orbit_population_variance_grad(x)
-
-                # mask + raw norm for diagnostics
-                as_mask = np.isfinite(g_asmooth_raw)
-                norm_as_raw = np.linalg.norm(g_asmooth_raw[as_mask]) if np.any(as_mask) else 0.0
-
-                # compute data gradient norm (only finite entries)
+                mask_as = np.isfinite(g_asmooth_raw)
+                norm_as = np.linalg.norm(g_asmooth_raw[mask_as]) if np.any(mask_as) else 0.0
                 data_mask = np.isfinite(g_data)
-                gdata_norm = np.linalg.norm(g_data[data_mask]) if np.any(data_mask) else 0.0
+                norm_data = np.linalg.norm(g_data[data_mask]) if np.any(data_mask) else 0.0
 
-                # compute the *effective* step the prior would cause after preconditioner
-                # and BB scaling: eff_vec = alpha_bb * invD * g_asmooth_raw
-                # (note: invD should already be present; if not, compute a safe approx)
-                try:
-                    invD_local = invD  # use precomputed invD
-                except NameError:
-                    # fallback conservative invD (no division by zero)
-                    D_tmp = np.copy(D_raw)
-                    pos_tmp = np.isfinite(D_tmp) & (D_tmp > 0.0)
-                    Dref_tmp = float(np.median(D_tmp[pos_tmp])) if np.any(pos_tmp) else 1.0
-                    Dtmp = D_raw / builtins.max(Dref_tmp, 1e-30)
-                    abs_zero_env = float(os.environ.get("CUBEFIT_ZERO_COL_ABS", "1e-12"))
-                    data_floor_mul = float(os.environ.get("CUBEFIT_ZERO_COL_DATAFLOOR_MUL", "1e-8"))
-                    data_floor = data_floor_mul * builtins.max(Dref_tmp, 1.0)
-                    abs_zero = builtins.max(abs_zero_env, data_floor)
-                    Dtmp = np.where(pos_tmp, np.maximum(Dtmp, abs_zero), 0.0)
-                    invD_local = np.zeros_like(Dtmp)
-                    finite_mask_tmp = np.isfinite(Dtmp) & (Dtmp > 0.0)
-                    invD_local[finite_mask_tmp] = 1.0 / Dtmp[finite_mask_tmp]
-                    max_inv_d = float(os.environ.get("CUBEFIT_MAX_INV_D", "1e6"))
-                    if np.isfinite(max_inv_d) and (max_inv_d > 0.0):
-                        invD_local = np.minimum(invD_local, max_inv_d)
+                if norm_as <= 0.0:
+                    print("[SPG-DBG] ASMOOTH skipped (zero norm)", flush=True)
+                else:
+                    # normalize the prior gradient to data gradient norm
+                    scale_as = (norm_data + 1e-30) / (norm_as + 1e-30)
+                    g_as_normed = g_asmooth_raw * scale_as
 
-                eff_vec = alpha_bb * invD_local * g_asmooth_raw
-                eff_mask = np.isfinite(eff_vec)
-                eff_norm = np.linalg.norm(eff_vec[eff_mask]) if np.any(eff_mask) else 0.0
+                    # apply user lambda directly (now interpretable)
+                    g += lambda_asmooth_env * g_as_normed
 
-                # Compute automatic λ so the prior's effective step is a small fraction of
-                # the data gradient (target_ratio is the fractional influence we allow).
-                target_ratio = float(os.environ.get("CUBEFIT_ASMOOTH_REL", "1e-3"))
-                lambda_auto = 0.0
-                if eff_norm > 0.0 and gdata_norm > 0.0:
-                    lambda_auto = target_ratio * gdata_norm / eff_norm
-
-                # final λ is the user-specified floor or the auto value, whichever is larger
-                lambda_asmooth = float(builtins.max(lambda_asmooth_env, lambda_auto))
-
-                # clamp lambda to avoid catastrophic amplification
-                lambda_max = float(os.environ.get("CUBEFIT_ASMOOTH_LAMBDA_MAX", "1e6"))
-                lambda_min = float(os.environ.get("CUBEFIT_ASMOOTH_LAMBDA_MIN", "0.0"))
-                lambda_asmooth = float(np.clip(lambda_asmooth, lambda_min, lambda_max))
-
-                # apply prior (if non-zero)
-                if lambda_asmooth > 0.0:
-                    g += lambda_asmooth * g_asmooth_raw
-
-                # diagnostics
-                print(
-                    f"[SPG-DBG] ASMOOTH ||g_as_raw||={norm_as_raw:.3e} "
-                    f"eff_norm={eff_norm:.3e} gdata_norm={gdata_norm:.3e} "
-                    f"λ_env={lambda_asmooth_env:.3e} λ_auto={lambda_auto:.3e} "
-                    f"λ_use={lambda_asmooth:.3e}",
-                    flush=True,
-                )
-            else:
-                g_asmooth_raw = None
+                    print(
+                        f"[SPG-DBG] ASMOOTH ||g_as||={norm_as:.3e} norm_data={norm_data:.3e} "
+                        f"scale={scale_as:.3e} λ_env={lambda_asmooth_env:.3e} λ_eff={lambda_asmooth_env:.3e}",
+                        flush=True,
+                    )
 
             # ----------------------------
             # BB step (diagonal-preconditioned) - same as before
@@ -1306,6 +1252,20 @@ def solve_global_spg(
                       f"from {step_norm:.3e} to {scale:.3e}",
                       flush=True)
             x += dx
+            # ============================================================
+            # L1 proximal sparsity (principled soft-threshold)
+            # ============================================================
+            lambda_l1 = float(os.environ.get("CUBEFIT_LAMBDA_L1", "0.0"))
+            if lambda_l1 > 0.0:
+                tau = alpha_bb * lambda_l1
+
+                # soft-threshold for non-negative variables
+                x -= tau
+
+                print(
+                    f"[SPG-L1] λ={lambda_l1:.3e} tau={tau:.3e}",
+                    flush=True,
+                )
             x = np.maximum(x, 0.0)
 
             # ============================================================

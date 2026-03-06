@@ -35,7 +35,8 @@ v1.5:   Get `warm_start` from `kwargs` in `genCubeFit`;
 v1.6:   Remove existing spectral fit plots before regenerating, to avoid
             confusion with stale files. 10 February 2026
 v1.7:   Removed axis loops of hyper-cube in `reconstruct_modelcube_fast` for
-            efficiency. 4 March 2026 
+            efficiency. 4 March 2026
+v1.8:   Fixed bug in SFH limits in `loadCubeFit`. 6 March 2026
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -590,7 +591,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=5,
+        epochs=6,
         # x0=x0,
         lr=0.1,
         project_nonneg=True,
@@ -1776,9 +1777,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             minZ, maxZ = np.min(umetals), np.max(umetals)
 
             wmax = np.log10(np.max((
-                np.min(coSFH[coSFH>0]) if np.any(coSFH>0) else 1e-1,
-                np.min(laSFH[laSFH>0]) if np.any(laSFH>0) else 1e-1,
-                np.min(boSFH[boSFH>0]) if np.any(boSFH>0) else 1e-1)))
+                np.max(coSFH[coSFH>0]) if np.any(coSFH>0) else 1e-1,
+                np.max(laSFH[laSFH>0]) if np.any(laSFH>0) else 1e-1,
+                np.max(boSFH[boSFH>0]) if np.any(boSFH>0) else 1e-1)))
             sfhMin = np.log10(np.min((
                 np.min(coSFH[coSFH>0]) if np.any(coSFH>0) else 1e10,
                 np.min(laSFH[laSFH>0]) if np.any(laSFH>0) else 1e10,
