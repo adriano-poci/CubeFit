@@ -83,28 +83,28 @@ def main():
     os.environ["CUBEFIT_ZERO_COL_FREEZE"] = str(1)
     os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-5)
     # os.environ["CUBEFIT_LAMBDA_ORBIT"] = str(50.0)
-    os.environ["CUBEFIT_LAMBDA_POP"] = str(1.0)
-    os.environ["CUBEFIT_LAMBDA_AGE"] = str(0.0)
+    os.environ["CUBEFIT_LAMBDA_POP"] = str(6.0)
+    os.environ["CUBEFIT_LAMBDA_AGE"] = str(4.0)
     # os.environ["CUBEFIT_LAMBDA_MIX"] = str(5e-3)
     os.environ["CUBEFIT_LAMBDA_ASMOOTH"] = str(0.0) # small non-zero
     os.environ["CUBEFIT_LAMBDA_FLAT"] = str(0.0)
     os.environ["CUBEFIT_LAMBDA_FLAT_MAX_SCALE"] = str(5e4)
-    os.environ["CUBEFIT_LAMBDA_L1"] = str(5e-2)
+    os.environ["CUBEFIT_LAMBDA_L1"] = str(1.0)
     os.environ["CUBEFIT_LAMBDA_L2"] = str(0.0)
-    os.environ["CUBEFIT_LR_Y"] = str(0.05)
-    os.environ["CUBEFIT_SEED_JITTER"] = str(1)
-    os.environ["CUBEFIT_SEED_SIGMA_C"] = str(1.0)
-    os.environ["CUBEFIT_SEED_SIGMA_P"] = str(1.0)
+    # os.environ["CUBEFIT_LR_Y"] = str(0.05)
+    # os.environ["CUBEFIT_SEED_JITTER"] = str(1)
+    # os.environ["CUBEFIT_SEED_SIGMA_C"] = str(1.0)
+    # os.environ["CUBEFIT_SEED_SIGMA_P"] = str(1.0)
     # --- Augmented Lagrangian (orbit ratios) ---
-    os.environ["CUBEFIT_ORBIT_RHO0"] = "1e-3"
-    os.environ["CUBEFIT_ORBIT_RHO_GROWTH"] = "2.0"
-    os.environ["CUBEFIT_ORBIT_RHO_MAX"] = "1e6"
+    # os.environ["CUBEFIT_ORBIT_RHO0"] = "1e-3"
+    # os.environ["CUBEFIT_ORBIT_RHO_GROWTH"] = "2.0"
+    # os.environ["CUBEFIT_ORBIT_RHO_MAX"] = "1e6"
     # --- SPG step control ---
     os.environ["CUBEFIT_MAX_INV_D"] = "1e6"
     os.environ["CUBEFIT_MAX_FRAC"] = "0.005"
     # --- y-update (SFH internal) ---
-    os.environ["CUBEFIT_LAMBDA_Y"] = "5e-4"
-    os.environ["CUBEFIT_Y_MAX_L1"] = "0.05"
+    # os.environ["CUBEFIT_LAMBDA_Y"] = "5e-4"
+    # os.environ["CUBEFIT_Y_MAX_L1"] = "0.05"
     # --- freezing thresholds ---
     os.environ["CUBEFIT_ZERO_COL_DATAFLOOR_MUL"] = "1e-8"
     os.environ["CUBEFIT_ZERO_COL_ABS"] = "1e-30"

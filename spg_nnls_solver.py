@@ -856,6 +856,7 @@ def solve_global_spg(
 
     # Delay orbit-mass projection until amplitude is established
     ORBIT_WARM_EPOCHS = builtins.max(0, builtins.min(2, cfg.epochs - 1))
+    ORBIT_WARM_EPOCHS = 0
     # always project final epoch, regardless of `cfg.epochs`
     print(f"[SPG] orbit-weight projection will start at epoch {ORBIT_WARM_EPOCHS + 1}", flush=True)
 
