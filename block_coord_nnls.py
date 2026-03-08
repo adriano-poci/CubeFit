@@ -42,7 +42,6 @@ except Exception:
 import multiprocessing as mp
 import numpy as np
 import h5py
-from tqdm.auto import tqdm
 
 from CubeFit.hdf5_manager import open_h5
 from CubeFit import cube_utils as cu
@@ -161,82 +160,6 @@ def rmse_proxy_subset(
             nres += R.size
 
     return float(np.sqrt(ssq / max(nres, 1)))
-
-# ------------------------------------------------------------------------------
-
-def _worker_block_nnls(
-    args: Tuple[str, int, int, int, Tuple[Tuple[int,int],...],
-                Optional[np.ndarray], Optional[np.ndarray],
-                int, int, float, int, int]
-) -> Tuple[np.ndarray, np.ndarray, int]:
-    """
-    Worker that builds a single block's design matrix by streaming tiles,
-    forms RHS (b_rhs = r + A_block x_block_old) and solves NNLS for the
-    block. Returns (z_block, cols_block, block_idx).
-    `args` contains:
-       (h5_path, block_idx, c0, c1, s_ranges, keep_idx, dset_slots,
-        dset_bytes, dset_w0, C, P)
-    Note: this top-level function is picklable for multiprocessing.
-    """
-    (h5_path, block_idx, c0, c1, s_ranges, keep_idx,
-     dset_slots, dset_bytes, dset_w0, C, P) = args
-
-    # Open HDF5 locally (each worker)
-    with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
-        M = f["/HyperCube/models"]
-        try:
-            M.id.set_chunk_cache(dset_slots, dset_bytes, dset_w0)
-        except Exception:
-            pass
-
-        # Determine kept wavelengths
-        L = int(DC.shape[1])
-        Lk = int(np.flatnonzero(cu._get_mask(f)).size) if ('/Mask' in f and keep_idx is None) else (int(keep_idx.size) if keep_idx is not None else L)
-        # Build list of global column indices for this block
-        cols = np.arange(c0, c1, dtype=np.int32)
-        ncols = cols.size
-
-        # Build block A as (S_total * Lk, ncols)
-        rows_list = []
-        y_list = []
-        for (s0, s1) in s_ranges:
-            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
-            if keep_idx is not None:
-                Yt = Yt[:, keep_idx]
-            rows = s1 - s0
-            # For this tile, stack A_tile columns contiguous in col axis
-            # A_tile shape (rows, ncols, Lk) -> transpose -> (rows*Lk, ncols)
-            A_tile_cols = np.empty((rows * (Yt.shape[1]), ncols), dtype=np.float64)
-            for j, gc in enumerate(cols):
-                # read M[s0:s1, gc // P, gc % P, :]
-                cc = int(gc // P)
-                pp = int(gc % P)
-                A_slice = np.asarray(M[s0:s1, cc, pp, :], dtype=np.float64, order="C")  # shape (rows, Lk)
-                if keep_idx is not None and A_slice.ndim == 2:
-                    # already restricted during read above if needed
-                    pass
-                A_tile_cols[:, j] = A_slice.reshape(-1)
-            rows_list.append(A_tile_cols)
-            y_list.append(Yt.reshape(-1))
-        A_block = np.vstack(rows_list) if rows_list else np.zeros((0, ncols), dtype=np.float64)
-        y_flat = np.concatenate(y_list) if y_list else np.zeros((0,), dtype=np.float64)
-
-    # Solve NNLS for block given current x_block_old. We can't access the
-    # global x here; instead main process should pass b_rhs. But to keep the
-    # worker self-contained (and avoid sending huge rhs), we solve the pure
-    # NNLS for y_flat ~ A_block z (equivalent to a seed solve). To apply the
-    # correct block-coordinate update in the main process, we instead return
-    # A_block and let main process form b_rhs and solve. However returning
-    # A_block is heavy (big pickles). To avoid that, we proceed with this
-    # pattern: workers assemble A_block and y_flat and compute ATA, ATy and
-    # return them to the master. The master then computes the block NNLS.
-    # This keeps per-worker I/O local and reduces pickling size (ATA small).
-    # Compute ATA and ATy
-    ATA = A_block.T @ A_block  # (ncols, ncols)
-    ATy = A_block.T @ y_flat   # (ncols,)
-
-    return ATA, ATy, int(block_idx)
 
 # ------------------------------------------------------------------------------
 
@@ -561,6 +484,8 @@ def solve_block_coord_nnls(
         else:
             seed_tested_mask = None
     # -------------------------------------------------------------------------------
+    # before epoch loop (after known_zero loaded)
+    known_zero_orbit = np.all(known_zero, axis=1)  # shape (C,)
 
     # pool only used to set BLAS threads per worker if you later parallelize
     ctx = mp.get_context(os.environ.get("CUBEFIT_MP_CTX", "forkserver"))
@@ -653,6 +578,37 @@ def solve_block_coord_nnls(
                     yhat_flat = yhat_tile.reshape(-1)
                     r_flat = y_flat - yhat_flat
 
+                    # --- DIAG: tile-level numeric checks & timings ---
+                    try:
+                        # basic shapes and norms
+                        yf_norm = float(np.linalg.norm(y_flat)) if y_flat.size > 0 else 0.0
+                        yhatf_norm = float(np.linalg.norm(yhat_flat)) if yhat_flat.size > 0 else 0.0
+                        r_norm = float(np.linalg.norm(r_flat)) if r_flat.size > 0 else 0.0
+
+                        nnans = int(np.count_nonzero(~np.isfinite(y_flat)))
+                        nnans += int(np.count_nonzero(~np.isfinite(yhat_flat)))
+                        nnans += int(np.count_nonzero(~np.isfinite(r_flat)))
+
+                        print(
+                            f"[BC-FUSED][tile s={s0}:{s1}] Sblk={Sblk} Lk={Lk} "
+                            f"||y||={yf_norm:.3e} ||yhat||={yhatf_norm:.3e} ||r||={r_norm:.3e} "
+                            f"nonfinite_vals={nnans}", flush=True
+                        )
+
+                        # quick histogram-ish checks (coarse)
+                        if r_flat.size > 0:
+                            r_max = float(np.max(r_flat))
+                            r_min = float(np.min(r_flat))
+                            r_pos_frac = float(np.count_nonzero(r_flat > 0) / max(1, r_flat.size))
+                            print(
+                                f"[BC-FUSED][tile s={s0}:{s1}] r_min={r_min:.3e} r_max={r_max:.3e} "
+                                f"r_pos_frac={r_pos_frac:.3f}", flush=True
+                            )
+
+                    except Exception as _e:
+                        print("[BC-FUSED][tile diag] error while computing tile diagnostics:", _e, flush=True)
+                    # --- end tile diagnostics ---
+
                     # 2) update ATA/ATy for each block using cached A_cache (no reread)
                     # For each cached orbit, push contributions to all blocks that include that orbit
                     for cc, A_cc in A_cache.items():
@@ -677,6 +633,80 @@ def solve_block_coord_nnls(
 
             # end tile-streaming
 
+            # ---------------- COLUMN NORMALIZATION ----------------
+            # Build per-column energy normalization
+            col_energy = D_tot.copy()  # shape (C,P)
+
+            # Avoid division by zero
+            col_energy[col_energy <= 0.0] = 1.0
+
+            inv_sqrt_energy = 1.0 / np.sqrt(col_energy)
+
+            # Normalize ATA and ATy blocks
+            for bi, meta in block_meta.items():
+                cols = meta["cols"]
+                # map flattened indices to (C,P)
+                cc_arr = meta["cc_arr"]
+                pp_arr = meta["pp_arr"]
+
+                scale = inv_sqrt_energy[cc_arr, pp_arr]  # shape (ncols,)
+
+                # Scale ATA: S A S
+                ATA_blocks[bi] = (ATA_blocks[bi] * scale[:, None]) * scale[None, :]
+
+                # Scale ATy: S ATy
+                ATy_blocks[bi] = ATy_blocks[bi] * scale
+
+            # --- DIAG: summary after tile streaming (epoch-level) ---
+            try:
+                # quick global ATA/ATy sanity summary across blocks
+                nblocks = len(ATA_blocks)
+                tot_cols = sum([meta["ncols"] for _, meta in block_meta.items()])
+                # per-block summaries
+                mm = []
+                atys_pos = 0
+                atys_neg = 0
+                atys_zero = 0
+                ata_diag_meds = []
+                ata_diag_mins = []
+                ata_diag_maxs = []
+                ata_nonfinite_counts = 0
+                aty_nonfinite_counts = 0
+                for bi, meta in block_meta.items():
+                    ATA = ATA_blocks[bi]
+                    ATy = ATy_blocks[bi]
+                    # diag stats
+                    diag = np.diag(ATA)
+                    ata_diag_meds.append(float(np.median(np.abs(diag))) if diag.size else 0.0)
+                    ata_diag_mins.append(float(np.min(diag)) if diag.size else 0.0)
+                    ata_diag_maxs.append(float(np.max(diag)) if diag.size else 0.0)
+                    # ATy sign counts
+                    if ATy.size > 0:
+                        atys_pos += int(np.count_nonzero(ATy > 0))
+                        atys_neg += int(np.count_nonzero(ATy < 0))
+                        atys_zero += int(np.count_nonzero(ATy == 0))
+                    ata_nonfinite_counts += int(np.count_nonzero(~np.isfinite(ATA)))
+                    aty_nonfinite_counts += int(np.count_nonzero(~np.isfinite(ATy)))
+
+                print(
+                    "[BC-FUSED][stream-summary] blocks=%d tot_cols=%d ata_nonfinite=%d aty_nonfinite=%d"
+                    % (nblocks, tot_cols, ata_nonfinite_counts, aty_nonfinite_counts),
+                    flush=True
+                )
+                if len(ata_diag_meds):
+                    print(
+                        "[BC-FUSED][stream-summary] ATA diag med/min/max = %.3e / %.3e / %.3e"
+                        % (float(np.median(ata_diag_meds)), float(np.min(ata_diag_mins)), float(np.max(ata_diag_maxs))),
+                        flush=True
+                    )
+                print(
+                    f"[BC-FUSED][stream-summary] ATy sign counts: +={atys_pos} -={atys_neg} 0={atys_zero}",
+                    flush=True
+                )
+            except Exception as _e:
+                print("[BC-FUSED][stream-summary] diag error:", _e, flush=True)
+            # --- end stream summary diagnostics ---
+
             # Build full flattened y and residual norm if needed
             if len(y_parts) > 0:
                 y_full = np.concatenate(y_parts)
@@ -700,17 +730,62 @@ def solve_block_coord_nnls(
                 ATA = ATA_blocks[bi]
                 ATy = ATy_blocks[bi].copy()  # (ncols,)
 
+                # ---------------- GAUSS-SEIDEL CORRECTION ----------------
+                # ATy currently holds A^T r
+                # convert to A^T r + ATA x_old
+                x_block_old = x_flat[meta["cols"]]
+                ATy = ATy + ATA @ x_block_old
+
+                # --- DIAG: per-block pre-solve diagnostics ---
+                try:
+                    ncols = meta["ncols"]
+                    diag = np.diag(ATA) if ncols > 0 else np.array([], dtype=float)
+                    diag_med = float(np.median(np.abs(diag))) if diag.size else 0.0
+                    diag_min = float(np.min(diag)) if diag.size else 0.0
+                    diag_max = float(np.max(diag)) if diag.size else 0.0
+                    aty_max = float(np.max(ATy)) if ATy.size else 0.0
+                    aty_min = float(np.min(ATy)) if ATy.size else 0.0
+                    aty_sum = float(np.sum(ATy)) if ATy.size else 0.0
+                    aty_pos = int(np.count_nonzero(ATy > 0)) if ATy.size else 0
+                    aty_neg = int(np.count_nonzero(ATy < 0)) if ATy.size else 0
+                    ata_nonfinite = int(np.count_nonzero(~np.isfinite(ATA)))
+                    aty_nonfinite = int(np.count_nonzero(~np.isfinite(ATy)))
+
+                    # simple diag-based condition estimate (cheap)
+                    cond_est = np.inf
+                    if diag.size and np.median(np.abs(diag)) > 0:
+                        cond_est = float(np.max(np.abs(diag)) / float(np.median(np.abs(diag))))
+
+                    print(
+                        f"[BC-FUSED][block {bi}] cols={ncols} diag_med={diag_med:.3e} "
+                        f"diag_min={diag_min:.3e} diag_max={diag_max:.3e} cond_est={cond_est:.3e}", flush=True
+                    )
+                    print(
+                        f"[BC-FUSED][block {bi}] ATy: max={aty_max:.3e} min={aty_min:.3e} sum={aty_sum:.3e} "
+                        f"+count={aty_pos} -count={aty_neg} nonfinite(ATA)={ata_nonfinite} nonfinite(ATy)={aty_nonfinite}",
+                        flush=True
+                    )
+
+                    # quick guard: warn if ATy is nonpositive (zero optimal) or ATA all tiny
+                    if ATy.size and np.all(ATy <= 0):
+                        print(f"[BC-FUSED][block {bi}] WARNING: ATy <= 0 for all cols -> zero is KKT candidate", flush=True)
+                    if diag.size and float(np.median(np.abs(diag))) <= 0.0:
+                        print(f"[BC-FUSED][block {bi}] WARNING: ATA diagonal median is zero; block may be rank-def.", flush=True)
+
+                except Exception as _e:
+                    print(f"[BC-FUSED][block {bi}] pre-solve diag error:", _e, flush=True)
+                # --- end per-block pre-solve diagnostics ---
+
                 # Soft-orbit augmentation (if requested)
                 if (orbit_beta is not None) and (orbit_beta > 0.0) and (meta["w_vec"] is not None):
                     # For block columns, ones vector u (length ncols) with ones per column
                     u = np.ones((meta["ncols"],), dtype=np.float64)
-                    # ATA += 2 * orbit_beta * (u u^T)
-                    ATA = ATA + (2.0 * float(orbit_beta)) * np.outer(u, u)
-                    # ATy += 2 * orbit_beta * w_vec
-                    ATy = ATy + (2.0 * float(orbit_beta)) * meta["w_vec"]
+                    if (2.0 * float(orbit_beta)) != 0.0:
+                        ATA += (2.0 * float(orbit_beta)) * np.outer(u, u)
+                        ATy += (2.0 * float(orbit_beta)) * meta["w_vec"]
 
                 # initial x for block: current x values
-                x_block_init = x_flat[meta["cols"] - 0]  # slice (works because cols are contiguous)
+                x_block_init = x_flat[meta["cols"]]  # slice (works because cols are contiguous)
                 # solve quadratic NNLS
                 try:
                     z_block = _nnls_from_quadratic(ATA, ATy, x0=x_block_init, max_iter=2000, tol=1e-8)
@@ -718,11 +793,60 @@ def solve_block_coord_nnls(
                     # robust fallback small iterations
                     z_block = _nnls_from_quadratic(ATA, ATy, x0=x_block_init, max_iter=500, tol=1e-6)
 
-                # place result into x
+                # Undo normalization before placing into x
+                scale = inv_sqrt_energy[meta["cc_arr"], meta["pp_arr"]]
+                z_block = z_block * scale
+
                 for j_local, gc in enumerate(meta["cols"]):
                     cc = int(gc // P)
                     pp = int(gc % P)
                     x[cc, pp] = float(z_block[j_local])
+
+                delta = z_block - x_block_old
+                if np.any(delta != 0.0):
+                    # Update residual approximation via A_delta
+                    # (optional advanced; skip for now if expensive)
+                    pass
+
+                # --- DIAG: post-solve block checks (delta & sparsity) ---
+                try:
+                    x_block_new = np.asarray(z_block, dtype=np.float64)
+                    x_block_old = x_block_init
+                    delta = np.linalg.norm(x_block_new - x_block_old) if x_block_new.size else 0.0
+                    x_block_l1 = float(np.sum(x_block_new))
+                    nonzero = int(np.count_nonzero(x_block_new > 0))
+                    print(
+                        f"[BC-FUSED][block {bi}] post-solve delta_norm={delta:.3e} l1={x_block_l1:.3e} "
+                        f"nonzero={nonzero}/{x_block_new.size}", flush=True
+                    )
+                except Exception as _e:
+                    print(f"[BC-FUSED][block {bi}] post-solve diag error:", _e, flush=True)
+                # --- end post-solve diagnostics ---
+
+            # --- DIAG: after all blocks solved (before projection) ---
+            try:
+                x_flat = x.ravel(order="C")
+                x_nonzero = int(np.count_nonzero(x_flat > 0))
+                x_sparsity = 1.0 - (x_nonzero / float(x_flat.size)) if x_flat.size else 1.0
+                x_l1 = float(np.sum(x_flat))
+                x_max = float(np.max(x_flat)) if x_flat.size else 0.0
+                x_min = float(np.min(x_flat)) if x_flat.size else 0.0
+                D_tot_finite = np.isfinite(D_tot)
+                dpos = float(np.sum(D_tot[D_tot_finite]))
+                print(
+                    f"[BC-FUSED][after-blocks] x_l1={x_l1:.3e} max={x_max:.3e} min={x_min:.3e} "
+                    f"nonzero={x_nonzero}/{x_flat.size} sparsity={x_sparsity:.3f} D_tot_sum={dpos:.3e}",
+                    flush=True
+                )
+
+                # check for non-finite in x
+                nbad = int(np.count_nonzero(~np.isfinite(x_flat)))
+                if nbad:
+                    print(f"[BC-FUSED][after-blocks] WARNING: non-finite entries in x: {nbad}", flush=True)
+
+            except Exception as _e:
+                print("[BC-FUSED][after-blocks] diag error:", _e, flush=True)
+            # --- end after-blocks diagnostics ---
 
             # -------------------- HARD ORBIT PROJECTION (epoch-end) --------------------
             projection_applied = False
@@ -754,7 +878,7 @@ def solve_block_coord_nnls(
                     # build current yhat_tile for diagnostics
                     yhat_tile = np.zeros_like(Yt)
                     for cc in range(C):
-                        if np.all(known_zero[cc, :]):
+                        if known_zero_orbit[cc]:
                             continue
                         A_cc = np.asarray(f["/HyperCube/models"][s0:s1, cc, :, :], dtype=np.float64, order="C")
                         if keep_idx is not None:
@@ -770,6 +894,60 @@ def solve_block_coord_nnls(
                 data_proxy = 0.5 * (rmse_curr ** 2)
             else:
                 data_proxy = np.inf
+
+
+            # --- DIAG: epoch summary (timings & numerical health) ---
+            try:
+                epoch_elapsed = time.perf_counter() - t0
+                # D_tot stats per-orbit
+                D_tot_flat = D_tot.ravel(order="C")
+                D_finite = D_tot_flat[np.isfinite(D_tot_flat) & (D_tot_flat > 0)]
+                D_median = float(np.median(D_finite)) if D_finite.size else 0.0
+                D_min = float(np.min(D_finite)) if D_finite.size else 0.0
+                D_max = float(np.max(D_finite)) if D_finite.size else 0.0
+
+                x_flat = best_x.ravel(order="C")
+                x_nonfinite = int(np.count_nonzero(~np.isfinite(x_flat)))
+                x_nonzero = int(np.count_nonzero(x_flat > 0))
+                x_sum = float(np.sum(x_flat))
+                x_norm = float(np.linalg.norm(x_flat)) if x_flat.size else 0.0
+
+                print("=== [BC-FUSED][epoch-summary] ===", flush=True)
+                print(f"[BC-FUSED][epoch-summary] epoch={ep+1}/{cfg.epochs} elapsed_total={epoch_elapsed:.1f}s", flush=True)
+                print(f"[BC-FUSED][epoch-summary] data_proxy={data_proxy:.3e} rmse={rmse_curr:.3e}", flush=True)
+                print(f"[BC-FUSED][epoch-summary] best_proxy={best_proxy:.3e}", flush=True)
+                print(
+                    f"[BC-FUSED][epoch-summary] x_sum={x_sum:.3e} x_norm={x_norm:.3e} nonzero={x_nonzero}/{x_flat.size} nonfinite={x_nonfinite}",
+                    flush=True
+                )
+                print(
+                    f"[BC-FUSED][epoch-summary] D_tot diag med/min/max = {D_median:.3e} / {D_min:.3e} / {D_max:.3e}",
+                    flush=True
+                )
+
+                # sanity checks that likely indicate major numerical problems
+                if x_nonzero == 0:
+                    print("[BC-FUSED][epoch-summary] ALERT: x is entirely zero after epoch!", flush=True)
+                if x_nonfinite > 0:
+                    print("[BC-FUSED][epoch-summary] ALERT: non-finite elements in x!", flush=True)
+                if not np.isfinite(data_proxy) or data_proxy <= 0.0:
+                    print("[BC-FUSED][epoch-summary] ALERT: data_proxy non-finite or <= 0.0", flush=True)
+
+                # show top contributors (per-orbit totals)
+                try:
+                    s_full = np.sum(x, axis=1)  # per-orbit
+                    top_idx = np.argsort(s_full)[::-1][:10]
+                    top_vals = s_full[top_idx]
+                    print("[BC-FUSED][epoch-summary] top orbits (index:mass): " + ", ".join(
+                        [f"{int(i)}:{v:.3e}" for i, v in zip(top_idx.tolist(), top_vals.tolist())]
+                    ), flush=True)
+                except Exception:
+                    pass
+
+                print("=== [BC-FUSED][epoch-summary] end ===", flush=True)
+            except Exception as _e:
+                print("[BC-FUSED][epoch-summary] error:", _e, flush=True)
+            # --- end epoch summary diagnostics ---
 
             if data_proxy < best_proxy:
                 best_proxy = float(data_proxy)

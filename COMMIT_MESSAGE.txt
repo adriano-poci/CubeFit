@@ -1,1 +1,0 @@
-* Implemented a block coordinate NNLS solver, instead of SPG, to better mimic monolithic NNLS numerics
