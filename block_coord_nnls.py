@@ -392,6 +392,14 @@ def solve_block_coord_nnls(
     """
     t0 = time.perf_counter()
 
+    # --- orbit-solve hyper-parameters (tunable) ---
+    _ORBIT_SOLVE = {
+        "tiny_ridge": 1e-6,
+        "lambda_curv": 1e-2, # smoother SFH inside each orbit
+        "max_iter_quad": 4000,
+        "tol_quad": 1e-8,
+    }
+
     # ---------------------------- metadata -----------------------------
     with open_h5(h5_path, role="reader") as f:
         S, L = map(int, f["/DataCube"].shape)
@@ -760,153 +768,133 @@ def solve_block_coord_nnls(
             else:
                 y_full = np.zeros((0,), dtype=np.float64)
 
-            # -------------------- per-block solves ----------------------
-            # Solve small quadratic NNLS using ATA_blocks / ATy_blocks (with soft prior augmentation)
-            # We treat blocks sequentially and update x in a Jacobi fashion (each block uses residual
-            # from start-of-epoch prediction).
-            x_flat = x.ravel(order="C")
-            # optional block progress bar
-            block_iter = list(block_meta.items())
-            if verbose:
-                block_iter = tqdm(block_iter,
-                    desc=f"[BC-FUSED] solve blocks ep{ep+1}",
-                    disable=not verbose)
+            # -------------------- ORBIT-LEVEL solves ----------------------
+            # Assemble per-orbit ATA / ATy by summing block contributions so each
+            # orbit (all P populations) is solved monolithically (approx full-column solve).
+            # This avoids small-block ambiguity / carpeting across populations.
 
-            for bi, meta in block_iter:
-                # Always define x_block_old at block start (prevents UnboundLocalError)
-                x_block_old = x_flat[meta["cols"]]
-                ATA = ATA_blocks[bi]
-                ATy = ATy_blocks[bi].copy()  # (ncols,)
-
-                # --- DIAG: per-block pre-solve diagnostics ---
-                try:
-                    ncols = meta["ncols"]
-                    diag = np.diag(ATA) if ncols > 0 else np.array([], dtype=float)
-                    diag_med = float(np.median(np.abs(diag))) if diag.size else 0.0
-                    diag_min = float(np.min(diag)) if diag.size else 0.0
-                    diag_max = float(np.max(diag)) if diag.size else 0.0
-                    aty_max = float(np.max(ATy)) if ATy.size else 0.0
-                    aty_min = float(np.min(ATy)) if ATy.size else 0.0
-                    aty_sum = float(np.sum(ATy)) if ATy.size else 0.0
-                    aty_pos = int(np.count_nonzero(ATy > 0)) if ATy.size else 0
-                    aty_neg = int(np.count_nonzero(ATy < 0)) if ATy.size else 0
-                    ata_nonfinite = int(np.count_nonzero(~np.isfinite(ATA)))
-                    aty_nonfinite = int(np.count_nonzero(~np.isfinite(ATy)))
-
-                    # simple diag-based condition estimate (cheap)
-                    cond_est = np.inf
-                    if diag.size and np.median(np.abs(diag)) > 0:
-                        cond_est = float(np.max(np.abs(diag)) / float(np.median(np.abs(diag))))
-
-                    print(
-                        f"[BC-FUSED][block {bi}] cols={ncols} diag_med={diag_med:.3e} "
-                        f"diag_min={diag_min:.3e} diag_max={diag_max:.3e} cond_est={cond_est:.3e}", flush=True
-                    )
-                    print(
-                        f"[BC-FUSED][block {bi}] ATy: max={aty_max:.3e} min={aty_min:.3e} sum={aty_sum:.3e} "
-                        f"+count={aty_pos} -count={aty_neg} nonfinite(ATA)={ata_nonfinite} nonfinite(ATy)={aty_nonfinite}",
-                        flush=True
-                    )
-
-                    # quick guard: warn if ATy is nonpositive (zero optimal) or ATA all tiny
-                    if ATy.size and np.all(ATy <= 0):
-                        print(f"[BC-FUSED][block {bi}] WARNING: ATy <= 0 for all cols -> zero is KKT candidate", flush=True)
-                    if diag.size and float(np.median(np.abs(diag))) <= 0.0:
-                        print(f"[BC-FUSED][block {bi}] WARNING: ATA diagonal median is zero; block may be rank-def.", flush=True)
-
-                except Exception as _e:
-                    print(f"[BC-FUSED][block {bi}] pre-solve diag error:", _e, flush=True)
-                # --- end per-block pre-solve diagnostics ---
-
-                # ------------------ Column-normalize + ridge ------------------
-                # Soft-orbit augmentation (if requested)
-                if (orbit_beta is not None) and (orbit_beta > 0.0) and (meta["w_vec"] is not None):
-                    u = np.ones((meta["ncols"],), dtype=np.float64)
-                    ATA = ATA + (2.0 * float(orbit_beta)) * np.outer(u, u)
-                    ATy = ATy + (2.0 * float(orbit_beta)) * meta["w_vec"]
-
-                # initial x for block: current x values
-                x_block_init = x_flat[meta["cols"] - 0]
-
-                # ---------------- CLEAN QUADRATIC SOLVE ----------------
-                # ATA and ATy are already globally column-normalized.
-                # Solve directly with strong ridge regularization.
-
-                ncol = ATA.shape[0]
-                if ncol == 0:
-                    z_block = np.zeros((0,), dtype=np.float64)
-                else:
-                    # Strong Tikhonov regularization (this is not optional)
-                    lambda_l2 = 1e-2   # strong stabilizer
-                    ATA_reg = ATA + lambda_l2 * np.eye(ncol, dtype=np.float64)
-
-                    # -------- Age curvature regularization ----------
-                    # Penalize (x_{p+1} - 2x_p + x_{p-1})^2 along population axis
-
-                    lambda_curv = 1e-2   # strong smoothing
-
-                    if lambda_curv > 0.0:
-                        # Build 1D second-difference operator per orbit within this block
-                        # This assumes populations contiguous in P ordering
-                        for j_local, gc in enumerate(meta["cols"]):
-                            cc = int(gc // P)
-                            pp = int(gc % P)
-
-                            if 0 < pp < (P - 1):
-                                # Add curvature penalty to diagonal
-                                ATA_reg[j_local, j_local] += 2.0 * lambda_curv
-                            else:
-                                ATA_reg[j_local, j_local] += lambda_curv
-                    # -------------------------------------------------
-
-                    # Solve NNLS quadratic
-                    try:
-                        z_block = _nnls_from_quadratic(
-                            ATA_reg,
-                            ATy,
-                            x0=x_block_old,
-                            max_iter=4000,
-                            tol=1e-10
-                        )
-                    except Exception:
-                        z_block = _projected_gradient_nnls(
-                            ATA_reg,
-                            ATy,
-                            max_iter=2000,
-                            tol=1e-8
-                        )
-                # ---------------------------------------------------------
-
-                # quick diagnostics per block
-                if verbose:
-                    print(f"[BC-FUSED][block {bi}] post-solve l1={np.sum(np.abs(z_block)):.3e} "
-                          f"max={np.max(z_block):.3e} nonzero={int(np.count_nonzero(z_block))}/{z_block.size}", flush=True)
-
-                for j_local, gc in enumerate(meta["cols"]):
+            # 1) Quick lookup: for each orbit cc, which global flat-col indices belong to it
+            orbit_cols_map = {cc: [] for cc in range(C)}
+            for bi, meta in block_meta.items():
+                cols = meta["cols"]  # global flat indices in this block
+                for local_j, gc in enumerate(cols):
                     cc = int(gc // P)
                     pp = int(gc % P)
-                    x[cc, pp] = float(z_block[j_local])
+                    orbit_cols_map[cc].append((bi, int(local_j), int(pp)))
 
-                delta = z_block - x_block_old
-                if np.any(delta != 0.0):
-                    # Update residual approximation via A_delta
-                    # (optional advanced; skip for now if expensive)
-                    pass
+            # 2) For each active orbit, build ATA_cc (n_p_active x n_p_active) and ATy_cc
+            x_flat = x.ravel(order="C")  # current x for warm-starts
+            for cc in range(C):
+                # skip known-zero orbits quickly
+                if known_zero_orbit[cc]:
+                    continue
 
-                # --- DIAG: post-solve block checks (delta & sparsity) ---
+                members = orbit_cols_map.get(cc, [])
+                if not members:
+                    # nothing to solve for this orbit
+                    continue
+
+                # Determine active population indices for this orbit and mapping
+                p_indices = sorted({pp for (_, _, pp) in members})
+                P_active = len(p_indices)
+                # map population -> local index in ATA_cc
+                p_to_idx = {p: idx for idx, p in enumerate(p_indices)}
+
+                # Initialise orbit-level ATA and ATy in the *normalized block space*
+                ATA_cc = np.zeros((P_active, P_active), dtype=np.float64)
+                ATy_cc = np.zeros((P_active,), dtype=np.float64)
+                x_init_cc = np.zeros((P_active,), dtype=np.float64)
+
+                # Sum contributions from each block containing columns for this orbit
+                for (bi, local_j, p) in members:
+                    # retrieve block-level scaled ATA and ATy (already scaled earlier)
+                    ATA_blk = ATA_blocks[bi]
+                    ATy_blk = ATy_blocks[bi]
+                    # local_j is the column index inside this block's ordering
+                    i = p_to_idx[p]
+                    # add diagonal / column cross-terms: select rows/cols in block corresponding to
+                    # all populations of this orbit that appear in this block
+                    # find all block-local positions (j_local) within this block that belong to this orbit
+                    # We can scan block_meta[bi]["cols"] to find which locals to pick
+                    blk_cols = block_meta[bi]["cols"]
+                    # find mask of indices in blk_cols belonging to this cc and present in p_indices
+                    # We'll use a small loop since blocks are modestly sized
+                    for j_local_idx, gc_j in enumerate(blk_cols):
+                        cc_j = int(gc_j // P)
+                        pp_j = int(gc_j % P)
+                        if cc_j != cc:
+                            continue
+                        # map pp_j -> index in ATA_cc
+                        ii = p_to_idx[pp_j]
+                        # accumulate the cross term ATA_blk[local_j, j_local_idx]
+                        ATA_cc[i, ii] += ATA_blk[local_j, j_local_idx]
+                    # accumulate ATy contribution for this column
+                    ATy_cc[i] += ATy_blk[local_j]
+                    # warm-start: take current x value (note: x is in un-normalized space; we'll
+                    # put a consistent init below after unscaling)
+                    x_init_cc[i] = x[cc, p]
+
+                # At this point ATA_cc and ATy_cc are assembled in the *normalized* block space.
+                # Add small ridge for numeric stability and optional curvature regularization.
+                tiny_ridge = 1e-6
+                ATA_cc += tiny_ridge * np.eye(P_active, dtype=np.float64)
+
+                # Optional curvature (age) smoothing inside the orbit:
+                # construct second-difference operator in the local P_active ordering (only if P_active>=3)
+                if P_active >= 3:
+                    lambda_curv = 1e-2  # tuneable: increase for stronger smoothing
+                    # build tri-diagonal curvature operator K where K = L^T L and L is second-diff
+                    K = np.zeros((P_active, P_active), dtype=np.float64)
+                    for i in range(P_active):
+                        if i == 0:
+                            K[i, i] += 1.0
+                            if P_active > 1:
+                                K[i, i+1] += -1.0
+                        elif i == P_active - 1:
+                            K[i, i] += 1.0
+                            K[i, i-1] += -1.0
+                        else:
+                            K[i, i-1] += -1.0
+                            K[i, i] += 2.0
+                            K[i, i+1] += -1.0
+                    ATA_cc += lambda_curv * K
+
+                # Solve the quadratic NNLS in orbit space
                 try:
-                    x_block_new = np.asarray(z_block, dtype=np.float64)
-                    x_block_old = x_block_init
-                    delta = np.linalg.norm(x_block_new - x_block_old) if x_block_new.size else 0.0
-                    x_block_l1 = float(np.sum(x_block_new))
-                    nonzero = int(np.count_nonzero(x_block_new > 0))
-                    print(
-                        f"[BC-FUSED][block {bi}] post-solve delta_norm={delta:.3e} l1={x_block_l1:.3e} "
-                        f"nonzero={nonzero}/{x_block_new.size}", flush=True
-                    )
-                except Exception as _e:
-                    print(f"[BC-FUSED][block {bi}] post-solve diag error:", _e, flush=True)
-                # --- end post-solve diagnostics ---
+                    # use the quadratic projected gradient solver on ATA_cc / ATy_cc
+                    z_cc = _nnls_from_quadratic(ATA_cc, ATy_cc, x0=None, max_iter=4000, tol=1e-8)
+                except Exception:
+                    # fallback to shorter solve if something odd happens
+                    z_cc = _nnls_from_quadratic(ATA_cc, ATy_cc, x0=None, max_iter=1000, tol=1e-6)
+
+                # Un-normalize solution: remember we assembled ATAs/ATy in normalized (scale) space.
+                # Determine the final scale vector for these p_indices
+                col_scales = inv_sqrt_energy[cc, p_indices]  # shape (P_active,)
+                # z_cc was solved for scaled columns; to bring back to original x units:
+                # (original logic used: scale = inv_sqrt_energy -> ATA_scaled = S ATA S; ATy_scaled = S ATy)
+                # so x_original = z_cc * scale
+                z_cc_unscaled = z_cc * col_scales
+
+                # Place results back into x
+                for p_i, p in enumerate(p_indices):
+                    x[cc, p] = float(z_cc_unscaled[p_i])
+
+                # diagnostics per-orbit (coarse)
+                if verbose:
+                    print(f"[BC-FUSED][orbit {cc}] solved P_active={P_active} l1={np.sum(z_cc_unscaled):.3e} "
+                        f"max={np.max(z_cc_unscaled):.3e} nonzero={int(np.count_nonzero(z_cc_unscaled))}/{P_active}", flush=True)
+            # end orbit solves
+            # ----------------------------------------------------
+
+            # small summary per-orbit (aggregate)
+            if verbose:
+                try:
+                    s_cc = float(np.sum(x[cc, p_indices]))
+                    nz_cc = int(np.count_nonzero(x[cc, p_indices] > 0))
+                    print(f"[BC-FUSED][orbit-summary {cc}] P_active={P_active} sum={s_cc:.3e} "
+                            f"nonzero={nz_cc}/{P_active}", flush=True)
+                except Exception:
+                    pass
 
             # --- DIAG: after all blocks solved (before projection) ---
             try:
