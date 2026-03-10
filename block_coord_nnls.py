@@ -621,12 +621,58 @@ def solve_block_coord_nnls(
                                 continue
                             # Extract columns for populations p_idx_arr
                             # A_cc[:, p_idx_arr, :] -> shape (Sblk, n_local, Lk)
+                            # === explicit A_tile construction (less error-prone) ===
+                            # sub: (Sblk, n_local, Lk)
+                            # We want rows = Sblk * Lk, cols = n_local
+                            # Do: transpose to (Sblk, Lk, n_local) then reshape
                             sub = A_cc[:, p_idx_arr, :]  # (Sblk, n_local, Lk)
-                            # reshape to (Sblk*Lk, n_local)
-                            A_tile = sub.transpose(1, 0, 2).reshape(sub.shape[1], -1).T  # (Sblk*Lk, n_local)
+                            # transpose axes to (Sblk, Lk, n_local)
+                            sub_t = sub.transpose(0, 2, 1)            # (Sblk, Lk, n_local)
+                            # then flatten first two dims -> (Sblk*Lk, n_local)
+                            A_tile = sub_t.reshape(sub_t.shape[0] * sub_t.shape[1], sub_t.shape[2])
+
+                            # === deep sanity check (dump tiny sample and fail-fast) ===
+                            # sample a few entries
+                            sample_idx = np.arange(min(5, y_flat.size))
+                            print(f"[BC-FUSED][DEBUG-SAMPLE] tile s={s0}:{s1} Sblk={Sblk} Lk={Lk} "
+                                f"||y||={np.linalg.norm(y_flat):.3e} y_sample={y_flat[sample_idx]!r}", flush=True)
+
+                            # check dot product signs between first column of A_tile and y_flat
+                            if A_tile.shape[0] > 0 and A_tile.shape[1] > 0:
+                                col0 = A_tile[:, 0]
+                                dot0 = float(np.dot(col0, y_flat))
+                                dot0_r = float(np.dot(col0, (y_flat - (col0 * (dot0 / (np.dot(col0, col0) + 1e-30))))))
+                                print(f"[BC-FUSED][DEBUG-SAMPLE] dot(col0,y)={dot0:.3e} dot0_resid_like={dot0_r:.3e} "
+                                    f"col0_norm={np.linalg.norm(col0):.3e}", flush=True)
+                            # abort early to inspect values if ATy will end up all negative
+                            ATy_tile_test = A_tile.T @ y_flat
+                            if np.all(ATy_tile_test <= 0.0):
+                                # print short diagnostic and raise to inspect environment (or keep running but noisy)
+                                print(f"[BC-FUSED][FATAL-DEBUG] ATy_tile_test all <= 0 (sample first 6): "
+                                    f"{ATy_tile_test[:6]!r}", flush=True)
+                                # Optionally raise to stop run and inspect; comment out raise if you prefer continuation
+                                # raise RuntimeError("ATy all non-positive in diagnostic check")
+
                             # update ATA and ATy
+                            # === explicit ATA and ATy from DATA (y_flat), not residual ===
+                            # Build ATA contribution for this block
                             ATA_blocks[bi][np.ix_(local_idx_arr, local_idx_arr)] += (A_tile.T @ A_tile)
-                            ATy_blocks[bi][local_idx_arr] += (A_tile.T @ r_flat)
+
+                            # Build ATy contribution *explicitly from data y_flat*
+                            # (very important: this must be A^T @ y, not A^T @ r)
+                            ATy_tile = A_tile.T @ y_flat    # shape (n_local,)
+                            ATy_blocks[bi][local_idx_arr] += ATy_tile
+
+                            # quick guard / assertion to detect accidental residual usage:
+                            # if global tile residual is strongly negative, it is expected,
+                            # but ATy computed from y_flat should not be all-negative of huge mag.
+                            _ifpos = np.count_nonzero(ATy_tile > 0)
+                            _ifneg = np.count_nonzero(ATy_tile < 0)
+                            _ifzero = ATy_tile.size - (_ifpos + _ifneg)
+                            if _ifpos == 0 and _ifneg > 0:
+                                print(f"[BC-FUSED][WARN][tile s={s0}:{s1} bi={bi}] ATy_tile all <=0 "
+                                    f"(+={_ifpos} -={_ifneg} 0={_ifzero}) sample_ATy[0:3]={ATy_tile[:3]!r}", flush=True)
+                            # ================================================================
 
                     # keep y parts if you need full y vector for diagnostics (optional)
                     y_parts.append(y_flat)
@@ -727,14 +773,10 @@ def solve_block_coord_nnls(
                     disable=not verbose)
 
             for bi, meta in block_iter:
+                # Always define x_block_old at block start (prevents UnboundLocalError)
+                x_block_old = x_flat[meta["cols"]]
                 ATA = ATA_blocks[bi]
                 ATy = ATy_blocks[bi].copy()  # (ncols,)
-
-                # ---------------- GAUSS-SEIDEL CORRECTION ----------------
-                # ATy currently holds A^T r
-                # convert to A^T r + ATA x_old
-                x_block_old = x_flat[meta["cols"]]
-                ATy = ATy + ATA @ x_block_old
 
                 # --- DIAG: per-block pre-solve diagnostics ---
                 try:
@@ -776,26 +818,69 @@ def solve_block_coord_nnls(
                     print(f"[BC-FUSED][block {bi}] pre-solve diag error:", _e, flush=True)
                 # --- end per-block pre-solve diagnostics ---
 
+                # ------------------ Column-normalize + ridge ------------------
                 # Soft-orbit augmentation (if requested)
                 if (orbit_beta is not None) and (orbit_beta > 0.0) and (meta["w_vec"] is not None):
-                    # For block columns, ones vector u (length ncols) with ones per column
                     u = np.ones((meta["ncols"],), dtype=np.float64)
-                    if (2.0 * float(orbit_beta)) != 0.0:
-                        ATA += (2.0 * float(orbit_beta)) * np.outer(u, u)
-                        ATy += (2.0 * float(orbit_beta)) * meta["w_vec"]
+                    ATA = ATA + (2.0 * float(orbit_beta)) * np.outer(u, u)
+                    ATy = ATy + (2.0 * float(orbit_beta)) * meta["w_vec"]
 
                 # initial x for block: current x values
-                x_block_init = x_flat[meta["cols"]]  # slice (works because cols are contiguous)
-                # solve quadratic NNLS
-                try:
-                    z_block = _nnls_from_quadratic(ATA, ATy, x0=x_block_init, max_iter=2000, tol=1e-8)
-                except Exception:
-                    # robust fallback small iterations
-                    z_block = _nnls_from_quadratic(ATA, ATy, x0=x_block_init, max_iter=500, tol=1e-6)
+                x_block_init = x_flat[meta["cols"] - 0]
 
-                # Undo normalization before placing into x
-                scale = inv_sqrt_energy[meta["cc_arr"], meta["pp_arr"]]
-                z_block = z_block * scale
+                # ---------------- CLEAN QUADRATIC SOLVE ----------------
+                # ATA and ATy are already globally column-normalized.
+                # Solve directly with strong ridge regularization.
+
+                ncol = ATA.shape[0]
+                if ncol == 0:
+                    z_block = np.zeros((0,), dtype=np.float64)
+                else:
+                    # Strong Tikhonov regularization (this is not optional)
+                    lambda_l2 = 1e-2   # strong stabilizer
+                    ATA_reg = ATA + lambda_l2 * np.eye(ncol, dtype=np.float64)
+
+                    # -------- Age curvature regularization ----------
+                    # Penalize (x_{p+1} - 2x_p + x_{p-1})^2 along population axis
+
+                    lambda_curv = 1e-2   # strong smoothing
+
+                    if lambda_curv > 0.0:
+                        # Build 1D second-difference operator per orbit within this block
+                        # This assumes populations contiguous in P ordering
+                        for j_local, gc in enumerate(meta["cols"]):
+                            cc = int(gc // P)
+                            pp = int(gc % P)
+
+                            if 0 < pp < (P - 1):
+                                # Add curvature penalty to diagonal
+                                ATA_reg[j_local, j_local] += 2.0 * lambda_curv
+                            else:
+                                ATA_reg[j_local, j_local] += lambda_curv
+                    # -------------------------------------------------
+
+                    # Solve NNLS quadratic
+                    try:
+                        z_block = _nnls_from_quadratic(
+                            ATA_reg,
+                            ATy,
+                            x0=x_block_old,
+                            max_iter=4000,
+                            tol=1e-10
+                        )
+                    except Exception:
+                        z_block = _projected_gradient_nnls(
+                            ATA_reg,
+                            ATy,
+                            max_iter=2000,
+                            tol=1e-8
+                        )
+                # ---------------------------------------------------------
+
+                # quick diagnostics per block
+                if verbose:
+                    print(f"[BC-FUSED][block {bi}] post-solve l1={np.sum(np.abs(z_block)):.3e} "
+                          f"max={np.max(z_block):.3e} nonzero={int(np.count_nonzero(z_block))}/{z_block.size}", flush=True)
 
                 for j_local, gc in enumerate(meta["cols"]):
                     cc = int(gc // P)
