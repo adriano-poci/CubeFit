@@ -55,6 +55,101 @@ def _init_worker(blas_threads: int):
     os.environ["MKL_NUM_THREADS"] = str(blas_threads)
     os.environ["NUMEXPR_NUM_THREADS"] = str(max(1, blas_threads // 2))
 
+# ------------------------------------------------------------------------------
+
+def _worker_reduced(
+    h5_path: str,
+    batch: list,
+    keep_idx,
+    active_idx: np.ndarray,
+    S_active: np.ndarray,
+    CP: int,
+    P: int,
+):
+    """
+    Worker to compute partial ATA_sub and ATy_sub for a batch of tiles,
+    given the active indices and their scaling S_active.
+    Returns tuple (ATA_loc, ATy_loc).
+    """
+    import numpy as _np
+
+    k = int(active_idx.size)
+    ATA_loc = _np.zeros((k, k), dtype=_np.float64)
+    ATy_loc = _np.zeros((k,), dtype=_np.float64)
+
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M = f["/HyperCube/models"]
+
+        for (s0, s1) in batch:
+            Yt = _np.asarray(DC[s0:s1, :], dtype=_np.float64, order="C")
+            if keep_idx is not None:
+                Yt = Yt[:, keep_idx]
+
+            Sblk = s1 - s0
+            Lk_loc = Yt.shape[1]
+
+            M_tile = _np.asarray(M[s0:s1, :, :, :], dtype=_np.float64, order="C")
+            if keep_idx is not None:
+                M_tile = M_tile[:, :, :, keep_idx]
+
+            # build A2 for this batch and active columns
+            A2 = _np.empty((Sblk * Lk_loc, k), dtype=_np.float64)
+            for j, gcol in enumerate(active_idx):
+                cc = int(gcol // P)
+                p = int(gcol % P)
+                A2[:, j] = M_tile[:, cc, p, :].reshape(Sblk * Lk_loc)
+
+            # scale columns by S_active and accumulate
+            A2 *= S_active[None, :]
+            ATA_loc += A2.T @ A2
+            ATy_loc += A2.T @ Yt.reshape(-1)
+
+    return ATA_loc, ATy_loc
+
+# ------------------------------------------------------------------------------
+
+def _worker_ATAz(
+    h5_path: str,
+    batch: list,
+    keep_idx,
+    x_cand: np.ndarray,
+    CP: int,
+):
+    """
+    Worker to compute partial ATAz for a batch of tiles.
+    Returns a 1D ndarray of length CP (partial ATAz).
+    Executed in a separate process (must be top-level).
+    """
+    import numpy as _np
+
+    partial = _np.zeros((CP,), dtype=_np.float64)
+
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M = f["/HyperCube/models"]
+
+        for (s0, s1) in batch:
+            Yt = _np.asarray(DC[s0:s1, :], dtype=_np.float64, order="C")
+            if keep_idx is not None:
+                Yt = Yt[:, keep_idx]
+
+            Sblk = s1 - s0
+            Lk_loc = Yt.shape[1]
+
+            M_tile = _np.asarray(M[s0:s1, :, :, :], dtype=_np.float64, order="C")
+            if keep_idx is not None:
+                M_tile = M_tile[:, :, :, keep_idx]
+
+            A2 = M_tile.transpose(0, 3, 1, 2).reshape(Sblk * Lk_loc, CP)
+
+            v = A2 @ x_cand
+            partial += A2.T @ v
+
+    return partial
+
+# ------------------------------------------------------------------------------
+
 # ----------------------------- Config ---------------------------------
 
 @dataclass
@@ -378,320 +473,6 @@ def _nnls_from_quadratic(
 
 # ------------------------------------------------------------------------------
 
-def solve_monolithic_nnls(
-    h5_path: str,
-    *,
-    orbit_weights: Optional[np.ndarray] = None,
-    orbit_beta: float = 0.0,
-    hard_project: bool = False,
-    apply_mask: bool = True,
-):
-    """
-    True monolithic NNLS baseline with orbit-weight support.
-
-    Streams tiles, assembles global normal equations ATA, ATy (in raw units),
-    optionally applies a soft orbit prior (orbit_beta) as an augmentation to
-    ATA/ATy, solves the global NNLS, and optionally applies a hard orbit
-    projection so per-orbit totals match the supplied prior.
-
-    Parameters
-    ----------
-    h5_path : str
-        Path to HDF5 dataset (same layout as the rest of this codebase).
-    orbit_weights : array-like or None
-        Prior per-orbit (C,) or per-column (C*P,) weights. If provided will be
-        canonicalized via _canon_orbit_weights().
-    orbit_beta : float
-        Soft prior strength. If >0, augments ATA/ATy per-orbit with a
-        rank-1 penalty in the style used elsewhere in the code.
-    hard_project : bool
-        If True and orbit_weights provided, apply the hard projection after
-        solving so each active orbit's sum matches the prior-scale (preserves
-        relative prior proportions).
-    apply_mask : bool
-        Whether to apply the wavelength mask (consistent with other routines).
-
-    Returns
-    -------
-    x : ndarray (C, P)
-        NNLS solution in original units.
-    stats : dict
-        Basic diagnostics: l1, nonzero_count, CP.
-    """
-    # Gather metadata
-    with open_h5(h5_path, role="reader") as f:
-        S, L = map(int, f["/DataCube"].shape)
-        _, C, P, Lm = map(int, f["/HyperCube/models"].shape)
-        if Lm != L:
-            raise RuntimeError("Model / data wavelength mismatch")
-        mask = cu._get_mask(f) if apply_mask else None
-        keep_idx = np.flatnonzero(mask) if mask is not None else None
-        chunks = f["/HyperCube/models"].chunks
-        s_tile = int(chunks[0]) if (chunks and chunks[0]) else 128
-
-    s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
-    CP = int(C * P)
-
-    # canonicalize orbit_weights (if any)
-    w_target = None
-    if orbit_weights is not None:
-        w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
-        # ensure finite and non-negative
-        w_target = np.nan_to_num(w_target, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        w_target[w_target < 0.0] = 0.0
-        # if prior sums to zero (degenerate) drop it
-        if np.sum(w_target) <= 0.0:
-            w_target = None
-
-    # allocate global normal equations (streamed assembly)
-    ATA = np.zeros((CP, CP), dtype=np.float64)
-    ATy = np.zeros((CP,), dtype=np.float64)
-
-    print(f"[MONO] assembling global normal equations CP={CP}", flush=True)
-    with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
-        M  = f["/HyperCube/models"]
-
-        # try to encourage chunk cache like other routines
-        try:
-            M.id.set_chunk_cache(1_000_003, 256 * 1024**2, 0.90)
-        except Exception:
-            pass
-
-        for (s0, s1) in tqdm(s_ranges, desc="[MONO] tiles", disable=False):
-            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
-            if keep_idx is not None:
-                Yt = Yt[:, keep_idx]
-
-            Sblk = s1 - s0
-            Lk = Yt.shape[1]
-
-            # load model tile: (Sblk, C, P, Lk)
-            A_block = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
-            if keep_idx is not None:
-                A_block = A_block[:, :, :, keep_idx]
-
-            # reshape to design (Sblk*Lk, CP)
-            A2 = A_block.transpose(0, 3, 1, 2).reshape(Sblk * Lk, CP)
-            y_flat = Yt.reshape(-1)
-
-            # accumulate normal equations (note: uses data y, not residual)
-            ATA += A2.T @ A2
-            ATy += A2.T @ y_flat
-
-            # update D_tot is optional here; the block solver tracks D_tot separately.
-            # If you need D_tot for later scaling, compute it separately.
-
-    # Optionally apply soft orbit prior as a rank-1 augmentation per-orbit.
-    # We follow the same per-orbit strategy: for orbit cc, for columns idx = cc*P:(cc+1)*P
-    if (w_target is not None) and (orbit_beta is not None) and (orbit_beta > 0.0):
-        print(f"[MONO] applying soft orbit prior (beta={orbit_beta})", flush=True)
-        for cc in range(C):
-            idx0 = cc * P
-            idx1 = idx0 + P
-            # u = ones (P,)
-            u = np.ones((P,), dtype=np.float64)
-            # ATA_block += 2*beta * (u outer u)
-            ATA[idx0:idx1, idx0:idx1] += (2.0 * float(orbit_beta)) * np.outer(u, u)
-            # ATy_block += 2*beta * w_cc  (distribute prior mass equally across populations)
-            # scale w_target[cc] into per-population vector (uniform across P)
-            ATy[idx0:idx1] += (2.0 * float(orbit_beta)) * float(w_target[cc]) * np.ones((P,), dtype=np.float64)
-
-    # small global stabilizer
-    ATA += 1e-12 * np.eye(CP, dtype=np.float64)
-
-    # Solve global quadratic NNLS
-    print("[MONO] solving global NNLS (projected-gradient on ATA/ATy)...", flush=True)
-    x_flat = _nnls_from_quadratic(ATA, ATy, x0=None, max_iter=5000, tol=1e-8)
-    x = x_flat.reshape(C, P)
-
-    # If requested, apply the same hard orbit projection used in block solver:
-    if (w_target is not None) and hard_project:
-        print("[MONO] applying hard orbit projection to match orbit_weights", flush=True)
-        known_zero_orbit = None
-        # attempt to read known_zero mask if present
-        try:
-            with open_h5(h5_path, role="reader") as f:
-                if "/HyperCube/known_zero_mask" in f:
-                    known_zero = np.asarray(f["/HyperCube/known_zero_mask"][...], dtype=bool)
-                    known_zero_orbit = np.all(known_zero, axis=1)
-                else:
-                    known_zero_orbit = np.zeros((C,), dtype=bool)
-        except Exception:
-            known_zero_orbit = np.zeros((C,), dtype=bool)
-
-        D_orbit = None  # not available here; treat active = ~known_zero_orbit
-        active = (~known_zero_orbit) if known_zero_orbit is not None else np.ones((C,), dtype=bool)
-        if np.any(active):
-            s = np.sum(x[active, :], axis=1)
-            w = np.asarray(w_target, dtype=np.float64)[active]
-            w_sum = float(np.sum(w)) if np.sum(w) > 0.0 else 1.0
-            alpha = float(np.sum(s)) / w_sum if (w_sum > 0.0) else 1.0
-            s_proj = alpha * w
-            ratio = s_proj / np.maximum(s, 1e-30)
-            x[active, :] *= ratio[:, None]
-            np.maximum(x, 0.0, out=x)
-
-    # Basic stats
-    l1 = float(np.sum(x))
-    nonzero = int(np.count_nonzero(x > 0))
-    stats = dict(l1=l1, nonzero=nonzero, CP=CP)
-
-    print(f"[MONO] done. l1={l1:.3e} nonzero={nonzero}/{CP}", flush=True)
-    return x, stats
-
-# ------------------------------------------------------------------------------
-
-def monolithic_nnls_scipy(
-    h5_path: str,
-    cfg: MPConfig,
-    *,
-    orbit_weights: Optional[np.ndarray] = None,
-    enforce_orbit_projection: bool = True,
-    use_scipy_if_available: bool = True,
-):
-    """
-    Build the full design matrix A and data vector y from the hypercube and
-    solve the global NNLS problem x = argmin_{x>=0} ||A x - y||^2.
-
-    Notes
-    -----
-    - This constructs A in memory. For your typical problem (C*P ~ 1k,
-      S*L ~ a few million), this is generally feasible but may require a
-      few tens of GB of RAM. The function prints an estimate and raises if
-      the estimated bytes exceed 120 GB as a safety guard.
-    - If SciPy's `nnls` is available it is used (single RHS). Otherwise the
-      function forms ATA/ATy and calls the quadratic NNLS fallback
-      `_nnls_from_quadratic`.
-    - If `enforce_orbit_projection` is True and `orbit_weights` is provided,
-      the solution is post-scaled per-orbit exactly as your epoch-end
-      hard projection does (so results are comparable).
-    - Returns (x, stats) where x is (C,P) ndarray, stats contains simple
-      diagnostics.
-    """
-    import math
-
-    t0 = time.perf_counter()
-    with open_h5(h5_path, role="reader") as f:
-        S, L = map(int, f["/DataCube"].shape)
-        _, C, P, Lm = map(int, f["/HyperCube/models"].shape)
-        if Lm != L:
-            raise RuntimeError("Model / data wavelength mismatch")
-        mask = cu._get_mask(f) if cfg.apply_mask else None
-        keep_idx = np.flatnonzero(mask) if mask is not None else None
-
-    Lk = int(keep_idx.size) if keep_idx is not None else int(L)
-    rows = int(S) * int(Lk)
-    cols = int(C) * int(P)
-
-    # memory estimate and safety guard (bytes)
-    est_bytes = rows * cols * np.dtype(np.float64).itemsize + rows * np.dtype(np.float64).itemsize
-    print(f"[MONO-NNLS] building A_full with shape ({rows},{cols}), "
-          f"estimated memory {est_bytes/1024**3:.2f} GiB", flush=True)
-    if est_bytes > 120 * 1024**3:
-        raise MemoryError(f"Estimated A+y memory {est_bytes/1024**3:.1f} GiB > 120 GiB; "
-                          "aborting to avoid OOM. Reduce problem size or use streaming solver.")
-
-    # allocate
-    A_full = np.empty((rows, cols), dtype=np.float64)
-    y_full = np.empty((rows,), dtype=np.float64)
-
-    # fill by streaming tiles (identical tiling logic to main solver)
-    s_tile = int(getattr(cfg, "s_tile_override", None) or 128)
-    s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
-
-    row_ptr = 0
-    with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
-        M = f["/HyperCube/models"]
-
-        try:
-            M.id.set_chunk_cache(cfg.dset_slots, cfg.dset_bytes, cfg.dset_w0)
-        except Exception:
-            pass
-
-        for (s0, s1) in tqdm(s_ranges, desc="[MONO-NNLS] build tiles", disable=not getattr(cfg, "verbose", True)):
-            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
-            if keep_idx is not None:
-                Yt = Yt[:, keep_idx]
-            Sblk = s1 - s0
-            Lk_loc = Yt.shape[1]
-
-            # read full model slice for this tile and reshape to (Sblk*Lk_loc, C*P)
-            # M[s0:s1, :, :, :] has shape (Sblk, C, P, L) -> keep_idx -> (Sblk, C, P, Lk)
-            M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
-            if keep_idx is not None:
-                M_tile = M_tile[:, :, :, keep_idx]
-            # transpose to (Sblk, Lk, C, P) then reshape to rows x cols
-            M_t = M_tile.transpose(0, 3, 1, 2).reshape(Sblk * Lk_loc, C * P)
-            nrows_loc = M_t.shape[0]
-
-            # place blocks
-            A_full[row_ptr:row_ptr + nrows_loc, :] = M_t
-            y_full[row_ptr:row_ptr + nrows_loc] = Yt.reshape(-1)
-
-            row_ptr += nrows_loc
-
-    if row_ptr != rows:
-        # should not happen, defensive
-        A_full = A_full[:row_ptr, :]
-        y_full = y_full[:row_ptr]
-        print(f"[MONO-NNLS] Warning: filled rows {row_ptr} != expected {rows}", flush=True)
-
-    # Solve NNLS (prefer SciPy)
-    x_flat = None
-    if use_scipy_if_available and _HAS_SCIPY_NNLS:
-        print("[MONO-NNLS] calling scipy.optimize.nnls on full A,y", flush=True)
-        x_flat, rnorm = _scipy_nnls(A_full, y_full)
-        x_flat = np.asarray(x_flat, dtype=np.float64).ravel()
-
-        # --- Direct SciPy diagnostics ---
-        l1 = float(np.sum(x_flat))
-        l2 = float(np.linalg.norm(x_flat))
-        nonzero = int(np.count_nonzero(x_flat > 0))
-        resid = float(np.linalg.norm(A_full @ x_flat - y_full))
-
-        print(f"[MONO-SCIPY] L1={l1:.6e}", flush=True)
-        print(f"[MONO-SCIPY] L2={l2:.6e}", flush=True)
-        print(f"[MONO-SCIPY] nonzero={nonzero}/{x_flat.size}", flush=True)
-        print(f"[MONO-SCIPY] residual_norm={resid:.6e}", flush=True)
-    else:
-        # fallback: form ATA / ATy and solve quadratic NNLS
-        print("[MONO-NNLS] SciPy nnls unavailable; falling back to ATA/ATy + quad NNLS", flush=True)
-        ATA = A_full.T @ A_full
-        ATy = A_full.T @ y_full
-        x_flat = _nnls_from_quadratic(ATA, ATy, x0=None,
-                                      max_iter=4000, tol=1e-8)
-
-    # reshape to (C,P)
-    x = x_flat.reshape((C, P)).copy()
-
-    # optional post-solve hard orbit projection (match existing pipeline)
-    if enforce_orbit_projection and (orbit_weights is not None):
-        w_t = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
-        if w_t is not None:
-            known_zero_orbit = np.all(np.zeros((C, P), dtype=bool), axis=1)  # no known_zero info here
-            # compute per-orbit sums on current x
-            s = np.sum(x, axis=1)
-            w = np.asarray(w_t, dtype=np.float64)
-            w_sum = float(np.sum(w))
-            alpha = float(np.sum(s)) / w_sum if (w_sum > 0.0) else 1.0
-            s_proj = alpha * w
-            ratio = s_proj / np.maximum(s, 1e-30)
-            x *= ratio[:, None]
-            np.maximum(x, 0.0, out=x)
-
-    elapsed = time.perf_counter() - t0
-    stats = dict(
-        elapsed_sec=float(elapsed),
-        rows=int(rows),
-        cols=int(cols),
-    )
-    print(f"[MONO-NNLS] done in {elapsed:.1f}s; x_sum={float(np.sum(x)):.3e}", flush=True)
-    return x, stats
-
-# ------------------------------------------------------------------------------
-
 def _streaming_active_set_nnls_via_streaming_matvec(
     h5_path: str,
     s_ranges: list,
@@ -727,51 +508,13 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     active = np.zeros((CP,), dtype=bool)
 
     # ------------------------------------------------------------
-    # Worker: compute ATAz partial for a batch of tiles
-    # ------------------------------------------------------------
-
-    def _worker_ATAz(args):
-        h5_path, batch, keep_idx, x_cand = args
-
-        from CubeFit.hdf5_manager import open_h5
-        import numpy as np
-
-        partial = np.zeros((CP,), dtype=np.float64)
-
-        with open_h5(h5_path, role="reader") as f:
-            DC = f["/DataCube"]
-            M = f["/HyperCube/models"]
-
-            for (s0, s1) in batch:
-                Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
-                if keep_idx is not None:
-                    Yt = Yt[:, keep_idx]
-
-                Sblk = s1 - s0
-                Lk_loc = Yt.shape[1]
-
-                M_tile = np.asarray(M[s0:s1, :, :, :],
-                                    dtype=np.float64, order="C")
-                if keep_idx is not None:
-                    M_tile = M_tile[:, :, :, keep_idx]
-
-                A2 = M_tile.transpose(0, 3, 1, 2).reshape(
-                    Sblk * Lk_loc, CP)
-
-                v = A2 @ x_cand
-                partial += A2.T @ v
-
-        return partial
-
-    # ------------------------------------------------------------
     # Helper: compute ATAz in parallel
     # ------------------------------------------------------------
 
     def _compute_ATAz_scaled(z_vec):
-
         x_cand = S_flat * z_vec
 
-        # --- batching tiles per worker ---
+        # batch s_ranges across workers
         n_workers = max(1, int(cfg.processes))
         batches = [[] for _ in range(n_workers)]
         for i, tile in enumerate(s_ranges):
@@ -779,6 +522,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
         ATAz = np.zeros((CP,), dtype=np.float64)
 
+        # use spawn context for HDF5 safety
         ctx = mp.get_context("spawn")
 
         with ProcessPoolExecutor(
@@ -789,15 +533,14 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         ) as exe:
 
             futures = [
-                exe.submit(_worker_ATAz,
-                           (h5_path, batch, keep_idx, x_cand))
+                exe.submit(_worker_ATAz, h5_path, batch, keep_idx, x_cand, CP)
                 for batch in batches if len(batch) > 0
             ]
 
             for f in tqdm(as_completed(futures),
-                          total=len(futures),
-                          desc="[MONO] ATAz tiles",
-                          leave=False):
+                        total=len(futures),
+                        desc="[MONO] ATAz tiles",
+                        leave=False):
                 ATAz += f.result()
 
         return S_flat * ATAz
@@ -843,49 +586,13 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         for i, tile in enumerate(s_ranges):
             batches[i % n_workers].append(tile)
 
-        def _worker_reduced(args):
-            h5_path, batch, keep_idx, active_idx, S_active = args
-            from CubeFit.hdf5_manager import open_h5
-            import numpy as np
+        ctx = mp.get_context("spawn")
 
-            k = len(active_idx)
-            ATA_loc = np.zeros((k, k), dtype=np.float64)
-            ATy_loc = np.zeros((k,), dtype=np.float64)
-
-            with open_h5(h5_path, role="reader") as f:
-                DC = f["/DataCube"]
-                M = f["/HyperCube/models"]
-
-                for (s0, s1) in batch:
-
-                    Yt = np.asarray(DC[s0:s1, :],
-                                    dtype=np.float64, order="C")
-                    if keep_idx is not None:
-                        Yt = Yt[:, keep_idx]
-
-                    Sblk = s1 - s0
-                    Lk_loc = Yt.shape[1]
-
-                    M_tile = np.asarray(M[s0:s1, :, :, :],
-                                        dtype=np.float64, order="C")
-                    if keep_idx is not None:
-                        M_tile = M_tile[:, :, :, keep_idx]
-
-                    A2 = np.empty((Sblk * Lk_loc, k),
-                                  dtype=np.float64)
-
-                    for j, gcol in enumerate(active_idx):
-                        cc = gcol // P
-                        p = gcol % P
-                        A2[:, j] = M_tile[:, cc, p, :].reshape(
-                            Sblk * Lk_loc)
-
-                    A2 *= S_active[None, :]
-
-                    ATA_loc += A2.T @ A2
-                    ATy_loc += A2.T @ Yt.reshape(-1)
-
-            return ATA_loc, ATy_loc
+        # assemble reduced normal by parallel tile batches using module-level worker
+        n_workers = max(1, int(cfg.processes))
+        batches = [[] for _ in range(n_workers)]
+        for i, tile in enumerate(s_ranges):
+            batches[i % n_workers].append(tile)
 
         ctx = mp.get_context("spawn")
 
@@ -897,16 +604,23 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         ) as exe:
 
             futures = [
-                exe.submit(_worker_reduced,
-                           (h5_path, batch, keep_idx,
-                            active_idx, S_active))
+                exe.submit(
+                    _worker_reduced,
+                    h5_path,
+                    batch,
+                    keep_idx,
+                    active_idx,
+                    S_active,
+                    CP,
+                    P,
+                )
                 for batch in batches if len(batch) > 0
             ]
 
             for f in tqdm(as_completed(futures),
-                          total=len(futures),
-                          desc="[MONO] reduced tiles",
-                          leave=False):
+                        total=len(futures),
+                        desc="[MONO] reduced tiles",
+                        leave=False):
                 ATA_loc, ATy_loc = f.result()
                 ATA_sub += ATA_loc
                 ATy_sub += ATy_loc

@@ -69,7 +69,7 @@ from CubeFit.hypercube_builder import build_hypercube
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
 from CubeFit.kaczmarz_solver import solve_global_kaczmarz, SolverCfg
 from CubeFit.block_coord_nnls import (
-    MPConfig, solve_block_coord_nnls, solve_monolithic_nnls, monolithic_nnls_scipy)
+    MPConfig, solve_block_coord_nnls)
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
 )
