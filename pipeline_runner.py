@@ -69,7 +69,7 @@ from CubeFit.hypercube_builder import build_hypercube
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
 from CubeFit.kaczmarz_solver import solve_global_kaczmarz, SolverCfg
 from CubeFit.block_coord_nnls import (
-    MPConfig, solve_block_coord_nnls)
+    MPConfig, solve_block_coord_nnls, solve_monolithic_nnls, monolithic_nnls_scipy)
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
 )
@@ -1205,38 +1205,16 @@ class PipelineRunner:
                     orbit_weights=orbit_weights,
                     x0=x0_effective,
                     tracker=tracker,
-                )
+                    monolithic_max_active=500)
+                # x_solver, stats = solve_monolithic_nnls(self.h5_path,
+                    # orbit_weights=orbit_weights, orbit_beta=0.0,
+                    # hard_project=True)
+                # cfg = MPConfig(epochs=1, processes=1, blas_threads=1, apply_mask=True)
+                # x_solver, stats = monolithic_nnls_scipy(self.h5_path, cfg,
+                #     orbit_weights=orbit_weights,
+                #     enforce_orbit_projection=True)
                 # Use active set from SPG (rows only)
                 active_orbits = stats.get("active_orbits", None)
-                
-                # # ------------------------------------------------------------
-                # # Final Kaczmarz NNLS polish (true row-action)
-                # # ------------------------------------------------------------
-                # logger.log("[Pipeline] Starting Kaczmarz NNLS polish...")
-
-                # C = self.nComp
-                # P = self.nPop
-
-
-                # logger.log(f"PRE-KACZ ||x_solver|| = {float(np.linalg.norm(x_solver))}")
-
-                # x_solver = solve_kaczmarz_nnls(
-                #     self.h5_path,
-                #     x_solver,
-                #     active_orbits=active_orbits,
-                #     orbit_weights=orbit_weights,
-                #     orbit_beta=float(os.environ.get("CUBEFIT_ORBIT_BETA", "0.2")),
-                #     max_epochs=int(os.environ.get("CUBEFIT_KACZMARZ_EPOCHS", "1")),
-                #     tol_kkt=float(os.environ.get("CUBEFIT_KACZMARZ_KKT", "1e-6")),
-                #     shuffle_spaxels=True,
-                #     apply_mask=bool(reader_apply_mask),
-                #     use_lambda_weights=True,
-                #     project_nonneg=cfg.project_nonneg,
-                #     tracker=tracker,
-                # )
-                # logger.log(f"POST-KACZ ||x_solver|| = {float(np.linalg.norm(x_solver))}")
-
-                # logger.log("[Pipeline] Kaczmarz NNLS polish complete.")
 
         finally:
             try:
@@ -1267,8 +1245,8 @@ class PipelineRunner:
 
             f_wr["/X_global"].attrs["layout"] = "C_P"
             f_wr["/X_global"].attrs["P"] = x_solver.shape[1]
-            f_wr["/X_global"].attrs["active_orbits"] = np.asarray(active_orbits,
-                dtype=int)
+            # f_wr["/X_global"].attrs["active_orbits"] = np.asarray(active_orbits,
+                # dtype=int)
 
             if "known_zero_mask" in stats:
                 print("[pipeline] writing KNOWN_ZERO mask to /HyperCube/known_zero_mask",

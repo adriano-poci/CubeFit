@@ -38,7 +38,7 @@ try:
     _HAS_SCIPY_NNLS = True
 except Exception:
     _HAS_SCIPY_NNLS = False
-
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 import numpy as np
 import h5py
@@ -46,6 +46,14 @@ import h5py
 from CubeFit.hdf5_manager import open_h5
 from CubeFit import cube_utils as cu
 from CubeFit.hypercube_builder import read_global_column_energy
+
+
+def _init_worker(blas_threads: int):
+    # called once per process; set BLAS env vars
+    os.environ["OMP_NUM_THREADS"] = str(blas_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
+    os.environ["MKL_NUM_THREADS"] = str(blas_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(max(1, blas_threads // 2))
 
 # ----------------------------- Config ---------------------------------
 
@@ -370,6 +378,557 @@ def _nnls_from_quadratic(
 
 # ------------------------------------------------------------------------------
 
+def solve_monolithic_nnls(
+    h5_path: str,
+    *,
+    orbit_weights: Optional[np.ndarray] = None,
+    orbit_beta: float = 0.0,
+    hard_project: bool = False,
+    apply_mask: bool = True,
+):
+    """
+    True monolithic NNLS baseline with orbit-weight support.
+
+    Streams tiles, assembles global normal equations ATA, ATy (in raw units),
+    optionally applies a soft orbit prior (orbit_beta) as an augmentation to
+    ATA/ATy, solves the global NNLS, and optionally applies a hard orbit
+    projection so per-orbit totals match the supplied prior.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to HDF5 dataset (same layout as the rest of this codebase).
+    orbit_weights : array-like or None
+        Prior per-orbit (C,) or per-column (C*P,) weights. If provided will be
+        canonicalized via _canon_orbit_weights().
+    orbit_beta : float
+        Soft prior strength. If >0, augments ATA/ATy per-orbit with a
+        rank-1 penalty in the style used elsewhere in the code.
+    hard_project : bool
+        If True and orbit_weights provided, apply the hard projection after
+        solving so each active orbit's sum matches the prior-scale (preserves
+        relative prior proportions).
+    apply_mask : bool
+        Whether to apply the wavelength mask (consistent with other routines).
+
+    Returns
+    -------
+    x : ndarray (C, P)
+        NNLS solution in original units.
+    stats : dict
+        Basic diagnostics: l1, nonzero_count, CP.
+    """
+    # Gather metadata
+    with open_h5(h5_path, role="reader") as f:
+        S, L = map(int, f["/DataCube"].shape)
+        _, C, P, Lm = map(int, f["/HyperCube/models"].shape)
+        if Lm != L:
+            raise RuntimeError("Model / data wavelength mismatch")
+        mask = cu._get_mask(f) if apply_mask else None
+        keep_idx = np.flatnonzero(mask) if mask is not None else None
+        chunks = f["/HyperCube/models"].chunks
+        s_tile = int(chunks[0]) if (chunks and chunks[0]) else 128
+
+    s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
+    CP = int(C * P)
+
+    # canonicalize orbit_weights (if any)
+    w_target = None
+    if orbit_weights is not None:
+        w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
+        # ensure finite and non-negative
+        w_target = np.nan_to_num(w_target, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        w_target[w_target < 0.0] = 0.0
+        # if prior sums to zero (degenerate) drop it
+        if np.sum(w_target) <= 0.0:
+            w_target = None
+
+    # allocate global normal equations (streamed assembly)
+    ATA = np.zeros((CP, CP), dtype=np.float64)
+    ATy = np.zeros((CP,), dtype=np.float64)
+
+    print(f"[MONO] assembling global normal equations CP={CP}", flush=True)
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M  = f["/HyperCube/models"]
+
+        # try to encourage chunk cache like other routines
+        try:
+            M.id.set_chunk_cache(1_000_003, 256 * 1024**2, 0.90)
+        except Exception:
+            pass
+
+        for (s0, s1) in tqdm(s_ranges, desc="[MONO] tiles", disable=False):
+            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
+            if keep_idx is not None:
+                Yt = Yt[:, keep_idx]
+
+            Sblk = s1 - s0
+            Lk = Yt.shape[1]
+
+            # load model tile: (Sblk, C, P, Lk)
+            A_block = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
+            if keep_idx is not None:
+                A_block = A_block[:, :, :, keep_idx]
+
+            # reshape to design (Sblk*Lk, CP)
+            A2 = A_block.transpose(0, 3, 1, 2).reshape(Sblk * Lk, CP)
+            y_flat = Yt.reshape(-1)
+
+            # accumulate normal equations (note: uses data y, not residual)
+            ATA += A2.T @ A2
+            ATy += A2.T @ y_flat
+
+            # update D_tot is optional here; the block solver tracks D_tot separately.
+            # If you need D_tot for later scaling, compute it separately.
+
+    # Optionally apply soft orbit prior as a rank-1 augmentation per-orbit.
+    # We follow the same per-orbit strategy: for orbit cc, for columns idx = cc*P:(cc+1)*P
+    if (w_target is not None) and (orbit_beta is not None) and (orbit_beta > 0.0):
+        print(f"[MONO] applying soft orbit prior (beta={orbit_beta})", flush=True)
+        for cc in range(C):
+            idx0 = cc * P
+            idx1 = idx0 + P
+            # u = ones (P,)
+            u = np.ones((P,), dtype=np.float64)
+            # ATA_block += 2*beta * (u outer u)
+            ATA[idx0:idx1, idx0:idx1] += (2.0 * float(orbit_beta)) * np.outer(u, u)
+            # ATy_block += 2*beta * w_cc  (distribute prior mass equally across populations)
+            # scale w_target[cc] into per-population vector (uniform across P)
+            ATy[idx0:idx1] += (2.0 * float(orbit_beta)) * float(w_target[cc]) * np.ones((P,), dtype=np.float64)
+
+    # small global stabilizer
+    ATA += 1e-12 * np.eye(CP, dtype=np.float64)
+
+    # Solve global quadratic NNLS
+    print("[MONO] solving global NNLS (projected-gradient on ATA/ATy)...", flush=True)
+    x_flat = _nnls_from_quadratic(ATA, ATy, x0=None, max_iter=5000, tol=1e-8)
+    x = x_flat.reshape(C, P)
+
+    # If requested, apply the same hard orbit projection used in block solver:
+    if (w_target is not None) and hard_project:
+        print("[MONO] applying hard orbit projection to match orbit_weights", flush=True)
+        known_zero_orbit = None
+        # attempt to read known_zero mask if present
+        try:
+            with open_h5(h5_path, role="reader") as f:
+                if "/HyperCube/known_zero_mask" in f:
+                    known_zero = np.asarray(f["/HyperCube/known_zero_mask"][...], dtype=bool)
+                    known_zero_orbit = np.all(known_zero, axis=1)
+                else:
+                    known_zero_orbit = np.zeros((C,), dtype=bool)
+        except Exception:
+            known_zero_orbit = np.zeros((C,), dtype=bool)
+
+        D_orbit = None  # not available here; treat active = ~known_zero_orbit
+        active = (~known_zero_orbit) if known_zero_orbit is not None else np.ones((C,), dtype=bool)
+        if np.any(active):
+            s = np.sum(x[active, :], axis=1)
+            w = np.asarray(w_target, dtype=np.float64)[active]
+            w_sum = float(np.sum(w)) if np.sum(w) > 0.0 else 1.0
+            alpha = float(np.sum(s)) / w_sum if (w_sum > 0.0) else 1.0
+            s_proj = alpha * w
+            ratio = s_proj / np.maximum(s, 1e-30)
+            x[active, :] *= ratio[:, None]
+            np.maximum(x, 0.0, out=x)
+
+    # Basic stats
+    l1 = float(np.sum(x))
+    nonzero = int(np.count_nonzero(x > 0))
+    stats = dict(l1=l1, nonzero=nonzero, CP=CP)
+
+    print(f"[MONO] done. l1={l1:.3e} nonzero={nonzero}/{CP}", flush=True)
+    return x, stats
+
+# ------------------------------------------------------------------------------
+
+def monolithic_nnls_scipy(
+    h5_path: str,
+    cfg: MPConfig,
+    *,
+    orbit_weights: Optional[np.ndarray] = None,
+    enforce_orbit_projection: bool = True,
+    use_scipy_if_available: bool = True,
+):
+    """
+    Build the full design matrix A and data vector y from the hypercube and
+    solve the global NNLS problem x = argmin_{x>=0} ||A x - y||^2.
+
+    Notes
+    -----
+    - This constructs A in memory. For your typical problem (C*P ~ 1k,
+      S*L ~ a few million), this is generally feasible but may require a
+      few tens of GB of RAM. The function prints an estimate and raises if
+      the estimated bytes exceed 120 GB as a safety guard.
+    - If SciPy's `nnls` is available it is used (single RHS). Otherwise the
+      function forms ATA/ATy and calls the quadratic NNLS fallback
+      `_nnls_from_quadratic`.
+    - If `enforce_orbit_projection` is True and `orbit_weights` is provided,
+      the solution is post-scaled per-orbit exactly as your epoch-end
+      hard projection does (so results are comparable).
+    - Returns (x, stats) where x is (C,P) ndarray, stats contains simple
+      diagnostics.
+    """
+    import math
+
+    t0 = time.perf_counter()
+    with open_h5(h5_path, role="reader") as f:
+        S, L = map(int, f["/DataCube"].shape)
+        _, C, P, Lm = map(int, f["/HyperCube/models"].shape)
+        if Lm != L:
+            raise RuntimeError("Model / data wavelength mismatch")
+        mask = cu._get_mask(f) if cfg.apply_mask else None
+        keep_idx = np.flatnonzero(mask) if mask is not None else None
+
+    Lk = int(keep_idx.size) if keep_idx is not None else int(L)
+    rows = int(S) * int(Lk)
+    cols = int(C) * int(P)
+
+    # memory estimate and safety guard (bytes)
+    est_bytes = rows * cols * np.dtype(np.float64).itemsize + rows * np.dtype(np.float64).itemsize
+    print(f"[MONO-NNLS] building A_full with shape ({rows},{cols}), "
+          f"estimated memory {est_bytes/1024**3:.2f} GiB", flush=True)
+    if est_bytes > 120 * 1024**3:
+        raise MemoryError(f"Estimated A+y memory {est_bytes/1024**3:.1f} GiB > 120 GiB; "
+                          "aborting to avoid OOM. Reduce problem size or use streaming solver.")
+
+    # allocate
+    A_full = np.empty((rows, cols), dtype=np.float64)
+    y_full = np.empty((rows,), dtype=np.float64)
+
+    # fill by streaming tiles (identical tiling logic to main solver)
+    s_tile = int(getattr(cfg, "s_tile_override", None) or 128)
+    s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
+
+    row_ptr = 0
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M = f["/HyperCube/models"]
+
+        try:
+            M.id.set_chunk_cache(cfg.dset_slots, cfg.dset_bytes, cfg.dset_w0)
+        except Exception:
+            pass
+
+        for (s0, s1) in tqdm(s_ranges, desc="[MONO-NNLS] build tiles", disable=not getattr(cfg, "verbose", True)):
+            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
+            if keep_idx is not None:
+                Yt = Yt[:, keep_idx]
+            Sblk = s1 - s0
+            Lk_loc = Yt.shape[1]
+
+            # read full model slice for this tile and reshape to (Sblk*Lk_loc, C*P)
+            # M[s0:s1, :, :, :] has shape (Sblk, C, P, L) -> keep_idx -> (Sblk, C, P, Lk)
+            M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
+            if keep_idx is not None:
+                M_tile = M_tile[:, :, :, keep_idx]
+            # transpose to (Sblk, Lk, C, P) then reshape to rows x cols
+            M_t = M_tile.transpose(0, 3, 1, 2).reshape(Sblk * Lk_loc, C * P)
+            nrows_loc = M_t.shape[0]
+
+            # place blocks
+            A_full[row_ptr:row_ptr + nrows_loc, :] = M_t
+            y_full[row_ptr:row_ptr + nrows_loc] = Yt.reshape(-1)
+
+            row_ptr += nrows_loc
+
+    if row_ptr != rows:
+        # should not happen, defensive
+        A_full = A_full[:row_ptr, :]
+        y_full = y_full[:row_ptr]
+        print(f"[MONO-NNLS] Warning: filled rows {row_ptr} != expected {rows}", flush=True)
+
+    # Solve NNLS (prefer SciPy)
+    x_flat = None
+    if use_scipy_if_available and _HAS_SCIPY_NNLS:
+        print("[MONO-NNLS] calling scipy.optimize.nnls on full A,y", flush=True)
+        x_flat, rnorm = _scipy_nnls(A_full, y_full)
+        x_flat = np.asarray(x_flat, dtype=np.float64).ravel()
+
+        # --- Direct SciPy diagnostics ---
+        l1 = float(np.sum(x_flat))
+        l2 = float(np.linalg.norm(x_flat))
+        nonzero = int(np.count_nonzero(x_flat > 0))
+        resid = float(np.linalg.norm(A_full @ x_flat - y_full))
+
+        print(f"[MONO-SCIPY] L1={l1:.6e}", flush=True)
+        print(f"[MONO-SCIPY] L2={l2:.6e}", flush=True)
+        print(f"[MONO-SCIPY] nonzero={nonzero}/{x_flat.size}", flush=True)
+        print(f"[MONO-SCIPY] residual_norm={resid:.6e}", flush=True)
+    else:
+        # fallback: form ATA / ATy and solve quadratic NNLS
+        print("[MONO-NNLS] SciPy nnls unavailable; falling back to ATA/ATy + quad NNLS", flush=True)
+        ATA = A_full.T @ A_full
+        ATy = A_full.T @ y_full
+        x_flat = _nnls_from_quadratic(ATA, ATy, x0=None,
+                                      max_iter=4000, tol=1e-8)
+
+    # reshape to (C,P)
+    x = x_flat.reshape((C, P)).copy()
+
+    # optional post-solve hard orbit projection (match existing pipeline)
+    if enforce_orbit_projection and (orbit_weights is not None):
+        w_t = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
+        if w_t is not None:
+            known_zero_orbit = np.all(np.zeros((C, P), dtype=bool), axis=1)  # no known_zero info here
+            # compute per-orbit sums on current x
+            s = np.sum(x, axis=1)
+            w = np.asarray(w_t, dtype=np.float64)
+            w_sum = float(np.sum(w))
+            alpha = float(np.sum(s)) / w_sum if (w_sum > 0.0) else 1.0
+            s_proj = alpha * w
+            ratio = s_proj / np.maximum(s, 1e-30)
+            x *= ratio[:, None]
+            np.maximum(x, 0.0, out=x)
+
+    elapsed = time.perf_counter() - t0
+    stats = dict(
+        elapsed_sec=float(elapsed),
+        rows=int(rows),
+        cols=int(cols),
+    )
+    print(f"[MONO-NNLS] done in {elapsed:.1f}s; x_sum={float(np.sum(x)):.3e}", flush=True)
+    return x, stats
+
+# ------------------------------------------------------------------------------
+
+def _streaming_active_set_nnls_via_streaming_matvec(
+    h5_path: str,
+    s_ranges: list,
+    keep_idx,
+    ATy_flat: np.ndarray,
+    inv_sqrt_energy_flat: np.ndarray,
+    C: int,
+    P: int,
+    *,
+    cfg: MPConfig,
+    max_active: int = 1000,
+    tol_grad: float = 1e-8,
+    max_iter: int = 5000,
+):
+    """
+    TRUE MONOLITHIC streaming active-set NNLS.
+
+    Hybrid parallel:
+        - Process-level parallel over tile batches
+        - BLAS threads inside each worker
+        - Parent reduces partial results
+
+    No per-orbit approximation.
+    No stored ATA.
+    Exact streaming monolithic math.
+    """
+
+    CP = int(C * P)
+    S_flat = np.asarray(inv_sqrt_energy_flat, dtype=np.float64).ravel()
+    ATy_scaled = S_flat * ATy_flat
+
+    z = np.zeros((CP,), dtype=np.float64)
+    active = np.zeros((CP,), dtype=bool)
+
+    # ------------------------------------------------------------
+    # Worker: compute ATAz partial for a batch of tiles
+    # ------------------------------------------------------------
+
+    def _worker_ATAz(args):
+        h5_path, batch, keep_idx, x_cand = args
+
+        from CubeFit.hdf5_manager import open_h5
+        import numpy as np
+
+        partial = np.zeros((CP,), dtype=np.float64)
+
+        with open_h5(h5_path, role="reader") as f:
+            DC = f["/DataCube"]
+            M = f["/HyperCube/models"]
+
+            for (s0, s1) in batch:
+                Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
+                if keep_idx is not None:
+                    Yt = Yt[:, keep_idx]
+
+                Sblk = s1 - s0
+                Lk_loc = Yt.shape[1]
+
+                M_tile = np.asarray(M[s0:s1, :, :, :],
+                                    dtype=np.float64, order="C")
+                if keep_idx is not None:
+                    M_tile = M_tile[:, :, :, keep_idx]
+
+                A2 = M_tile.transpose(0, 3, 1, 2).reshape(
+                    Sblk * Lk_loc, CP)
+
+                v = A2 @ x_cand
+                partial += A2.T @ v
+
+        return partial
+
+    # ------------------------------------------------------------
+    # Helper: compute ATAz in parallel
+    # ------------------------------------------------------------
+
+    def _compute_ATAz_scaled(z_vec):
+
+        x_cand = S_flat * z_vec
+
+        # --- batching tiles per worker ---
+        n_workers = max(1, int(cfg.processes))
+        batches = [[] for _ in range(n_workers)]
+        for i, tile in enumerate(s_ranges):
+            batches[i % n_workers].append(tile)
+
+        ATAz = np.zeros((CP,), dtype=np.float64)
+
+        ctx = mp.get_context("spawn")
+
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=ctx,
+            initializer=_init_worker,
+            initargs=(cfg.blas_threads,)
+        ) as exe:
+
+            futures = [
+                exe.submit(_worker_ATAz,
+                           (h5_path, batch, keep_idx, x_cand))
+                for batch in batches if len(batch) > 0
+            ]
+
+            for f in tqdm(as_completed(futures),
+                          total=len(futures),
+                          desc="[MONO] ATAz tiles",
+                          leave=False):
+                ATAz += f.result()
+
+        return S_flat * ATAz
+
+    # ------------------------------------------------------------
+    # Active-set loop
+    # ------------------------------------------------------------
+
+    for it in range(max_iter):
+
+        ATAz_scaled = _compute_ATAz_scaled(z)
+        grad = ATy_scaled - ATAz_scaled
+
+        not_active = np.where(~active)[0]
+        if not_active.size == 0:
+            break
+
+        gvals = grad[not_active]
+        idx = not_active[np.argmax(gvals)]
+        if gvals.max() <= tol_grad:
+            break
+
+        active[idx] = True
+
+        if np.count_nonzero(active) > max_active:
+            active[idx] = False
+            break
+
+        # --------------------------------------------------------
+        # Reduced solve (parallel tile streaming)
+        # --------------------------------------------------------
+
+        active_idx = np.nonzero(active)[0]
+        k = len(active_idx)
+        S_active = S_flat[active_idx]
+
+        ATA_sub = np.zeros((k, k), dtype=np.float64)
+        ATy_sub = np.zeros((k,), dtype=np.float64)
+
+        # tile batching
+        n_workers = max(1, int(cfg.processes))
+        batches = [[] for _ in range(n_workers)]
+        for i, tile in enumerate(s_ranges):
+            batches[i % n_workers].append(tile)
+
+        def _worker_reduced(args):
+            h5_path, batch, keep_idx, active_idx, S_active = args
+            from CubeFit.hdf5_manager import open_h5
+            import numpy as np
+
+            k = len(active_idx)
+            ATA_loc = np.zeros((k, k), dtype=np.float64)
+            ATy_loc = np.zeros((k,), dtype=np.float64)
+
+            with open_h5(h5_path, role="reader") as f:
+                DC = f["/DataCube"]
+                M = f["/HyperCube/models"]
+
+                for (s0, s1) in batch:
+
+                    Yt = np.asarray(DC[s0:s1, :],
+                                    dtype=np.float64, order="C")
+                    if keep_idx is not None:
+                        Yt = Yt[:, keep_idx]
+
+                    Sblk = s1 - s0
+                    Lk_loc = Yt.shape[1]
+
+                    M_tile = np.asarray(M[s0:s1, :, :, :],
+                                        dtype=np.float64, order="C")
+                    if keep_idx is not None:
+                        M_tile = M_tile[:, :, :, keep_idx]
+
+                    A2 = np.empty((Sblk * Lk_loc, k),
+                                  dtype=np.float64)
+
+                    for j, gcol in enumerate(active_idx):
+                        cc = gcol // P
+                        p = gcol % P
+                        A2[:, j] = M_tile[:, cc, p, :].reshape(
+                            Sblk * Lk_loc)
+
+                    A2 *= S_active[None, :]
+
+                    ATA_loc += A2.T @ A2
+                    ATy_loc += A2.T @ Yt.reshape(-1)
+
+            return ATA_loc, ATy_loc
+
+        ctx = mp.get_context("spawn")
+
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=ctx,
+            initializer=_init_worker,
+            initargs=(cfg.blas_threads,)
+        ) as exe:
+
+            futures = [
+                exe.submit(_worker_reduced,
+                           (h5_path, batch, keep_idx,
+                            active_idx, S_active))
+                for batch in batches if len(batch) > 0
+            ]
+
+            for f in tqdm(as_completed(futures),
+                          total=len(futures),
+                          desc="[MONO] reduced tiles",
+                          leave=False):
+                ATA_loc, ATy_loc = f.result()
+                ATA_sub += ATA_loc
+                ATy_sub += ATy_loc
+
+        ATA_sub += 1e-12 * np.eye(k)
+
+        try:
+            z_sub = np.linalg.solve(ATA_sub, ATy_sub)
+        except np.linalg.LinAlgError:
+            z_sub = _nnls_from_quadratic(
+                ATA_sub, ATy_sub,
+                max_iter=2000, tol=1e-8
+            )
+
+        z[active_idx] = z_sub
+        z[z < 0.0] = 0.0
+        active[z == 0.0] = False
+
+    return S_flat * z
+
+# ------------------------------------------------------------------------------
+
 def solve_block_coord_nnls(
     h5_path: str,
     cfg: MPConfig,
@@ -378,7 +937,7 @@ def solve_block_coord_nnls(
     x0: Optional[np.ndarray] = None,
     tracker: Optional[object] = None,
     block_size: Optional[int] = None,
-    orbit_beta: float = 0.0,   # soft prior strength (per-request)
+    monolithic_max_active: int = 1000,
     ):
     """
     Fused single-pass block-coordinate NNLS solver (BLAS-friendly).
@@ -507,394 +1066,102 @@ def solve_block_coord_nnls(
         for ep in range(cfg.epochs):
             print(f"[BC-FUSED] epoch {ep+1}/{cfg.epochs}", flush=True)
 
-            # Prepare accumulators for this epoch
             # D_tot per column (C,P)
             D_tot = np.zeros((C, P), dtype=np.float64)
-            # ATA and ATy per block
-            ATA_blocks = {bi: np.zeros((meta["ncols"], meta["ncols"]), dtype=np.float64)
-                          for bi, meta in block_meta.items()}
-            ATy_blocks = {bi: np.zeros((meta["ncols"],), dtype=np.float64)
-                          for bi, meta in block_meta.items()}
 
-            # Build a quick lookup: for each orbit cc, which blocks & local indices
-            # orbit_block_map[cc] = list of (bi, local_col_indices, p_indices)
-            orbit_block_map = {cc: [] for cc in range(C)}
-            for bi, meta in block_meta.items():
-                cols = meta["cols"]
-                # for each unique orbit in this block, collect local indices and p's
-                unique_ccs = {}
-                for local_j, gc in enumerate(cols):
-                    cc = int(gc // P)
-                    p = int(gc % P)
-                    if cc not in unique_ccs:
-                        unique_ccs[cc] = {"local": [], "p": []}
-                    unique_ccs[cc]["local"].append(local_j)
-                    unique_ccs[cc]["p"].append(p)
-                for cc, d in unique_ccs.items():
-                    orbit_block_map[cc].append((bi, np.asarray(d["local"], dtype=np.int64), np.asarray(d["p"], dtype=np.int64)))
-
-            # We'll stream tiles once: compute yhat, D_tot, and update ATA/ATy
+            # ---------- single streaming pass: build ATy_flat & D_tot -------
+            ATy_flat = np.zeros((CP,), dtype=np.float64)
             y_parts = []
             with open_h5(h5_path, role="reader") as f:
                 DC = f["/DataCube"]
                 M  = f["/HyperCube/models"]
-
                 try:
-                    M.id.set_chunk_cache(cfg.dset_slots, cfg.dset_bytes, cfg.dset_w0)
+                    M.id.set_chunk_cache(cfg.dset_slots, cfg.dset_bytes,
+                        cfg.dset_w0)
                 except Exception:
                     pass
 
-                # tile loop
                 tile_iter = s_ranges
                 if verbose and (len(s_ranges) > 1):
-                    tile_iter = tqdm(s_ranges, desc=f"[BC-FUSED] tiles ep{ep+1}", disable=not verbose)
+                    tile_iter = tqdm(s_ranges,
+                        desc=f"[BC-FUSED] tiles ep{ep+1}",
+                        disable=not verbose)
 
                 for (s0, s1) in tile_iter:
-                    Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
+                    Yt = np.asarray(DC[s0:s1, :], dtype=np.float64,
+                                    order="C")
                     if keep_idx is not None:
                         Yt = Yt[:, keep_idx]
                     Sblk = s1 - s0
                     Lk = Yt.shape[1]
+
+                    # accumulate prediction for diagnostics (warm-start)
                     yhat_tile = np.zeros((Sblk, Lk), dtype=np.float64)
+                    # read model tile (Sblk, C, P, Lk)
+                    M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64,
+                        order="C")
+                    if keep_idx is not None:
+                        M_tile = M_tile[:, :, :, keep_idx]
 
-                    # cache A_cc for this tile for reuse (only for cc that appear in any block)
-                    A_cache = {}
+                    # compute D_tot contributions (per-column energy)
+                    # sum over Sblk and wavelength dims
+                    # M_tile: (Sblk, C, P, Lk)
+                    D_tot += np.sum(M_tile * M_tile, axis=(0, 3))
 
-                    # 1) build yhat_tile & D_tot incrementally
-                    for cc in range(C):
-                        # skip if entire orbit marked known-zero for speed
-                        if np.all(known_zero[cc, :]):
-                            continue
-
-                        A_cc = np.asarray(M[s0:s1, cc, :, :], dtype=np.float64, order="C")  # (Sblk, P, L)
-                        if keep_idx is not None:
-                            A_cc = A_cc[:, :, keep_idx]  # (Sblk, P, Lk)
-
-                        # accumulate prediction
-                        # x[cc] shape (P,), A_cc shape (Sblk, P, Lk) -> x[cc] @ A_cc -> (Sblk, Lk)
-                        yhat_tile += x[cc] @ A_cc
-
-                        # accumulate curvature
-                        D_tot[cc] += np.sum(A_cc * A_cc, axis=(0, 2))
-
-                        # store slices only if this orbit has columns in at least one block
-                        if orbit_block_map.get(cc):
-                            A_cache[cc] = A_cc  # keep reference for block contributions
-
-                    # residual for this tile (flattened)
+                    # build A2_tile once for ATy accumulation
+                    A2_tile = M_tile.transpose(0, 3, 1, 2).reshape(
+                        Sblk * Lk, CP)
                     y_flat = Yt.reshape(-1)
-                    yhat_flat = yhat_tile.reshape(-1)
-                    r_flat = y_flat - yhat_flat
 
-                    # --- DIAG: tile-level numeric checks & timings ---
+                    # accumulate ATy (uses data y, not residual)
+                    ATy_flat += A2_tile.T @ y_flat
+
+                    # diagnostics (same as before)
                     try:
-                        # basic shapes and norms
                         yf_norm = float(np.linalg.norm(y_flat)) if y_flat.size > 0 else 0.0
-                        yhatf_norm = float(np.linalg.norm(yhat_flat)) if yhat_flat.size > 0 else 0.0
-                        r_norm = float(np.linalg.norm(r_flat)) if r_flat.size > 0 else 0.0
+                        yhatf_norm = float(np.linalg.norm(yhat_tile)) if yhat_tile.size > 0 else 0.0
+                        r_norm = float(np.linalg.norm(y_flat - yhat_tile.reshape(-1))) if y_flat.size > 0 else 0.0
 
                         nnans = int(np.count_nonzero(~np.isfinite(y_flat)))
-                        nnans += int(np.count_nonzero(~np.isfinite(yhat_flat)))
-                        nnans += int(np.count_nonzero(~np.isfinite(r_flat)))
+                        nnans += int(np.count_nonzero(~np.isfinite(yhat_tile)))
+                        nnans += int(np.count_nonzero(~np.isfinite(y_flat - yhat_tile.reshape(-1))))
 
                         print(
                             f"[BC-FUSED][tile s={s0}:{s1}] Sblk={Sblk} Lk={Lk} "
-                            f"||y||={yf_norm:.3e} ||yhat||={yhatf_norm:.3e} ||r||={r_norm:.3e} "
-                            f"nonfinite_vals={nnans}", flush=True
+                            f"||y||={yf_norm:.3e} ||yhat||={yhatf_norm:.3e} "
+                            f"||r||={r_norm:.3e} nonfinite_vals={nnans}",
+                            flush=True
                         )
-
-                        # quick histogram-ish checks (coarse)
-                        if r_flat.size > 0:
-                            r_max = float(np.max(r_flat))
-                            r_min = float(np.min(r_flat))
-                            r_pos_frac = float(np.count_nonzero(r_flat > 0) / max(1, r_flat.size))
-                            print(
-                                f"[BC-FUSED][tile s={s0}:{s1}] r_min={r_min:.3e} r_max={r_max:.3e} "
-                                f"r_pos_frac={r_pos_frac:.3f}", flush=True
-                            )
-
                     except Exception as _e:
                         print("[BC-FUSED][tile diag] error while computing tile diagnostics:", _e, flush=True)
-                    # --- end tile diagnostics ---
 
-                    # 2) update ATA/ATy for each block using cached A_cache (no reread)
-                    # For each cached orbit, push contributions to all blocks that include that orbit
-                    for cc, A_cc in A_cache.items():
-                        # A_cc: (Sblk, P, Lk) -> reshape columns per population to flat rows
-                        # We'll extract only p's that belong to block local columns
-                        for (bi, local_idx_arr, p_idx_arr) in orbit_block_map.get(cc, ()):
-                            # build A_tile_cols with shape (Sblk*Lk, n_local)
-                            # carefully handle if p_idx_arr empty
-                            if local_idx_arr.size == 0:
-                                continue
-                            # Extract columns for populations p_idx_arr
-                            # A_cc[:, p_idx_arr, :] -> shape (Sblk, n_local, Lk)
-                            # === explicit A_tile construction (less error-prone) ===
-                            # sub: (Sblk, n_local, Lk)
-                            # We want rows = Sblk * Lk, cols = n_local
-                            # Do: transpose to (Sblk, Lk, n_local) then reshape
-                            sub = A_cc[:, p_idx_arr, :]  # (Sblk, n_local, Lk)
-                            # transpose axes to (Sblk, Lk, n_local)
-                            sub_t = sub.transpose(0, 2, 1)            # (Sblk, Lk, n_local)
-                            # then flatten first two dims -> (Sblk*Lk, n_local)
-                            A_tile = sub_t.reshape(sub_t.shape[0] * sub_t.shape[1], sub_t.shape[2])
-
-                            # === deep sanity check (dump tiny sample and fail-fast) ===
-                            # sample a few entries
-                            sample_idx = np.arange(min(5, y_flat.size))
-                            print(f"[BC-FUSED][DEBUG-SAMPLE] tile s={s0}:{s1} Sblk={Sblk} Lk={Lk} "
-                                f"||y||={np.linalg.norm(y_flat):.3e} y_sample={y_flat[sample_idx]!r}", flush=True)
-
-                            # check dot product signs between first column of A_tile and y_flat
-                            if A_tile.shape[0] > 0 and A_tile.shape[1] > 0:
-                                col0 = A_tile[:, 0]
-                                dot0 = float(np.dot(col0, y_flat))
-                                dot0_r = float(np.dot(col0, (y_flat - (col0 * (dot0 / (np.dot(col0, col0) + 1e-30))))))
-                                print(f"[BC-FUSED][DEBUG-SAMPLE] dot(col0,y)={dot0:.3e} dot0_resid_like={dot0_r:.3e} "
-                                    f"col0_norm={np.linalg.norm(col0):.3e}", flush=True)
-                            # abort early to inspect values if ATy will end up all negative
-                            ATy_tile_test = A_tile.T @ y_flat
-                            if np.all(ATy_tile_test <= 0.0):
-                                # print short diagnostic and raise to inspect environment (or keep running but noisy)
-                                print(f"[BC-FUSED][FATAL-DEBUG] ATy_tile_test all <= 0 (sample first 6): "
-                                    f"{ATy_tile_test[:6]!r}", flush=True)
-                                # Optionally raise to stop run and inspect; comment out raise if you prefer continuation
-                                # raise RuntimeError("ATy all non-positive in diagnostic check")
-
-                            # update ATA and ATy
-                            # === explicit ATA and ATy from DATA (y_flat), not residual ===
-                            # Build ATA contribution for this block
-                            ATA_blocks[bi][np.ix_(local_idx_arr, local_idx_arr)] += (A_tile.T @ A_tile)
-
-                            # Build ATy contribution *explicitly from data y_flat*
-                            # (very important: this must be A^T @ y, not A^T @ r)
-                            ATy_tile = A_tile.T @ y_flat    # shape (n_local,)
-                            ATy_blocks[bi][local_idx_arr] += ATy_tile
-
-                            # quick guard / assertion to detect accidental residual usage:
-                            # if global tile residual is strongly negative, it is expected,
-                            # but ATy computed from y_flat should not be all-negative of huge mag.
-                            _ifpos = np.count_nonzero(ATy_tile > 0)
-                            _ifneg = np.count_nonzero(ATy_tile < 0)
-                            _ifzero = ATy_tile.size - (_ifpos + _ifneg)
-                            if _ifpos == 0 and _ifneg > 0:
-                                print(f"[BC-FUSED][WARN][tile s={s0}:{s1} bi={bi}] ATy_tile all <=0 "
-                                    f"(+={_ifpos} -={_ifneg} 0={_ifzero}) sample_ATy[0:3]={ATy_tile[:3]!r}", flush=True)
-                            # ================================================================
-
-                    # keep y parts if you need full y vector for diagnostics (optional)
                     y_parts.append(y_flat)
+            # end single streaming pass
+            # ------------------------ end streaming --------------------------
 
-            # end tile-streaming
-
-            # ---------------- COLUMN NORMALIZATION ----------------
-            # Build per-column energy normalization
-            col_energy = D_tot.copy()  # shape (C,P)
-
-            # Avoid division by zero
+            # compute inv_sqrt_energy and scaled targets
+            col_energy = D_tot.copy()
             col_energy[col_energy <= 0.0] = 1.0
-
             inv_sqrt_energy = 1.0 / np.sqrt(col_energy)
+            inv_sqrt_energy_flat = inv_sqrt_energy.ravel(order="C")
 
-            # Normalize ATA and ATy blocks
-            for bi, meta in block_meta.items():
-                cols = meta["cols"]
-                # map flattened indices to (C,P)
-                cc_arr = meta["cc_arr"]
-                pp_arr = meta["pp_arr"]
-
-                scale = inv_sqrt_energy[cc_arr, pp_arr]  # shape (ncols,)
-
-                # Scale ATA: S A S
-                ATA_blocks[bi] = (ATA_blocks[bi] * scale[:, None]) * scale[None, :]
-
-                # Scale ATy: S ATy
-                ATy_blocks[bi] = ATy_blocks[bi] * scale
-
-            # --- DIAG: summary after tile streaming (epoch-level) ---
-            try:
-                # quick global ATA/ATy sanity summary across blocks
-                nblocks = len(ATA_blocks)
-                tot_cols = sum([meta["ncols"] for _, meta in block_meta.items()])
-                # per-block summaries
-                mm = []
-                atys_pos = 0
-                atys_neg = 0
-                atys_zero = 0
-                ata_diag_meds = []
-                ata_diag_mins = []
-                ata_diag_maxs = []
-                ata_nonfinite_counts = 0
-                aty_nonfinite_counts = 0
-                for bi, meta in block_meta.items():
-                    ATA = ATA_blocks[bi]
-                    ATy = ATy_blocks[bi]
-                    # diag stats
-                    diag = np.diag(ATA)
-                    ata_diag_meds.append(float(np.median(np.abs(diag))) if diag.size else 0.0)
-                    ata_diag_mins.append(float(np.min(diag)) if diag.size else 0.0)
-                    ata_diag_maxs.append(float(np.max(diag)) if diag.size else 0.0)
-                    # ATy sign counts
-                    if ATy.size > 0:
-                        atys_pos += int(np.count_nonzero(ATy > 0))
-                        atys_neg += int(np.count_nonzero(ATy < 0))
-                        atys_zero += int(np.count_nonzero(ATy == 0))
-                    ata_nonfinite_counts += int(np.count_nonzero(~np.isfinite(ATA)))
-                    aty_nonfinite_counts += int(np.count_nonzero(~np.isfinite(ATy)))
-
-                print(
-                    "[BC-FUSED][stream-summary] blocks=%d tot_cols=%d ata_nonfinite=%d aty_nonfinite=%d"
-                    % (nblocks, tot_cols, ata_nonfinite_counts, aty_nonfinite_counts),
-                    flush=True
-                )
-                if len(ata_diag_meds):
-                    print(
-                        "[BC-FUSED][stream-summary] ATA diag med/min/max = %.3e / %.3e / %.3e"
-                        % (float(np.median(ata_diag_meds)), float(np.min(ata_diag_mins)), float(np.max(ata_diag_maxs))),
-                        flush=True
-                    )
-                print(
-                    f"[BC-FUSED][stream-summary] ATy sign counts: +={atys_pos} -={atys_neg} 0={atys_zero}",
-                    flush=True
-                )
-            except Exception as _e:
-                print("[BC-FUSED][stream-summary] diag error:", _e, flush=True)
-            # --- end stream summary diagnostics ---
-
-            # Build full flattened y and residual norm if needed
-            if len(y_parts) > 0:
-                y_full = np.concatenate(y_parts)
-                # compute global residual norm from ATA/ATy & x if desired later
-            else:
-                y_full = np.zeros((0,), dtype=np.float64)
-
-            # -------------------- ORBIT-LEVEL solves ----------------------
-            # Assemble per-orbit ATA / ATy by summing block contributions so each
-            # orbit (all P populations) is solved monolithically (approx full-column solve).
-            # This avoids small-block ambiguity / carpeting across populations.
-
-            # 1) Quick lookup: for each orbit cc, which global flat-col indices belong to it
-            orbit_cols_map = {cc: [] for cc in range(C)}
-            for bi, meta in block_meta.items():
-                cols = meta["cols"]  # global flat indices in this block
-                for local_j, gc in enumerate(cols):
-                    cc = int(gc // P)
-                    pp = int(gc % P)
-                    orbit_cols_map[cc].append((bi, int(local_j), int(pp)))
-
-            # 2) For each active orbit, build ATA_cc (n_p_active x n_p_active) and ATy_cc
-            x_flat = x.ravel(order="C")  # current x for warm-starts
-            for cc in range(C):
-                # skip known-zero orbits quickly
-                if known_zero_orbit[cc]:
-                    continue
-
-                members = orbit_cols_map.get(cc, [])
-                if not members:
-                    # nothing to solve for this orbit
-                    continue
-
-                # Determine active population indices for this orbit and mapping
-                p_indices = sorted({pp for (_, _, pp) in members})
-                P_active = len(p_indices)
-                # map population -> local index in ATA_cc
-                p_to_idx = {p: idx for idx, p in enumerate(p_indices)}
-
-                # Initialise orbit-level ATA and ATy in the *normalized block space*
-                ATA_cc = np.zeros((P_active, P_active), dtype=np.float64)
-                ATy_cc = np.zeros((P_active,), dtype=np.float64)
-                x_init_cc = np.zeros((P_active,), dtype=np.float64)
-
-                # Sum contributions from each block containing columns for this orbit
-                for (bi, local_j, p) in members:
-                    # retrieve block-level scaled ATA and ATy (already scaled earlier)
-                    ATA_blk = ATA_blocks[bi]
-                    ATy_blk = ATy_blocks[bi]
-                    # local_j is the column index inside this block's ordering
-                    i = p_to_idx[p]
-                    # add diagonal / column cross-terms: select rows/cols in block corresponding to
-                    # all populations of this orbit that appear in this block
-                    # find all block-local positions (j_local) within this block that belong to this orbit
-                    # We can scan block_meta[bi]["cols"] to find which locals to pick
-                    blk_cols = block_meta[bi]["cols"]
-                    # find mask of indices in blk_cols belonging to this cc and present in p_indices
-                    # We'll use a small loop since blocks are modestly sized
-                    for j_local_idx, gc_j in enumerate(blk_cols):
-                        cc_j = int(gc_j // P)
-                        pp_j = int(gc_j % P)
-                        if cc_j != cc:
-                            continue
-                        # map pp_j -> index in ATA_cc
-                        ii = p_to_idx[pp_j]
-                        # accumulate the cross term ATA_blk[local_j, j_local_idx]
-                        ATA_cc[i, ii] += ATA_blk[local_j, j_local_idx]
-                    # accumulate ATy contribution for this column
-                    ATy_cc[i] += ATy_blk[local_j]
-                    # warm-start: take current x value (note: x is in un-normalized space; we'll
-                    # put a consistent init below after unscaling)
-                    x_init_cc[i] = x[cc, p]
-
-                # At this point ATA_cc and ATy_cc are assembled in the *normalized* block space.
-                # Add small ridge for numeric stability and optional curvature regularization.
-                tiny_ridge = 1e-6
-                ATA_cc += tiny_ridge * np.eye(P_active, dtype=np.float64)
-
-                # Optional curvature (age) smoothing inside the orbit:
-                # construct second-difference operator in the local P_active ordering (only if P_active>=3)
-                if P_active >= 3:
-                    lambda_curv = 1e-2  # tuneable: increase for stronger smoothing
-                    # build tri-diagonal curvature operator K where K = L^T L and L is second-diff
-                    K = np.zeros((P_active, P_active), dtype=np.float64)
-                    for i in range(P_active):
-                        if i == 0:
-                            K[i, i] += 1.0
-                            if P_active > 1:
-                                K[i, i+1] += -1.0
-                        elif i == P_active - 1:
-                            K[i, i] += 1.0
-                            K[i, i-1] += -1.0
-                        else:
-                            K[i, i-1] += -1.0
-                            K[i, i] += 2.0
-                            K[i, i+1] += -1.0
-                    ATA_cc += lambda_curv * K
-
-                # Solve the quadratic NNLS in orbit space
-                try:
-                    # use the quadratic projected gradient solver on ATA_cc / ATy_cc
-                    z_cc = _nnls_from_quadratic(ATA_cc, ATy_cc, x0=None, max_iter=4000, tol=1e-8)
-                except Exception:
-                    # fallback to shorter solve if something odd happens
-                    z_cc = _nnls_from_quadratic(ATA_cc, ATy_cc, x0=None, max_iter=1000, tol=1e-6)
-
-                # Un-normalize solution: remember we assembled ATAs/ATy in normalized (scale) space.
-                # Determine the final scale vector for these p_indices
-                col_scales = inv_sqrt_energy[cc, p_indices]  # shape (P_active,)
-                # z_cc was solved for scaled columns; to bring back to original x units:
-                # (original logic used: scale = inv_sqrt_energy -> ATA_scaled = S ATA S; ATy_scaled = S ATy)
-                # so x_original = z_cc * scale
-                z_cc_unscaled = z_cc * col_scales
-
-                # Place results back into x
-                for p_i, p in enumerate(p_indices):
-                    x[cc, p] = float(z_cc_unscaled[p_i])
-
-                # diagnostics per-orbit (coarse)
-                if verbose:
-                    print(f"[BC-FUSED][orbit {cc}] solved P_active={P_active} l1={np.sum(z_cc_unscaled):.3e} "
-                        f"max={np.max(z_cc_unscaled):.3e} nonzero={int(np.count_nonzero(z_cc_unscaled))}/{P_active}", flush=True)
-            # end orbit solves
-            # ----------------------------------------------------
-
-            # small summary per-orbit (aggregate)
-            if verbose:
-                try:
-                    s_cc = float(np.sum(x[cc, p_indices]))
-                    nz_cc = int(np.count_nonzero(x[cc, p_indices] > 0))
-                    print(f"[BC-FUSED][orbit-summary {cc}] P_active={P_active} sum={s_cc:.3e} "
-                            f"nonzero={nz_cc}/{P_active}", flush=True)
-                except Exception:
-                    pass
+            # run streaming active-set NNLS (monolithic)
+            print("[BC-FUSED][MONO] starting streaming active-set NNLS (mono)", flush=True)
+            x_flat_unscaled = _streaming_active_set_nnls_via_streaming_matvec(
+                h5_path=h5_path,
+                s_ranges=s_ranges,
+                keep_idx=keep_idx,
+                ATy_flat=ATy_flat,
+                inv_sqrt_energy_flat=inv_sqrt_energy_flat,
+                C=C,
+                P=P,
+                cfg=cfg,
+                max_active=monolithic_max_active,
+                tol_grad=1e-8,
+                max_iter=5 * monolithic_max_active,
+            )
+            x = x_flat_unscaled.reshape(C, P).copy()
+            print("[BC-FUSED][MONO] finished streaming active-set NNLS", flush=True)
 
             # --- DIAG: after all blocks solved (before projection) ---
             try:
@@ -940,6 +1207,7 @@ def solve_block_coord_nnls(
 
             # -------------------- epoch diagnostics & best-x --------------------
             # Compute simple RMSE proxy (full scan cheap relative to earlier streaming)
+            rmse_curr = float("nan")
             ssq = 0.0
             nres = 0
             with open_h5(h5_path, role="reader") as f:
@@ -985,9 +1253,11 @@ def solve_block_coord_nnls(
                 x_sum = float(np.sum(x_flat))
                 x_norm = float(np.linalg.norm(x_flat)) if x_flat.size else 0.0
 
+                rmse_str = f"{rmse_curr:.3e}" if np.isfinite(rmse_curr) else "nan"
+
                 print("=== [BC-FUSED][epoch-summary] ===", flush=True)
                 print(f"[BC-FUSED][epoch-summary] epoch={ep+1}/{cfg.epochs} elapsed_total={epoch_elapsed:.1f}s", flush=True)
-                print(f"[BC-FUSED][epoch-summary] data_proxy={data_proxy:.3e} rmse={rmse_curr:.3e}", flush=True)
+                print(f"[BC-FUSED][epoch-summary] data_proxy={data_proxy:.3e} rmse={rmse_str:.3e}", flush=True)
                 print(f"[BC-FUSED][epoch-summary] best_proxy={best_proxy:.3e}", flush=True)
                 print(
                     f"[BC-FUSED][epoch-summary] x_sum={x_sum:.3e} x_norm={x_norm:.3e} nonzero={x_nonzero}/{x_flat.size} nonfinite={x_nonfinite}",
