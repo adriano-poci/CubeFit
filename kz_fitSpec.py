@@ -37,6 +37,11 @@ v1.6:   Remove existing spectral fit plots before regenerating, to avoid
 v1.7:   Removed axis loops of hyper-cube in `reconstruct_modelcube_fast` for
             efficiency. 4 March 2026
 v1.8:   Fixed bug in SFH limits in `loadCubeFit`. 6 March 2026
+v1.9:   Defined `reconstruct_modelcube_fast_parallel` for multi-process
+            reconstruction of the model-cube;
+        Added global `CPU_PROCESSES` and `BLAS_THREADS` constants for default
+            parallelism settings;
+        Renamed HDF5 file to `hypercube_*.h5`. 13 March 2026
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -88,6 +93,9 @@ moncmap = 'inferno'
 moncmapr = 'inferno_r'
 
 os.environ["FITTRACKER_START"] = "fork"
+
+CPU_PROCESSES = 4
+BLAS_THREADS = 1
 
 # ------------------------------------------------------------------------------
 
@@ -479,7 +487,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
-    hdf5Path = (hdf5Dir/f"{galaxy}_{nComp}_{lOrder:02d}").with_suffix('.h5')
+    hdf5Path = (hdf5Dir/f"hypercube_{nComp}_{lOrder:02d}").with_suffix('.h5')
 
     # --- Initialize and load data ---
     mgr = H5Manager(hdf5Path)
@@ -591,17 +599,18 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=3,
+        epochs=1,
         # x0=x0,
         lr=0.1,
         project_nonneg=True,
         # orbit_weights=None, # or None for “free” fit
         orbit_weights=cWeights,
-        processes=4, # 4 workers
-        blas_threads=1, # 12 BLAS threads each → 48 total
+        processes=CPU_PROCESSES,
+        blas_threads=BLAS_THREADS,
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
         warm_start=warm_start,
+        orbit_beta=2e-4,
         # 'zeros', 'resume', 'jacobi', 'nnls'
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
@@ -826,6 +835,187 @@ def parallel_model_cube_global_batched(
             with open_h5(h5_path, role="writer") as f:
                 f[array_name][s0:s1, :] = Y
     print("[Reconstruct] Done (multi-process).")
+
+# ------------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Parallel model-cube reconstruction (safe HDF5 writer in parent process)
+# ---------------------------------------------------------------------------
+
+def _reconstruct_worker(args):
+    """
+    Worker executed in a separate process. Must be top-level (pickleable).
+
+    Args tuple:
+      (h5_path, s0, s1, want_dtype_str, rdcc_slots, rdcc_bytes, rdcc_w0)
+
+    Returns:
+      (s0, s1, Y_tile_as_dtype) where Y_tile has shape (dS, L)
+    """
+    import numpy as _np
+    try:
+        h5_path, s0, s1, want_dtype_str, rdcc_slots, rdcc_bytes, rdcc_w0 = args
+    except Exception:
+        raise
+
+    want_dtype = _np.float64 if str(want_dtype_str) == "float64" else _np.float32
+
+    # Each worker opens the file read-only and reads its slab.
+    with open_h5(h5_path, role="reader") as f:
+        M = f["/HyperCube/models"]
+        try:
+            M.id.set_chunk_cache(int(rdcc_slots), int(rdcc_bytes),
+                                 float(rdcc_w0))
+        except Exception:
+            pass
+
+        # read slab: shape (dS, C, P, L)
+        slab = _np.asarray(M[s0:s1, :, :, :], dtype=_np.float64, order="C")
+        # We'll compute tensordot(slab, x_cp, axes=([1,2],[0,1])) in caller,
+        # but x_cp is not available in worker. To avoid sending full x_cp across
+        # processes repeatedly we must include it in args OR compute using a
+        # broadcast mechanism. Simpler: workers will not need x_cp if the parent
+        # sends x_cp in the args. We'll include x_cp below if present.
+    # NOTE: we return the raw slab to the parent to contract there only if
+    # we want to avoid pickling x_cp for each worker. However returning a
+    # potentially large slab increases IPC cost. Instead we will *expect*
+    # the caller to include x_cp in args (see reconstruct_modelcube_fast).
+    # For safety this worker simply returns the slab and s0,s1.
+    return (s0, s1, slab.astype(want_dtype, copy=False))
+
+
+def reconstruct_modelcube_fast_parallel(
+    h5_path: str,
+    x_cp: np.ndarray,
+    out_dset: str = "/ModelCube",
+    s_chunk: int | None = None,
+    out_dtype: str = "float64",
+    rdcc_slots: int = 1_000_003,
+    rdcc_bytes: int = 512 * 1024**2,
+    rdcc_w0: float = 0.90,
+    n_workers: int | None = None,
+    blas_threads_per_worker: int | None = None,
+) -> None:
+    """
+    Parallel reconstruction of /ModelCube.
+
+    Strategy:
+      - Spawn a small process pool.
+      - Each worker reads a spatial slab (s0:s1) from
+        /HyperCube/models and returns the slab.
+      - Parent contracts each slab with x_cp (tensordot) and writes the
+        completed (s0:s1, :) tile to /ModelCube.
+
+    This keeps all HDF5 write operations in the parent process and lets
+    workers do the read+heavy contraction work in parallel memory.
+    """
+
+    want_dtype = np.float64 if str(out_dtype) == "float64" else np.float32
+    x_in = np.ascontiguousarray(np.asarray(x_cp, dtype=np.float64).ravel(),
+                                dtype=np.float64)
+    # open to inspect models shape & decide tile size
+    with open_h5(h5_path, role="writer") as f:
+        if "/HyperCube/models" not in f:
+            raise RuntimeError("No /HyperCube/models found.")
+        M = f["/HyperCube/models"]
+        try:
+            M.id.set_chunk_cache(int(rdcc_slots), int(rdcc_bytes),
+                                 float(rdcc_w0))
+        except Exception:
+            pass
+        if M.ndim != 4:
+            raise RuntimeError(f"Unexpected models rank {M.ndim}")
+        S, C, P, L = map(int, M.shape)
+
+        # choose spatial tile size consistent with file chunking
+        m_chunks = M.chunks or (S, 1, P, L)
+        S_chunk_file = int(m_chunks[0])
+        S_blk = S_chunk_file if s_chunk is None else int(s_chunk)
+        S_blk = max(1, min(S_blk, S))
+        n_tiles = math.ceil(S / S_blk)
+
+        # prepare output dataset (create/overwrite like before)
+        ds = f.get(out_dset, None)
+        if ds is not None:
+            ok = (tuple(ds.shape) == (S, L) and str(ds.dtype) == str(want_dtype))
+            if not ok:
+                del f[out_dset]
+                ds = None
+        if ds is None:
+            ds = f.create_dataset(
+                out_dset,
+                shape=(S, L),
+                dtype=want_dtype,
+                chunks=(S_blk, L),
+                compression=None,
+                shuffle=False,
+            )
+        out_ds = ds
+
+    # reshape x once in parent for contracting
+    x_cp2 = x_in.reshape(C, P).astype(np.float64, copy=False)
+
+    # choose number of workers
+    if n_workers is None:
+        n_workers = max(1, int(mp.cpu_count() // 2))
+    n_workers = max(1, int(n_workers))
+
+    if n_workers == 1:
+        # single-worker (no pool) path to avoid overhead
+        pbar = tqdm(total=n_tiles, desc="[Reconstruct]", mininterval=1.5)
+        with open_h5(h5_path, role="writer") as f:
+            M = f["/HyperCube/models"]
+            for s0 in range(0, S, S_blk):
+                s1 = min(S, s0 + S_blk)
+                slab = np.asarray(M[s0:s1, :, :, :], dtype=np.float64,
+                                   order="C")
+                Y_tile = np.tensordot(slab, x_cp2, axes=([1, 2], [0, 1]))
+                if want_dtype != np.float64:
+                    Y_tile = Y_tile.astype(want_dtype, copy=False)
+                out_ds[s0:s1, :] = Y_tile
+                pbar.update(1)
+        pbar.close()
+        return
+
+    # parallel path: spawn a pool; each worker reads a slab and returns it.
+    ctx = mp.get_context("spawn")
+
+    # set BLAS threads for workers
+    bt = int(blas_threads_per_worker) if blas_threads_per_worker else 1
+
+    # Build tile job list
+    jobs = []
+    for s0 in range(0, S, S_blk):
+        s1 = min(S, s0 + S_blk)
+        jobs.append((h5_path, s0, s1, str(out_dtype),
+                     int(rdcc_slots), int(rdcc_bytes), float(rdcc_w0)))
+
+    pbar = tqdm(total=n_tiles, desc="[Reconstruct]", mininterval=1.5)
+
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx,
+                             initializer=_init_worker,
+                             initargs=(bt,)) as exe:
+
+        # submit jobs
+        futures = {exe.submit(_reconstruct_worker, arg): arg for arg in jobs}
+
+        # as results come in, contract and write
+        with open_h5(h5_path, role="writer") as f:
+            out_ds = f[out_dset]  # re-open in writer role
+            for fut in as_completed(futures):
+                s0, s1, slab = fut.result()
+                # contract in parent; slab dtype may be float64 or out dtype
+                # slab shape: (dS, C, P, L)
+                # ensure slab is float64 for accurate tensordot
+                slab64 = np.asarray(slab, dtype=np.float64, order="C")
+                Y_tile = np.tensordot(slab64, x_cp2, axes=([1, 2], [0, 1]))
+                if want_dtype != np.float64:
+                    Y_tile = Y_tile.astype(want_dtype, copy=False)
+                out_ds[s0:s1, :] = Y_tile
+                pbar.update(1)
+
+    pbar.close()
+    print("[Reconstruct] Done (parallel).")
 
 # ------------------------------------------------------------------------------
 
@@ -1190,12 +1380,15 @@ def choose_spat_tile_fast(S, n_workers, s_chunk, k=2):
 
     return tile, n_tiles
 
-def _init_worker():
-    import os
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["NUMEXPR_MAX_THREADS"] = "1"
+def _init_worker(blas_threads: int):
+    """
+    Worker initializer: set BLAS threading environment variables.
+    Must be top-level and pickleable.
+    """
+    os.environ["OMP_NUM_THREADS"] = str(int(blas_threads))
+    os.environ["OPENBLAS_NUM_THREADS"] = str(int(blas_threads))
+    os.environ["MKL_NUM_THREADS"] = str(int(blas_threads))
+    os.environ["NUMEXPR_NUM_THREADS"] = str(max(1, int(blas_threads) // 2))
     try:
         # runtime guard in case threads were already initialized
         from threadpoolctl import threadpool_limits
@@ -1207,9 +1400,9 @@ def _init_worker():
 
 def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     full=False, slope=1.30, IMF='KB', iso='pad', weighting='luminosity',
-    nProcs=1, lOrder=4, rescale=False, specRange=None, lsf=False,
-    band='r', smask=None, method='fsf', varIMF=False,
-    source='ppxf', pplots=['sfh', 'spec', 'mw'], redraw=False, **kwargs):
+    lOrder=4, rescale=False, specRange=None, lsf=False, band='r', smask=None,
+    method='fsf', varIMF=False, source='ppxf', pplots=['sfh', 'spec', 'mw'],
+    redraw=False, **kwargs):
     """
     Load the CubeFit data for a given galaxy and model path.
     """
@@ -1417,7 +1610,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
-    hdf5Path = (hdf5Dir/f"{galaxy}_{nComp}_{lOrder:02d}").with_suffix('.h5')
+    hdf5Path = (hdf5Dir/f"hypercube_{nComp}_{lOrder:02d}").with_suffix('.h5')
     
     # Read dims & X_global using robust reader
     with open_h5(hdf5Path, role="reader") as f:
@@ -1444,8 +1637,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         mask_arr = np.asarray(f["/Mask"][...], bool) if has_mask else None
         obs = f["/ObsPix"][...] if "/ObsPix" in f else np.arange(nLSpec)
 
-    spat_tile, nTiles = choose_spat_tile_fast(nSpat, nProcs, s_chunk, k=2)
-    nProcs = builtins.min(nProcs, nTiles, 12) 
+    spat_tile, nTiles = choose_spat_tile_fast(nSpat, CPU_PROCESSES, s_chunk, k=2)
+    nProcs = builtins.min(CPU_PROCESSES, nTiles, 12) 
     # don’t spawn more processes than tiles
 
     ok, why = modelcube_status(str(hdf5Path), x_global=x_global, require_float64=True, redraw=redraw)
@@ -1456,12 +1649,25 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         logger.log("[ModelCube] Reconstructing…")
         # reconstruct_model_cube_single(  # or your parallel version
         try:
-            reconstruct_modelcube_fast(
-                h5_path=str(hdf5Path),
-                x_cp=x_global,
-                # array_name="ModelCube",
-                # blas_threads=nProcs,
-            )
+            if CPU_PROCESSES <= 1:
+                reconstruct_modelcube_fast(
+                    h5_path=str(hdf5Path),
+                    x_cp=x_global,
+                    s_chunk=spat_tile,
+                    out_dtype="float64",
+                )
+            else:
+                reconstruct_modelcube_fast_parallel(
+                    h5_path=str(hdf5Path),
+                    x_cp=x_global,
+                    s_chunk=None,                 # or tune tile size
+                    out_dtype="float64",
+                    rdcc_slots=1_000_003,
+                    rdcc_bytes=512 * 1024**2,
+                    rdcc_w0=0.90,
+                    n_workers=builtins.min(CPU_PROCESSES, nTiles, 12),
+                    blas_threads_per_worker=BLAS_THREADS // max(1, CPU_PROCESSES)
+                )
         except Exception as e:
             logger.log(
                 f"[ModelCube] Error: Could not reconstruct ModelCube")
@@ -1623,6 +1829,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         # ax.add_patch(copy(pPatch))
 
         rmax = np.percentile(rms_resid_sb, 99)
+        rmax = 200
         maText = POT.prec(pren, rmax)
         ax = fig.add_subplot(gs[2])
         cnt = dbi(
@@ -1692,6 +1899,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         # ax.add_patch(copy(pPatch))
 
         rmax = np.percentile(rms_resid_raw, 99)
+        rmax = 200
         maText = POT.prec(pren, rmax)
         ax = fig.add_subplot(gs[2])
         cnt = dbi(
@@ -1737,7 +1945,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 chi2=rms_resid_raw,
                 n=100,
                 plot_dir=str(figDir),
-                n_workers=builtins.min(12, builtins.max(1, nProcs)),
+                n_workers=CPU_PROCESSES,
                 tag=f"C{nComp:04d}",
                 mask=mask_arr,
             )
@@ -1793,7 +2001,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             print(nAlphas, ualphas)
             for ali in range(nAlphas):
                 ax = fig.add_subplot(gs[0, ali])
-                cnt = ax.imshow(np.log10(coSFH[:, :, ali]),
+                cnt = ax.imshow(np.log10(coSFH[:, :, ali] + 1e-30),
                     extent=[minT, maxT, minZ, maxZ],
                     aspect='auto', interpolation='none', origin='lower',
                     cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
@@ -1813,7 +2021,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     lT.set_path_effects(
                         [PathEffects.withStroke(linewidth=1.5, foreground='k')])
                 ax = fig.add_subplot(gs[1, ali])
-                ax.imshow(np.log10(laSFH[:, :, ali]),
+                ax.imshow(np.log10(laSFH[:, :, ali] + 1e-30),
                     extent=[minT, maxT, minZ, maxZ],
                     aspect='auto', interpolation='none', origin='lower',
                     cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
@@ -1827,7 +2035,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                         foreground='k')])
                 ax = fig.add_subplot(gs[2, ali])
-                ax.imshow(np.log10(boSFH[:, :, ali]),
+                ax.imshow(np.log10(boSFH[:, :, ali] + 1e-30),
                     extent=[minT, maxT, minZ, maxZ],
                     aspect='auto', interpolation='none', origin='lower',
                     cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
@@ -1854,15 +2062,79 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 transform=cax.transAxes, rotation=270)
             lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                 foreground='k')])
-            cax.text(0.45, 1.0-1e-3, f"{wmax:.2f}", va='top', ha='center',
+            cax.text(0.45, 1.0-5e-3, f"{wmax:.2f}", va='top', ha='center',
                 color='w', transform=cax.transAxes, rotation=270)
-            cax.text(0.45, 1e-3, f"{wmin:.2f}", va='bottom', ha='center',
+            cax.text(0.45, 5e-3, f"{wmin:.2f}", va='bottom', ha='center',
                 color='k', transform=cax.transAxes, rotation=270)
             cb.set_ticks([])
+
             plt.savefig(figDir/\
-                f"orbitSFH_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+                f"orbitSFH_full_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+                
         except AssertionError as e:
             print(f"Could not make orbital SFH plot: {e}")
+        
+        # also make a 3-panel plot of metallicity (x) vs alpha (y)
+        try:
+            # collapse SFH over ages -> shape (nMetals, nAlphas)
+            coZalpha = coSFH.sum(axis=1)
+            laZalpha = laSFH.sum(axis=1)
+            boZalpha = boSFH.sum(axis=1)
+
+            # compute log limits across panels, ignore zeros
+            vals = np.hstack([
+                np.log10(coZalpha[coZalpha>0]).ravel() if np.any(coZalpha>0) else np.array([]),
+                np.log10(laZalpha[laZalpha>0]).ravel() if np.any(laZalpha>0) else np.array([]),
+                np.log10(boZalpha[boZalpha>0]).ravel() if np.any(boZalpha>0) else np.array([]),
+            ])
+            if vals.size > 0:
+                vmin2 = float(np.max((np.min(vals), -12.0)))
+                vmax2 = float(np.max(vals))
+            else:
+                vmin2, vmax2 = -12.0, -8.0
+
+            fig2 = plt.figure(figsize=(12, 4))
+            gs2 = gridspec.GridSpec(1, 3, wspace=0.0, hspace=0.0)
+            panels = [(coZalpha, 'Short-axis Tubes'), (laZalpha, 'Long-axis Tubes'), (boZalpha, 'Boxes')]
+            for pi, (arr, title) in enumerate(panels):
+                ax = fig2.add_subplot(gs2[0, pi])
+                # arr shape (nMetals, nAlphas) -> transpose for imshow so y=alpha
+                im = ax.imshow(np.log10(arr.T + 1e-30),
+                    extent=[minZ, maxZ, np.min(ualphas), np.max(ualphas)],
+                    aspect='auto', origin='lower', cmap=moncmapr,
+                    norm=Normalize(vmin=vmin2, vmax=vmax2))
+                lT = ax.text(1e-2, 1e-2, title, va='bottom', ha='left',
+                    color=POT.pgreen, transform=ax.transAxes)
+                lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                    foreground='k')])
+                if pi > 0:
+                    ax.set_yticklabels([])
+
+            BIG2 = fig2.add_subplot(gs2[:])
+            BIG2.set_frame_on(False)
+            BIG2.set_xticks([])
+            BIG2.set_yticks([])
+            BIG2.set_xlabel(r'$[Z/H]$', labelpad=20)
+            BIG2.set_ylabel(r'$[\alpha/Fe]$', labelpad=35)
+            cax2 = POT.attachAxis(BIG2, 'right', 0.03)
+            cb2 = plt.colorbar(im, cax=cax2, orientation='vertical')
+            lT2 = cax2.text(0.5, 0.5, r'$\log_{10}($Mass Weight$)$',
+                va='center', ha='center', color=POT.pgreen,
+                transform=cax2.transAxes, rotation=270)
+            lT2.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                foreground='k')])
+            cax2.text(0.45, 1.0-1e-3, f"{vmax2:.2f}", va='top', ha='center',
+                color='w', transform=cax2.transAxes, rotation=270)
+            cax2.text(0.45, 1e-3, f"{vmin2:.2f}", va='bottom', ha='center',
+                color='k', transform=cax2.transAxes, rotation=270)
+            cb2.set_ticks([])
+
+            fig2.savefig(figDir/\
+                f"orbitSFH_alphaMetal_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+        
+        except Exception as e:
+            print(f"Could not make Z-alpha plot: {e}")
+            pass
 
 # ------------------------------------------------------------------------------
 

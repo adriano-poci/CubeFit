@@ -68,8 +68,8 @@ from CubeFit.hdf5_manager import H5Manager, H5Dims, open_h5
 from CubeFit.hypercube_builder import build_hypercube
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
 from CubeFit.kaczmarz_solver import solve_global_kaczmarz, SolverCfg
-from CubeFit.block_coord_nnls import (
-    MPConfig, solve_block_coord_nnls)
+from CubeFit.streaming_nnls import (
+    MPConfig, solve_streaming_nnls, monolithic_nnls_scipy)
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
 )
@@ -938,6 +938,7 @@ class PipelineRunner:
         processes=2,
         blas_threads=12,
         orbit_weights=None,
+        orbit_beta=0.0,
         x0=None,
         warm_start="nnls",  # default to the new seed
         seed_cfg=None,
@@ -1191,6 +1192,7 @@ class PipelineRunner:
         cfg = MPConfig(
             epochs=int(epochs),
             lr=float(lr),
+            orbit_beta=float(orbit_beta) if orbit_weights is not None else 0.0,
             project_nonneg=bool(project_nonneg),
             processes=int(processes),
             blas_threads=int(blas_threads),
@@ -1199,7 +1201,7 @@ class PipelineRunner:
 
         try:
             with logger.capture_all_output():
-                x_solver, stats = solve_block_coord_nnls(
+                x_solver, stats = solve_streaming_nnls(
                     self.h5_path,
                     cfg,
                     orbit_weights=orbit_weights,
@@ -1213,8 +1215,6 @@ class PipelineRunner:
                 # x_solver, stats = monolithic_nnls_scipy(self.h5_path, cfg,
                 #     orbit_weights=orbit_weights,
                 #     enforce_orbit_projection=True)
-                # Use active set from SPG (rows only)
-                active_orbits = stats.get("active_orbits", None)
 
         finally:
             try:
@@ -1245,8 +1245,6 @@ class PipelineRunner:
 
             f_wr["/X_global"].attrs["layout"] = "C_P"
             f_wr["/X_global"].attrs["P"] = x_solver.shape[1]
-            # f_wr["/X_global"].attrs["active_orbits"] = np.asarray(active_orbits,
-                # dtype=int)
 
             if "known_zero_mask" in stats:
                 print("[pipeline] writing KNOWN_ZERO mask to /HyperCube/known_zero_mask",

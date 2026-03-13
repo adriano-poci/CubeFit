@@ -1,0 +1,6 @@
+* Defined `reconstruct_modelcube_fast_parallel` for multi-process reconstruction of the model-cube in `kf_fitSpec`
+* Added global `CPU_PROCESSES` and `BLAS_THREADS` constants for default parallelism settings in `ks_fitSpec`
+* Renamed HDF5 file to `hypercube_*.h5` in `kz_fitSpec`
+* Renamed `block_coord_nnls` to `streaming_nnls`
+* Implemented streaming active-set Lawson-Hanson NNLS in `streaming_nnls`
+* Added rank-1 orbit penalisation with `orbit_beta` parameter instead of hard projection in `block_coord_nnls`

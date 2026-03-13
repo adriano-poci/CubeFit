@@ -34,21 +34,8 @@ History
 v1.0:	12 November 2021
 """
 
-# from site import addsitedir as sas
-# import pathlib as plp
-# sas(str(plp.Path(plp.os.sep, 'fred', 'oz059', 'poci')))
-# sas(str(plp.Path(plp.os.sep, 'fred', 'oz059', 'poci', 'dynamics')))
-# sas(str(plp.Path(plp.os.sep, 'fred', 'oz059', 'poci', 'pxf')))
-# sas(str(plp.Path(plp.os.sep, 'fred', 'oz059', 'poci', 'muse')))
-# do not need to add to paths, if run with
-#   mpiexec -usize <nProcs+1> -n 1 ipython slurmSpecFCC170.py
-
-# props = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=393, lOrder=7,
-#     specRange=[5100, 5950], full=True, lsf=True, iso='BaSTI', nProcs=1,
-#     band='F814W', smask=[[5550, 5560]], genSwitch=None)
 props = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=207, lOrder=12,
-# props = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=3, lOrder=12,
     specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI', nProcs=1,
-    band='F814W', genSwitch=None, kind='MILES', cont=True,
+    band='F814W', genSwitch=None, kind='SMILES', cont=True,
     smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],
-    lam=1e-12, warm='seed')
+    lam=1e-12, warm='zeros')
