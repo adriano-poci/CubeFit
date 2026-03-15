@@ -94,8 +94,8 @@ moncmapr = 'inferno_r'
 
 os.environ["FITTRACKER_START"] = "fork"
 
-CPU_PROCESSES = 4
-BLAS_THREADS = 1
+CPU_PROCESSES = 6
+BLAS_THREADS = 8
 
 # ------------------------------------------------------------------------------
 
@@ -610,8 +610,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
         warm_start=warm_start,
-        orbit_beta=2e-4,
-        # 'zeros', 'resume', 'jacobi', 'nnls'
+        orbit_beta=float(1e2),
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
@@ -2314,14 +2313,15 @@ def compare_orbit_vs_solution(
         print(f"  relative error   = {rel:.6e}")
 
         # optional identity plot
+        plotw = np.log10(w_scaled + eps)
+        plotx = np.log10(sol_tot + eps)
         fig, ax = plt.subplots(figsize=(4,4))
-        ax.plot(w_scaled, sol_tot, '.', alpha=0.6)
-        lim = [min(w_scaled.min(), sol_tot.min()),
-            max(w_scaled.max(), sol_tot.max())]
+        ax.plot(plotw, plotx, '.', alpha=0.6)
+        lim = [min(plotw.min(), plotx.min()),
+            max(plotw.max(), plotx.max())]
         ax.plot(lim, lim, 'k-')
-        ax.set_xlabel("orbit prior (scaled)")
-        ax.set_ylabel("solution ∑_p x[c,p]")
-        ax.set_title("Exact orbit constraint")
+        ax.set_xlabel("$\\log_{10}(\\text{orbit prior (scaled)})$")
+        ax.set_ylabel("$\\log_{10}(\\text{solution } \\sum_p x[c,p])$")
         if save:
             fig.savefig(save, dpi=140)
         plt.close(fig)

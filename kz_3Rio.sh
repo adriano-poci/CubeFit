@@ -17,8 +17,8 @@
 #SBATCH --job-name="CubeFit_3Rio"
 #SBATCH --time=0-12:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
-#SBATCH --mem=150G
+#SBATCH --cpus-per-task=48
+#SBATCH --mem=300G
 #SBATCH --hint=nomultithread
 #SBATCH --exclusive
 #SBATCH --mail-type=ALL
@@ -28,28 +28,24 @@ module purge
 module load foss/2023a
 module load Python/3.11.3-GCCcore-12.3.0
 
-# glibc / allocator hygiene
-export MALLOC_ARENA_MAX=2
-
-# Threading (OpenBLAS-backed NumPy)
-export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}      # harmless with OpenBLAS(pthreads)
-export OMP_DYNAMIC=FALSE
-export OMP_PROC_BIND=false
-unset GOMP_CPU_AFFINITY
-export KMP_AFFINITY=disabled
-export MKL_NUM_THREADS=1
+# --- BLAS / OpenMP threading (per worker) ---
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
 export NUMEXPR_NUM_THREADS=1
+export OMP_PROC_BIND=TRUE
+export OMP_PLACES=cores
+export OMP_DYNAMIC=FALSE
+export MKL_DYNAMIC=FALSE
+# For OpenBLAS, avoid accidental main-thread reuse:
+export OPENBLAS_VERBOSE=0
 
-# HDF5 raw chunk cache (4 GiB is plenty; bump if you like)
-export CUBEFIT_RDCC_NBYTES=$((4*1024*1024*1024))  # 4 GiB
-export CUBEFIT_RDCC_NSLOTS=400003
+# --- HDF5 raw-data chunk cache (reader side) ---
+export CUBEFIT_RDCC_NBYTES=$((16*1024*1024*1024))  # 16 GiB
+export CUBEFIT_RDCC_NSLOTS=400003                   # large-ish prime
 export CUBEFIT_RDCC_W0=0.9
 
-# FitTracker tweaks (reduce sidecar churn; enforce spawn)
-export CUBEFIT_RMSE_STRIDE=16
-export CUBEFIT_TRACKER_QSIZE=8192
-export FITTRACKER_START=spawn
+export HDF5_USE_FILE_LOCKING=FALSE
 
 # File descriptors
 ulimit -n 8192
