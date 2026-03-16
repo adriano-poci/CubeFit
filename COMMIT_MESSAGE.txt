@@ -1,1 +1,1 @@
-* Compute global `alpha_fixed` in `streaming_nnls._streaming_active_set_nnls_via_streaming_matvec` so that the orbit prior scale is predictable
+* Added soft exit where new column is randomly promoted to test local optima, up to `explore_budget` times in `streaming_nnls._streaming_active_set_nnls_via_streaming_matvec`

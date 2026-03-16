@@ -32,7 +32,10 @@ v1.2:   Apply the orbit prior in the `z`-space of the solver in
             `_streaming_active_set_nnls_via_streaming_matvec`. 14 March 2026
 v1.3:   Compute global `alpha_fixed` in 
             `_streaming_active_set_nnls_via_streaming_matvec` so that the orbit
-            prior scale is predictable. 15 March 2026
+            prior scale is predictable;
+        Added soft exit where new column is randomly promoted to test local 
+            optima, up to `explore_budget` times in 
+            `_streaming_active_set_nnls_via_streaming_matvec`. 15 March 2026
 """
 
 from __future__ import annotations, print_function
@@ -577,27 +580,12 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     Assumes executor is a ProcessPoolExecutor created once by caller.
     """
 
+    negative_grad_count = 0
+    explore_budget = 2
+
     CP = int(C * P)
     S_flat = np.asarray(inv_sqrt_energy_flat, dtype=np.float64).ravel()
     ATy_scaled = S_flat * ATy_flat
-
-    # ---------------------------
-    # compute a single fixed alpha
-    # ---------------------------
-    # alpha estimates the total mass scale that w_target refers to.
-    # We compute a robust approximate total x by the diagonal heuristic:
-    #   x_approx_i ≈ ATy_unscaled_i / D_i   (where D_i = 1 / S_i^2)
-    # so sum(x_approx) = sum( ATy_flat * S_flat**2 ).
-    try:
-        alpha_fixed = float(np.sum(ATy_flat * (S_flat ** 2)))
-        # guard against degenerate values
-        if not np.isfinite(alpha_fixed) or alpha_fixed <= 0.0:
-            alpha_fixed = 1.0
-    except Exception:
-        alpha_fixed = 1.0
-
-    # expose for diagnostics
-    print("[DIAG] prior alpha_fixed (approx total x) =", alpha_fixed, flush=True)
 
     # --- orbit prior setup ---
     w_target = None
@@ -662,7 +650,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             # Compute alpha from current x (x = S * z) so prior redistributes
             # existing mass rather than creating mass from ATy magnitude.
                 # use fixed alpha computed once (not the running x-sum)
-            alpha_global = float(alpha_fixed)
+            alpha_global = float(np.sum(S_flat * z))
 
             # Build prior gradient in z-space:
             # d/dz 0.5*beta*(S·z_local - alpha*w_cc)^2 = beta * (S·z_local - alpha*w_cc) * S
@@ -677,7 +665,8 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 resid = float(np.dot(S_local, z_local) - alpha_global * w_cc)
                 if not np.isfinite(resid):
                     continue
-                g_prior[idxs] = orbit_beta * resid * S_local
+                s_norm = float(np.sum(S_local * S_local)) + 1e-30
+                g_prior[idxs] = (orbit_beta / s_norm) * resid * S_local
 
             # Prevent prior from overwhelming data gradient:
             # compute robust norms, allow prior up to `clip_factor` times data gradient norm
@@ -730,6 +719,22 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         max_g = float(gvals[imax])
 
         if max_g <= tol_grad:
+
+            negative_grad_count += 1
+
+            if negative_grad_count <= explore_budget and not_active.size > 0:
+                # choose randomly among the least negative gradients
+                k = min(5, gvals.size)  # candidate pool
+                top = np.argsort(gvals)[-k:]   # least negative
+                pick_local = int(np.random.choice(top))
+                idx = int(not_active[pick_local])
+
+                print(f"[MONO][explore] promoting column {idx} despite negative gradient", flush=True)
+
+                active[idx] = True
+                continue
+
+            # exploration budget exhausted → normal termination
             break
 
         # promote
@@ -790,15 +795,15 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         try:
             # S_active summary
             Sact = S_active
-            print("[DIAG] S_active stats: min/median/max:", float(np.min(Sact)), float(np.median(Sact)), float(np.max(Sact)), flush=True)
+            print(f"[DIAG] S_active stats: min/median/max: {float(np.min(Sact)):.4e}/{float(np.median(Sact)):.4e}/{float(np.max(Sact)):.4e}", flush=True)
 
             # Basic norms of assembled scaled ATA / ATy
             ATA_norm = float(np.linalg.norm(ATA_sub))
             ATy_norm = float(np.linalg.norm(ATy_sub))
             ATA_diag = np.diag(ATA_sub)[:min(6, ATA_sub.shape[0])]
-            print("[DIAG] ATA_sub shape, ATy_sub[0:6]:", ATA_sub.shape, ATy_sub[:6].tolist(), flush=True)
-            print("[DIAG] ATA_sub norm / ATy_sub norm:", ATA_norm, ATy_norm, flush=True)
-            print("[DIAG] ATA_sub diag (first 6):", ATA_diag.tolist(), flush=True)
+            print(f"[DIAG] ATA_sub shape, ATy_sub[0:6]: {ATA_sub.shape}, {ATy_sub[:6].tolist()}", flush=True)
+            print(f"[DIAG] ATA_sub norm / ATy_sub norm: {ATA_norm:.4e} / {ATy_norm:.4e}", flush=True)
+            print(f"[DIAG] ATA_sub diag (first 6): {ATA_diag.tolist()}", flush=True)
 
             # Attempt to infer unscaled ATA/ATy (undo S scaling):
             # ATA_sub_scaled = (S_active * S_active^T) * ATA_unscaled  (since you scaled columns)
@@ -816,7 +821,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
             ATA_unscaled_norm = float(np.linalg.norm(ATA_unscaled_est))
             ATy_unscaled_norm = float(np.linalg.norm(ATy_unscaled_est))
-            print("[DIAG] inferred unscaled ATA/ATy norms:", ATA_unscaled_norm, ATy_unscaled_norm, flush=True)
+            print(f"[DIAG] inferred unscaled ATA/ATy norms: {ATA_unscaled_norm:.4e} / {ATy_unscaled_norm:.4e}", flush=True)
 
             # Condition number of the scaled reduced normal (small k so cheap)
             try:
@@ -824,7 +829,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 emin = float(np.min(eigs))
                 emax = float(np.max(eigs))
                 cond = float(emax / max(1e-30, emin))
-                print("[DIAG] ATA_sub eigmin/emax/cond:", emin, emax, cond, flush=True)
+                print(f"[DIAG] ATA_sub eigmin/emax/cond: {emin:.4e}/{emax:.4e}/{cond:.4e}", flush=True)
             except Exception:
                 pass
 
@@ -832,12 +837,12 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             try:
                 ridge = 1e-12 * np.eye(ATA_unscaled_est.shape[0], dtype=np.float64)
                 z_unscaled = np.linalg.solve(ATA_unscaled_est + ridge, ATy_unscaled_est)
-                print("[DIAG] z_unscaled stats: l1, l2, max:", float(np.sum(z_unscaled)), float(np.linalg.norm(z_unscaled)), float(np.max(z_unscaled)), flush=True)
+                print(f"[DIAG] z_unscaled stats: l1, l2, max: {float(np.sum(z_unscaled)):.4e}, {float(np.linalg.norm(z_unscaled)):.4e}, {float(np.max(z_unscaled)):.4e}", flush=True)
             except Exception as _e:
-                print("[DIAG] solving unscaled diagnostic failed:", _e, flush=True)
+                print(f"[DIAG] solving unscaled diagnostic failed: {_e}", flush=True)
 
         except Exception as _e:
-            print("[DIAG] reduced-diagnostics error:", _e, flush=True)
+            print(f"[DIAG] reduced-diagnostics error: {_e}", flush=True)
         # ---------------------------------------------------------------------------
 
         # ---- Stabilised reduced solve: adaptive ridge then SVD-truncated fallback ----
@@ -851,49 +856,42 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         ATA_sub += ridge * np.eye(k, dtype=np.float64)
 
         # ----------------------------------------------------
-        # Soft orbit-weight constraint (corrected and consistent with promotion alpha)
-        # We compute alpha from current x (x = S*z) restricted to the active orbits
-        # and then add the prior *in z-space*:
-        #   penalty = 0.5 * beta * (S_local · z_local - alpha*w_cc)^2
-        # => ATA += beta * outer(S_local, S_local)
-        # => ATy += beta * (alpha * w_cc) * S_local
+        # Robust orbit prior (scale-independent)
+        # ----------------------------------------------------
         if (w_target is not None) and (orbit_beta > 0.0):
 
-            # group active variables by orbit -> dict[cc] = list(local_idx)
+            # group active variables by orbit
             orbit_groups = {}
             for local_i, gcol in enumerate(active_idx):
                 cc = int(gcol // P)
                 orbit_groups.setdefault(cc, []).append(local_i)
 
-            # use single fixed alpha (keeps prior predictable)
-            alpha = float(alpha_fixed)
+            # fixed total mass scale
+            alpha = float(np.sum(S_flat * z))
 
-            if not np.isfinite(alpha) or alpha <= 0.0:
-                alpha = 1.0
-
-            # Apply per-orbit rank-1 updates in z-space using S_local
             for cc, idx_list in orbit_groups.items():
 
                 idx = np.array(idx_list, dtype=np.int64)
-                m = idx.size
-                if m == 0:
+                if idx.size == 0:
                     continue
 
-                # S_active is the scaled S for the full active_idx; index into it
-                S_local = S_active[idx]  # shape (m,)
-
+                S_local = S_active[idx]
                 w_cc = float(w_target[cc])
 
-                ATA_sub[np.ix_(idx, idx)] += orbit_beta * np.outer(S_local, S_local)
-                ATy_sub[idx] += orbit_beta * (alpha * w_cc) * S_local
+                # --- normalization to remove dependence on C, P, and S scaling ---
+                s_norm = float(np.sum(S_local * S_local)) + 1e-30
+                beta_eff = orbit_beta / s_norm
 
-                # Diagnostics: report the scale of the addition to ATy (per-local mean)
+                # apply rank-1 prior
+                ATA_sub[np.ix_(idx, idx)] += beta_eff * np.outer(S_local, S_local)
+                ATy_sub[idx] += beta_eff * (alpha * w_cc) * S_local
+
+                # diagnostics
                 try:
-                    at_add_mean = float(orbit_beta * alpha * w_cc * np.mean(S_local))
-                    s_data_est = float(np.sum(ATy_unscaled_est[idx]))
                     print(
-                        f"[DIAG][orbit_prior] orbit={cc} cols={m} w={w_cc:.3e} alpha={alpha:.3e} "
-                        f"beta_eff={orbit_beta:.3e} data_est={s_data_est:.3e} ATy_add_mean={at_add_mean:.3e}",
+                        f"[DIAG][orbit_prior_norm] orbit={cc} cols={len(idx)} "
+                        f"s_norm={s_norm:.3e} beta_eff={beta_eff:.3e} "
+                        f"target_mass={(alpha*w_cc):.3e}",
                         flush=True,
                     )
                 except Exception:
@@ -1308,22 +1306,17 @@ def solve_streaming_nnls(
         inv_sqrt_energy = S_temp
         inv_sqrt_energy_flat = inv_sqrt_energy.ravel(order="C")
 
-        # ------------------------------------------------------------------
-        # Scale orbit penalty relative to data magnitude
-        # Use the SAME per-tile-averaged energy metric (col_energy) to compute
-        # a meaningful D_med for beta scaling.
-        # ------------------------------------------------------------------
+
         beta_eff = 0.0
+        # ------------------------------------------------------------------
+        # Orbit prior strength: pass-through cfg.orbit_beta (no extra scaling).
+        # The prior block later normalizes by sum(S_local^2) so cfg.orbit_beta is
+        # now scale-stable and interpretable (tune cfg.orbit_beta directly).
+        # ------------------------------------------------------------------
         if orbit_weights is not None and cfg.orbit_beta > 0.0:
-            # median diagonal scale in the unscaled per-tile-energy system
-            D_med = float(np.median(col_energy[pos_mask])) if np.any(pos_mask) else 1.0
-
-            beta_eff = float(cfg.orbit_beta) * D_med
-
-            print("[DIAG] orbit penalty scaling:", flush=True)
-            print("    cfg.orbit_beta =", float(cfg.orbit_beta), flush=True)
-            print("    median(per-tile col_energy) =", D_med, flush=True)
-            print("    beta_effective =", beta_eff, flush=True)
+            beta_eff = float(cfg.orbit_beta)
+            print(f"[DIAG] orbit prior : cfg.orbit_beta = {beta_eff:.4e}",
+                flush=True)
 
         # DIAGNOSTIC: report S statistics (helps find extreme scalings)
         S_sample = inv_sqrt_energy_flat
@@ -1333,10 +1326,9 @@ def solve_streaming_nnls(
             S_p90 = float(np.percentile(S_sample, 90.0))
             S_p99 = float(np.percentile(S_sample, 99.0))
             S_max = float(np.max(S_sample))
-            print("[DIAG] inv_sqrt_energy after per-tile avg + floor/cap: min/med/p90/p99/max =",
-                    S_min, S_p50, S_p90, S_p99, S_max, flush=True)
+            print(f"[DIAG] inv_sqrt_energy after per-tile avg + floor/cap: min/med/p90/p99/max = {S_min:.4e}/{S_p50:.4e}/{S_p90:.4e}/{S_p99:.4e}/{S_max:.4e}", flush=True)
         except Exception as _e:
-            print("[DIAG] error printing S stats:", _e, flush=True)
+            print(f"[DIAG] error printing S stats: {_e}", flush=True)
 
         # run streaming active-set NNLS (monolithic) using persistent executor
         print("[BC-FUSED][MONO] starting streaming active-set NNLS (mono)", flush=True)
@@ -1370,8 +1362,7 @@ def solve_streaming_nnls(
 
         # 1) D_tot sanity
         D_sample = np.sum(M_tile * M_tile, axis=(0, 3))
-        print("[DIAG] sample D_tot (per-column) stats: min/max/median =",
-            D_sample.min(), D_sample.max(), np.median(D_sample), flush=True)
+        print(f"[DIAG] sample D_tot (per-column) stats: min/max/median = {D_sample.min():.4e}/{D_sample.max():.4e}/{np.median(D_sample):.4e}", flush=True)
 
         # 2) ATy from streaming vs manual for the same tile
         CP = int(C * P)
@@ -1381,8 +1372,7 @@ def solve_streaming_nnls(
         # compute by summing per-column norm & dot to detect transpose/reshape errors
         for col in range(min(10, ATy_tile_stream.size)):
             ATy_tile_manual[col] = np.dot(A2_tile[:, col], Yt.reshape(-1))
-        print("[DIAG] ATy_tile difference (first 10 cols) maxabs =",
-            float(np.max(np.abs(ATy_tile_stream[:10] - ATy_tile_manual[:10]))), flush=True)
+        print(f"[DIAG] ATy_tile difference (first 10 cols) maxabs = {float(np.max(np.abs(ATy_tile_stream[:10] - ATy_tile_manual[:10]))):.4e}", flush=True)
 
         # 3) compare scaled vs unscaled reduced-worker ATA/ATy for a tiny active set
         # pick first k columns as "active"
@@ -1399,8 +1389,7 @@ def solve_streaming_nnls(
         A2_small *= S_active[None, :]
         ATA_sub_local = A2_small.T @ A2_small
         ATy_sub_local = A2_small.T @ Yt.reshape(-1)
-        print("[DIAG] ATA_sub_local shape, ATy_sub_local[0:6]:",
-            ATA_sub_local.shape, ATy_sub_local[:6], flush=True)
+        print(f"[DIAG] ATA_sub_local shape, ATy_sub_local[0:6]: {ATA_sub_local.shape} {ATy_sub_local[:6]}", flush=True)
 
         try:
             x_flat_unscaled = _streaming_active_set_nnls_via_streaming_matvec(
@@ -1414,7 +1403,7 @@ def solve_streaming_nnls(
                 executor=executor,
                 cfg=cfg,
                 orbit_weights=orbit_weights,
-                orbit_beta_eff=beta_eff,   # ← ADD THIS
+                orbit_beta_eff=beta_eff,
                 max_active=monolithic_max_active,
                 tol_grad=1e-8,
                 max_iter=5 * monolithic_max_active,
