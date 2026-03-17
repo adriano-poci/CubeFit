@@ -1,1 +1,2 @@
-* Added soft exit where new column is randomly promoted to test local optima, up to `explore_budget` times in `streaming_nnls._streaming_active_set_nnls_via_streaming_matvec`
+* Fixed `alpha_ref` calculation in `streaming_nnls._streaming_active_set_nnls_via_streaming_matvec`
+* Implemented group promotion when all gradients are negative to attempt escaping local optima in `streaming_nnls._streaming_active_set_nnls_via_streaming_matvec`

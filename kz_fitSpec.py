@@ -1981,18 +1981,22 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 laSFH = arSOL[latube, :, :, :].sum(axis=0)
             if boxess.sum() > 0:
                 boSFH = arSOL[boxess, :, :, :].sum(axis=0)
+            
+            coSFH = np.ma.masked_less_equal(coSFH, 0.0)
+            laSFH = np.ma.masked_less_equal(laSFH, 0.0)
+            boSFH = np.ma.masked_less_equal(boSFH, 0.0)
 
             minT, maxT = np.min(uages), np.max(uages)
             minZ, maxZ = np.min(umetals), np.max(umetals)
 
             wmax = np.log10(np.max((
-                np.max(coSFH[coSFH>0]) if np.any(coSFH>0) else 1e-1,
-                np.max(laSFH[laSFH>0]) if np.any(laSFH>0) else 1e-1,
-                np.max(boSFH[boSFH>0]) if np.any(boSFH>0) else 1e-1)))
+                np.ma.max(coSFH[coSFH>0]) if np.ma.any(coSFH>0) else 1e-5,
+                np.ma.max(laSFH[laSFH>0]) if np.ma.any(laSFH>0) else 1e-5,
+                np.ma.max(boSFH[boSFH>0]) if np.ma.any(boSFH>0) else 1e-5)))
             sfhMin = np.log10(np.min((
-                np.min(coSFH[coSFH>0]) if np.any(coSFH>0) else 1e10,
-                np.min(laSFH[laSFH>0]) if np.any(laSFH>0) else 1e10,
-                np.min(boSFH[boSFH>0]) if np.any(boSFH>0) else 1e10)))
+                np.ma.min(coSFH[coSFH>0]) if np.ma.any(coSFH>0) else 1e10,
+                np.ma.min(laSFH[laSFH>0]) if np.ma.any(laSFH>0) else 1e10,
+                np.ma.min(boSFH[boSFH>0]) if np.ma.any(boSFH>0) else 1e10)))
             wmin = np.max((sfhMin, -12))
             print(f"SFH plot limits: {wmin:.2f} ({sfhMin:.2f}) to {wmax:.2f}")
 
@@ -2002,7 +2006,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             print(nAlphas, ualphas)
             for ali in range(nAlphas):
                 ax = fig.add_subplot(gs[0, ali])
-                cnt = ax.imshow(np.log10(coSFH[:, :, ali] + 1e-30),
+                cnt = ax.imshow(np.ma.log10(coSFH[:, :, ali]),
                     extent=[minT, maxT, minZ, maxZ],
                     aspect='auto', interpolation='none', origin='lower',
                     cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
@@ -2011,18 +2015,19 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 if not ax.get_subplotspec().is_first_col():
                     ax.set_yticklabels([])
                 if ax.get_subplotspec().is_first_col():
-                    lT = ax.text(1e-2, 1e-2, r'$z$ Tubes', va='bottom', ha='left',
-                        color=POT.pgreen, transform=ax.transAxes)
+                    lT = ax.text(1e-2, 1e-2, r'$z$ Tubes', va='bottom',
+                        ha='left', color=POT.pgreen, transform=ax.transAxes)
                     lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                         foreground='k')])
                 if nAlphas > 1:
-                    lT = ax.text(0.5, 1.05, rf"$[\alpha/Fe]={ualphas[ali]:.2f}$",
+                    lT = ax.text(0.5, 1.05,
+                        rf"$[\alpha/Fe]={ualphas[ali]:.2f}$",
                         va='bottom', ha='center', color=POT.pgreen,
                         transform=ax.transAxes)
                     lT.set_path_effects(
                         [PathEffects.withStroke(linewidth=1.5, foreground='k')])
                 ax = fig.add_subplot(gs[1, ali])
-                ax.imshow(np.log10(laSFH[:, :, ali] + 1e-30),
+                ax.imshow(np.ma.log10(laSFH[:, :, ali]),
                     extent=[minT, maxT, minZ, maxZ],
                     aspect='auto', interpolation='none', origin='lower',
                     cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
@@ -2031,12 +2036,12 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 if not ax.get_subplotspec().is_first_col():
                     ax.set_yticklabels([])
                 if ax.get_subplotspec().is_first_col():
-                    lT = ax.text(1e-2, 1e-2, r'$x$ Tubes', va='bottom', ha='left',
-                        color=POT.pgreen, transform=ax.transAxes)
+                    lT = ax.text(1e-2, 1e-2, r'$x$ Tubes', va='bottom',
+                        ha='left', color=POT.pgreen, transform=ax.transAxes)
                     lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                         foreground='k')])
                 ax = fig.add_subplot(gs[2, ali])
-                ax.imshow(np.log10(boSFH[:, :, ali] + 1e-30),
+                ax.imshow(np.ma.log10(boSFH[:, :, ali]),
                     extent=[minT, maxT, minZ, maxZ],
                     aspect='auto', interpolation='none', origin='lower',
                     cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
@@ -2084,9 +2089,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
             # compute log limits across panels, ignore zeros
             vals = np.hstack([
-                np.log10(coZalpha[coZalpha>0]).ravel() if np.any(coZalpha>0) else np.array([]),
-                np.log10(laZalpha[laZalpha>0]).ravel() if np.any(laZalpha>0) else np.array([]),
-                np.log10(boZalpha[boZalpha>0]).ravel() if np.any(boZalpha>0) else np.array([]),
+                np.log10(coZalpha[coZalpha>0]).ravel() if np.ma.any(coZalpha>0) else np.array([]),
+                np.log10(laZalpha[laZalpha>0]).ravel() if np.ma.any(laZalpha>0) else np.array([]),
+                np.log10(boZalpha[boZalpha>0]).ravel() if np.ma.any(boZalpha>0) else np.array([]),
             ])
             if vals.size > 0:
                 vmin2 = float(np.max((np.min(vals), -12.0)))
@@ -2100,7 +2105,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             for pi, (arr, title) in enumerate(panels):
                 ax = fig2.add_subplot(gs2[0, pi])
                 # arr shape (nMetals, nAlphas) -> transpose for imshow so y=alpha
-                im = ax.imshow(np.log10(arr.T + 1e-30),
+                im = ax.imshow(np.ma.log10(arr.T),
                     extent=[minZ, maxZ, np.min(ualphas), np.max(ualphas)],
                     aspect='auto', origin='lower', cmap=moncmapr,
                     norm=Normalize(vmin=vmin2, vmax=vmax2))

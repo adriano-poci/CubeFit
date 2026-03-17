@@ -36,6 +36,11 @@ v1.3:   Compute global `alpha_fixed` in
         Added soft exit where new column is randomly promoted to test local 
             optima, up to `explore_budget` times in 
             `_streaming_active_set_nnls_via_streaming_matvec`. 15 March 2026
+v1.4:   Fixed `alpha_ref` calculation in
+            `_streaming_active_set_nnls_via_streaming_matvec`;
+        Implemented group promotion when all gradients are negative to attempt
+            escaping local optima in
+            `_streaming_active_set_nnls_via_streaming_matvec`. 16 March 2026
 """
 
 from __future__ import annotations, print_function
@@ -580,12 +585,36 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     Assumes executor is a ProcessPoolExecutor created once by caller.
     """
 
-    negative_grad_count = 0
-    explore_budget = 2
-
     CP = int(C * P)
+    negative_grad_count = 0
+    explore_budget = max(1, min(20, CP // 50))
+
     S_flat = np.asarray(inv_sqrt_energy_flat, dtype=np.float64).ravel()
     ATy_scaled = S_flat * ATy_flat
+
+    grad_ref = max(1.0, float(np.max(np.abs(ATy_scaled))))
+    tol_grad_rel = 1e-3
+
+    # --- plateau-stop controls ---
+    grad_hist = []
+    plateau_window = 8
+    plateau_frac = 0.995
+
+    # --- positive-gradient batch-promotion controls ---
+    positive_batch_size = 3
+    positive_pool_size = 12
+
+    # robust prior mass reference scale
+    ATy_pos = ATy_flat[np.isfinite(ATy_flat) & (ATy_flat > 0.0)]
+    if ATy_pos.size > 0:
+        alpha_ref = float(np.median(ATy_pos))
+    else:
+        alpha_ref = 1.0
+
+    if (not np.isfinite(alpha_ref)) or (alpha_ref <= 0.0):
+        alpha_ref = 1.0
+
+    print(f"[DIAG] alpha_ref = {alpha_ref:.4e}", flush=True)
 
     # --- orbit prior setup ---
     w_target = None
@@ -650,7 +679,6 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             # Compute alpha from current x (x = S * z) so prior redistributes
             # existing mass rather than creating mass from ATy magnitude.
                 # use fixed alpha computed once (not the running x-sum)
-            alpha_global = float(np.sum(S_flat * z))
 
             # Build prior gradient in z-space:
             # d/dz 0.5*beta*(S·z_local - alpha*w_cc)^2 = beta * (S·z_local - alpha*w_cc) * S
@@ -662,7 +690,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 S_local = S_flat[idxs]
                 z_local = z[idxs]
                 w_cc = float(w_target[cc]) if (w_target is not None) else 0.0
-                resid = float(np.dot(S_local, z_local) - alpha_global * w_cc)
+                resid = float(np.dot(S_local, z_local) - alpha_ref * w_cc)
                 if not np.isfinite(resid):
                     continue
                 s_norm = float(np.sum(S_local * S_local)) + 1e-30
@@ -670,7 +698,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
             # Prevent prior from overwhelming data gradient:
             # compute robust norms, allow prior up to `clip_factor` times data gradient norm
-            clip_factor = 8.0
+            clip_factor = 1.5
             g_prior_norm = np.linalg.norm(g_prior)
             g_data_norm = np.linalg.norm(grad) + 1e-30
             if g_prior_norm > clip_factor * g_data_norm:
@@ -685,6 +713,25 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         avg_grad = float(np.mean(grad)) if grad.size else 0.0
         n_active = int(np.count_nonzero(active))
         print(f"[MONO][iter {it+1}] max_grad={max_grad_overall:.3e} avg_grad={avg_grad:.3e} active={n_active}", flush=True)
+
+        # ---------------- plateau termination ----------------
+        grad_hist.append(max_grad_overall)
+        if len(grad_hist) > plateau_window:
+            grad_hist.pop(0)
+
+        if len(grad_hist) == plateau_window:
+            g0 = float(grad_hist[0])
+            g1 = float(grad_hist[-1])
+            if np.isfinite(g0) and np.isfinite(g1) and (g0 > 0.0):
+                if g1 >= plateau_frac * g0:
+                    print(
+                        "[MONO] terminating on max_grad plateau: "
+                        f"start={g0:.3e} end={g1:.3e} "
+                        f"window={plateau_window}",
+                        flush=True,
+                    )
+                    break
+        # ---------------------------------------------------------
 
         not_active = np.where(~active)[0]
         if not_active.size == 0:
@@ -718,30 +765,82 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         idx = int(not_active[imax])
         max_g = float(gvals[imax])
 
-        if max_g <= tol_grad:
+        did_explore = False
+        newly_activated = None
+
+        # ------------------------------------------------------------
+        # If all gradients are <= 0 we may still be stuck in a local
+        # minimum because several columns together could improve the
+        # fit even though each individually has negative gradient.
+        # Try promoting a small group of promising columns, then
+        # immediately run the reduced solve on that enlarged set.
+        # ------------------------------------------------------------
+        tol_here = max(tol_grad, tol_grad_rel * grad_ref)
+        if max_g <= tol_here:
 
             negative_grad_count += 1
 
             if negative_grad_count <= explore_budget and not_active.size > 0:
-                # choose randomly among the least negative gradients
-                k = min(5, gvals.size)  # candidate pool
-                top = np.argsort(gvals)[-k:]   # least negative
-                pick_local = int(np.random.choice(top))
-                idx = int(not_active[pick_local])
+                preferred_group = min(6, max(3, CP // 300))
+                pool_size = min(50, gvals.size)
 
-                print(f"[MONO][explore] promoting column {idx} despite negative gradient", flush=True)
+                top = np.argsort(gvals)[-pool_size:]
+                n_pick = min(preferred_group, top.size)
 
-                active[idx] = True
-                continue
+                chosen = np.random.choice(top, size=n_pick, replace=False)
+                cols_to_activate = not_active[chosen]
 
-            # exploration budget exhausted → normal termination
-            break
+                print(
+                    f"[MONO][explore] promoting group of "
+                    f"{len(cols_to_activate)} columns despite negative "
+                    f"gradients: {cols_to_activate}",
+                    flush=True,
+                )
 
-        # promote
-        active[idx] = True
+                active[cols_to_activate] = True
+                newly_activated = np.array(cols_to_activate, dtype=np.int64)
+                did_explore = True
+
+            else:
+                # exploration exhausted → terminate normally
+                break
+
+        else:
+            # --------------------------------------------------------
+            # positive-gradient batch promotion
+            # --------------------------------------------------------
+            pos_mask = np.where(gvals > tol_grad)[0]
+
+            if pos_mask.size == 0:
+                break
+
+            order = pos_mask[np.argsort(adj_score[pos_mask])[::-1]]
+            pool = order[:min(positive_pool_size, order.size)]
+            n_pick = min(positive_batch_size, pool.size)
+
+            chosen_local = pool[:n_pick]
+            cols_to_activate = not_active[chosen_local]
+
+            if n_pick == 1:
+                print(
+                    f"[MONO] promoting column {int(cols_to_activate[0])} "
+                    f"with positive gradient",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[MONO] promoting batch of {n_pick} columns with "
+                    f"positive gradients: {cols_to_activate}",
+                    flush=True,
+                )
+
+            active[cols_to_activate] = True
+            newly_activated = np.array(cols_to_activate, dtype=np.int64)
+            negative_grad_count = 0
+
         if int(np.count_nonzero(active)) > int(max_active):
-            # abort promotion if would exceed allowed size
-            active[idx] = False
+            if newly_activated is not None and newly_activated.size > 0:
+                active[newly_activated] = False
             break
 
         # --------------------------------------------------------
@@ -845,29 +944,32 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             print(f"[DIAG] reduced-diagnostics error: {_e}", flush=True)
         # ---------------------------------------------------------------------------
 
-        # ---- Stabilised reduced solve: adaptive ridge then SVD-truncated fallback ----
-        # k = ATA_sub.shape[0]
-        # adaptive ridge proportional to median diagonal (robust to scale)
+        # ---- Stabilised reduced solve: stronger adaptive ridge ----
         diag = np.diag(ATA_sub)
         diag_med = float(np.median(diag)) if diag.size else 0.0
-        # pick a relative ridge (tunable); higher if condition is bad
-        ridge_rel = 1e-4
-        ridge = max(1e-12, ridge_rel * max(1.0, diag_med))
-        ATA_sub += ridge * np.eye(k, dtype=np.float64)
+
+        try:
+            eigs = np.linalg.eigvalsh(ATA_sub)
+            emin = float(np.min(eigs))
+            emax = float(np.max(eigs))
+        except Exception:
+            emin = 0.0
+            emax = float(np.max(diag)) if diag.size else 1.0
+
+        cond_bad = (emin <= 1e-10 * max(emax, 1.0))
+        ridge_rel = 1e-2 if cond_bad else 1e-3
+        ridge = max(1e-10, ridge_rel * max(1.0, diag_med))
+        ATA_sub_reg = ATA_sub + ridge * np.eye(k, dtype=np.float64)
 
         # ----------------------------------------------------
-        # Robust orbit prior (scale-independent)
+        # Robust orbit prior (scale-independent, fixed alpha)
         # ----------------------------------------------------
         if (w_target is not None) and (orbit_beta > 0.0):
 
-            # group active variables by orbit
             orbit_groups = {}
             for local_i, gcol in enumerate(active_idx):
                 cc = int(gcol // P)
                 orbit_groups.setdefault(cc, []).append(local_i)
-
-            # fixed total mass scale
-            alpha = float(np.sum(S_flat * z))
 
             for cc, idx_list in orbit_groups.items():
 
@@ -878,58 +980,90 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 S_local = S_active[idx]
                 w_cc = float(w_target[cc])
 
-                # --- normalization to remove dependence on C, P, and S scaling ---
                 s_norm = float(np.sum(S_local * S_local)) + 1e-30
                 beta_eff = orbit_beta / s_norm
 
-                # apply rank-1 prior
-                ATA_sub[np.ix_(idx, idx)] += beta_eff * np.outer(S_local, S_local)
-                ATy_sub[idx] += beta_eff * (alpha * w_cc) * S_local
+                ATA_sub_reg[np.ix_(idx, idx)] += beta_eff * np.outer(S_local, S_local)
+                ATy_sub[idx] += beta_eff * (alpha_ref * w_cc) * S_local
 
-                # diagnostics
                 try:
                     print(
                         f"[DIAG][orbit_prior_norm] orbit={cc} cols={len(idx)} "
                         f"s_norm={s_norm:.3e} beta_eff={beta_eff:.3e} "
-                        f"target_mass={(alpha*w_cc):.3e}",
+                        f"target_mass={(alpha_ref*w_cc):.3e}",
                         flush=True,
                     )
                 except Exception:
                     pass
 
-        z_sub = None
+        z_old_active = z[active_idx].copy()
+
+        def _quad_obj(A, b, x):
+            return 0.5 * float(x @ (A @ x)) - float(b @ x)
+
+        z_sub_raw = None
         try:
-            z_sub = np.linalg.solve(ATA_sub, ATy_sub)
+            z_sub_raw = np.linalg.solve(ATA_sub_reg, ATy_sub)
         except np.linalg.LinAlgError:
-            # SVD truncated pseudo-inverse fallback: robust for near-singular ATA_sub
-            U, svals, Vt = np.linalg.svd(ATA_sub, full_matrices=False)
+            U, svals, Vt = np.linalg.svd(ATA_sub_reg, full_matrices=False)
             smax = svals[0] if svals.size else 1.0
             s_thresh = max(1e-12, 1e-6 * smax)
-            s_inv = np.array([1.0/s if s > s_thresh else 0.0 for s in svals], dtype=np.float64)
-            z_sub = Vt.T @ (s_inv * (U.T @ ATy_sub))
+            s_inv = np.array(
+                [1.0 / s if s > s_thresh else 0.0 for s in svals],
+                dtype=np.float64,
+            )
+            z_sub_raw = Vt.T @ (s_inv * (U.T @ ATy_sub))
 
-        # final non-negativity enforcement (keep small negatives for hysteresis handling)
-        # but we will not aggressively remove here — see Patch C
-        z_sub = np.maximum(z_sub, -1e-12)
+        z_sub_raw = np.maximum(z_sub_raw, 0.0)
 
-        # write back, enforce non-negativity + active-set adjustments
+        step_frac = 0.25 if did_explore else 0.5
+        z_sub = (1.0 - step_frac) * z_old_active + step_frac * z_sub_raw
+
+        obj_old = _quad_obj(ATA_sub_reg, ATy_sub, z_old_active)
+        obj_new = _quad_obj(ATA_sub_reg, ATy_sub, z_sub)
+
+        norm_old = float(np.linalg.norm(z_old_active))
+        norm_new = float(np.linalg.norm(z_sub))
+
+        reject = False
+        if did_explore:
+            if obj_new > obj_old:
+                reject = True
+            if norm_new > 5.0 * max(norm_old, 1.0):
+                reject = True
+
+        if reject:
+            print(
+                "[MONO][explore] rejecting exploratory update "
+                f"(obj_old={obj_old:.4e}, obj_new={obj_new:.4e}, "
+                f"norm_old={norm_old:.4e}, norm_new={norm_new:.4e})",
+                flush=True,
+            )
+            if newly_activated is not None and newly_activated.size > 0:
+                active[newly_activated] = False
+            z[active_idx] = z_old_active
+            continue
+
         for ii, gcol in enumerate(active_idx):
             z[int(gcol)] = float(z_sub[ii])
 
-        # Lawson–Hanson style step-back: only drop columns that are substantially
-        # negative (numerical noise tolerance), otherwise clip to small positive
-        # and keep active to allow subsequent refinement.
         scale = np.max(np.abs(z)) + 1e-30
         _eps_drop = 1e-10 * scale
+
         neg_idx = np.where(z < -_eps_drop)[0]
         if neg_idx.size > 0:
-            # zero them and remove from active
             z[neg_idx] = 0.0
             active[neg_idx] = False
-        # clip tiny negatives
+
         tiny_neg = np.where((z >= -_eps_drop) & (z < 0.0))[0]
         if tiny_neg.size > 0:
             z[tiny_neg] = 0.0
+
+        z_scale = np.max(z) + 1e-30
+        tiny_pos = np.where(active & (z <= 1e-6 * z_scale))[0]
+        if tiny_pos.size > 0:
+            z[tiny_pos] = 0.0
+            active[tiny_pos] = False
 
     return S_flat * z
 
