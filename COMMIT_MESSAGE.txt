@@ -1,2 +1,1 @@
-* Fixed `alpha_ref` calculation in `streaming_nnls._streaming_active_set_nnls_via_streaming_matvec`
-* Implemented group promotion when all gradients are negative to attempt escaping local optima in `streaming_nnls._streaming_active_set_nnls_via_streaming_matvec`
+* Added targeted orbit promotion for columns in under-represented orbits to more strategically match the orbit prior without degrading fit quality in `streaming_nnls`

@@ -2099,7 +2099,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             else:
                 vmin2, vmax2 = -12.0, -8.0
 
-            fig2 = plt.figure(figsize=(12, 4))
+            fig2 = plt.figure(figsize=plt.figaspect(1./3.)*0.75)
             gs2 = gridspec.GridSpec(1, 3, wspace=0.0, hspace=0.0)
             panels = [(coZalpha, 'Short-axis Tubes'), (laZalpha, 'Long-axis Tubes'), (boZalpha, 'Boxes')]
             for pi, (arr, title) in enumerate(panels):

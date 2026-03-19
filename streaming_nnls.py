@@ -41,6 +41,9 @@ v1.4:   Fixed `alpha_ref` calculation in
         Implemented group promotion when all gradients are negative to attempt
             escaping local optima in
             `_streaming_active_set_nnls_via_streaming_matvec`. 16 March 2026
+v1.5:   Added targeted orbit promotion for columns in under-represented orbits
+            to more strategically match the orbit prior without degrading fit
+            quality. 19 March 2026
 """
 
 from __future__ import annotations, print_function
@@ -557,6 +560,368 @@ def _nnls_from_quadratic(
 
 # ------------------------------------------------------------------------------
 
+def _build_stage_rescue_seed(
+    x_stage: np.ndarray,
+    w_target: Optional[np.ndarray],
+    alpha_ref: float,
+    C: int,
+    P: int,
+    *,
+    per_orbit: int = 2,
+    max_orbits: int = 3,
+    seed_frac: float = 1e-3,
+) -> np.ndarray:
+    """
+    Build a tiny warm-start seed in underweight orbits for the next continuation
+    stage.
+
+    Parameters
+    ----------
+    x_stage : ndarray, shape (C, P)
+        Current stage solution in physical x-space.
+    w_target : ndarray or None, shape (C,)
+        Normalized orbit target weights.
+    alpha_ref : float
+        Fixed reference mass scale used by the monolithic solver.
+    C : int
+        Number of orbit components.
+    P : int
+        Number of populations per orbit.
+    per_orbit : int, optional
+        Maximum number of seed columns per rescued orbit.
+    max_orbits : int, optional
+        Maximum number of rescued orbits.
+    seed_frac : float, optional
+        Seed amplitude as a fraction of the target orbit mass, divided across
+        selected columns.
+
+    Returns
+    -------
+    x_seed : ndarray, shape (C, P)
+        Tiny additive warm-start seed for the next stage.
+    """
+    x_stage = np.asarray(x_stage, dtype=np.float64).reshape(C, P)
+    x_seed = np.zeros((C, P), dtype=np.float64)
+
+    if (w_target is None) or (not np.any(np.isfinite(w_target))):
+        return x_seed
+
+    w_target = np.asarray(w_target, dtype=np.float64).ravel()
+    if w_target.size != C:
+        return x_seed
+
+    s_orbit = np.sum(x_stage, axis=1)
+    t_orbit = alpha_ref * w_target
+    deficit = t_orbit - s_orbit
+
+    under = np.where(np.isfinite(deficit) & (deficit > 0.0))[0]
+    if under.size == 0:
+        return x_seed
+
+    under = under[np.argsort(deficit[under])[::-1]]
+    under = under[:min(max_orbits, under.size)]
+
+    for cc in under:
+        row = x_stage[cc]
+        inactive = np.where(row <= 0.0)[0]
+
+        if inactive.size == 0:
+            # if the whole orbit is already active, seed the weakest entries
+            order = np.argsort(row)
+            pick = order[:min(per_orbit, order.size)]
+        else:
+            pick = inactive[:min(per_orbit, inactive.size)]
+
+        if pick.size == 0:
+            continue
+
+        orbit_seed_mass = max(0.0, seed_frac * t_orbit[cc])
+        amp = orbit_seed_mass / float(pick.size)
+
+        if np.isfinite(amp) and (amp > 0.0):
+            x_seed[cc, pick] = amp
+
+    return x_seed
+
+# ------------------------------------------------------------------------------
+
+def _prepare_stage_warm_start(
+    x_stage: np.ndarray,
+    w_target: Optional[np.ndarray],
+    alpha_ref: float,
+    C: int,
+    P: int,
+    *,
+    keep_per_orbit: int = 8,
+    tiny_rel: float = 1e-4,
+    rescue_per_orbit: int = 2,
+    rescue_orbits_max: int = 3,
+    rescue_seed_frac: float = 1e-3,
+) -> np.ndarray:
+    """
+    Rebuild a warm start for the next continuation stage.
+
+    Strategy
+    --------
+    1. Prune weak support within each orbit.
+    2. If orbit targets are available, add tiny rescue seeds into the most
+       underweight orbits, even if those orbits already have active support.
+
+    Parameters
+    ----------
+    x_stage : ndarray, shape (C, P)
+        Current stage solution in physical x-space.
+    w_target : ndarray or None, shape (C,)
+        Normalized orbit weights.
+    alpha_ref : float
+        Fixed reference target mass scale.
+    C : int
+        Number of orbit components.
+    P : int
+        Number of populations per orbit.
+    keep_per_orbit : int, optional
+        Maximum number of existing support entries to keep per orbit.
+    tiny_rel : float, optional
+        Relative threshold within each orbit for pruning weak coefficients.
+    rescue_per_orbit : int, optional
+        Number of rescue seed columns per rescued orbit.
+    rescue_orbits_max : int, optional
+        Maximum number of underweight orbits to rescue.
+    rescue_seed_frac : float, optional
+        Tiny mass fraction of target orbit mass to inject.
+
+    Returns
+    -------
+    x_next : ndarray, shape (C, P)
+        Warm start for the next continuation stage.
+    """
+    x_stage = np.asarray(x_stage, dtype=np.float64).reshape(C, P)
+    x_next = np.zeros((C, P), dtype=np.float64)
+
+    # ----------------------------
+    # 1. prune existing support
+    # ----------------------------
+    for cc in range(C):
+        row = x_stage[cc]
+        row_max = float(np.max(row)) if row.size else 0.0
+        if row_max <= 0.0:
+            continue
+
+        keep = np.where(row > tiny_rel * row_max)[0]
+        if keep.size > keep_per_orbit:
+            keep = keep[np.argsort(row[keep])[::-1][:keep_per_orbit]]
+
+        x_next[cc, keep] = row[keep]
+
+    # ----------------------------
+    # 2. add rescue seeds
+    # ----------------------------
+    if (w_target is None) or (not np.any(np.isfinite(w_target))):
+        return x_next
+
+    w_target = np.asarray(w_target, dtype=np.float64).ravel()
+    if w_target.size != C:
+        return x_next
+
+    s_orbit = np.sum(x_next, axis=1)
+    t_orbit = alpha_ref * w_target
+    deficit = t_orbit - s_orbit
+
+    under = np.where(np.isfinite(deficit) & (deficit > 0.0))[0]
+    if under.size == 0:
+        return x_next
+
+    under = under[np.argsort(deficit[under])[::-1]]
+    under = under[:min(rescue_orbits_max, under.size)]
+
+    for cc in under:
+        row = x_next[cc]
+
+        # Prefer currently inactive columns; if none exist, perturb the weakest.
+        inactive = np.where(row <= 0.0)[0]
+        if inactive.size >= rescue_per_orbit:
+            pick = inactive[:rescue_per_orbit]
+        elif inactive.size > 0:
+            pick = inactive
+        else:
+            order = np.argsort(row)
+            pick = order[:min(rescue_per_orbit, order.size)]
+
+        if pick.size == 0:
+            continue
+
+        seed_mass = max(0.0, rescue_seed_frac * t_orbit[cc])
+        amp = seed_mass / float(pick.size)
+
+        if np.isfinite(amp) and (amp > 0.0):
+            x_next[cc, pick] = np.maximum(x_next[cc, pick], amp)
+
+    return x_next
+
+# ------------------------------------------------------------------------------
+
+def _quota_rescue_columns(
+    grad_vec: np.ndarray,
+    aty_scaled_vec: np.ndarray,
+    active_mask: np.ndarray,
+    S_flat: np.ndarray,
+    w_target: np.ndarray | None,
+    C: int,
+    P: int,
+    total_cols: int,
+    *,
+    min_per_orbit: int = 1,
+    max_per_orbit: int = 12,
+    penalty_strength: float = 0.5,
+) -> np.ndarray:
+    """
+    Select rescue columns using per-orbit promotion quotas derived from
+    the orbit prior weights.
+
+    The prior biases *which columns are tested*, not the final solution.
+    The reduced NNLS solve still determines which columns survive.
+
+    Parameters
+    ----------
+    grad_vec : ndarray, shape (C*P,)
+        Current full gradient vector.
+    aty_scaled_vec : ndarray, shape (C*P,)
+        Scaled A^T y vector, used as a secondary data-support score.
+    active_mask : ndarray, shape (C*P,)
+        Boolean active mask.
+    S_flat : ndarray, shape (C*P,)
+        Column scaling vector.
+    w_target : ndarray or None, shape (C,)
+        Normalized orbit prior weights.
+    C : int
+        Number of orbit components.
+    P : int
+        Number of populations per orbit.
+    total_cols : int
+        Total number of columns to promote.
+    min_per_orbit : int, optional
+        Minimum quota per orbit with non-zero target weight.
+    max_per_orbit : int, optional
+        Maximum quota per orbit.
+    penalty_strength : float, optional
+        Penalty against very large-S columns.
+
+    Returns
+    -------
+    cols : ndarray of int64
+        Global column indices to activate.
+    """
+    if total_cols <= 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    if w_target is None:
+        # fallback: global selection
+        not_active = np.where(~active_mask)[0]
+        if not_active.size == 0:
+            return np.zeros((0,), dtype=np.int64)
+
+        gvals = grad_vec[not_active]
+        svals = S_flat[not_active]
+        s_med = np.median(svals) + 1e-30
+        score = gvals / (1.0 + penalty_strength * (svals / s_med - 1.0))
+
+        order = np.argsort(score)[::-1]
+        pick = not_active[order[:min(total_cols, order.size)]]
+        return np.asarray(pick, dtype=np.int64)
+
+    w = np.asarray(w_target, dtype=np.float64).ravel()
+    if w.size != C:
+        return np.zeros((0,), dtype=np.int64)
+
+    w = np.maximum(w, 0.0)
+    w_sum = float(np.sum(w))
+
+    if w_sum <= 0.0:
+        return np.zeros((0,), dtype=np.int64)
+
+    w = w / w_sum
+
+    # ----------------------------
+    # initial quotas from weights
+    # ----------------------------
+    raw = total_cols * w
+    quotas = np.floor(raw).astype(np.int64)
+
+    # guarantee minimum quota on non-zero-weight orbits
+    nz = np.where(w > 0.0)[0]
+    for cc in nz:
+        quotas[cc] = max(quotas[cc], min_per_orbit)
+
+    # cap quotas
+    quotas = np.minimum(quotas, max_per_orbit)
+
+    # adjust total quota to requested total_cols
+    qsum = int(np.sum(quotas))
+
+    if qsum < total_cols:
+        frac = raw - np.floor(raw)
+        order = np.argsort(frac)[::-1]
+        for cc in order:
+            if qsum >= total_cols:
+                break
+            if quotas[cc] < max_per_orbit:
+                quotas[cc] += 1
+                qsum += 1
+
+    elif qsum > total_cols:
+        order = np.argsort(w)  # remove from weakest-target orbits first
+        for cc in order:
+            while (qsum > total_cols) and (quotas[cc] > 0):
+                quotas[cc] -= 1
+                qsum -= 1
+                if qsum <= total_cols:
+                    break
+
+    chosen = []
+    chosen_set = set()
+
+    for cc in np.argsort(w)[::-1]:
+        q = int(quotas[cc])
+        if q <= 0:
+            continue
+
+        base = int(cc * P)
+        cols_cc = np.arange(base, base + P, dtype=np.int64)
+        inactive_cc = cols_cc[~active_mask[cols_cc]]
+
+        if inactive_cc.size == 0:
+            continue
+
+        g_cc = grad_vec[inactive_cc]
+        s_cc = S_flat[inactive_cc]
+        aty_cc = aty_scaled_vec[inactive_cc]
+
+        s_med = np.median(s_cc) + 1e-30
+        score_cc = g_cc / (1.0 + penalty_strength * (s_cc / s_med - 1.0))
+
+        aty_scale = np.max(np.abs(aty_cc)) + 1e-30
+        score_cc = score_cc + 0.10 * (aty_cc / aty_scale)
+
+        order = np.argsort(score_cc)[::-1]
+        take = min(q, order.size)
+
+        for j in order[:take]:
+            gcol = int(inactive_cc[j])
+            if gcol not in chosen_set:
+                chosen.append(gcol)
+                chosen_set.add(gcol)
+
+    if len(chosen) == 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    # hard trim if rounding produced a few extra
+    if len(chosen) > total_cols:
+        chosen = chosen[:total_cols]
+
+    return np.asarray(chosen, dtype=np.int64)
+
+# ------------------------------------------------------------------------------
+
 def _streaming_active_set_nnls_via_streaming_matvec(
     h5_path: str,
     s_ranges: list,
@@ -570,6 +935,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     cfg: MPConfig,
     orbit_weights: Optional[np.ndarray] = None,
     orbit_beta_eff: float = 0.0,
+    x0_flat: Optional[np.ndarray] = None,
     max_active: int = 1000,
     tol_grad: float = 1e-8,
     max_iter: int = 5000,
@@ -622,8 +988,124 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
     orbit_beta = float(orbit_beta_eff)
 
-    z = np.zeros((CP,), dtype=np.float64)
-    active = np.zeros((CP,), dtype=bool)
+    if x0_flat is None:
+        z = np.zeros((CP,), dtype=np.float64)
+    else:
+        x0_flat = np.asarray(x0_flat, dtype=np.float64).ravel(order="C")
+        if x0_flat.size != CP:
+            raise ValueError("x0_flat has wrong size in monolithic solver")
+        z = np.divide(
+            x0_flat,
+            S_flat,
+            out=np.zeros_like(x0_flat, dtype=np.float64),
+            where=S_flat > 0.0,
+        )
+        np.maximum(z, 0.0, out=z)
+
+    z_scale0 = np.max(z) + 1e-30
+    active = z > (1e-10 * z_scale0)
+
+    # stage-status bookkeeping for continuation
+    termination_reason = "max_iter"
+    rescue_orbits = np.zeros((0,), dtype=np.int64)
+
+    def _current_x_from_z(z_vec: np.ndarray) -> np.ndarray:
+        """
+        Convert solver variable z to physical x.
+        """
+        return S_flat * z_vec
+
+    def _orbit_mass_and_deficit(z_vec: np.ndarray):
+        """
+        Compute current per-orbit masses and deficits relative to alpha_ref*w_target.
+
+        Returns
+        -------
+        s_orbit : ndarray, shape (C,)
+            Current orbit masses in x-space.
+        t_orbit : ndarray, shape (C,)
+            Target orbit masses.
+        deficit : ndarray, shape (C,)
+            Positive means underweight relative to target.
+        """
+        x_vec = _current_x_from_z(z_vec).reshape(C, P)
+        s_orbit = np.sum(x_vec, axis=1)
+
+        if w_target is None:
+            t_orbit = np.zeros((C,), dtype=np.float64)
+            deficit = np.zeros((C,), dtype=np.float64)
+        else:
+            t_orbit = alpha_ref * np.asarray(w_target, dtype=np.float64)
+            deficit = t_orbit - s_orbit
+
+        return s_orbit, t_orbit, deficit
+
+    def _targeted_rescue_columns(
+        grad_vec: np.ndarray,
+        active_mask: np.ndarray,
+        max_cols: int,
+    ) -> np.ndarray:
+        """
+        Choose exploratory columns from the most underweight orbits.
+        """
+        if (w_target is None) or (max_cols <= 0):
+            return np.zeros((0,), dtype=np.int64)
+
+        _, _, deficit = _orbit_mass_and_deficit(z)
+
+        under = np.where(deficit > 0.0)[0]
+        if under.size == 0:
+            return np.zeros((0,), dtype=np.int64)
+
+        under = under[np.argsort(deficit[under])[::-1]]
+
+        chosen_cols = []
+        chosen_set = set()
+
+        n_orbits_touch = min(5, under.size)
+
+        for cc in under[:n_orbits_touch]:
+            base = int(cc * P)
+            cols_cc = np.arange(base, base + P, dtype=np.int64)
+
+            inactive_cc = cols_cc[~active_mask[cols_cc]]
+            if inactive_cc.size == 0:
+                continue
+
+            g_cc = grad_vec[inactive_cc]
+            s_cc = S_flat[inactive_cc]
+            aty_cc = ATy_scaled[inactive_cc]
+
+            s_med = np.median(s_cc) + 1e-30
+            s_norm = s_cc / s_med
+
+            penalty_strength_local = 0.5
+            score_cc = g_cc / (1.0 + penalty_strength_local * (s_norm - 1.0))
+
+            aty_scale = np.max(np.abs(aty_cc)) + 1e-30
+            score_blend = score_cc + 0.10 * (aty_cc / aty_scale)
+
+            order = np.argsort(score_blend)[::-1]
+            n_take_cc = min(
+                max(2, int(np.ceil(max_cols / max(1, n_orbits_touch)))),
+                inactive_cc.size,
+            )
+
+            for j in order[:n_take_cc]:
+                gcol = int(inactive_cc[j])
+                if gcol not in chosen_set:
+                    chosen_cols.append(gcol)
+                    chosen_set.add(gcol)
+                if len(chosen_cols) >= max_cols:
+                    break
+
+            if len(chosen_cols) >= max_cols:
+                break
+
+        if len(chosen_cols) == 0:
+            return np.zeros((0,), dtype=np.int64)
+
+        return np.asarray(chosen_cols, dtype=np.int64)
 
     # ------------------------------------------------------------
     # Helper: compute ATAz in parallel using provided executor
@@ -724,6 +1206,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             g1 = float(grad_hist[-1])
             if np.isfinite(g0) and np.isfinite(g1) and (g0 > 0.0):
                 if g1 >= plateau_frac * g0:
+                    termination_reason = "plateau"
                     print(
                         "[MONO] terminating on max_grad plateau: "
                         f"start={g0:.3e} end={g1:.3e} "
@@ -781,28 +1264,52 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             negative_grad_count += 1
 
             if negative_grad_count <= explore_budget and not_active.size > 0:
-                preferred_group = min(6, max(3, CP // 300))
-                pool_size = min(50, gvals.size)
+                preferred_group = min(12, max(4, CP // 120))
 
-                top = np.argsort(gvals)[-pool_size:]
-                n_pick = min(preferred_group, top.size)
-
-                chosen = np.random.choice(top, size=n_pick, replace=False)
-                cols_to_activate = not_active[chosen]
-
-                print(
-                    f"[MONO][explore] promoting group of "
-                    f"{len(cols_to_activate)} columns despite negative "
-                    f"gradients: {cols_to_activate}",
-                    flush=True,
+                cols_to_activate = _quota_rescue_columns(
+                    grad_vec=grad,
+                    aty_scaled_vec=ATy_scaled,
+                    active_mask=active,
+                    S_flat=S_flat,
+                    w_target=w_target,
+                    C=C,
+                    P=P,
+                    total_cols=preferred_group,
+                    min_per_orbit=1,
+                    max_per_orbit=max(3, preferred_group),
+                    penalty_strength=0.5,
                 )
 
+                if cols_to_activate.size == 0:
+                    pool_size = min(50, gvals.size)
+                    top = np.argsort(gvals)[-pool_size:]
+                    n_pick = min(preferred_group, top.size)
+                    chosen = np.random.choice(top, size=n_pick, replace=False)
+                    cols_to_activate = not_active[chosen].astype(np.int64)
+
+                    print(
+                        f"[MONO][explore] fallback global promotion of "
+                        f"{len(cols_to_activate)} columns despite negative "
+                        f"gradients: {cols_to_activate}",
+                        flush=True,
+                    )
+                else:
+                    touched_orbits = np.unique(cols_to_activate // P)
+                    orbit_desc = ", ".join(
+                        [f"{int(cc)}" for cc in touched_orbits.tolist()]
+                    )
+                    print(
+                        f"[MONO][explore] quota-based orbit promotion of "
+                        f"{len(cols_to_activate)} columns: {cols_to_activate} "
+                        f"| orbits: {orbit_desc}",
+                        flush=True,
+                    )
+
                 active[cols_to_activate] = True
-                newly_activated = np.array(cols_to_activate, dtype=np.int64)
+                newly_activated = np.asarray(cols_to_activate, dtype=np.int64)
                 did_explore = True
 
             else:
-                # exploration exhausted → terminate normally
                 break
 
         else:
@@ -1042,6 +1549,10 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             if newly_activated is not None and newly_activated.size > 0:
                 active[newly_activated] = False
             z[active_idx] = z_old_active
+
+            if did_explore and negative_grad_count >= explore_budget:
+                break
+
             continue
 
         for ii, gcol in enumerate(active_idx):
@@ -1440,17 +1951,14 @@ def solve_streaming_nnls(
         inv_sqrt_energy = S_temp
         inv_sqrt_energy_flat = inv_sqrt_energy.ravel(order="C")
 
-
         beta_eff = 0.0
-        # ------------------------------------------------------------------
-        # Orbit prior strength: pass-through cfg.orbit_beta (no extra scaling).
-        # The prior block later normalizes by sum(S_local^2) so cfg.orbit_beta is
-        # now scale-stable and interpretable (tune cfg.orbit_beta directly).
-        # ------------------------------------------------------------------
         if orbit_weights is not None and cfg.orbit_beta > 0.0:
             beta_eff = float(cfg.orbit_beta)
-            print(f"[DIAG] orbit prior : cfg.orbit_beta = {beta_eff:.4e}",
-                flush=True)
+
+        print(
+            f"[DIAG] orbit prior : cfg.orbit_beta = {beta_eff:.4e}",
+            flush=True,
+        )
 
         # DIAGNOSTIC: report S statistics (helps find extreme scalings)
         S_sample = inv_sqrt_energy_flat
@@ -1538,12 +2046,16 @@ def solve_streaming_nnls(
                 cfg=cfg,
                 orbit_weights=orbit_weights,
                 orbit_beta_eff=beta_eff,
+                x0_flat=x.ravel(order="C"),
                 max_active=monolithic_max_active,
                 tol_grad=1e-8,
                 max_iter=5 * monolithic_max_active,
             )
+
             x = x_flat_unscaled.reshape(C, P).copy()
-            print("[BC-FUSED][MONO] finished streaming active-set NNLS", flush=True)
+            print("[BC-FUSED][MONO] finished streaming active-set NNLS",
+                flush=True)
+
         finally:
             try:
                 # shut down worker pool once per monolithic solve
