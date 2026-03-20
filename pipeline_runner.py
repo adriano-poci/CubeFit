@@ -67,13 +67,12 @@ from dataclasses import dataclass
 from CubeFit.hdf5_manager import H5Manager, H5Dims, open_h5
 from CubeFit.hypercube_builder import build_hypercube
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
-from CubeFit.kaczmarz_solver import solve_global_kaczmarz, SolverCfg
 from CubeFit.streaming_nnls import (
     MPConfig, solve_streaming_nnls, monolithic_nnls_scipy)
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
 )
-from CubeFit.nnls_patch import run_patch as _nnls_patch_run
+# from CubeFit.nnls_patch import run_patch as _nnls_patch_run
 from CubeFit.fit_tracker import FitTracker, NullTracker, TrackerConfig
 import CubeFit.cube_utils as cu
 from CubeFit.cube_utils import RatioCfg

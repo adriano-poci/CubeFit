@@ -1321,13 +1321,37 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             if pos_mask.size == 0:
                 break
 
-            order = pos_mask[np.argsort(adj_score[pos_mask])[::-1]]
-            pool = order[:min(positive_pool_size, order.size)]
-            n_pick = min(positive_batch_size, pool.size)
+            # --------------------------------------------------------
+            # Orbit-aware positive promotion (same logic as rescue)
+            # --------------------------------------------------------
+            preferred_group = min(positive_batch_size, pos_mask.size)
 
-            chosen_local = pool[:n_pick]
-            cols_to_activate = not_active[chosen_local]
+            cols_to_activate = _quota_rescue_columns(
+                grad_vec=grad,
+                aty_scaled_vec=ATy_scaled,
+                active_mask=active,
+                S_flat=S_flat,
+                w_target=w_target,
+                C=C,
+                P=P,
+                total_cols=preferred_group,
+                min_per_orbit=1,
+                max_per_orbit=max(2, preferred_group),
+                penalty_strength=0.5,
+            )
 
+            if cols_to_activate.size == 0:
+                # fallback
+                order = pos_mask[np.argsort(adj_score[pos_mask])[::-1]]
+                chosen_local = order[:preferred_group]
+                cols_to_activate = not_active[chosen_local]
+
+            print(
+                f"[MONO] orbit-aware positive promotion: {cols_to_activate}",
+                flush=True,
+            )
+
+            n_pick = int(cols_to_activate.size)
             if n_pick == 1:
                 print(
                     f"[MONO] promoting column {int(cols_to_activate[0])} "
@@ -1349,6 +1373,38 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             if newly_activated is not None and newly_activated.size > 0:
                 active[newly_activated] = False
             break
+
+        # --------------------------------------------------------
+        # Enforce minimum active columns per orbit
+        # (prevents orbit collapse under strong prior)
+        # --------------------------------------------------------
+        min_per_orbit = 1  # tunable (2–4 recommended)
+
+        for cc in range(C):
+            base = cc * P
+            idxs = np.arange(base, base + P, dtype=np.int64)
+
+            active_cc = idxs[active[idxs]]
+
+            if active_cc.size < min_per_orbit:
+                inactive_cc = idxs[~active[idxs]]
+
+                if inactive_cc.size > 0:
+                    # choose by strongest data support (NOT gradient)
+                    scores = ATy_scaled[inactive_cc]
+                    order = np.argsort(scores)[::-1]
+
+                    n_add = min(min_per_orbit - active_cc.size, order.size)
+
+                    chosen = inactive_cc[order[:n_add]]
+
+                    active[chosen] = True
+
+                    print(
+                        f"[MONO][enforce] orbit {cc}: adding {n_add} columns "
+                        f"to ensure minimum support: {chosen}",
+                        flush=True,
+                    )
 
         # --------------------------------------------------------
         # Reduced solve (assemble ATA_sub & ATy_sub) in parallel
@@ -1490,14 +1546,18 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 s_norm = float(np.sum(S_local * S_local)) + 1e-30
                 beta_eff = orbit_beta / s_norm
 
-                ATA_sub_reg[np.ix_(idx, idx)] += beta_eff * np.outer(S_local, S_local)
-                ATy_sub[idx] += beta_eff * (alpha_ref * w_cc) * S_local
+                ATA_sub_reg[np.ix_(idx, idx)] += (
+                    beta_eff * np.outer(S_local, S_local)
+                )
+                ATy_sub[idx] += (
+                    beta_eff * (alpha_ref * w_cc) * S_local
+                )
 
                 try:
                     print(
                         f"[DIAG][orbit_prior_norm] orbit={cc} cols={len(idx)} "
                         f"s_norm={s_norm:.3e} beta_eff={beta_eff:.3e} "
-                        f"target_mass={(alpha_ref*w_cc):.3e}",
+                        f"target_mass={(alpha_ref * w_cc):.3e}",
                         flush=True,
                     )
                 except Exception:
@@ -1533,9 +1593,29 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         norm_new = float(np.linalg.norm(z_sub))
 
         reject = False
+
         if did_explore:
-            if obj_new > obj_old:
+            # ----------------------------
+            # Evaluate orbit improvement
+            # ----------------------------
+            if w_target is not None:
+                _, _, deficit_old = _orbit_mass_and_deficit(z)
+                z_tmp = z.copy()
+                z_tmp[active_idx] = z_sub
+                _, _, deficit_new = _orbit_mass_and_deficit(z_tmp)
+
+                orbit_improved = (
+                    np.sum(np.abs(deficit_new)) < np.sum(np.abs(deficit_old))
+                )
+            else:
+                orbit_improved = False
+
+            # ----------------------------
+            # rejection logic
+            # ----------------------------
+            if (obj_new > obj_old) and (not orbit_improved):
                 reject = True
+
             if norm_new > 5.0 * max(norm_old, 1.0):
                 reject = True
 

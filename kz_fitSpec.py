@@ -79,6 +79,8 @@ from CubeFit.pipeline_runner   import PipelineRunner
 from CubeFit import cube_utils as cu
 from dynamics.IFU.Constants import Constants, Units, UnitStr
 from dynamics.IFU.Functions import Plot, Geometric
+from cythonModules import C_utils as Cu
+from cythonModules import C_GHKinematics as Cgh
 
 mDir = curdir.parent/'muse'
 dDir = cu._ddir()
@@ -1484,6 +1486,15 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     nSSP = int(np.prod((nMetals, nAges, nAlphas), dtype=int))
     pred = f"0{len(repr(nComp)):d}"
     nComp = int(nComp)
+    print(RZ)
+    par = INF['parameters']
+    dataMax = np.max(INF['dataMax'])
+    rLogMin, rLogMax = par['rLogMin'], par['rLogMax']
+    nMom = INF['kin']['nMom']
+    grid = np.array(INF['bins'][0]['grid'], dtype=int).T.ravel()-1
+    nbins = np.max(grid).astype(int)+1
+    ss = np.where(grid >= 0)[0]
+    GRIDS = grid[ss]
 
     oDict = cu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
     binFN = oDict['binFN']
@@ -1530,6 +1541,29 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     oClass = plp.Path(bDir, decDir, oClass.parent.name, oClass.name)
     obClass = plp.Path(bDir, decDir, obClass.parent.name, obClass.name)
     fpd = cu._deetExtr(bLKey)
+
+    pc = RZ.getPC()
+    km = RZ.getKM()
+
+    sRadius = np.logspace(par['rLogMin'], par['rLogMax'], par['nE']) #spherical
+    refML = par['gpML']
+    tMGE = par['tMGE']
+    sMGE = par['sMGE']
+    minQ = np.min([sMGE.q.min(), tMGE.q.min()])
+    bTheta, bPhi, bPsi = Cu.oneQPUtoTPP(fpd['q'], fpd['p'], fpd['u'], minQ)
+    cRadius = sRadius * np.sin(np.radians(bPhi))  # Spherical -> Cylindrical
+    wc = np.nonzero(cRadius <= 0.1)[0]
+    inner = cRadius[wc]
+    cRadius = np.delete(cRadius, wc)
+    cRadius = np.append(np.nanmean(inner), cRadius)
+    nCRad = cRadius.size
+    wc = np.nonzero(sRadius <= 0.1)[0]
+    inner = sRadius[wc]
+    sRadius = np.delete(sRadius, wc)
+    sRadius = np.append(np.nanmean(inner), sRadius)
+    nSRad = sRadius.size
+    print(f"# Radial bins: {nCRad} cylindrical, {nSRad} spherical")
+
     apDir = bDir/bLKey/'nn_aphist.out'
     maDir = (bDir/bLKey).parent/'datfil'/'mass_aper.dat'
 
@@ -1607,6 +1641,37 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     logger.log('Done.')
     apHists = np.ma.masked_invalid(apHists)
     nApHists = (apHists*(massNorm/norma)[:, np.newaxis, np.newaxis])
+
+    intFN = direc/'intrinsicData.xz'
+    if intFN.is_file():
+        angle, intData = cu.Load.lzma(intFN)
+    else:
+        imDir = direc/f"ii_{1:{pred}d}"/'declib_intrinsic_moments.out'
+        nMoms, nPh, nTh, nLr, phiBound, thBound, rBound, phi, theta, rr,\
+            mgeMass, fitMass, errMass, XX, YY, ZZ, vX, vY, vZ, vX2, vY2, vZ2,\
+            vXvY, vYvZ, vZvX, orbLong, orbShort, orbBox = \
+            cu.Read.intrMoments(imDir)
+        angles = np.ma.ones((3, nComp, XX.size), dtype=int)*np.nan
+        intData = np.ma.ones((18, nComp, XX.size), dtype=float)*np.nan
+        for comp in tqdm(range(nComp), desc='intrData', total=nComp):
+            imDir = direc/f"ii_{comp+1:{pred}d}"/'declib_intrinsic_moments.out'
+            nMoms, nPh, nTh, nLr, phiBound, thBound, rBound, phi, theta, rr,\
+                mgeMass, fitMass, errMass, XX, YY, ZZ, vX, vY, vZ, vX2, vY2,\
+                vZ2, vXvY, vYvZ, vZvX, orbLong, orbShort, orbBox = \
+                cu.Read.intrMoments(imDir)
+            angles[:, comp, :] = np.vstack((rr, theta, phi))
+            intData[:, comp, :] = np.vstack((mgeMass, fitMass, errMass, XX,
+                YY, ZZ, vX, vY, vZ, vX2, vY2, vZ2, vXvY, vYvZ, vZvX, orbLong,
+                orbShort, orbBox))
+        cu.Write.lzma(intFN, [angles, intData], preset=2)
+    # mgeMass fitMass errMass XX YY ZZ vX vY vZ vX2 vY2 vZ2 vXvY vYvZ vZvX
+    #    0       1       2     3  4  5  6  7  8  9   10  11  12   13   14
+    # orbLong orbShort orbBox
+    #    15      16      17
+    intData[1, :, :] /= np.ma.sum(intData[1, :, :])
+    ftmMask = np.broadcast_to(np.ma.getmaskarray(np.ma.masked_equal(
+        intData[1, :, :], 0.0))[np.newaxis, :, :], intData.shape)
+    intData = np.ma.masked_array(intData, mask=ftmMask)
 
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
@@ -1699,6 +1764,11 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         M = np.asarray(f["/ModelCube"][...], np.float64)     # (nSpat, nLam)
         mask = np.asarray(f["/Mask"][...], bool).ravel()
         nSpat, nLam = D.shape
+    
+    arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
+    compDisp = np.ma.ones((nComp, nCRad), dtype=float)*np.nan
+    compVel = np.ma.ones((nComp, nSRad), dtype=float)*np.nan
+    breakpoint()
 
     compare_orbit_vs_solution(
         h5_path=str(hdf5Path),
@@ -1715,7 +1785,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     model_raw = np.sum(model_cube[:, mask_arr], axis=1)
     # residuals in raw units (what the solver fits)
     resid_raw = data_cube[:, mask_arr] - model_cube[:, mask_arr]   # (nSpat, nMask)
-
     # RMS residual per bin in RAW flux units
     rms_resid_raw = np.sqrt(np.mean(resid_raw**2, axis=1))         # (nSpat,)
 
@@ -1970,7 +2039,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             satube = (otypes == 0) # group short-axis tubes
             latube = (otypes == 1)
             boxess = (otypes == 2)
-            arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
 
             coSFH = np.zeros((nMetals, nAges, nAlphas), dtype=float)
             laSFH = np.zeros((nMetals, nAges, nAlphas), dtype=float)
