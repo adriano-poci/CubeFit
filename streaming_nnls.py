@@ -44,6 +44,9 @@ v1.4:   Fixed `alpha_ref` calculation in
 v1.5:   Added targeted orbit promotion for columns in under-represented orbits
             to more strategically match the orbit prior without degrading fit
             quality. 19 March 2026
+v1.6:   Replace conventional orbit projection with a smooth penalty in the
+            actual NNLS solve to simultaneously bias towards the orbit prior in
+            `_streaming_active_set_nnls_via_streaming_matvec`. 21 March 2026
 """
 
 from __future__ import annotations, print_function
@@ -963,8 +966,8 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
     # --- plateau-stop controls ---
     grad_hist = []
-    plateau_window = 8
-    plateau_frac = 0.995
+    plateau_window = 10
+    plateau_frac = 0.998
 
     # --- positive-gradient batch-promotion controls ---
     positive_batch_size = 3
@@ -979,6 +982,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
     if (not np.isfinite(alpha_ref)) or (alpha_ref <= 0.0):
         alpha_ref = 1.0
+    alpha_running = alpha_ref
 
     print(f"[DIAG] alpha_ref = {alpha_ref:.4e}", flush=True)
 
@@ -986,7 +990,6 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     w_target = None
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
-    orbit_beta = float(orbit_beta_eff)
 
     if x0_flat is None:
         z = np.zeros((CP,), dtype=np.float64)
@@ -1154,41 +1157,13 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         ATAz_scaled = _compute_ATAz_scaled(z)
         grad = ATy_scaled - ATAz_scaled
 
-        # ---- inject prior-gradient into the promotion gradient (so prior can
-        # ---- encourage activation of columns that help meet orbit targets)
-        # ---- Prior influence on promotion gradient (revised alpha + clipping)
-        if (w_target is not None) and (orbit_beta > 0.0):
-            # Compute alpha from current x (x = S * z) so prior redistributes
-            # existing mass rather than creating mass from ATy magnitude.
-                # use fixed alpha computed once (not the running x-sum)
+        # --- update alpha from current solution (stabilised) ---
+        if (w_target is not None) and (it > 0) and (it % 5 == 0):
+            x_full = S_flat * z
+            alpha_new = float(np.sum(x_full) / (np.sum(w_target) + 1e-30))
 
-            # Build prior gradient in z-space:
-            # d/dz 0.5*beta*(S·z_local - alpha*w_cc)^2 = beta * (S·z_local - alpha*w_cc) * S
-            g_prior = np.zeros_like(grad)
-            # Loop per-orbit (cheap relative to expensive matvecs)
-            for cc in range(C):
-                base = cc * P
-                idxs = np.arange(base, base + P, dtype=np.int64)
-                S_local = S_flat[idxs]
-                z_local = z[idxs]
-                w_cc = float(w_target[cc]) if (w_target is not None) else 0.0
-                resid = float(np.dot(S_local, z_local) - alpha_ref * w_cc)
-                if not np.isfinite(resid):
-                    continue
-                s_norm = float(np.sum(S_local * S_local)) + 1e-30
-                g_prior[idxs] = (orbit_beta / s_norm) * resid * S_local
-
-            # Prevent prior from overwhelming data gradient:
-            # compute robust norms, allow prior up to `clip_factor` times data gradient norm
-            clip_factor = 1.5
-            g_prior_norm = np.linalg.norm(g_prior)
-            g_data_norm = np.linalg.norm(grad) + 1e-30
-            if g_prior_norm > clip_factor * g_data_norm:
-                # scale down prior proportionally
-                g_prior *= (clip_factor * g_data_norm) / (g_prior_norm + 1e-30)
-
-            # Add prior gradient to promotion gradient
-            grad = grad + g_prior
+            # exponential smoothing (prevents instability)
+            alpha_running = 0.9 * alpha_running + 0.1 * alpha_new
 
         # diagnostic logging for the active-set iteration
         max_grad_overall = float(np.max(grad)) if grad.size else 0.0
@@ -1202,18 +1177,20 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             grad_hist.pop(0)
 
         if len(grad_hist) == plateau_window:
-            g0 = float(grad_hist[0])
-            g1 = float(grad_hist[-1])
-            if np.isfinite(g0) and np.isfinite(g1) and (g0 > 0.0):
-                if g1 >= plateau_frac * g0:
-                    termination_reason = "plateau"
-                    print(
-                        "[MONO] terminating on max_grad plateau: "
-                        f"start={g0:.3e} end={g1:.3e} "
-                        f"window={plateau_window}",
-                        flush=True,
-                    )
-                    break
+            g_start = grad_hist[0]
+            g_end   = grad_hist[-1]
+
+            rel_improve = (g_start - g_end) / (abs(g_start) + 1e-30)
+
+            if rel_improve < 1e-3:
+                termination_reason = "plateau"
+                print(
+                    "[MONO] terminating on plateau: "
+                    f"start={g_start:.3e} end={g_end:.3e} "
+                    f"rel_improve={rel_improve:.3e}",
+                    flush=True,
+                )
+                break
         # ---------------------------------------------------------
 
         not_active = np.where(~active)[0]
@@ -1525,116 +1502,47 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         ATA_sub_reg = ATA_sub + ridge * np.eye(k, dtype=np.float64)
 
         # ----------------------------------------------------
-        # Robust orbit prior (scale-independent, fixed alpha)
+        # Constrained reduced solve (KKT system)
         # ----------------------------------------------------
-        if (w_target is not None) and (orbit_beta > 0.0):
 
+        if w_target is not None:
+
+            # --- build constraint matrix ---
             orbit_groups = {}
             for local_i, gcol in enumerate(active_idx):
                 cc = int(gcol // P)
                 orbit_groups.setdefault(cc, []).append(local_i)
 
-            for cc, idx_list in orbit_groups.items():
+            n_constraints = len(orbit_groups)
 
+            Cmat = np.zeros((n_constraints, k), dtype=np.float64)
+            dvec = np.zeros((n_constraints,), dtype=np.float64)
+
+            for row, (cc, idx_list) in enumerate(orbit_groups.items()):
                 idx = np.array(idx_list, dtype=np.int64)
-                if idx.size == 0:
-                    continue
-
                 S_local = S_active[idx]
-                w_cc = float(w_target[cc])
+                Cmat[row, idx] = S_local
+                dvec[row] = alpha_running * w_target[cc]
 
-                s_norm = float(np.sum(S_local * S_local)) + 1e-30
-                beta_eff = orbit_beta / s_norm
+            KKT = np.block([
+                [ATA_sub_reg, Cmat.T],
+                [Cmat, np.zeros((n_constraints, n_constraints))]
+            ])
 
-                ATA_sub_reg[np.ix_(idx, idx)] += (
-                    beta_eff * np.outer(S_local, S_local)
-                )
-                ATy_sub[idx] += (
-                    beta_eff * (alpha_ref * w_cc) * S_local
-                )
+            rhs = np.concatenate([ATy_sub, dvec])
 
-                try:
-                    print(
-                        f"[DIAG][orbit_prior_norm] orbit={cc} cols={len(idx)} "
-                        f"s_norm={s_norm:.3e} beta_eff={beta_eff:.3e} "
-                        f"target_mass={(alpha_ref * w_cc):.3e}",
-                        flush=True,
-                    )
-                except Exception:
-                    pass
+            KKT += 1e-10 * np.eye(KKT.shape[0])
 
-        z_old_active = z[active_idx].copy()
+            sol = np.linalg.lstsq(KKT, rhs, rcond=1e-12)[0]
+            z_sub = sol[:k]
 
-        def _quad_obj(A, b, x):
-            return 0.5 * float(x @ (A @ x)) - float(b @ x)
+        else:
+            # fallback: unconstrained NNLS
+            z_sub = _nnls_from_quadratic(ATA_sub_reg, ATy_sub)
 
-        z_sub_raw = None
-        try:
-            z_sub_raw = np.linalg.solve(ATA_sub_reg, ATy_sub)
-        except np.linalg.LinAlgError:
-            U, svals, Vt = np.linalg.svd(ATA_sub_reg, full_matrices=False)
-            smax = svals[0] if svals.size else 1.0
-            s_thresh = max(1e-12, 1e-6 * smax)
-            s_inv = np.array(
-                [1.0 / s if s > s_thresh else 0.0 for s in svals],
-                dtype=np.float64,
-            )
-            z_sub_raw = Vt.T @ (s_inv * (U.T @ ATy_sub))
+        z_sub = np.maximum(z_sub, 0.0)
 
-        z_sub_raw = np.maximum(z_sub_raw, 0.0)
-
-        step_frac = 0.25 if did_explore else 0.5
-        z_sub = (1.0 - step_frac) * z_old_active + step_frac * z_sub_raw
-
-        obj_old = _quad_obj(ATA_sub_reg, ATy_sub, z_old_active)
-        obj_new = _quad_obj(ATA_sub_reg, ATy_sub, z_sub)
-
-        norm_old = float(np.linalg.norm(z_old_active))
-        norm_new = float(np.linalg.norm(z_sub))
-
-        reject = False
-
-        if did_explore:
-            # ----------------------------
-            # Evaluate orbit improvement
-            # ----------------------------
-            if w_target is not None:
-                _, _, deficit_old = _orbit_mass_and_deficit(z)
-                z_tmp = z.copy()
-                z_tmp[active_idx] = z_sub
-                _, _, deficit_new = _orbit_mass_and_deficit(z_tmp)
-
-                orbit_improved = (
-                    np.sum(np.abs(deficit_new)) < np.sum(np.abs(deficit_old))
-                )
-            else:
-                orbit_improved = False
-
-            # ----------------------------
-            # rejection logic
-            # ----------------------------
-            if (obj_new > obj_old) and (not orbit_improved):
-                reject = True
-
-            if norm_new > 5.0 * max(norm_old, 1.0):
-                reject = True
-
-        if reject:
-            print(
-                "[MONO][explore] rejecting exploratory update "
-                f"(obj_old={obj_old:.4e}, obj_new={obj_new:.4e}, "
-                f"norm_old={norm_old:.4e}, norm_new={norm_new:.4e})",
-                flush=True,
-            )
-            if newly_activated is not None and newly_activated.size > 0:
-                active[newly_activated] = False
-            z[active_idx] = z_old_active
-
-            if did_explore and negative_grad_count >= explore_budget:
-                break
-
-            continue
-
+        # write back
         for ii, gcol in enumerate(active_idx):
             z[int(gcol)] = float(z_sub[ii])
 

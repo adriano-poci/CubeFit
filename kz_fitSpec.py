@@ -1766,9 +1766,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         nSpat, nLam = D.shape
     
     arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
-    compDisp = np.ma.ones((nComp, nCRad), dtype=float)*np.nan
-    compVel = np.ma.ones((nComp, nSRad), dtype=float)*np.nan
-    breakpoint()
+    # compDisp = np.ma.ones((nComp, nCRad), dtype=float)*np.nan
+    # compVel = np.ma.ones((nComp, nSRad), dtype=float)*np.nan
 
     compare_orbit_vs_solution(
         h5_path=str(hdf5Path),
