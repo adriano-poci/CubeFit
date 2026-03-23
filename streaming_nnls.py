@@ -1025,11 +1025,6 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     z_scale0 = np.max(z) + 1e-30
     active = z > (1e-10 * z_scale0)
 
-    # --- promotion cooldown (Fix 1) ---
-    recent_promotions: set[int] = set()
-    promotion_history: list[set[int]] = []
-    cooldown_iters = 10
-
     def _current_x_from_z(z_vec: np.ndarray) -> np.ndarray:
         """
         Convert solver variable z to physical x.
@@ -1227,11 +1222,6 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         # ---------------------------------------------------------
 
         gvals = grad[not_active].copy()
-
-        # suppress recently used columns
-        if len(recent_promotions) > 0:
-            mask_recent = np.isin(not_active, list(recent_promotions))
-            gvals[mask_recent] -= 1e6 * np.max(np.abs(gvals))
         if gvals.size == 0:
             break
 
@@ -1290,12 +1280,6 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                     max_per_orbit=max(3, preferred_group),
                     penalty_strength=0.5,
                 )
-                # --- cooldown filter ---
-                if cols_to_activate.size > 0:
-                    cols_to_activate = np.array(
-                        [c for c in cols_to_activate if c not in recent_promotions],
-                        dtype=np.int64
-                    )
 
                 # fallback if everything was filtered out
                 if cols_to_activate.size == 0:
@@ -1325,16 +1309,6 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 active[cols_to_activate] = True
                 newly_activated = np.asarray(cols_to_activate, dtype=np.int64)
                 did_explore = True
-
-                # --- update cooldown memory ---
-                if cols_to_activate.size > 0:
-                    sset = set(map(int, cols_to_activate.tolist()))
-                    recent_promotions.update(sset)
-                    promotion_history.append(sset)
-
-                    if len(promotion_history) > cooldown_iters:
-                        old = promotion_history.pop(0)
-                        recent_promotions -= old
 
             else:
                 break
@@ -1366,12 +1340,6 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 max_per_orbit=max(2, preferred_group),
                 penalty_strength=0.5,
             )
-            # --- cooldown filter ---
-            if cols_to_activate.size > 0:
-                cols_to_activate = np.array(
-                    [c for c in cols_to_activate if c not in recent_promotions],
-                    dtype=np.int64
-                )
 
             # fallback if everything was filtered out
             if cols_to_activate.size == 0:
@@ -1402,16 +1370,6 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             active[cols_to_activate] = True
             newly_activated = np.array(cols_to_activate, dtype=np.int64)
             negative_grad_count = 0
-
-            # --- update cooldown memory ---
-            if cols_to_activate.size > 0:
-                sset = set(map(int, cols_to_activate.tolist()))
-                recent_promotions.update(sset)
-                promotion_history.append(sset)
-
-                if len(promotion_history) > cooldown_iters:
-                    old = promotion_history.pop(0)
-                    recent_promotions -= old
 
         if int(np.count_nonzero(active)) > int(max_active):
             if newly_activated is not None and newly_activated.size > 0:
