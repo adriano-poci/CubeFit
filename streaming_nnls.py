@@ -88,94 +88,86 @@ def _worker_reduced(
     keep_idx,
     active_idx: np.ndarray,
     S_active: np.ndarray,
-    CP: int,
     P: int,
 ):
-    """
-    Worker to compute partial ATA_sub and ATy_sub for a batch of tiles,
-    given the active indices and their scaling S_active.
 
-    Memory-efficient, exact-equivalence implementation that does NOT
-    form the large (Sblk*Lk, k) A2 matrix.  Uses tensor contractions to
-    compute the same sums:
-
-        ATA_loc[i,j] += sum_{s,lambda} (S_i * M_{s,ci,pi,lambda})
-                              * (S_j * M_{s,cj,pj,lambda})
-
-        ATy_loc[i] += sum_{s,lambda} (S_i * M_{s,ci,pi,lambda}) * Yt[s,lambda]
-
-    Inputs
-    ------
-    - active_idx: 1D int array of global column indices (length k)
-    - S_active : 1D float array of length k (per-active-column scaling)
-    - P : number of populations per orbit (used for cc/p decode)
-    """
     k = int(active_idx.size)
     ATA_loc = np.zeros((k, k), dtype=np.float64)
     ATy_loc = np.zeros((k,), dtype=np.float64)
 
-    # decode orbit & population indices for active columns
+    # decode indices
     cc_arr = (active_idx // P).astype(np.int64)
     pp_arr = (active_idx % P).astype(np.int64)
 
+    # group active columns by orbit
+    orbit_groups = {}
+    for i, cc in enumerate(cc_arr):
+        orbit_groups.setdefault(cc, []).append(i)
+
     with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]         # kept for shape reference; Yt read below
+        DC = f["/DataCube"]
         M = f["/HyperCube/models"]
 
         for (s0, s1) in batch:
-            # read data tile and model tile
+
+            # --- load data ---
             Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
             if keep_idx is not None:
-                Yt = Yt[:, keep_idx]           # shape (Sblk, Lk)
-            Sblk = s1 - s0
-            Lk_loc = Yt.shape[1]
+                Yt = Yt[:, keep_idx]
 
-            M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
-            if keep_idx is not None:
-                M_tile = M_tile[:, :, :, keep_idx]   # shape (Sblk, C, P, Lk_loc)
+            Sblk, Lk = Yt.shape
 
-            # Extract the k active column slices into shape (Sblk, k, Lk_loc)
-            # M_sub[s, i, lambda] = M_tile[s, cc_arr[i], pp_arr[i], lambda]
-            # This is the minimal temporary we need (k typically much smaller than CP)
-            M_sub = M_tile[:, cc_arr, pp_arr, :]  # shape (Sblk, k, Lk_loc)
+            # --- cache per-orbit slices ---
+            orbit_cache = {}
 
-            # --- compute inner products over s and lambda ---
-            # ATA_unscaled_loc[i,j] = sum_{s,lambda} M_sub[s,i,lambda] * M_sub[s,j,lambda]
-            # Use einsum for clarity and numerical stability / memory locality.
-            # result shape (k,k)
-            ATA_unscaled_loc = np.einsum("s i l, s j l -> i j", M_sub, M_sub, optimize=True)
+            for cc, idx_list in orbit_groups.items():
+                Mc = M[s0:s1, cc, :, :]
+                if keep_idx is not None:
+                    Mc = Mc[:, :, keep_idx]
 
-            # scale by S_active outer product: ATA_loc += (S_i * S_j) * ATA_unscaled_loc
-            outerS = (S_active[:, None] * S_active[None, :])
-            ATA_loc += outerS * ATA_unscaled_loc
+                Mc = np.asarray(Mc, dtype=np.float64, order="C")
+                orbit_cache[cc] = Mc   # shape (Sblk, P, Lk)
 
-            # --- compute ATy contributions ---
-            # ATy_unscaled_loc[i] = sum_{s,lambda} M_sub[s,i,lambda] * Yt[s,lambda]
-            # shape (k,)
-            ATy_unscaled_loc = np.einsum("s i l, s l -> i", M_sub, Yt, optimize=True)
+            # -------------------------------------------------
+            # ATy: each column independently
+            # -------------------------------------------------
+            for i in range(k):
+                cc = cc_arr[i]
+                p  = pp_arr[i]
 
-            # scale by S_active: ATy_loc += S_i * ATy_unscaled_loc[i]
-            ATy_loc += (S_active * ATy_unscaled_loc)
+                Mc = orbit_cache[cc][:, p, :]  # (Sblk, Lk)
 
-            # (optional consistency check -- enable for one debug run only)
-            # If you want to validate exact equivalence to former A2-based code,
-            # enable the block below (it will allocate A2 for the tile and compare).
-            #
-            # if False:
-            #     # build A2 (old approach) for a single-tile verification
-            #     A2_chk = np.empty((Sblk * Lk_loc, k), dtype=np.float64)
-            #     for j, gcol in enumerate(active_idx):
-            #         cc = int(gcol // P)
-            #         p = int(gcol % P)
-            #         A2_chk[:, j] = M_tile[:, cc, p, :].reshape(Sblk * Lk_loc)
-            #     A2_chk *= S_active[None, :]
-            #     ATA_chk = A2_chk.T @ A2_chk
-            #     ATy_chk = A2_chk.T @ Yt.reshape(-1)
-            #     # tolerance checks
-            #     err_ATA = np.max(np.abs(ATA_loc - ATA_chk))
-            #     err_ATy = np.max(np.abs(ATy_loc - ATy_chk))
-            #     if (err_ATA > 1e-10) or (err_ATy > 1e-10):
-            #         raise RuntimeError(f"_worker_reduced verification failed: err_ATA={err_ATA}, err_ATy={err_ATy}")
+                ATy_loc[i] += S_active[i] * np.sum(Mc * Yt)
+
+            # -------------------------------------------------
+            # ATA: grouped by orbit (vectorised mapping)
+            # -------------------------------------------------
+
+            for cc_i, idx_i_list in orbit_groups.items():
+
+                Mc_i = orbit_cache[cc_i]
+                p_i_idx = [pp_arr[i] for i in idx_i_list]
+                Mc_i_sub = Mc_i[:, p_i_idx, :]
+
+                I = np.array(idx_i_list, dtype=np.int64)
+
+                for cc_j, idx_j_list in orbit_groups.items():
+
+                    Mc_j = orbit_cache[cc_j]
+                    p_j_idx = [pp_arr[j] for j in idx_j_list]
+                    Mc_j_sub = Mc_j[:, p_j_idx, :]
+
+                    J = np.array(idx_j_list, dtype=np.int64)
+
+                    ATA_block = np.einsum(
+                        "s i l, s j l -> i j",
+                        Mc_i_sub,
+                        Mc_j_sub,
+                        optimize=True
+                    )
+
+                    scale = np.outer(S_active[I], S_active[J])
+                    ATA_loc[np.ix_(I, J)] += scale * ATA_block
 
     return ATA_loc, ATy_loc
 
@@ -186,48 +178,74 @@ def _worker_ATAz(
     batch: list,
     keep_idx,
     z: np.ndarray,
-    CP: int,
+    C: int,
+    P: int,
     S_flat: np.ndarray,
 ):
+    """
+    Streaming ATAz computation.
 
-    partial = np.zeros((CP,), dtype=np.float64)
+    Memory complexity:
+        O(Sblk * P * Lk) instead of O(Sblk * C * P * Lk)
+
+    This avoids materialising the full model tile.
+    """
+
+    partial = np.zeros((int(C*P),), dtype=np.float64)
 
     with open_h5(h5_path, role="reader") as f:
         M = f["/HyperCube/models"]
 
+        # reshape once outside loops
+        z_s = (S_flat * z).reshape(-1)  # flattened
+        # reshape vectors
+        z_cp = (S_flat * z).reshape(C, P)
+        S_cp = S_flat.reshape(C, P)
         for (s0, s1) in batch:
 
-            M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
+            # determine shapes WITHOUT loading full cube
+            Mc0 = M[s0:s1, 0, :, :]
             if keep_idx is not None:
-                M_tile = M_tile[:, :, :, keep_idx]
+                Mc0 = Mc0[:, :, keep_idx]
+            Sblk, _P, Lk = Mc0.shape
 
-            Sblk, C, P, Lk = M_tile.shape
 
-            # reshape vectors
-            z_s = (S_flat * z).reshape(C, P)
-
-            # compute v = A (S z)
+            # --- compute v = A (S z) ---
             v = np.zeros((Sblk, Lk), dtype=np.float64)
 
             for cc in range(C):
+                Mc = M[s0:s1, cc, :, :]
+                if keep_idx is not None:
+                    Mc = Mc[:, :, keep_idx]
+
+                Mc = np.asarray(Mc, dtype=np.float64, order="C")
+
+                # (P,) dot (Sblk, P, Lk) -> (Sblk, Lk)
                 v += np.tensordot(
-                    z_s[cc],
-                    M_tile[:, cc, :, :],
+                    z_cp[cc],
+                    Mc,
                     axes=(0, 1)
                 )
 
-            # compute g = A^T v
+            # --- compute g = A^T v ---
             g = np.zeros((C, P), dtype=np.float64)
 
             for cc in range(C):
+                Mc = M[s0:s1, cc, :, :]
+                if keep_idx is not None:
+                    Mc = Mc[:, :, keep_idx]
+
+                Mc = np.asarray(Mc, dtype=np.float64, order="C")
+
+                # (Sblk, P, Lk) ⋅ (Sblk, Lk) -> (P,)
                 g[cc] = np.tensordot(
-                    M_tile[:, cc, :, :],
+                    Mc,
                     v,
                     axes=([0, 2], [0, 1])
                 )
 
             # apply column scaling
-            partial += (S_flat.reshape(C, P) * g).reshape(-1)
+            partial += (S_cp * g).reshape(-1)
 
     return partial
 
@@ -1008,9 +1026,10 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     z_scale0 = np.max(z) + 1e-30
     active = z > (1e-10 * z_scale0)
 
-    # stage-status bookkeeping for continuation
-    termination_reason = "max_iter"
-    rescue_orbits = np.zeros((0,), dtype=np.int64)
+    # --- promotion cooldown (Fix 1) ---
+    recent_promotions: set[int] = set()
+    promotion_history: list[set[int]] = []
+    cooldown_iters = 10
 
     def _current_x_from_z(z_vec: np.ndarray) -> np.ndarray:
         """
@@ -1133,7 +1152,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         # create a temporary pool (but prefer passing a persistent executor).
         # Here we assume executor argument was passed into outer function.
         worker_args = [
-            (h5_path, batch, keep_idx, x_cand, CP, S_flat)
+            (h5_path, batch, keep_idx, x_cand, C, P, S_flat)
             for batch in batches if len(batch) > 0
         ]
         # Using executor.map (streamed) is fine — it returns results in submission order
@@ -1191,13 +1210,29 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                     flush=True,
                 )
                 break
-        # ---------------------------------------------------------
-
         not_active = np.where(~active)[0]
         if not_active.size == 0:
             break
+        # --- stagnation escape ---
+        if len(grad_hist) >= 5:
+            g_tail = np.array(grad_hist[-5:], dtype=np.float64)
+            if (np.max(g_tail) - np.min(g_tail)) / (np.max(g_tail) + 1e-30) < 1e-2:
+                n_force = min(5, not_active.size)
+                if n_force > 0:
+                    extra = not_active[np.random.choice(not_active.size, size=n_force, replace=False)]
+                    active[extra] = True
+                    print(f"[MONO][escape] forced expansion: {extra}", flush=True)
+        not_active = np.where(~active)[0]
+        if not_active.size == 0:
+            break
+        # ---------------------------------------------------------
 
-        gvals = grad[not_active]
+        gvals = grad[not_active].copy()
+
+        # suppress recently used columns
+        if len(recent_promotions) > 0:
+            mask_recent = np.isin(not_active, list(recent_promotions))
+            gvals[mask_recent] -= 1e6 * np.max(np.abs(gvals))
         if gvals.size == 0:
             break
 
@@ -1256,13 +1291,19 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                     max_per_orbit=max(3, preferred_group),
                     penalty_strength=0.5,
                 )
+                # --- cooldown filter ---
+                if cols_to_activate.size > 0:
+                    cols_to_activate = np.array(
+                        [c for c in cols_to_activate if c not in recent_promotions],
+                        dtype=np.int64
+                    )
 
+                # fallback if everything was filtered out
                 if cols_to_activate.size == 0:
                     pool_size = min(50, gvals.size)
                     top = np.argsort(gvals)[-pool_size:]
                     n_pick = min(preferred_group, top.size)
-                    chosen = np.random.choice(top, size=n_pick, replace=False)
-                    cols_to_activate = not_active[chosen].astype(np.int64)
+                    cols_to_activate = not_active[np.random.choice(top, size=n_pick, replace=False)].astype(np.int64)
 
                     print(
                         f"[MONO][explore] fallback global promotion of "
@@ -1285,6 +1326,16 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 active[cols_to_activate] = True
                 newly_activated = np.asarray(cols_to_activate, dtype=np.int64)
                 did_explore = True
+
+                # --- update cooldown memory ---
+                if cols_to_activate.size > 0:
+                    sset = set(map(int, cols_to_activate.tolist()))
+                    recent_promotions.update(sset)
+                    promotion_history.append(sset)
+
+                    if len(promotion_history) > cooldown_iters:
+                        old = promotion_history.pop(0)
+                        recent_promotions -= old
 
             else:
                 break
@@ -1316,12 +1367,19 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 max_per_orbit=max(2, preferred_group),
                 penalty_strength=0.5,
             )
+            # --- cooldown filter ---
+            if cols_to_activate.size > 0:
+                cols_to_activate = np.array(
+                    [c for c in cols_to_activate if c not in recent_promotions],
+                    dtype=np.int64
+                )
 
+            # fallback if everything was filtered out
             if cols_to_activate.size == 0:
-                # fallback
-                order = pos_mask[np.argsort(adj_score[pos_mask])[::-1]]
-                chosen_local = order[:preferred_group]
-                cols_to_activate = not_active[chosen_local]
+                pool_size = min(50, gvals.size)
+                top = np.argsort(gvals)[-pool_size:]
+                n_pick = min(preferred_group, top.size)
+                cols_to_activate = not_active[np.random.choice(top, size=n_pick, replace=False)].astype(np.int64)
 
             print(
                 f"[MONO] orbit-aware positive promotion: {cols_to_activate}",
@@ -1345,6 +1403,16 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             active[cols_to_activate] = True
             newly_activated = np.array(cols_to_activate, dtype=np.int64)
             negative_grad_count = 0
+
+            # --- update cooldown memory ---
+            if cols_to_activate.size > 0:
+                sset = set(map(int, cols_to_activate.tolist()))
+                recent_promotions.update(sset)
+                promotion_history.append(sset)
+
+                if len(promotion_history) > cooldown_iters:
+                    old = promotion_history.pop(0)
+                    recent_promotions -= old
 
         if int(np.count_nonzero(active)) > int(max_active):
             if newly_activated is not None and newly_activated.size > 0:
@@ -1413,7 +1481,6 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 keep_idx,
                 active_idx,
                 S_active,
-                CP,
                 P,
             )
             for batch in batches if len(batch) > 0
@@ -1497,8 +1564,8 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             emax = float(np.max(diag)) if diag.size else 1.0
 
         cond_bad = (emin <= 1e-10 * max(emax, 1.0))
-        ridge_rel = 1e-2 if cond_bad else 1e-3
-        ridge = max(1e-10, ridge_rel * max(1.0, diag_med))
+        ridge_rel = 1e-1 if cond_bad else 1e-2
+        ridge = max(1e-8, ridge_rel * max(1.0, diag_med))
         ATA_sub_reg = ATA_sub + ridge * np.eye(k, dtype=np.float64)
 
         # ----------------------------------------------------
@@ -1531,7 +1598,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
             rhs = np.concatenate([ATy_sub, dvec])
 
-            KKT += 1e-10 * np.eye(KKT.shape[0])
+            KKT += 1e-6 * np.eye(KKT.shape[0])
 
             sol = np.linalg.lstsq(KKT, rhs, rcond=1e-12)[0]
             z_sub = sol[:k]
