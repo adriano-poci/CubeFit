@@ -47,6 +47,7 @@ v1.5:   Added targeted orbit promotion for columns in under-represented orbits
 v1.6:   Replace conventional orbit projection with a smooth penalty in the
             actual NNLS solve to simultaneously bias towards the orbit prior in
             `_streaming_active_set_nnls_via_streaming_matvec`. 21 March 2026
+v1.7:   Removed lingering `orbit_beta`. 23 March 2026
 """
 
 from __future__ import annotations, print_function
@@ -272,7 +273,6 @@ class MPConfig:
     dset_slots: int = 1_000_003
     dset_bytes: int = 256 * 1024**2
     dset_w0: float = 0.90
-    orbit_beta: float = 0.0 # strength of rank-1 orbit penalisation (if > 0)
     s_tile_override: Optional[int] = None
     pixels_per_aperture: int = 256
     max_tiles: Optional[int] = None
@@ -955,7 +955,6 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     executor,
     cfg: MPConfig,
     orbit_weights: Optional[np.ndarray] = None,
-    orbit_beta_eff: float = 0.0,
     x0_flat: Optional[np.ndarray] = None,
     max_active: int = 1000,
     tol_grad: float = 1e-8,
@@ -1423,7 +1422,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         # Enforce minimum active columns per orbit
         # (prevents orbit collapse under strong prior)
         # --------------------------------------------------------
-        min_per_orbit = 1  # tunable (2–4 recommended)
+        min_per_orbit = 1  # tunable
 
         for cc in range(C):
             base = cc * P
@@ -1798,7 +1797,6 @@ def solve_streaming_nnls(
       epoch (no repeated HDF5 reads per block).
     - Solves small quadratic NNLS problems per block using a projected-gradient
       solver on the quadratic form ATA/ATy.
-    - Supports soft orbit prior (orbit_beta) via augmentation of ATA/ATy.
     - Applies hard rank-1 orbit projection at epoch end (using D_tot).
     """
     t0 = time.perf_counter()
@@ -2006,15 +2004,6 @@ def solve_streaming_nnls(
         inv_sqrt_energy = S_temp
         inv_sqrt_energy_flat = inv_sqrt_energy.ravel(order="C")
 
-        beta_eff = 0.0
-        if orbit_weights is not None and cfg.orbit_beta > 0.0:
-            beta_eff = float(cfg.orbit_beta)
-
-        print(
-            f"[DIAG] orbit prior : cfg.orbit_beta = {beta_eff:.4e}",
-            flush=True,
-        )
-
         # DIAGNOSTIC: report S statistics (helps find extreme scalings)
         S_sample = inv_sqrt_energy_flat
         try:
@@ -2100,7 +2089,6 @@ def solve_streaming_nnls(
                 executor=executor,
                 cfg=cfg,
                 orbit_weights=orbit_weights,
-                orbit_beta_eff=beta_eff,
                 x0_flat=x.ravel(order="C"),
                 max_active=monolithic_max_active,
                 tol_grad=1e-8,

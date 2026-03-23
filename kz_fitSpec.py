@@ -43,6 +43,7 @@ v1.9:   Defined `reconstruct_modelcube_fast_parallel` for multi-process
             parallelism settings;
         Renamed HDF5 file to `hypercube_*.h5`. 13 March 2026
 v1.10:  Get `orbit_beta` from kwargs. 15 March 2026
+v1.11:  Removed lingering `orbit_beta`. 23 March 2026
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -334,7 +335,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         raise RuntimeError(f"No binned spectra.\n{'': <4s}{vbSpec}")
 
     warm_start = kwargs.pop('warm', 'zeros')
-    orbit_beta = kwargs.pop('orbit_beta', 1.0)
 
     with logger.capture_all_output():
         decDir, cDirs, cKeys, nComp, teLL, lnGrid, histBinSize, dataVelScale,\
@@ -614,7 +614,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         reader_s_tile=128, # match /HyperCube/models chunking on S
         verbose=True,
         warm_start=warm_start,
-        orbit_beta=orbit_beta,
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 

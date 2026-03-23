@@ -55,6 +55,7 @@ v1.15:  Persist `known_zero_mask` after SPG in `solve_all_mp_batched`. 3 Februar
 v1.16:  Fixed bug in `PipelineRunner._read_latest_from_main` which incorrectly
             sliced read-in solutions assuming they were history-like. 17
             February 2026
+v1.17:  Removed lingering `orbit_beta`. 23 March 2026
 """
 
 from __future__ import annotations
@@ -937,7 +938,6 @@ class PipelineRunner:
         processes=2,
         blas_threads=12,
         orbit_weights=None,
-        orbit_beta=0.0,
         x0=None,
         warm_start="nnls",  # default to the new seed
         seed_cfg=None,
@@ -1191,7 +1191,6 @@ class PipelineRunner:
         cfg = MPConfig(
             epochs=int(epochs),
             lr=float(lr),
-            orbit_beta=float(orbit_beta) if orbit_weights is not None else 0.0,
             project_nonneg=bool(project_nonneg),
             processes=int(processes),
             blas_threads=int(blas_threads),
@@ -1208,7 +1207,7 @@ class PipelineRunner:
                     tracker=tracker,
                     monolithic_max_active=500)
                 # x_solver, stats = solve_monolithic_nnls(self.h5_path,
-                    # orbit_weights=orbit_weights, orbit_beta=0.0,
+                    # orbit_weights=orbit_weights, 
                     # hard_project=True)
                 # cfg = MPConfig(epochs=1, processes=1, blas_threads=1, apply_mask=True)
                 # x_solver, stats = monolithic_nnls_scipy(self.h5_path, cfg,
