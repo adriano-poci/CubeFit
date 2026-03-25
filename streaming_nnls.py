@@ -44,10 +44,6 @@ v1.4:   Fixed `alpha_ref` calculation in
 v1.5:   Added targeted orbit promotion for columns in under-represented orbits
             to more strategically match the orbit prior without degrading fit
             quality. 19 March 2026
-v1.6:   Replace conventional orbit projection with a smooth penalty in the
-            actual NNLS solve to simultaneously bias towards the orbit prior in
-            `_streaming_active_set_nnls_via_streaming_matvec`. 21 March 2026
-v1.7:   Removed lingering `orbit_beta`. 23 March 2026
 """
 
 from __future__ import annotations, print_function
@@ -89,86 +85,94 @@ def _worker_reduced(
     keep_idx,
     active_idx: np.ndarray,
     S_active: np.ndarray,
+    CP: int,
     P: int,
 ):
+    """
+    Worker to compute partial ATA_sub and ATy_sub for a batch of tiles,
+    given the active indices and their scaling S_active.
 
+    Memory-efficient, exact-equivalence implementation that does NOT
+    form the large (Sblk*Lk, k) A2 matrix.  Uses tensor contractions to
+    compute the same sums:
+
+        ATA_loc[i,j] += sum_{s,lambda} (S_i * M_{s,ci,pi,lambda})
+                              * (S_j * M_{s,cj,pj,lambda})
+
+        ATy_loc[i] += sum_{s,lambda} (S_i * M_{s,ci,pi,lambda}) * Yt[s,lambda]
+
+    Inputs
+    ------
+    - active_idx: 1D int array of global column indices (length k)
+    - S_active : 1D float array of length k (per-active-column scaling)
+    - P : number of populations per orbit (used for cc/p decode)
+    """
     k = int(active_idx.size)
     ATA_loc = np.zeros((k, k), dtype=np.float64)
     ATy_loc = np.zeros((k,), dtype=np.float64)
 
-    # decode indices
+    # decode orbit & population indices for active columns
     cc_arr = (active_idx // P).astype(np.int64)
     pp_arr = (active_idx % P).astype(np.int64)
 
-    # group active columns by orbit
-    orbit_groups = {}
-    for i, cc in enumerate(cc_arr):
-        orbit_groups.setdefault(cc, []).append(i)
-
     with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
+        DC = f["/DataCube"]         # kept for shape reference; Yt read below
         M = f["/HyperCube/models"]
 
         for (s0, s1) in batch:
-
-            # --- load data ---
+            # read data tile and model tile
             Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
             if keep_idx is not None:
-                Yt = Yt[:, keep_idx]
+                Yt = Yt[:, keep_idx]           # shape (Sblk, Lk)
+            Sblk = s1 - s0
+            Lk_loc = Yt.shape[1]
 
-            Sblk, Lk = Yt.shape
+            M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
+            if keep_idx is not None:
+                M_tile = M_tile[:, :, :, keep_idx]   # shape (Sblk, C, P, Lk_loc)
 
-            # --- cache per-orbit slices ---
-            orbit_cache = {}
+            # Extract the k active column slices into shape (Sblk, k, Lk_loc)
+            # M_sub[s, i, lambda] = M_tile[s, cc_arr[i], pp_arr[i], lambda]
+            # This is the minimal temporary we need (k typically much smaller than CP)
+            M_sub = M_tile[:, cc_arr, pp_arr, :]  # shape (Sblk, k, Lk_loc)
 
-            for cc, idx_list in orbit_groups.items():
-                Mc = M[s0:s1, cc, :, :]
-                if keep_idx is not None:
-                    Mc = Mc[:, :, keep_idx]
+            # --- compute inner products over s and lambda ---
+            # ATA_unscaled_loc[i,j] = sum_{s,lambda} M_sub[s,i,lambda] * M_sub[s,j,lambda]
+            # Use einsum for clarity and numerical stability / memory locality.
+            # result shape (k,k)
+            ATA_unscaled_loc = np.einsum("s i l, s j l -> i j", M_sub, M_sub, optimize=True)
 
-                Mc = np.asarray(Mc, dtype=np.float64, order="C")
-                orbit_cache[cc] = Mc   # shape (Sblk, P, Lk)
+            # scale by S_active outer product: ATA_loc += (S_i * S_j) * ATA_unscaled_loc
+            outerS = (S_active[:, None] * S_active[None, :])
+            ATA_loc += outerS * ATA_unscaled_loc
 
-            # -------------------------------------------------
-            # ATy: each column independently
-            # -------------------------------------------------
-            for i in range(k):
-                cc = cc_arr[i]
-                p  = pp_arr[i]
+            # --- compute ATy contributions ---
+            # ATy_unscaled_loc[i] = sum_{s,lambda} M_sub[s,i,lambda] * Yt[s,lambda]
+            # shape (k,)
+            ATy_unscaled_loc = np.einsum("s i l, s l -> i", M_sub, Yt, optimize=True)
 
-                Mc = orbit_cache[cc][:, p, :]  # (Sblk, Lk)
+            # scale by S_active: ATy_loc += S_i * ATy_unscaled_loc[i]
+            ATy_loc += (S_active * ATy_unscaled_loc)
 
-                ATy_loc[i] += S_active[i] * np.sum(Mc * Yt)
-
-            # -------------------------------------------------
-            # ATA: grouped by orbit (vectorised mapping)
-            # -------------------------------------------------
-
-            for cc_i, idx_i_list in orbit_groups.items():
-
-                Mc_i = orbit_cache[cc_i]
-                p_i_idx = [pp_arr[i] for i in idx_i_list]
-                Mc_i_sub = Mc_i[:, p_i_idx, :]
-
-                I = np.array(idx_i_list, dtype=np.int64)
-
-                for cc_j, idx_j_list in orbit_groups.items():
-
-                    Mc_j = orbit_cache[cc_j]
-                    p_j_idx = [pp_arr[j] for j in idx_j_list]
-                    Mc_j_sub = Mc_j[:, p_j_idx, :]
-
-                    J = np.array(idx_j_list, dtype=np.int64)
-
-                    ATA_block = np.einsum(
-                        "s i l, s j l -> i j",
-                        Mc_i_sub,
-                        Mc_j_sub,
-                        optimize=True
-                    )
-
-                    scale = np.outer(S_active[I], S_active[J])
-                    ATA_loc[np.ix_(I, J)] += scale * ATA_block
+            # (optional consistency check -- enable for one debug run only)
+            # If you want to validate exact equivalence to former A2-based code,
+            # enable the block below (it will allocate A2 for the tile and compare).
+            #
+            # if False:
+            #     # build A2 (old approach) for a single-tile verification
+            #     A2_chk = np.empty((Sblk * Lk_loc, k), dtype=np.float64)
+            #     for j, gcol in enumerate(active_idx):
+            #         cc = int(gcol // P)
+            #         p = int(gcol % P)
+            #         A2_chk[:, j] = M_tile[:, cc, p, :].reshape(Sblk * Lk_loc)
+            #     A2_chk *= S_active[None, :]
+            #     ATA_chk = A2_chk.T @ A2_chk
+            #     ATy_chk = A2_chk.T @ Yt.reshape(-1)
+            #     # tolerance checks
+            #     err_ATA = np.max(np.abs(ATA_loc - ATA_chk))
+            #     err_ATy = np.max(np.abs(ATy_loc - ATy_chk))
+            #     if (err_ATA > 1e-10) or (err_ATy > 1e-10):
+            #         raise RuntimeError(f"_worker_reduced verification failed: err_ATA={err_ATA}, err_ATy={err_ATy}")
 
     return ATA_loc, ATy_loc
 
@@ -179,74 +183,48 @@ def _worker_ATAz(
     batch: list,
     keep_idx,
     z: np.ndarray,
-    C: int,
-    P: int,
+    CP: int,
     S_flat: np.ndarray,
 ):
-    """
-    Streaming ATAz computation.
 
-    Memory complexity:
-        O(Sblk * P * Lk) instead of O(Sblk * C * P * Lk)
-
-    This avoids materialising the full model tile.
-    """
-
-    partial = np.zeros((int(C*P),), dtype=np.float64)
+    partial = np.zeros((CP,), dtype=np.float64)
 
     with open_h5(h5_path, role="reader") as f:
         M = f["/HyperCube/models"]
 
-        # reshape once outside loops
-        z_s = (S_flat * z).reshape(-1)  # flattened
-        # reshape vectors
-        z_cp = (S_flat * z).reshape(C, P)
-        S_cp = S_flat.reshape(C, P)
         for (s0, s1) in batch:
 
-            # determine shapes WITHOUT loading full cube
-            Mc0 = M[s0:s1, 0, :, :]
+            M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
             if keep_idx is not None:
-                Mc0 = Mc0[:, :, keep_idx]
-            Sblk, _P, Lk = Mc0.shape
+                M_tile = M_tile[:, :, :, keep_idx]
 
+            Sblk, C, P, Lk = M_tile.shape
 
-            # --- compute v = A (S z) ---
+            # reshape vectors
+            z_s = (S_flat * z).reshape(C, P)
+
+            # compute v = A (S z)
             v = np.zeros((Sblk, Lk), dtype=np.float64)
 
             for cc in range(C):
-                Mc = M[s0:s1, cc, :, :]
-                if keep_idx is not None:
-                    Mc = Mc[:, :, keep_idx]
-
-                Mc = np.asarray(Mc, dtype=np.float64, order="C")
-
-                # (P,) dot (Sblk, P, Lk) -> (Sblk, Lk)
                 v += np.tensordot(
-                    z_cp[cc],
-                    Mc,
+                    z_s[cc],
+                    M_tile[:, cc, :, :],
                     axes=(0, 1)
                 )
 
-            # --- compute g = A^T v ---
+            # compute g = A^T v
             g = np.zeros((C, P), dtype=np.float64)
 
             for cc in range(C):
-                Mc = M[s0:s1, cc, :, :]
-                if keep_idx is not None:
-                    Mc = Mc[:, :, keep_idx]
-
-                Mc = np.asarray(Mc, dtype=np.float64, order="C")
-
-                # (Sblk, P, Lk) ⋅ (Sblk, Lk) -> (P,)
                 g[cc] = np.tensordot(
-                    Mc,
+                    M_tile[:, cc, :, :],
                     v,
                     axes=([0, 2], [0, 1])
                 )
 
             # apply column scaling
-            partial += (S_cp * g).reshape(-1)
+            partial += (S_flat.reshape(C, P) * g).reshape(-1)
 
     return partial
 
@@ -273,6 +251,7 @@ class MPConfig:
     dset_slots: int = 1_000_003
     dset_bytes: int = 256 * 1024**2
     dset_w0: float = 0.90
+    orbit_beta: float = 0.0 # strength of rank-1 orbit penalisation (if > 0)
     s_tile_override: Optional[int] = None
     pixels_per_aperture: int = 256
     max_tiles: Optional[int] = None
@@ -955,6 +934,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     executor,
     cfg: MPConfig,
     orbit_weights: Optional[np.ndarray] = None,
+    orbit_beta_eff: float = 0.0,
     x0_flat: Optional[np.ndarray] = None,
     max_active: int = 1000,
     tol_grad: float = 1e-8,
@@ -983,8 +963,8 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
     # --- plateau-stop controls ---
     grad_hist = []
-    plateau_window = 10
-    plateau_frac = 0.998
+    plateau_window = 8
+    plateau_frac = 0.995
 
     # --- positive-gradient batch-promotion controls ---
     positive_batch_size = 3
@@ -999,7 +979,6 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
     if (not np.isfinite(alpha_ref)) or (alpha_ref <= 0.0):
         alpha_ref = 1.0
-    alpha_running = alpha_ref
 
     print(f"[DIAG] alpha_ref = {alpha_ref:.4e}", flush=True)
 
@@ -1007,6 +986,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     w_target = None
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
+    orbit_beta = float(orbit_beta_eff)
 
     if x0_flat is None:
         z = np.zeros((CP,), dtype=np.float64)
@@ -1024,6 +1004,10 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
     z_scale0 = np.max(z) + 1e-30
     active = z > (1e-10 * z_scale0)
+
+    # stage-status bookkeeping for continuation
+    termination_reason = "max_iter"
+    rescue_orbits = np.zeros((0,), dtype=np.int64)
 
     def _current_x_from_z(z_vec: np.ndarray) -> np.ndarray:
         """
@@ -1146,7 +1130,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         # create a temporary pool (but prefer passing a persistent executor).
         # Here we assume executor argument was passed into outer function.
         worker_args = [
-            (h5_path, batch, keep_idx, x_cand, C, P, S_flat)
+            (h5_path, batch, keep_idx, x_cand, CP, S_flat)
             for batch in batches if len(batch) > 0
         ]
         # Using executor.map (streamed) is fine — it returns results in submission order
@@ -1170,13 +1154,41 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         ATAz_scaled = _compute_ATAz_scaled(z)
         grad = ATy_scaled - ATAz_scaled
 
-        # --- update alpha from current solution (stabilised) ---
-        if (w_target is not None) and (it > 0) and (it % 5 == 0):
-            x_full = S_flat * z
-            alpha_new = float(np.sum(x_full) / (np.sum(w_target) + 1e-30))
+        # ---- inject prior-gradient into the promotion gradient (so prior can
+        # ---- encourage activation of columns that help meet orbit targets)
+        # ---- Prior influence on promotion gradient (revised alpha + clipping)
+        if (w_target is not None) and (orbit_beta > 0.0):
+            # Compute alpha from current x (x = S * z) so prior redistributes
+            # existing mass rather than creating mass from ATy magnitude.
+                # use fixed alpha computed once (not the running x-sum)
 
-            # exponential smoothing (prevents instability)
-            alpha_running = 0.9 * alpha_running + 0.1 * alpha_new
+            # Build prior gradient in z-space:
+            # d/dz 0.5*beta*(S·z_local - alpha*w_cc)^2 = beta * (S·z_local - alpha*w_cc) * S
+            g_prior = np.zeros_like(grad)
+            # Loop per-orbit (cheap relative to expensive matvecs)
+            for cc in range(C):
+                base = cc * P
+                idxs = np.arange(base, base + P, dtype=np.int64)
+                S_local = S_flat[idxs]
+                z_local = z[idxs]
+                w_cc = float(w_target[cc]) if (w_target is not None) else 0.0
+                resid = float(np.dot(S_local, z_local) - alpha_ref * w_cc)
+                if not np.isfinite(resid):
+                    continue
+                s_norm = float(np.sum(S_local * S_local)) + 1e-30
+                g_prior[idxs] = (orbit_beta / s_norm) * resid * S_local
+
+            # Prevent prior from overwhelming data gradient:
+            # compute robust norms, allow prior up to `clip_factor` times data gradient norm
+            clip_factor = 1.5
+            g_prior_norm = np.linalg.norm(g_prior)
+            g_data_norm = np.linalg.norm(grad) + 1e-30
+            if g_prior_norm > clip_factor * g_data_norm:
+                # scale down prior proportionally
+                g_prior *= (clip_factor * g_data_norm) / (g_prior_norm + 1e-30)
+
+            # Add prior gradient to promotion gradient
+            grad = grad + g_prior
 
         # diagnostic logging for the active-set iteration
         max_grad_overall = float(np.max(grad)) if grad.size else 0.0
@@ -1190,38 +1202,25 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             grad_hist.pop(0)
 
         if len(grad_hist) == plateau_window:
-            g_start = grad_hist[0]
-            g_end   = grad_hist[-1]
-
-            rel_improve = (g_start - g_end) / (abs(g_start) + 1e-30)
-
-            if rel_improve < 1e-3:
-                termination_reason = "plateau"
-                print(
-                    "[MONO] terminating on plateau: "
-                    f"start={g_start:.3e} end={g_end:.3e} "
-                    f"rel_improve={rel_improve:.3e}",
-                    flush=True,
-                )
-                break
-        not_active = np.where(~active)[0]
-        if not_active.size == 0:
-            break
-        # --- stagnation escape ---
-        if len(grad_hist) >= 5:
-            g_tail = np.array(grad_hist[-5:], dtype=np.float64)
-            if (np.max(g_tail) - np.min(g_tail)) / (np.max(g_tail) + 1e-30) < 1e-2:
-                n_force = min(5, not_active.size)
-                if n_force > 0:
-                    extra = not_active[np.random.choice(not_active.size, size=n_force, replace=False)]
-                    active[extra] = True
-                    print(f"[MONO][escape] forced expansion: {extra}", flush=True)
-        not_active = np.where(~active)[0]
-        if not_active.size == 0:
-            break
+            g0 = float(grad_hist[0])
+            g1 = float(grad_hist[-1])
+            if np.isfinite(g0) and np.isfinite(g1) and (g0 > 0.0):
+                if g1 >= plateau_frac * g0:
+                    termination_reason = "plateau"
+                    print(
+                        "[MONO] terminating on max_grad plateau: "
+                        f"start={g0:.3e} end={g1:.3e} "
+                        f"window={plateau_window}",
+                        flush=True,
+                    )
+                    break
         # ---------------------------------------------------------
 
-        gvals = grad[not_active].copy()
+        not_active = np.where(~active)[0]
+        if not_active.size == 0:
+            break
+
+        gvals = grad[not_active]
         if gvals.size == 0:
             break
 
@@ -1281,12 +1280,12 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                     penalty_strength=0.5,
                 )
 
-                # fallback if everything was filtered out
                 if cols_to_activate.size == 0:
                     pool_size = min(50, gvals.size)
                     top = np.argsort(gvals)[-pool_size:]
                     n_pick = min(preferred_group, top.size)
-                    cols_to_activate = not_active[np.random.choice(top, size=n_pick, replace=False)].astype(np.int64)
+                    chosen = np.random.choice(top, size=n_pick, replace=False)
+                    cols_to_activate = not_active[chosen].astype(np.int64)
 
                     print(
                         f"[MONO][explore] fallback global promotion of "
@@ -1341,12 +1340,11 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 penalty_strength=0.5,
             )
 
-            # fallback if everything was filtered out
             if cols_to_activate.size == 0:
-                pool_size = min(50, gvals.size)
-                top = np.argsort(gvals)[-pool_size:]
-                n_pick = min(preferred_group, top.size)
-                cols_to_activate = not_active[np.random.choice(top, size=n_pick, replace=False)].astype(np.int64)
+                # fallback
+                order = pos_mask[np.argsort(adj_score[pos_mask])[::-1]]
+                chosen_local = order[:preferred_group]
+                cols_to_activate = not_active[chosen_local]
 
             print(
                 f"[MONO] orbit-aware positive promotion: {cols_to_activate}",
@@ -1380,7 +1378,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         # Enforce minimum active columns per orbit
         # (prevents orbit collapse under strong prior)
         # --------------------------------------------------------
-        min_per_orbit = 1  # tunable
+        min_per_orbit = 1  # tunable (2–4 recommended)
 
         for cc in range(C):
             base = cc * P
@@ -1438,6 +1436,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 keep_idx,
                 active_idx,
                 S_active,
+                CP,
                 P,
             )
             for batch in batches if len(batch) > 0
@@ -1521,52 +1520,121 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             emax = float(np.max(diag)) if diag.size else 1.0
 
         cond_bad = (emin <= 1e-10 * max(emax, 1.0))
-        ridge_rel = 1e-1 if cond_bad else 1e-2
-        ridge = max(1e-8, ridge_rel * max(1.0, diag_med))
+        ridge_rel = 1e-2 if cond_bad else 1e-3
+        ridge = max(1e-10, ridge_rel * max(1.0, diag_med))
         ATA_sub_reg = ATA_sub + ridge * np.eye(k, dtype=np.float64)
 
         # ----------------------------------------------------
-        # Constrained reduced solve (KKT system)
+        # Robust orbit prior (scale-independent, fixed alpha)
         # ----------------------------------------------------
+        if (w_target is not None) and (orbit_beta > 0.0):
 
-        if w_target is not None:
-
-            # --- build constraint matrix ---
             orbit_groups = {}
             for local_i, gcol in enumerate(active_idx):
                 cc = int(gcol // P)
                 orbit_groups.setdefault(cc, []).append(local_i)
 
-            n_constraints = len(orbit_groups)
+            for cc, idx_list in orbit_groups.items():
 
-            Cmat = np.zeros((n_constraints, k), dtype=np.float64)
-            dvec = np.zeros((n_constraints,), dtype=np.float64)
-
-            for row, (cc, idx_list) in enumerate(orbit_groups.items()):
                 idx = np.array(idx_list, dtype=np.int64)
+                if idx.size == 0:
+                    continue
+
                 S_local = S_active[idx]
-                Cmat[row, idx] = S_local
-                dvec[row] = alpha_running * w_target[cc]
+                w_cc = float(w_target[cc])
 
-            KKT = np.block([
-                [ATA_sub_reg, Cmat.T],
-                [Cmat, np.zeros((n_constraints, n_constraints))]
-            ])
+                s_norm = float(np.sum(S_local * S_local)) + 1e-30
+                beta_eff = orbit_beta / s_norm
 
-            rhs = np.concatenate([ATy_sub, dvec])
+                ATA_sub_reg[np.ix_(idx, idx)] += (
+                    beta_eff * np.outer(S_local, S_local)
+                )
+                ATy_sub[idx] += (
+                    beta_eff * (alpha_ref * w_cc) * S_local
+                )
 
-            KKT += 1e-6 * np.eye(KKT.shape[0])
+                try:
+                    print(
+                        f"[DIAG][orbit_prior_norm] orbit={cc} cols={len(idx)} "
+                        f"s_norm={s_norm:.3e} beta_eff={beta_eff:.3e} "
+                        f"target_mass={(alpha_ref * w_cc):.3e}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
 
-            sol = np.linalg.lstsq(KKT, rhs, rcond=1e-12)[0]
-            z_sub = sol[:k]
+        z_old_active = z[active_idx].copy()
 
-        else:
-            # fallback: unconstrained NNLS
-            z_sub = _nnls_from_quadratic(ATA_sub_reg, ATy_sub)
+        def _quad_obj(A, b, x):
+            return 0.5 * float(x @ (A @ x)) - float(b @ x)
 
-        z_sub = np.maximum(z_sub, 0.0)
+        z_sub_raw = None
+        try:
+            z_sub_raw = np.linalg.solve(ATA_sub_reg, ATy_sub)
+        except np.linalg.LinAlgError:
+            U, svals, Vt = np.linalg.svd(ATA_sub_reg, full_matrices=False)
+            smax = svals[0] if svals.size else 1.0
+            s_thresh = max(1e-12, 1e-6 * smax)
+            s_inv = np.array(
+                [1.0 / s if s > s_thresh else 0.0 for s in svals],
+                dtype=np.float64,
+            )
+            z_sub_raw = Vt.T @ (s_inv * (U.T @ ATy_sub))
 
-        # write back
+        z_sub_raw = np.maximum(z_sub_raw, 0.0)
+
+        step_frac = 0.25 if did_explore else 0.5
+        z_sub = (1.0 - step_frac) * z_old_active + step_frac * z_sub_raw
+
+        obj_old = _quad_obj(ATA_sub_reg, ATy_sub, z_old_active)
+        obj_new = _quad_obj(ATA_sub_reg, ATy_sub, z_sub)
+
+        norm_old = float(np.linalg.norm(z_old_active))
+        norm_new = float(np.linalg.norm(z_sub))
+
+        reject = False
+
+        if did_explore:
+            # ----------------------------
+            # Evaluate orbit improvement
+            # ----------------------------
+            if w_target is not None:
+                _, _, deficit_old = _orbit_mass_and_deficit(z)
+                z_tmp = z.copy()
+                z_tmp[active_idx] = z_sub
+                _, _, deficit_new = _orbit_mass_and_deficit(z_tmp)
+
+                orbit_improved = (
+                    np.sum(np.abs(deficit_new)) < np.sum(np.abs(deficit_old))
+                )
+            else:
+                orbit_improved = False
+
+            # ----------------------------
+            # rejection logic
+            # ----------------------------
+            if (obj_new > obj_old) and (not orbit_improved):
+                reject = True
+
+            if norm_new > 5.0 * max(norm_old, 1.0):
+                reject = True
+
+        if reject:
+            print(
+                "[MONO][explore] rejecting exploratory update "
+                f"(obj_old={obj_old:.4e}, obj_new={obj_new:.4e}, "
+                f"norm_old={norm_old:.4e}, norm_new={norm_new:.4e})",
+                flush=True,
+            )
+            if newly_activated is not None and newly_activated.size > 0:
+                active[newly_activated] = False
+            z[active_idx] = z_old_active
+
+            if did_explore and negative_grad_count >= explore_budget:
+                break
+
+            continue
+
         for ii, gcol in enumerate(active_idx):
             z[int(gcol)] = float(z_sub[ii])
 
@@ -1755,6 +1823,7 @@ def solve_streaming_nnls(
       epoch (no repeated HDF5 reads per block).
     - Solves small quadratic NNLS problems per block using a projected-gradient
       solver on the quadratic form ATA/ATy.
+    - Supports soft orbit prior (orbit_beta) via augmentation of ATA/ATy.
     - Applies hard rank-1 orbit projection at epoch end (using D_tot).
     """
     t0 = time.perf_counter()
@@ -1962,6 +2031,15 @@ def solve_streaming_nnls(
         inv_sqrt_energy = S_temp
         inv_sqrt_energy_flat = inv_sqrt_energy.ravel(order="C")
 
+        beta_eff = 0.0
+        if orbit_weights is not None and cfg.orbit_beta > 0.0:
+            beta_eff = float(cfg.orbit_beta)
+
+        print(
+            f"[DIAG] orbit prior : cfg.orbit_beta = {beta_eff:.4e}",
+            flush=True,
+        )
+
         # DIAGNOSTIC: report S statistics (helps find extreme scalings)
         S_sample = inv_sqrt_energy_flat
         try:
@@ -2047,6 +2125,7 @@ def solve_streaming_nnls(
                 executor=executor,
                 cfg=cfg,
                 orbit_weights=orbit_weights,
+                orbit_beta_eff=beta_eff,
                 x0_flat=x.ravel(order="C"),
                 max_active=monolithic_max_active,
                 tol_grad=1e-8,

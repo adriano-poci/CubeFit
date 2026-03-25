@@ -1765,8 +1765,27 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         nSpat, nLam = D.shape
     
     arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
-    # compDisp = np.ma.ones((nComp, nCRad), dtype=float)*np.nan
-    # compVel = np.ma.ones((nComp, nSRad), dtype=float)*np.nan
+    M = np.zeros((NOrbs, nComp), dtype=np.float64)
+    for c, ck in enumerate(oDict['wheres'].keys()):
+        w = oDict['weights'][ck]
+        mask = oDict['wheres'][ck]
+        if w.shape != mask.shape:
+            raise ValueError('weight array and mask must have the same shape')
+        w = np.where(mask, w, 0.0)
+        s = w.sum()
+        if s > 0.0:
+            M[:, c] = w / s
+    orbSOL = np.tensordot(M, arSOL, axes=(1, 0))
+    compDisp = np.ma.ones((nComp, nCRad), dtype=float)*np.nan
+    compVel = np.ma.ones((nComp, nSRad), dtype=float)*np.nan
+    for nc in range(nComp):
+        cnData = np.take(intData, nc, axis=1).reshape(18, -1)
+        drad, svR, svRe, dweights, dcirc = Cgh.broadBetaCompsCyl(cnData,
+            np.append(cRadius, 1e15), 'z', -np.inf, 0.0)
+        _drad, vMean, vErr, _dweights, _dcirc = Cgh.broadVelCompsSph(cnData,
+            np.append(sRadius, 1e15), -np.inf, 0.0)
+        compDisp[nc, :] = svR
+        compVel[nc, :] = vMean[:, 2] # v_phi
 
     compare_orbit_vs_solution(
         h5_path=str(hdf5Path),
