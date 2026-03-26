@@ -44,6 +44,11 @@ v1.4:   Fixed `alpha_ref` calculation in
 v1.5:   Added targeted orbit promotion for columns in under-represented orbits
             to more strategically match the orbit prior without degrading fit
             quality. 19 March 2026
+v1.6:   Consider full plateau window for early exit in
+            `_streaming_active_set_nnls_via_streaming_matvec`;
+        Use a relative per-orbit scale to determine which columns to drop, 
+            rather than a global scale in 
+            `_streaming_active_set_nnls_via_streaming_matvec`. 26 March 2026
 """
 
 from __future__ import annotations, print_function
@@ -68,7 +73,6 @@ except Exception:
 from CubeFit.hdf5_manager import open_h5
 from CubeFit import cube_utils as cu
 from CubeFit.hypercube_builder import read_global_column_energy
-
 
 def _init_worker(blas_threads: int):
     # called once per process; set BLAS env vars
@@ -153,26 +157,6 @@ def _worker_reduced(
 
             # scale by S_active: ATy_loc += S_i * ATy_unscaled_loc[i]
             ATy_loc += (S_active * ATy_unscaled_loc)
-
-            # (optional consistency check -- enable for one debug run only)
-            # If you want to validate exact equivalence to former A2-based code,
-            # enable the block below (it will allocate A2 for the tile and compare).
-            #
-            # if False:
-            #     # build A2 (old approach) for a single-tile verification
-            #     A2_chk = np.empty((Sblk * Lk_loc, k), dtype=np.float64)
-            #     for j, gcol in enumerate(active_idx):
-            #         cc = int(gcol // P)
-            #         p = int(gcol % P)
-            #         A2_chk[:, j] = M_tile[:, cc, p, :].reshape(Sblk * Lk_loc)
-            #     A2_chk *= S_active[None, :]
-            #     ATA_chk = A2_chk.T @ A2_chk
-            #     ATy_chk = A2_chk.T @ Yt.reshape(-1)
-            #     # tolerance checks
-            #     err_ATA = np.max(np.abs(ATA_loc - ATA_chk))
-            #     err_ATy = np.max(np.abs(ATy_loc - ATy_chk))
-            #     if (err_ATA > 1e-10) or (err_ATy > 1e-10):
-            #         raise RuntimeError(f"_worker_reduced verification failed: err_ATA={err_ATA}, err_ATy={err_ATy}")
 
     return ATA_loc, ATy_loc
 
@@ -922,6 +906,127 @@ def _quota_rescue_columns(
 
 # ------------------------------------------------------------------------------
 
+def _deficit_rescue_columns(
+    grad_vec: np.ndarray,
+    aty_scaled_vec: np.ndarray,
+    active_mask: np.ndarray,
+    S_flat: np.ndarray,
+    w_target: np.ndarray | None,
+    deficit: np.ndarray,
+    C: int,
+    P: int,
+    total_cols: int,
+    *,
+    min_per_orbit: int = 1,
+    max_per_orbit: int = 12,
+    deficit_boost: float = 2.0,
+    penalty_strength: float = 0.5,
+) -> np.ndarray:
+    """
+    Select rescue columns with quotas driven by orbit deficit.
+
+    Orbits with larger positive deficit are promoted first.
+    """
+    if total_cols <= 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    if (w_target is None) or (not np.any(np.isfinite(deficit))):
+        return _quota_rescue_columns(
+            grad_vec=grad_vec,
+            aty_scaled_vec=aty_scaled_vec,
+            active_mask=active_mask,
+            S_flat=S_flat,
+            w_target=w_target,
+            C=C,
+            P=P,
+            total_cols=total_cols,
+            min_per_orbit=min_per_orbit,
+            max_per_orbit=max_per_orbit,
+            penalty_strength=penalty_strength,
+        )
+
+    deficit = np.asarray(deficit, dtype=np.float64).ravel()
+    deficit = np.maximum(deficit, 0.0)
+
+    if np.sum(deficit) <= 0.0:
+        return np.zeros((0,), dtype=np.int64)
+
+    w = np.asarray(w_target, dtype=np.float64).ravel()
+    w = np.maximum(w, 0.0)
+    w_sum = float(np.sum(w))
+    if w_sum <= 0.0:
+        return np.zeros((0,), dtype=np.int64)
+    w = w / w_sum
+
+    # Orbit priority combines target weight and current deficit.
+    d_norm = deficit / (np.max(deficit) + 1e-30)
+    orbit_priority = (w + deficit_boost * d_norm)
+    orbit_priority = np.maximum(orbit_priority, 0.0)
+    orbit_priority /= (np.sum(orbit_priority) + 1e-30)
+
+    raw = total_cols * orbit_priority
+    quotas = np.floor(raw).astype(np.int64)
+
+    nz = np.where(orbit_priority > 0.0)[0]
+    for cc in nz:
+        quotas[cc] = max(quotas[cc], min_per_orbit)
+
+    quotas = np.minimum(quotas, max_per_orbit)
+
+    qsum = int(np.sum(quotas))
+    if qsum < total_cols:
+        frac = raw - np.floor(raw)
+        order = np.argsort(frac)[::-1]
+        for cc in order:
+            if qsum >= total_cols:
+                break
+            if quotas[cc] < max_per_orbit:
+                quotas[cc] += 1
+                qsum += 1
+
+    chosen = []
+    chosen_set = set()
+
+    for cc in np.argsort(orbit_priority)[::-1]:
+        q = int(quotas[cc])
+        if q <= 0:
+            continue
+
+        base = int(cc * P)
+        cols_cc = np.arange(base, base + P, dtype=np.int64)
+        inactive_cc = cols_cc[~active_mask[cols_cc]]
+        if inactive_cc.size == 0:
+            continue
+
+        g_cc = grad_vec[inactive_cc]
+        s_cc = S_flat[inactive_cc]
+        aty_cc = aty_scaled_vec[inactive_cc]
+
+        s_med = np.median(s_cc) + 1e-30
+        score_cc = g_cc / (1.0 + penalty_strength * (s_cc / s_med - 1.0))
+
+        aty_scale = np.max(np.abs(aty_cc)) + 1e-30
+        score_cc = score_cc + 0.10 * (aty_cc / aty_scale)
+
+        order = np.argsort(score_cc)[::-1]
+        take = min(q, order.size)
+
+        for j in order[:take]:
+            gcol = int(inactive_cc[j])
+            if gcol not in chosen_set:
+                chosen.append(gcol)
+                chosen_set.add(gcol)
+
+    if len(chosen) == 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    if len(chosen) > total_cols:
+        chosen = chosen[:total_cols]
+
+    return np.asarray(chosen, dtype=np.int64)
+
+# ------------------------------------------------------------------------------
+
 def _streaming_active_set_nnls_via_streaming_matvec(
     h5_path: str,
     s_ranges: list,
@@ -959,11 +1064,11 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     ATy_scaled = S_flat * ATy_flat
 
     grad_ref = max(1.0, float(np.max(np.abs(ATy_scaled))))
-    tol_grad_rel = 1e-3
+    tol_grad_rel = 1e-6
 
     # --- plateau-stop controls ---
     grad_hist = []
-    plateau_window = 8
+    plateau_window = 60
     plateau_frac = 0.995
 
     # --- positive-gradient batch-promotion controls ---
@@ -1154,6 +1259,10 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         ATAz_scaled = _compute_ATAz_scaled(z)
         grad = ATy_scaled - ATAz_scaled
 
+        # orbit state used to bias active-set growth
+        orbit_s, orbit_t, orbit_deficit = _orbit_mass_and_deficit(z)
+        orbit_pressure = np.maximum(orbit_deficit, 0.0)
+
         # ---- inject prior-gradient into the promotion gradient (so prior can
         # ---- encourage activation of columns that help meet orbit targets)
         # ---- Prior influence on promotion gradient (revised alpha + clipping)
@@ -1202,15 +1311,24 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             grad_hist.pop(0)
 
         if len(grad_hist) == plateau_window:
-            g0 = float(grad_hist[0])
-            g1 = float(grad_hist[-1])
-            if np.isfinite(g0) and np.isfinite(g1) and (g0 > 0.0):
-                if g1 >= plateau_frac * g0:
+            gwin = np.asarray(grad_hist, dtype=np.float64)
+            gwin = gwin[np.isfinite(gwin)]
+
+            if gwin.size == plateau_window:
+                gmax = float(np.max(gwin))
+                gmin = float(np.min(gwin))
+                gmean = float(np.mean(gwin))
+
+                # plateau if the entire window stays within a tiny band
+                # relative to the window's mean level
+                spread_rel = (gmax - gmin) / max(abs(gmean), 1e-30)
+
+                if spread_rel < (1.0 - plateau_frac):
                     termination_reason = "plateau"
                     print(
                         "[MONO] terminating on max_grad plateau: "
-                        f"start={g0:.3e} end={g1:.3e} "
-                        f"window={plateau_window}",
+                        f"min={gmin:.3e} max={gmax:.3e} mean={gmean:.3e} "
+                        f"spread_rel={spread_rel:.3e} window={plateau_window}",
                         flush=True,
                     )
                     break
@@ -1266,17 +1384,19 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             if negative_grad_count <= explore_budget and not_active.size > 0:
                 preferred_group = min(12, max(4, CP // 120))
 
-                cols_to_activate = _quota_rescue_columns(
+                cols_to_activate = _deficit_rescue_columns(
                     grad_vec=grad,
                     aty_scaled_vec=ATy_scaled,
                     active_mask=active,
                     S_flat=S_flat,
                     w_target=w_target,
+                    deficit=orbit_deficit,
                     C=C,
                     P=P,
                     total_cols=preferred_group,
                     min_per_orbit=1,
                     max_per_orbit=max(3, preferred_group),
+                    deficit_boost=2.0,
                     penalty_strength=0.5,
                 )
 
@@ -1326,17 +1446,19 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             # --------------------------------------------------------
             preferred_group = min(positive_batch_size, pos_mask.size)
 
-            cols_to_activate = _quota_rescue_columns(
+            cols_to_activate = _deficit_rescue_columns(
                 grad_vec=grad,
                 aty_scaled_vec=ATy_scaled,
                 active_mask=active,
                 S_flat=S_flat,
                 w_target=w_target,
+                deficit=orbit_deficit,
                 C=C,
                 P=P,
                 total_cols=preferred_group,
                 min_per_orbit=1,
-                max_per_orbit=max(2, preferred_group),
+                max_per_orbit=max(3, preferred_group),
+                deficit_boost=2.0,
                 penalty_strength=0.5,
             )
 
@@ -1375,34 +1497,48 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             break
 
         # --------------------------------------------------------
-        # Enforce minimum active columns per orbit
-        # (prevents orbit collapse under strong prior)
+        # Enforce weighted minimum active support per orbit
+        # Orbits with larger deficit get a larger floor.
         # --------------------------------------------------------
-        min_per_orbit = 1  # tunable (2–4 recommended)
+        if w_target is not None and np.sum(orbit_pressure) > 0.0:
+            pressure = orbit_pressure / (np.sum(orbit_pressure) + 1e-30)
+            min_per_orbit_vec = np.maximum(
+                1,
+                np.ceil(1.0 + 4.0 * pressure).astype(np.int64),
+            )
+        else:
+            min_per_orbit_vec = np.ones((C,), dtype=np.int64)
 
         for cc in range(C):
             base = cc * P
             idxs = np.arange(base, base + P, dtype=np.int64)
 
             active_cc = idxs[active[idxs]]
+            min_req = int(min_per_orbit_vec[cc])
 
-            if active_cc.size < min_per_orbit:
+            if active_cc.size < min_req:
                 inactive_cc = idxs[~active[idxs]]
 
                 if inactive_cc.size > 0:
-                    # choose by strongest data support (NOT gradient)
-                    scores = ATy_scaled[inactive_cc]
+                    scores = ATy_scaled[inactive_cc].copy()
+
+                    # bias toward underweight orbits and away from huge-S columns
+                    if orbit_pressure[cc] > 0.0:
+                        scores += 0.25 * orbit_pressure[cc]
+
+                    s_loc = S_flat[inactive_cc]
+                    s_med = np.median(s_loc) + 1e-30
+                    scores = scores / (1.0 + 0.5 * (s_loc / s_med - 1.0))
+
                     order = np.argsort(scores)[::-1]
-
-                    n_add = min(min_per_orbit - active_cc.size, order.size)
-
+                    n_add = min(min_req - active_cc.size, order.size)
                     chosen = inactive_cc[order[:n_add]]
 
                     active[chosen] = True
 
                     print(
                         f"[MONO][enforce] orbit {cc}: adding {n_add} columns "
-                        f"to ensure minimum support: {chosen}",
+                        f"to meet weighted minimum support: {chosen}",
                         flush=True,
                     )
 
@@ -1583,8 +1719,46 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
         z_sub_raw = np.maximum(z_sub_raw, 0.0)
 
-        step_frac = 0.25 if did_explore else 0.5
-        z_sub = (1.0 - step_frac) * z_old_active + step_frac * z_sub_raw
+        z_sub = z_sub_raw.copy()
+
+        # ----------------------------------------------------
+        # Exact orbit-mass correction in x-space
+        # ----------------------------------------------------
+        if w_target is not None:
+            x_sub = S_active * z_sub
+
+            orbit_groups = {}
+            for local_i, gcol in enumerate(active_idx):
+                cc = int(gcol // P)
+                orbit_groups.setdefault(cc, []).append(local_i)
+
+            for cc, idx_list in orbit_groups.items():
+                idx = np.asarray(idx_list, dtype=np.int64)
+                if idx.size == 0:
+                    continue
+
+                target_mass = alpha_ref * float(w_target[cc])
+                current_mass = float(np.sum(x_sub[idx]))
+
+                if target_mass <= 0.0:
+                    x_sub[idx] = 0.0
+                    continue
+
+                if current_mass > 0.0:
+                    # Exact rescale of this orbit's current active mass
+                    x_sub[idx] *= target_mass / current_mass
+                else:
+                    # If the orbit has target mass but the solve gave none,
+                    # seed it uniformly across the active columns.
+                    x_sub[idx] = target_mass / float(idx.size)
+
+            # Convert back to z-space
+            z_sub = np.divide(
+                x_sub,
+                S_active,
+                out=np.zeros_like(z_sub),
+                where=S_active > 0.0,
+            )
 
         obj_old = _quad_obj(ATA_sub_reg, ATy_sub, z_old_active)
         obj_new = _quad_obj(ATA_sub_reg, ATy_sub, z_sub)
@@ -1598,25 +1772,35 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             # ----------------------------
             # Evaluate orbit improvement
             # ----------------------------
+            orbit_improved = False
             if w_target is not None:
                 _, _, deficit_old = _orbit_mass_and_deficit(z)
                 z_tmp = z.copy()
                 z_tmp[active_idx] = z_sub
                 _, _, deficit_new = _orbit_mass_and_deficit(z_tmp)
 
-                orbit_improved = (
-                    np.sum(np.abs(deficit_new)) < np.sum(np.abs(deficit_old))
-                )
-            else:
-                orbit_improved = False
+                old_l1 = float(np.sum(np.abs(deficit_old)))
+                new_l1 = float(np.sum(np.abs(deficit_new)))
+
+                orbit_improved = new_l1 < (0.995 * old_l1)
 
             # ----------------------------
             # rejection logic
             # ----------------------------
-            if (obj_new > obj_old) and (not orbit_improved):
-                reject = True
+            obj_worsened = np.isfinite(obj_new) and (
+                obj_new > obj_old + 1e-12 * (1.0 + abs(obj_old))
+            )
 
-            if norm_new > 5.0 * max(norm_old, 1.0):
+            # Only apply the norm safeguard once there is already a nontrivial
+            # incumbent solution. Do not block the first successful escape.
+            norm_exploded = (
+                norm_old > 1e-12 and norm_new > 50.0 * norm_old
+            )
+
+            reject = False
+            if obj_worsened and not orbit_improved:
+                reject = True
+            if norm_exploded and not orbit_improved:
                 reject = True
 
         if reject:
@@ -1638,23 +1822,48 @@ def _streaming_active_set_nnls_via_streaming_matvec(
         for ii, gcol in enumerate(active_idx):
             z[int(gcol)] = float(z_sub[ii])
 
-        scale = np.max(np.abs(z)) + 1e-30
-        _eps_drop = 1e-10 * scale
+        # --------------------------------------------------------
+        # Orbit-local pruning of weak active coefficients
+        # --------------------------------------------------------
+        x_phys = S_flat * z
+        prune_rel = 5e-4
+        keep_per_orbit = 4
 
-        neg_idx = np.where(z < -_eps_drop)[0]
-        if neg_idx.size > 0:
-            z[neg_idx] = 0.0
-            active[neg_idx] = False
+        for cc in range(C):
+            base = cc * P
+            idxs = np.arange(base, base + P, dtype=np.int64)
 
-        tiny_neg = np.where((z >= -_eps_drop) & (z < 0.0))[0]
-        if tiny_neg.size > 0:
-            z[tiny_neg] = 0.0
+            active_cc = idxs[active[idxs]]
+            if active_cc.size == 0:
+                continue
 
-        z_scale = np.max(z) + 1e-30
-        tiny_pos = np.where(active & (z <= 1e-6 * z_scale))[0]
-        if tiny_pos.size > 0:
-            z[tiny_pos] = 0.0
-            active[tiny_pos] = False
+            x_cc = x_phys[active_cc]
+            orbit_sum = float(np.sum(x_cc))
+            if orbit_sum <= 0.0:
+                continue
+
+            # If this orbit is over target, prune slightly harder.
+            rel_floor = prune_rel if orbit_deficit[cc] <= 0.0 else 2.0 * prune_rel
+
+            # Keep only the strongest columns in this orbit.
+            order = np.argsort(x_cc)[::-1]
+            keep_loc = order[:min(keep_per_orbit, order.size)]
+
+            # Remove columns that are tiny relative to orbit mass.
+            keep_loc = keep_loc[
+                x_cc[keep_loc] >= max(1e-12, rel_floor * orbit_sum)
+            ]
+
+            # Never prune the orbit completely if it already has support.
+            if keep_loc.size == 0:
+                keep_loc = np.array([order[0]], dtype=np.int64)
+
+            kept = active_cc[keep_loc]
+            drop = np.setdiff1d(active_cc, kept, assume_unique=False)
+
+            if drop.size > 0:
+                z[drop] = 0.0
+                active[drop] = False
 
     return S_flat * z
 
