@@ -48,7 +48,9 @@ v1.6:   Consider full plateau window for early exit in
             `_streaming_active_set_nnls_via_streaming_matvec`;
         Use a relative per-orbit scale to determine which columns to drop, 
             rather than a global scale in 
-            `_streaming_active_set_nnls_via_streaming_matvec`. 26 March 2026
+            `_streaming_active_set_nnls_via_streaming_matvec`;
+        Temporarily ban columns from re-promotion after an initial unhelpful
+            promotion. 26 March 2026
 """
 
 from __future__ import annotations, print_function
@@ -921,6 +923,7 @@ def _deficit_rescue_columns(
     max_per_orbit: int = 12,
     deficit_boost: float = 2.0,
     penalty_strength: float = 0.5,
+    exclude_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Select rescue columns with quotas driven by orbit deficit.
@@ -995,6 +998,8 @@ def _deficit_rescue_columns(
         base = int(cc * P)
         cols_cc = np.arange(base, base + P, dtype=np.int64)
         inactive_cc = cols_cc[~active_mask[cols_cc]]
+        if exclude_mask is not None:
+            inactive_cc = inactive_cc[~exclude_mask[inactive_cc]]
         if inactive_cc.size == 0:
             continue
 
@@ -1068,8 +1073,9 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
     # --- plateau-stop controls ---
     grad_hist = []
-    plateau_window = 60
+    plateau_window = 30
     plateau_frac = 0.995
+    failed_promotions_hist: list[int] = []
 
     # --- positive-gradient batch-promotion controls ---
     positive_batch_size = 3
@@ -1109,6 +1115,10 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
     z_scale0 = np.max(z) + 1e-30
     active = z > (1e-10 * z_scale0)
+    # Columns that were promoted but did not survive the reduced solve.
+    # These are temporarily blacklisted so the solver can try other columns.
+    recent_fail_iter: dict[int, int] = {}
+    cooldown_iters = 6
 
     # stage-status bookkeeping for continuation
     termination_reason = "max_iter"
@@ -1312,26 +1322,22 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
         if len(grad_hist) == plateau_window:
             gwin = np.asarray(grad_hist, dtype=np.float64)
-            gwin = gwin[np.isfinite(gwin)]
+            gmin = float(np.min(gwin))
+            gmax = float(np.max(gwin))
+            gmean = float(np.mean(gwin))
+            spread_rel = (gmax - gmin) / (abs(gmean) + 1e-30)
 
-            if gwin.size == plateau_window:
-                gmax = float(np.max(gwin))
-                gmin = float(np.min(gwin))
-                gmean = float(np.mean(gwin))
-
-                # plateau if the entire window stays within a tiny band
-                # relative to the window's mean level
-                spread_rel = (gmax - gmin) / max(abs(gmean), 1e-30)
-
-                if spread_rel < (1.0 - plateau_frac):
-                    termination_reason = "plateau"
-                    print(
-                        "[MONO] terminating on max_grad plateau: "
-                        f"min={gmin:.3e} max={gmax:.3e} mean={gmean:.3e} "
-                        f"spread_rel={spread_rel:.3e} window={plateau_window}",
-                        flush=True,
-                    )
-                    break
+            # Only call it a plateau if the gradient is flat AND the solver
+            # has not been repeatedly trying failed promotions.
+            if spread_rel < 5e-4 and sum(failed_promotions_hist) == 0:
+                termination_reason = "plateau"
+                print(
+                    "[MONO] terminating on max_grad plateau: "
+                    f"min={gmin:.3e} max={gmax:.3e} mean={gmean:.3e} "
+                    f"spread_rel={spread_rel:.3e} window={plateau_window}",
+                    flush=True,
+                )
+                break
         # ---------------------------------------------------------
 
         not_active = np.where(~active)[0]
@@ -1399,13 +1405,27 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                     deficit_boost=2.0,
                     penalty_strength=0.5,
                 )
+                if cols_to_activate.size > 0 and recent_fail_iter:
+                    cols_to_activate = np.asarray(
+                        [
+                            int(c) for c in cols_to_activate
+                            if (it - recent_fail_iter.get(int(c), -10**9))
+                            >= cooldown_iters
+                        ],
+                        dtype=np.int64,
+                    )
 
                 if cols_to_activate.size == 0:
-                    pool_size = min(50, gvals.size)
-                    top = np.argsort(gvals)[-pool_size:]
-                    n_pick = min(preferred_group, top.size)
-                    chosen = np.random.choice(top, size=n_pick, replace=False)
-                    cols_to_activate = not_active[chosen].astype(np.int64)
+                    order = np.argsort(adj_score)[::-1]
+                    chosen = []
+                    for local_i in order:
+                        gcol = int(not_active[local_i])
+                        if (it - recent_fail_iter.get(gcol, -10**9)) < cooldown_iters:
+                            continue
+                        chosen.append(gcol)
+                        if len(chosen) >= preferred_group:
+                            break
+                    cols_to_activate = np.asarray(chosen, dtype=np.int64)
 
                     print(
                         f"[MONO][explore] fallback global promotion of "
@@ -1461,12 +1481,27 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 deficit_boost=2.0,
                 penalty_strength=0.5,
             )
+            if cols_to_activate.size > 0 and recent_fail_iter:
+                cols_to_activate = np.asarray(
+                    [
+                        int(c) for c in cols_to_activate
+                        if (it - recent_fail_iter.get(int(c), -10**9))
+                        >= cooldown_iters
+                    ],
+                    dtype=np.int64,
+                )
 
             if cols_to_activate.size == 0:
-                # fallback
                 order = pos_mask[np.argsort(adj_score[pos_mask])[::-1]]
-                chosen_local = order[:preferred_group]
-                cols_to_activate = not_active[chosen_local]
+                chosen = []
+                for local_i in order:
+                    gcol = int(not_active[local_i])
+                    if (it - recent_fail_iter.get(gcol, -10**9)) < cooldown_iters:
+                        continue
+                    chosen.append(gcol)
+                    if len(chosen) >= preferred_group:
+                        break
+                cols_to_activate = np.asarray(chosen, dtype=np.int64)
 
             print(
                 f"[MONO] orbit-aware positive promotion: {cols_to_activate}",
@@ -1759,6 +1794,26 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 out=np.zeros_like(z_sub),
                 where=S_active > 0.0,
             )
+
+        # Track promoted columns that did not survive the reduced solve.
+        # These get blacklisted for a few iterations so the solver can
+        # explore other candidates.
+        failed_this_iter = 0
+        if newly_activated is not None and newly_activated.size > 0:
+            active_lookup = {int(c): i for i, c in enumerate(active_idx)}
+            z_scale_loc = float(np.max(z_sub)) + 1e-30
+
+            for c in newly_activated:
+                ii = active_lookup.get(int(c))
+                if ii is None:
+                    continue
+
+                if z_sub[ii] <= 1e-8 * z_scale_loc:
+                    recent_fail_iter[int(c)] = it
+                    failed_this_iter += 1
+        failed_promotions_hist.append(failed_this_iter)
+        if len(failed_promotions_hist) > plateau_window:
+            failed_promotions_hist.pop(0)
 
         obj_old = _quad_obj(ATA_sub_reg, ATy_sub, z_old_active)
         obj_new = _quad_obj(ATA_sub_reg, ATy_sub, z_sub)
