@@ -1078,11 +1078,11 @@ def streamActiveSetNNLS(
 
     # --- plateau-stop controls ---
     grad_hist = []
-    plateau_window = 30
+    plateau_window = 60
     plateau_frac = 0.995
 
     # --- positive-gradient batch-promotion controls ---
-    positive_batch_size = 3
+    positive_batch_size = 5
     positive_pool_size = 12
 
     # robust prior mass reference scale
@@ -1122,7 +1122,7 @@ def streamActiveSetNNLS(
     # Columns that were promoted but did not survive the reduced solve.
     # These are temporarily blacklisted so the solver can try other columns.
     cooldown_until: dict[int, int] = {}
-    cooldown_iters = 6
+    cooldown_iters = 20
 
     def _on_cooldown(col: int, it: int) -> bool:
         return it < cooldown_until.get(int(col), -1)
