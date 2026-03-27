@@ -51,6 +51,11 @@ v1.6:   Consider full plateau window for early exit in
             `_streaming_active_set_nnls_via_streaming_matvec`;
         Temporarily ban columns from re-promotion after an initial unhelpful
             promotion. 26 March 2026
+v1.7:   Added `cooldown_iters` parameter to control how long a column is banned
+            after a failed promotion in
+            `_streaming_active_set_nnls_via_streaming_matvec`;
+        Renamed `streaming_active_set_nnls_via_streaming_matvec` to
+            `streamActiveSetNNLS`. 27 March 2026
 """
 
 from __future__ import annotations, print_function
@@ -1032,7 +1037,7 @@ def _deficit_rescue_columns(
 
 # ------------------------------------------------------------------------------
 
-def _streaming_active_set_nnls_via_streaming_matvec(
+def streamActiveSetNNLS(
     h5_path: str,
     s_ranges: list,
     keep_idx,
@@ -1075,7 +1080,6 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     grad_hist = []
     plateau_window = 30
     plateau_frac = 0.995
-    failed_promotions_hist: list[int] = []
 
     # --- positive-gradient batch-promotion controls ---
     positive_batch_size = 3
@@ -1117,12 +1121,16 @@ def _streaming_active_set_nnls_via_streaming_matvec(
     active = z > (1e-10 * z_scale0)
     # Columns that were promoted but did not survive the reduced solve.
     # These are temporarily blacklisted so the solver can try other columns.
-    recent_fail_iter: dict[int, int] = {}
+    cooldown_until: dict[int, int] = {}
     cooldown_iters = 6
 
-    # stage-status bookkeeping for continuation
-    termination_reason = "max_iter"
-    rescue_orbits = np.zeros((0,), dtype=np.int64)
+    def _on_cooldown(col: int, it: int) -> bool:
+        return it < cooldown_until.get(int(col), -1)
+
+    def _blacklist_cols(cols, it: int) -> None:
+        expire = int(it + cooldown_iters)
+        for c in np.asarray(cols, dtype=np.int64).ravel():
+            cooldown_until[int(c)] = expire
 
     def _current_x_from_z(z_vec: np.ndarray) -> np.ndarray:
         """
@@ -1329,7 +1337,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
 
             # Only call it a plateau if the gradient is flat AND the solver
             # has not been repeatedly trying failed promotions.
-            if spread_rel < 5e-4 and sum(failed_promotions_hist) == 0:
+            if spread_rel < 5e-4:
                 termination_reason = "plateau"
                 print(
                     "[MONO] terminating on max_grad plateau: "
@@ -1390,6 +1398,10 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             if negative_grad_count <= explore_budget and not_active.size > 0:
                 preferred_group = min(12, max(4, CP // 120))
 
+                cooldown_mask = np.zeros(CP, dtype=bool)
+                for c, expiry in cooldown_until.items():
+                    if expiry > it:
+                        cooldown_mask[int(c)] = True
                 cols_to_activate = _deficit_rescue_columns(
                     grad_vec=grad,
                     aty_scaled_vec=ATy_scaled,
@@ -1404,23 +1416,15 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                     max_per_orbit=max(3, preferred_group),
                     deficit_boost=2.0,
                     penalty_strength=0.5,
+                    exclude_mask=cooldown_mask,
                 )
-                if cols_to_activate.size > 0 and recent_fail_iter:
-                    cols_to_activate = np.asarray(
-                        [
-                            int(c) for c in cols_to_activate
-                            if (it - recent_fail_iter.get(int(c), -10**9))
-                            >= cooldown_iters
-                        ],
-                        dtype=np.int64,
-                    )
 
                 if cols_to_activate.size == 0:
                     order = np.argsort(adj_score)[::-1]
                     chosen = []
                     for local_i in order:
                         gcol = int(not_active[local_i])
-                        if (it - recent_fail_iter.get(gcol, -10**9)) < cooldown_iters:
+                        if _on_cooldown(gcol, it):
                             continue
                         chosen.append(gcol)
                         if len(chosen) >= preferred_group:
@@ -1466,6 +1470,10 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             # --------------------------------------------------------
             preferred_group = min(positive_batch_size, pos_mask.size)
 
+            cooldown_mask = np.zeros(CP, dtype=bool)
+            for c, expiry in cooldown_until.items():
+                if expiry > it:
+                    cooldown_mask[int(c)] = True
             cols_to_activate = _deficit_rescue_columns(
                 grad_vec=grad,
                 aty_scaled_vec=ATy_scaled,
@@ -1480,23 +1488,15 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                 max_per_orbit=max(3, preferred_group),
                 deficit_boost=2.0,
                 penalty_strength=0.5,
+                exclude_mask=cooldown_mask,
             )
-            if cols_to_activate.size > 0 and recent_fail_iter:
-                cols_to_activate = np.asarray(
-                    [
-                        int(c) for c in cols_to_activate
-                        if (it - recent_fail_iter.get(int(c), -10**9))
-                        >= cooldown_iters
-                    ],
-                    dtype=np.int64,
-                )
 
             if cols_to_activate.size == 0:
                 order = pos_mask[np.argsort(adj_score[pos_mask])[::-1]]
                 chosen = []
                 for local_i in order:
                     gcol = int(not_active[local_i])
-                    if (it - recent_fail_iter.get(gcol, -10**9)) < cooldown_iters:
+                    if _on_cooldown(gcol, it):
                         continue
                     chosen.append(gcol)
                     if len(chosen) >= preferred_group:
@@ -1809,11 +1809,8 @@ def _streaming_active_set_nnls_via_streaming_matvec(
                     continue
 
                 if z_sub[ii] <= 1e-8 * z_scale_loc:
-                    recent_fail_iter[int(c)] = it
+                    cooldown_until[int(c)] = it + cooldown_iters
                     failed_this_iter += 1
-        failed_promotions_hist.append(failed_this_iter)
-        if len(failed_promotions_hist) > plateau_window:
-            failed_promotions_hist.pop(0)
 
         obj_old = _quad_obj(ATA_sub_reg, ATy_sub, z_old_active)
         obj_new = _quad_obj(ATA_sub_reg, ATy_sub, z_sub)
@@ -1917,6 +1914,7 @@ def _streaming_active_set_nnls_via_streaming_matvec(
             drop = np.setdiff1d(active_cc, kept, assume_unique=False)
 
             if drop.size > 0:
+                _blacklist_cols(drop, it)
                 z[drop] = 0.0
                 active[drop] = False
 
@@ -2378,7 +2376,7 @@ def solve_streaming_nnls(
         print(f"[DIAG] ATA_sub_local shape, ATy_sub_local[0:6]: {ATA_sub_local.shape} {ATy_sub_local[:6]}", flush=True)
 
         try:
-            x_flat_unscaled = _streaming_active_set_nnls_via_streaming_matvec(
+            x_flat_unscaled = streamActiveSetNNLS(
                 h5_path=h5_path,
                 s_ranges=s_ranges,
                 keep_idx=keep_idx,
