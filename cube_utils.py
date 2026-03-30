@@ -16,6 +16,8 @@ v1.4:   Fixed generator addition bug in `_globMILES`. 30 January 2026
 v1.5:   Fixed bug in `_glob*MILES` where the metallicity parsing was not
             correctly sorting the templates, so added `parseMetallicityFromPath`
             and sorting logic. 9 February 2026
+v1.6:   Fixed bug in `_glob*MILES` where age sorting was neglected, so added
+            `parseAgeFromPath` and updated sorting logic. 30 March 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -2422,6 +2424,19 @@ def parseMetallicityFromPath(pth: plp.Path) -> float:
 
 # ------------------------------------------------------------------------------
 
+def parseAgeFromPath(pth: plp.Path) -> float:
+    """
+    Parse temperature/age token like 'T00.000' from filename and return float.
+    Raises ValueError if not found.
+    """
+    s = pth.name
+    m = re.search(r"T(\d+(?:\.\d+)?)", s)
+    if not m:
+        raise ValueError(f"Could not parse T from '{s}'")
+    return float(m.group(1))
+
+# ------------------------------------------------------------------------------
+
 def _globEMILES(iso, IMF, slope):
     """
     This function generates the glob pattern for the EMILES templates
@@ -2438,10 +2453,16 @@ def _globEMILES(iso, IMF, slope):
     tglob = np.array(list(dDir.rglob(str(plp.Path(
         f"EMILES*{iso.upper()}*{IMF}*", f"E{IMF.lower()}{slope:.2f}*.fits")))))
 
-    mpairs = [(parseMetallicityFromPath(tpath), tpath) for tpath in tglob]
-    sortMpairs = sorted(mpairs, key=lambda x: x[0])
+    mpairs = [
+        (parseMetallicityFromPath(tpath),
+        parseAgeFromPath(tpath),
+        tpath)
+        for tpath in tglob
+    ]
 
-    sortedTemplates = np.array([t[1] for t in sortMpairs])
+    sortMpairs = sorted(mpairs, key=lambda x: (x[0], x[1]))
+
+    sortedTemplates = np.array([t[2] for t in sortMpairs])
 
     return sortedTemplates
 
@@ -2471,10 +2492,16 @@ def _globMILES(iso, IMF, slope):
     paths = list(dDir.rglob(p1)) + list(dDir.rglob(p2))
     tglob = np.array(paths)
 
-    mpairs = [(parseMetallicityFromPath(tpath), tpath) for tpath in tglob]
-    sortMpairs = sorted(mpairs, key=lambda x: x[0])
+    mpairs = [
+        (parseMetallicityFromPath(tpath),
+        parseAgeFromPath(tpath),
+        tpath)
+        for tpath in tglob
+    ]
 
-    sortedTemplates = np.array([t[1] for t in sortMpairs])
+    sortMpairs = sorted(mpairs, key=lambda x: (x[0], x[1]))
+
+    sortedTemplates = np.array([t[2] for t in sortMpairs])
 
     return sortedTemplates
 
@@ -2498,10 +2525,16 @@ def _globSMILES(iso, IMF, slope):
     tglob = np.array(list(dDir.rglob(str(plp.Path('sMILES_SSPs',
         imfDict[IMF], 'aFe*', f"M{IMF.lower()}{slope:.2f}*.fits")))))
 
-    mpairs = [(parseMetallicityFromPath(tpath), tpath) for tpath in tglob]
-    sortMpairs = sorted(mpairs, key=lambda x: x[0])
+    mpairs = [
+        (parseMetallicityFromPath(tpath),
+        parseAgeFromPath(tpath),
+        tpath)
+        for tpath in tglob
+    ]
 
-    sortedTemplates = np.array([t[1] for t in sortMpairs])
+    sortMpairs = sorted(mpairs, key=lambda x: (x[0], x[1]))
+
+    sortedTemplates = np.array([t[2] for t in sortMpairs])
 
     return sortedTemplates
 

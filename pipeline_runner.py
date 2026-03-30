@@ -56,6 +56,8 @@ v1.16:  Fixed bug in `PipelineRunner._read_latest_from_main` which incorrectly
             sliced read-in solutions assuming they were history-like. 17
             February 2026
 v1.17:  Removed lingering `orbit_beta`. 23 March 2026
+v1.18:  Re-implemented `orbit_beta` support in `solve_all_mp_batched` and passed
+            it to the solver. 30 March 2026
 """
 
 from __future__ import annotations
@@ -938,8 +940,9 @@ class PipelineRunner:
         processes=2,
         blas_threads=12,
         orbit_weights=None,
+        orbit_beta=0.0,
         x0=None,
-        warm_start="nnls",  # default to the new seed
+        warm_start="zeros",  # default to the new seed
         seed_cfg=None,
         tracker_mode="on",
         verbose=True,
@@ -1195,6 +1198,7 @@ class PipelineRunner:
             processes=int(processes),
             blas_threads=int(blas_threads),
             apply_mask=bool(reader_apply_mask),
+            orbit_beta=float(orbit_beta)
         )
 
         try:

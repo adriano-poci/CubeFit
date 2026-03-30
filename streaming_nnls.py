@@ -66,6 +66,8 @@ v1.9:   Jail columns which are technically non-zero, but also not helpful to the
             fit to encourage diverse exploration;
         Removed over-zealous per-orbit pruning of columns in
             `streamActiveSetNNLS`. 29 March 2026
+v1.10:  Re-implemented `orbit_beta` as a soft penalty in the objective rather
+            than a hard projection, and scale it to the data. 30 March 2026
 """
 
 from __future__ import annotations, print_function
@@ -561,203 +563,46 @@ def _nnls_from_quadratic(
 
 # ------------------------------------------------------------------------------
 
-def _build_stage_rescue_seed(
-    x_stage: np.ndarray,
-    w_target: Optional[np.ndarray],
-    alpha_ref: float,
-    C: int,
-    P: int,
-    *,
-    per_orbit: int = 2,
-    max_orbits: int = 3,
-    seed_frac: float = 1e-3,
-) -> np.ndarray:
+def _robust_scale_ref(values: np.ndarray, fallback: float = 1.0) -> float:
     """
-    Build a tiny warm-start seed in underweight orbits for the next continuation
-    stage.
-
-    Parameters
-    ----------
-    x_stage : ndarray, shape (C, P)
-        Current stage solution in physical x-space.
-    w_target : ndarray or None, shape (C,)
-        Normalized orbit target weights.
-    alpha_ref : float
-        Fixed reference mass scale used by the monolithic solver.
-    C : int
-        Number of orbit components.
-    P : int
-        Number of populations per orbit.
-    per_orbit : int, optional
-        Maximum number of seed columns per rescued orbit.
-    max_orbits : int, optional
-        Maximum number of rescued orbits.
-    seed_frac : float, optional
-        Seed amplitude as a fraction of the target orbit mass, divided across
-        selected columns.
-
-    Returns
-    -------
-    x_seed : ndarray, shape (C, P)
-        Tiny additive warm-start seed for the next stage.
+    Return a robust positive scale for a numeric vector.
     """
-    x_stage = np.asarray(x_stage, dtype=np.float64).reshape(C, P)
-    x_seed = np.zeros((C, P), dtype=np.float64)
+    vals = np.asarray(values, dtype=np.float64).ravel(order="C")
+    vals = vals[np.isfinite(vals)]
+    vals = np.abs(vals[vals > 0.0])
 
-    if (w_target is None) or (not np.any(np.isfinite(w_target))):
-        return x_seed
+    if vals.size == 0:
+        return max(1.0, float(fallback))
 
-    w_target = np.asarray(w_target, dtype=np.float64).ravel()
-    if w_target.size != C:
-        return x_seed
+    ref = float(np.median(vals))
+    if not np.isfinite(ref) or ref <= 0.0:
+        ref = float(np.max(vals)) if vals.size else float(fallback)
 
-    s_orbit = np.sum(x_stage, axis=1)
-    t_orbit = alpha_ref * w_target
-    deficit = t_orbit - s_orbit
-
-    under = np.where(np.isfinite(deficit) & (deficit > 0.0))[0]
-    if under.size == 0:
-        return x_seed
-
-    under = under[np.argsort(deficit[under])[::-1]]
-    under = under[:min(max_orbits, under.size)]
-
-    for cc in under:
-        row = x_stage[cc]
-        inactive = np.where(row <= 0.0)[0]
-
-        if inactive.size == 0:
-            # if the whole orbit is already active, seed the weakest entries
-            order = np.argsort(row)
-            pick = order[:min(per_orbit, order.size)]
-        else:
-            pick = inactive[:min(per_orbit, inactive.size)]
-
-        if pick.size == 0:
-            continue
-
-        orbit_seed_mass = max(0.0, seed_frac * t_orbit[cc])
-        amp = orbit_seed_mass / float(pick.size)
-
-        if np.isfinite(amp) and (amp > 0.0):
-            x_seed[cc, pick] = amp
-
-    return x_seed
+    return max(1.0, ref)
 
 # ------------------------------------------------------------------------------
 
-def _prepare_stage_warm_start(
-    x_stage: np.ndarray,
-    w_target: Optional[np.ndarray],
-    alpha_ref: float,
-    C: int,
-    P: int,
-    *,
-    keep_per_orbit: int = 8,
-    tiny_rel: float = 1e-4,
-    rescue_per_orbit: int = 2,
-    rescue_orbits_max: int = 3,
-    rescue_seed_frac: float = 1e-3,
-) -> np.ndarray:
+def _orbit_prior_beta_eff(
+    orbit_beta: float,
+    target_mass: float,
+    data_scale_ref: float,
+) -> float:
     """
-    Rebuild a warm start for the next continuation stage.
+    Convert the user-facing orbit_beta into a problem-scale prior weight.
 
-    Strategy
-    --------
-    1. Prune weak support within each orbit.
-    2. If orbit targets are available, add tiny rescue seeds into the most
-       underweight orbits, even if those orbits already have active support.
+    The normalization is:
+        beta_eff = orbit_beta * data_scale_ref / target_mass**2
 
-    Parameters
-    ----------
-    x_stage : ndarray, shape (C, P)
-        Current stage solution in physical x-space.
-    w_target : ndarray or None, shape (C,)
-        Normalized orbit weights.
-    alpha_ref : float
-        Fixed reference target mass scale.
-    C : int
-        Number of orbit components.
-    P : int
-        Number of populations per orbit.
-    keep_per_orbit : int, optional
-        Maximum number of existing support entries to keep per orbit.
-    tiny_rel : float, optional
-        Relative threshold within each orbit for pruning weak coefficients.
-    rescue_per_orbit : int, optional
-        Number of rescue seed columns per rescued orbit.
-    rescue_orbits_max : int, optional
-        Maximum number of underweight orbits to rescue.
-    rescue_seed_frac : float, optional
-        Tiny mass fraction of target orbit mass to inject.
-
-    Returns
-    -------
-    x_next : ndarray, shape (C, P)
-        Warm start for the next continuation stage.
+    so orbit_beta is dimensionless and comparable across problem sizes.
     """
-    x_stage = np.asarray(x_stage, dtype=np.float64).reshape(C, P)
-    x_next = np.zeros((C, P), dtype=np.float64)
+    orbit_beta = float(orbit_beta)
+    if (not np.isfinite(orbit_beta)) or orbit_beta <= 0.0:
+        return 0.0
 
-    # ----------------------------
-    # 1. prune existing support
-    # ----------------------------
-    for cc in range(C):
-        row = x_stage[cc]
-        row_max = float(np.max(row)) if row.size else 0.0
-        if row_max <= 0.0:
-            continue
+    target_mass = max(float(target_mass), 1e-30)
+    data_scale_ref = max(float(data_scale_ref), 1.0)
 
-        keep = np.where(row > tiny_rel * row_max)[0]
-        if keep.size > keep_per_orbit:
-            keep = keep[np.argsort(row[keep])[::-1][:keep_per_orbit]]
-
-        x_next[cc, keep] = row[keep]
-
-    # ----------------------------
-    # 2. add rescue seeds
-    # ----------------------------
-    if (w_target is None) or (not np.any(np.isfinite(w_target))):
-        return x_next
-
-    w_target = np.asarray(w_target, dtype=np.float64).ravel()
-    if w_target.size != C:
-        return x_next
-
-    s_orbit = np.sum(x_next, axis=1)
-    t_orbit = alpha_ref * w_target
-    deficit = t_orbit - s_orbit
-
-    under = np.where(np.isfinite(deficit) & (deficit > 0.0))[0]
-    if under.size == 0:
-        return x_next
-
-    under = under[np.argsort(deficit[under])[::-1]]
-    under = under[:min(rescue_orbits_max, under.size)]
-
-    for cc in under:
-        row = x_next[cc]
-
-        # Prefer currently inactive columns; if none exist, perturb the weakest.
-        inactive = np.where(row <= 0.0)[0]
-        if inactive.size >= rescue_per_orbit:
-            pick = inactive[:rescue_per_orbit]
-        elif inactive.size > 0:
-            pick = inactive
-        else:
-            order = np.argsort(row)
-            pick = order[:min(rescue_per_orbit, order.size)]
-
-        if pick.size == 0:
-            continue
-
-        seed_mass = max(0.0, rescue_seed_frac * t_orbit[cc])
-        amp = seed_mass / float(pick.size)
-
-        if np.isfinite(amp) and (amp > 0.0):
-            x_next[cc, pick] = np.maximum(x_next[cc, pick], amp)
-
-    return x_next
+    return orbit_beta * data_scale_ref / (target_mass * target_mass)
 
 # ------------------------------------------------------------------------------
 
@@ -1173,6 +1018,7 @@ def streamActiveSetNNLS(
     ATy_scaled = S_flat * ATy_flat
 
     grad_ref = max(1.0, float(np.max(np.abs(ATy_scaled))))
+    data_scale_ref = _robust_scale_ref(ATy_scaled, fallback=grad_ref)
     tol_grad_rel = 1e-6
 
     # --- plateau-stop controls ---
@@ -1331,36 +1177,38 @@ def streamActiveSetNNLS(
         # ---- encourage activation of columns that help meet orbit targets)
         # ---- Prior influence on promotion gradient (revised alpha + clipping)
         if (w_target is not None) and (orbit_beta > 0.0):
-            # Compute alpha from current x (x = S * z) so prior redistributes
-            # existing mass rather than creating mass from ATy magnitude.
-                # use fixed alpha computed once (not the running x-sum)
-
-            # Build prior gradient in z-space:
-            # d/dz 0.5*beta*(S·z_local - alpha*w_cc)^2 = beta * (S·z_local - alpha*w_cc) * S
             g_prior = np.zeros_like(grad)
-            # Loop per-orbit (cheap relative to expensive matvecs)
+
             for cc in range(C):
                 base = cc * P
                 idxs = np.arange(base, base + P, dtype=np.int64)
+
                 S_local = S_flat[idxs]
                 z_local = z[idxs]
-                w_cc = float(w_target[cc]) if (w_target is not None) else 0.0
-                resid = float(np.dot(S_local, z_local) - alpha_ref * w_cc)
+
+                w_cc = float(w_target[cc])
+                target_mass = max(1e-30, alpha_ref * w_cc)
+
+                resid = float(np.dot(S_local, z_local) - target_mass)
                 if not np.isfinite(resid):
                     continue
-                s_norm = float(np.sum(S_local * S_local)) + 1e-30
-                g_prior[idxs] = (orbit_beta / s_norm) * resid * S_local
 
-            # Prevent prior from overwhelming data gradient:
-            # compute robust norms, allow prior up to `clip_factor` times data gradient norm
+                beta_eff = _orbit_prior_beta_eff(
+                    orbit_beta=orbit_beta,
+                    target_mass=target_mass,
+                    data_scale_ref=data_scale_ref,
+                )
+
+                g_prior[idxs] = beta_eff * resid * S_local
+
             clip_factor = 1.5
             g_prior_norm = np.linalg.norm(g_prior)
             g_data_norm = np.linalg.norm(grad) + 1e-30
             if g_prior_norm > clip_factor * g_data_norm:
-                # scale down prior proportionally
-                g_prior *= (clip_factor * g_data_norm) / (g_prior_norm + 1e-30)
+                g_prior *= (clip_factor * g_data_norm) / (
+                    g_prior_norm + 1e-30
+                )
 
-            # Add prior gradient to promotion gradient
             grad = grad + g_prior
 
         not_active = np.where(~active)[0]
@@ -1783,81 +1631,74 @@ def streamActiveSetNNLS(
         # ----------------------------------------------------
         # Soft occupancy penalty in the reduced solve
         # ----------------------------------------------------
-        # This is stronger than promotion-only scoring because it changes the
-        # objective seen by the active-set solve itself.
-        #
-        # Interpretation:
-        #   - columns in crowded orbits get an extra diagonal penalty
-        #   - this discourages orbit bloat without hard-capping support
-        #   - for C=3, keep the strength modest but nonzero
-        #
-        # orbit_occ_counts must be defined earlier in the iteration as:
-        #   orbit_occ_counts = np.bincount(active_idx // P, minlength=C)
-        #
-        if w_target is not None:
-            occ_scale = float(np.median(orbit_occ_counts[orbit_occ_counts > 0])) \
-                if np.any(orbit_occ_counts > 0) else 1.0
+        # This is deliberately weak and normalized by the current
+        # occupancy scale, so it shapes the solve without hard-capping
+        # support. It stays well-behaved for small C as well.
+        # ----------------------------------------------------
+        if orbit_occ_counts.size > 0:
+            occ_pos = orbit_occ_counts[orbit_occ_counts > 0]
+            occ_scale = float(np.median(occ_pos)) if occ_pos.size else 1.0
+        else:
+            occ_scale = 1.0
 
-            if not np.isfinite(occ_scale) or occ_scale <= 0.0:
-                occ_scale = 1.0
+        if not np.isfinite(occ_scale) or occ_scale <= 0.0:
+            occ_scale = 1.0
 
-            # Small for tiny-C cases, stronger when there are many orbits.
-            occ_lambda = 0.04 if C <= 3 else 0.10
+        occ_lambda = 0.02 if C <= 3 else 0.06
 
-            occ_pen = np.zeros((k,), dtype=np.float64)
-            for local_i, gcol in enumerate(active_idx):
-                cc = int(gcol // P)
-                occ_pen[local_i] = (
-                    occ_lambda * max(0.0, float(orbit_occ_counts[cc]) - 1.0)
-                    / occ_scale
-                )
+        occ_pen = np.zeros((k,), dtype=np.float64)
+        for local_i, gcol in enumerate(active_idx):
+            cc = int(gcol // P)
+            crowd = max(0.0, float(orbit_occ_counts[cc]) - occ_scale)
+            occ_pen[local_i] = occ_lambda * crowd / occ_scale
 
-            ATA_sub_reg[np.diag_indices(k)] += occ_pen
+        ATA_sub_reg[np.diag_indices(k)] += occ_pen
 
-            print(
-                "[DIAG][occupancy_penalty] "
-                f"lambda={occ_lambda:.3e} "
-                f"scale={occ_scale:.3e} "
-                f"min/med/max={float(np.min(occ_pen)):.3e}/"
-                f"{float(np.median(occ_pen)):.3e}/"
-                f"{float(np.max(occ_pen)):.3e}",
-                flush=True,
-            )
+        print(
+            "[DIAG][occupancy_penalty] "
+            f"lambda={occ_lambda:.3e} "
+            f"scale={occ_scale:.3e} "
+            f"min/med/max={float(np.min(occ_pen)):.3e}/"
+            f"{float(np.median(occ_pen)):.3e}/"
+            f"{float(np.max(occ_pen)):.3e}",
+            flush=True,
+        )
 
         # ----------------------------------------------------
-        # Robust orbit prior (scale-independent, fixed alpha)
+        # Robust orbit prior (soft, scale-normalized)
         # ----------------------------------------------------
         if (w_target is not None) and (orbit_beta > 0.0):
-
             orbit_groups = {}
             for local_i, gcol in enumerate(active_idx):
                 cc = int(gcol // P)
                 orbit_groups.setdefault(cc, []).append(local_i)
 
             for cc, idx_list in orbit_groups.items():
-
-                idx = np.array(idx_list, dtype=np.int64)
+                idx = np.asarray(idx_list, dtype=np.int64)
                 if idx.size == 0:
                     continue
 
                 S_local = S_active[idx]
                 w_cc = float(w_target[cc])
+                target_mass = max(1e-30, alpha_ref * w_cc)
 
-                s_norm = float(np.sum(S_local * S_local)) + 1e-30
-                beta_eff = orbit_beta / s_norm
+                beta_eff = _orbit_prior_beta_eff(
+                    orbit_beta=orbit_beta,
+                    target_mass=target_mass,
+                    data_scale_ref=data_scale_ref,
+                )
 
                 ATA_sub_reg[np.ix_(idx, idx)] += (
                     beta_eff * np.outer(S_local, S_local)
                 )
-                ATy_sub[idx] += (
-                    beta_eff * (alpha_ref * w_cc) * S_local
-                )
+                ATy_sub[idx] += beta_eff * target_mass * S_local
 
                 try:
                     print(
-                        f"[DIAG][orbit_prior_norm] orbit={cc} cols={len(idx)} "
-                        f"s_norm={s_norm:.3e} beta_eff={beta_eff:.3e} "
-                        f"target_mass={(alpha_ref * w_cc):.3e}",
+                        f"[DIAG][orbit_prior_soft] orbit={cc} "
+                        f"cols={len(idx)} target_mass={target_mass:.3e} "
+                        f"data_scale={data_scale_ref:.3e} "
+                        f"beta_eff={beta_eff:.3e}",
                         flush=True,
                     )
                 except Exception:
@@ -1882,47 +1723,7 @@ def streamActiveSetNNLS(
             z_sub_raw = Vt.T @ (s_inv * (U.T @ ATy_sub))
 
         z_sub_raw = np.maximum(z_sub_raw, 0.0)
-
         z_sub = z_sub_raw.copy()
-
-        # ----------------------------------------------------
-        # Exact orbit-mass correction in x-space
-        # ----------------------------------------------------
-        if w_target is not None:
-            x_sub = S_active * z_sub
-
-            orbit_groups = {}
-            for local_i, gcol in enumerate(active_idx):
-                cc = int(gcol // P)
-                orbit_groups.setdefault(cc, []).append(local_i)
-
-            for cc, idx_list in orbit_groups.items():
-                idx = np.asarray(idx_list, dtype=np.int64)
-                if idx.size == 0:
-                    continue
-
-                target_mass = alpha_ref * float(w_target[cc])
-                current_mass = float(np.sum(x_sub[idx]))
-
-                if target_mass <= 0.0:
-                    x_sub[idx] = 0.0
-                    continue
-
-                if current_mass > 0.0:
-                    # Exact rescale of this orbit's current active mass
-                    x_sub[idx] *= target_mass / current_mass
-                else:
-                    # If the orbit has target mass but the solve gave none,
-                    # seed it uniformly across the active columns.
-                    x_sub[idx] = target_mass / float(idx.size)
-
-            # Convert back to z-space
-            z_sub = np.divide(
-                x_sub,
-                S_active,
-                out=np.zeros_like(z_sub),
-                where=S_active > 0.0,
-            )
 
         # Track promoted columns that did not survive the reduced solve.
         # These get blacklisted for a few iterations so the solver can
