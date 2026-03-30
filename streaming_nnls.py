@@ -1413,12 +1413,15 @@ def streamActiveSetNNLS(
 
             if cols_to_activate.size == 0:
                 order = pos_mask[np.argsort(adj_score[pos_mask])[::-1]]
-                pool = order[:min(10, order.size)]
+                chosen = []
+
+                # First fallback: prefer high-score positives, but respect cooldown.
+                pool = order[:min(80, order.size)]
                 pool_cols = not_active[pool]
                 pool_occ = orbit_occ_counts[pool_cols // P]
                 pool_pen = 1.0 + orbit_occ_lambda * np.log1p(pool_occ)
                 pool_score = adj_score[pool] / pool_pen
-                chosen = []
+
                 for local_i in pool[np.argsort(pool_score)[::-1]]:
                     gcol = int(not_active[local_i])
                     if _on_cooldown(gcol, it):
@@ -1427,7 +1430,22 @@ def streamActiveSetNNLS(
                     if len(chosen) >= preferred_group:
                         break
 
+                # Second fallback: if cooldown filtered everything, ignore cooldown once.
+                if len(chosen) == 0:
+                    for local_i in order:
+                        chosen.append(int(not_active[local_i]))
+                        if len(chosen) >= preferred_group:
+                            break
+
                 cols_to_activate = np.asarray(chosen, dtype=np.int64)
+
+            if cols_to_activate.size == 0:
+                print(
+                    "[MONO] no promotable positive columns found; "
+                    "continuing",
+                    flush=True,
+                )
+                continue
 
             print(
                 f"[MONO] orbit-aware positive promotion: {cols_to_activate}",
@@ -1441,14 +1459,12 @@ def streamActiveSetNNLS(
                     f"with positive gradient",
                     flush=True,
                 )
-            elif n_pick > 1:
+            else:
                 print(
                     f"[MONO] promoting batch of {n_pick} columns with "
                     f"positive gradients: {cols_to_activate}",
                     flush=True,
                 )
-            else:
-                break
 
             active[cols_to_activate] = True
             newly_activated = np.array(cols_to_activate, dtype=np.int64)
@@ -2244,8 +2260,8 @@ def solve_streaming_nnls(
         # Use average column energy per tile (not the summed D_tot) so the
         # worker tile matrices and the global scaling agree.
         # ------------------------------------------------------------------
-        col_energy_sum = D_tot.copy()     # D_tot currently holds summed energy
-        n_tiles = max(1, len(s_ranges))   # number of tiles used in streaming pass
+        col_energy_sum = D_tot.copy() # D_tot currently holds summed energy
+        n_tiles = max(1, len(s_ranges)) # number of tiles used in streaming pass
 
         # Convert summed energy -> per-tile average energy
         col_energy = col_energy_sum / float(n_tiles)

@@ -1771,9 +1771,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     
     arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
     M = np.zeros((NOrbs, nComp), dtype=np.float64)
-    for c, ck in enumerate(oDict['wheres'].keys()):
-        w = oDict['weights'][ck]
-        mask = oDict['wheres'][ck]
+    for c, comp in enumerate(nzComp):
+        w = oDict['weights'][f"{comp:{pred}d}"]
+        mask = oDict['wheres'][f"{comp:{pred}d}"]
         if w.shape != mask.shape:
             raise ValueError('weight array and mask must have the same shape')
         w = np.where(mask, w, 0.0)
