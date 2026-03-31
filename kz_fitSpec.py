@@ -46,6 +46,7 @@ v1.10:  Get `orbit_beta` from kwargs. 15 March 2026
 v1.11:  Removed lingering `orbit_beta`. 23 March 2026
 v1.12:  Re-implemented `orbit_beta` support in `genCubeFit` and passed it to the
             solver. 30 March 2026
+v1.13:  Fixed spectral fit plot unlinking glob in `loadCubeFit`. 31 March 2026
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -2030,7 +2031,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         with logger.capture_all_output():
             if figDir.exists():
                 for prefix in ("best", "worst"):
-                    for f in figDir.glob(f"{prefix}_{tag}_spax*.png"):
+                    for f in figDir.glob(f"{prefix}_C{nComp:04d}_spax*.png"):
                         f.unlink()
             parallel_spectrum_plots(
                 h5_or_path=str(hdf5Path),

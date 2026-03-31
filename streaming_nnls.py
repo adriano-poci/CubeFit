@@ -1005,14 +1005,79 @@ def streamActiveSetNNLS(
 ):
     """
     TRUE MONOLITHIC streaming active-set NNLS.
-
-    Hybrid parallel:
-        - Process-level parallel over tile batches (executor)
-        - BLAS threads inside each worker (initializer/_init_worker)
-        - Parent reduces partial results
-
-    Assumes executor is a ProcessPoolExecutor created once by caller.
     """
+
+    def _robust_scale_ref(vec: np.ndarray, fallback: float = 1.0) -> float:
+        arr = np.asarray(vec, dtype=np.float64).ravel()
+        arr = arr[np.isfinite(arr)]
+        arr = np.abs(arr[arr > 0.0])
+        if arr.size == 0:
+            return float(max(1.0, fallback))
+        ref = float(np.median(arr))
+        if (not np.isfinite(ref)) or (ref <= 0.0):
+            return float(max(1.0, fallback))
+        return ref
+
+    def _orbit_prior_beta_eff(
+        *,
+        orbit_beta: float,
+        target_mass: float,
+        data_scale_ref: float,
+    ) -> float:
+        """
+        Conservative, scale-aware orbit-prior weight.
+
+        The knob the user should increase is still `orbit_beta_eff`, but this
+        keeps the prior on a problem-scale-aware footing.
+        """
+        if orbit_beta <= 0.0:
+            return 0.0
+
+        target_mass = max(1e-30, float(target_mass))
+        data_scale_ref = max(1.0, float(data_scale_ref))
+
+        # Soft normalization: stronger than a pure 1/target_mass^2 penalty,
+        # but still conservative when the data scale is large.
+        return float(orbit_beta) / (
+            np.sqrt(target_mass) * np.sqrt(data_scale_ref)
+        )
+
+    def _watch_progress() -> bool:
+        """
+        Update the committed-state watchdog.
+
+        Returns
+        -------
+        stalled : bool
+            True if the committed state has failed to move for too long.
+        """
+        nonlocal committed_z, committed_active, no_progress_count
+
+        z_delta = float(np.linalg.norm(z - committed_z))
+        z_ref = max(1.0, float(np.linalg.norm(committed_z)))
+        z_delta_rel = z_delta / z_ref
+
+        active_delta = int(np.count_nonzero(active ^ committed_active))
+
+        if (z_delta_rel <= z_delta_tol) and (active_delta <= active_delta_tol):
+            no_progress_count += 1
+        else:
+            no_progress_count = 0
+            committed_z = z.copy()
+            committed_active = active.copy()
+
+        if no_progress_count >= hard_stall_patience:
+            print(
+                "[MONO] terminating on committed-state stall: "
+                f"z_delta_rel={z_delta_rel:.3e} "
+                f"active_delta={active_delta} "
+                f"no_progress={no_progress_count} "
+                f"window={progress_window}",
+                flush=True,
+            )
+            return True
+
+        return False
 
     CP = int(C * P)
     negative_grad_count = 0
@@ -1025,22 +1090,13 @@ def streamActiveSetNNLS(
     data_scale_ref = _robust_scale_ref(ATy_scaled, fallback=grad_ref)
     tol_grad_rel = 1e-6
 
-    # --- plateau / stagnation controls ---
-    grad_hist = []
-    active_delta_hist = []
-
-    plateau_window = 60
-    min_plateau_iters = 50
-
-    plateau_span_rel = 5e-4
-    plateau_slope_rel = 1e-6
-    plateau_churn_max = 1
-
+    # --- committed-state watchdog ---
     z_delta_tol = 1e-6
     active_delta_tol = 0
-
-    z_delta_hist: list[float] = []
-    active_delta_hist: list[int] = []
+    progress_window = 20
+    force_explore_after = 4
+    hard_stall_patience = 20
+    no_progress_count = 0
 
     # --- positive-gradient batch-promotion controls ---
     positive_batch_size = 2 if C <= 3 else 9
@@ -1080,6 +1136,10 @@ def streamActiveSetNNLS(
     z_scale0 = np.max(z) + 1e-30
     active = z > (1e-10 * z_scale0)
 
+    # initialize committed baseline
+    committed_z = z.copy()
+    committed_active = active.copy()
+
     # Soft occupancy control: discourage crowded orbits, but do not cap them.
     orbit_occ_lambda = 0.15 if C <= 3 else 0.35
 
@@ -1112,23 +1172,11 @@ def streamActiveSetNNLS(
         return mask
 
     def _current_x_from_z(z_vec: np.ndarray) -> np.ndarray:
-        """
-        Convert solver variable z to physical x.
-        """
         return S_flat * z_vec
 
     def _orbit_mass_and_deficit(z_vec: np.ndarray):
         """
         Compute current per-orbit masses and deficits relative to alpha_ref*w_target.
-
-        Returns
-        -------
-        s_orbit : ndarray, shape (C,)
-            Current orbit masses in x-space.
-        t_orbit : ndarray, shape (C,)
-            Target orbit masses.
-        deficit : ndarray, shape (C,)
-            Positive means underweight relative to target.
         """
         x_vec = _current_x_from_z(z_vec).reshape(C, P)
         s_orbit = np.sum(x_vec, axis=1)
@@ -1146,11 +1194,8 @@ def streamActiveSetNNLS(
     # Helper: compute ATAz in parallel using provided executor
     # ------------------------------------------------------------
     def _compute_ATAz_scaled(z_vec):
-        # here z_vec is the solver variable (unscaled).
-        # Workers will apply column-scaling S_flat directly to A2.
         x_cand = np.asarray(z_vec, dtype=np.float64)
 
-        # batch s_ranges across workers
         n_workers = max(1, int(cfg.processes))
         batches = [[] for _ in range(n_workers)]
         for i, tile in enumerate(s_ranges):
@@ -1158,41 +1203,42 @@ def streamActiveSetNNLS(
 
         ATAz = np.zeros((CP,), dtype=np.float64)
 
-        # submit tasks to the (persistent) executor if provided; otherwise
-        # create a temporary pool (but prefer passing a persistent executor).
-        # Here we assume executor argument was passed into outer function.
         worker_args = [
             (h5_path, batch, keep_idx, x_cand, CP, S_flat)
-            for batch in batches if len(batch) > 0
+            for batch in batches
+            if len(batch) > 0
         ]
-        # Using executor.map (streamed) is fine — it returns results in submission order
         it = executor.map(_worker_ATAz_from_tuple, worker_args)
 
-        for r in tqdm(it, total=len(worker_args), desc="[MONO] ATAz tiles", leave=False):
+        for r in tqdm(
+            it,
+            total=len(worker_args),
+            desc="[MONO] ATAz tiles",
+            leave=False,
+        ):
             try:
                 ATAz += r
             except Exception as e:
                 print("[ERROR] worker returned exception:", e, flush=True)
                 raise
 
-        # Note: workers already applied S_flat to columns, so ATAz is the
-        # correctly scaled A^T A z in the scaled-column convention.
         return ATAz
 
     # ------------------------------------------------------------
     # Active-set outer loop
     # ------------------------------------------------------------
     for it in range(max_iter):
+        force_explore = no_progress_count >= force_explore_after
+
         ATAz_scaled = _compute_ATAz_scaled(z)
         grad_data = ATy_scaled - ATAz_scaled
         grad_promo = grad_data.copy()
 
-        # orbit state used to bias active-set growth
         orbit_s, orbit_t, orbit_deficit = _orbit_mass_and_deficit(z)
         orbit_pressure = np.maximum(orbit_deficit, 0.0)
 
-        # ---- inject prior-gradient into the promotion gradient only.
-        # The data-only gradient is kept unchanged for stagnation tests.
+        # Prior affects promotion ranking and reduced solve, but data-only
+        # gradient remains the reference for watchdog / rollback.
         if (w_target is not None) and (orbit_beta > 0.0):
             g_prior = np.zeros_like(grad_promo)
 
@@ -1222,9 +1268,7 @@ def streamActiveSetNNLS(
             g_prior_norm = np.linalg.norm(g_prior)
             g_data_norm = np.linalg.norm(grad_data) + 1e-30
             if g_prior_norm > clip_factor * g_data_norm:
-                g_prior *= (clip_factor * g_data_norm) / (
-                    g_prior_norm + 1e-30
-                )
+                g_prior *= (clip_factor * g_data_norm) / (g_prior_norm + 1e-30)
 
             grad_promo = grad_promo + g_prior
 
@@ -1234,11 +1278,9 @@ def streamActiveSetNNLS(
 
         gvals_data = grad_data[not_active]
         gvals_promo = grad_promo[not_active]
-
         if gvals_data.size == 0:
             break
 
-        # diagnostic logging for the active-set iteration
         max_grad_all = float(np.max(grad_data)) if grad_data.size else 0.0
         active_before = active.copy()
         z_before = z.copy()
@@ -1252,6 +1294,7 @@ def streamActiveSetNNLS(
         max_grad_data = (
             float(np.max(gvals_data)) if gvals_data.size else 0.0
         )
+        grad_before_data = max_grad_data
 
         n_active = int(np.count_nonzero(active))
         print(
@@ -1263,82 +1306,24 @@ def streamActiveSetNNLS(
             flush=True,
         )
 
-        grad_before_promotable = max_grad_promotable
-        grad_before_data = max_grad_data
-
         # --------------------------------------------------------
-        # Plateau / stagnation check
-        # Compare only the data-only promotable gradient across
-        # iterations. The prior-adjusted score is used only for
-        # promotion ranking.
+        # Promotion score
         # --------------------------------------------------------
-        active_delta = int(np.count_nonzero(active ^ active_before))
-
-        grad_hist.append(max_grad_data)
-        active_delta_hist.append(active_delta)
-
-        if len(grad_hist) > plateau_window:
-            grad_hist.pop(0)
-            active_delta_hist.pop(0)
-
-        if (it + 1) >= min_plateau_iters and len(grad_hist) == plateau_window:
-            gwin = np.asarray(grad_hist, dtype=np.float64)
-            awin = np.asarray(active_delta_hist, dtype=np.int64)
-
-            gmean = float(np.mean(gwin))
-            gmin = float(np.min(gwin))
-            gmax = float(np.max(gwin))
-
-            span_rel = (gmax - gmin) / (abs(gmean) + 1e-30)
-
-            xw = np.arange(plateau_window, dtype=np.float64)
-            xw -= float(np.mean(xw))
-            yw = gwin - gmean
-            slope = float(np.dot(xw, yw) / (np.dot(xw, xw) + 1e-30))
-            slope_rel = abs(slope) / (abs(gmean) + 1e-30)
-
-            churn_mean = float(np.mean(awin))
-
-            if (
-                span_rel < plateau_span_rel
-                and slope_rel < plateau_slope_rel
-                and churn_mean <= plateau_churn_max
-            ):
-                print(
-                    "[MONO] terminating on stagnation plateau: "
-                    f"min={gmin:.3e} max={gmax:.3e} mean={gmean:.3e} "
-                    f"span_rel={span_rel:.3e} slope_rel={slope_rel:.3e} "
-                    f"mean_active_delta={churn_mean:.3f} "
-                    f"window={plateau_window}",
-                    flush=True,
-                )
-                break
-        # ---------------------------------------------------------
-
-        # ---------- promotion: penalise columns with very large S to avoid tiny-D bias ----------
-        # not_active and gvals already defined above
-        if gvals.size == 0:
-            break
-        # per-candidate scaling (S_flat is in scope; larger S -> originally favoured)
         S_not = S_flat[not_active]
-        # robust normalization
         S_med = np.median(S_not) + 1e-30
         S_norm = S_not / S_med
         penalty_strength = 0.5
-        gvals = grad_promo[not_active]
-        adj_score = gvals / (1.0 + penalty_strength * (S_norm - 1.0))
-        # if many candidates have very similar adj_score, optionally prefer the one with
-        # larger raw gvals among the top-k (break ties toward raw gradient)
+        adj_score = gvals_promo / (1.0 + penalty_strength * (S_norm - 1.0))
+
         topk = 5
         if adj_score.size > topk:
             top_idxs = np.argsort(adj_score)[-topk:]
-            # pick among topk the index with largest raw gvals (stable tie-break)
-            pick_local = top_idxs[np.argmax(gvals[top_idxs])]
+            pick_local = top_idxs[np.argmax(gvals_promo[top_idxs])]
         else:
             pick_local = int(np.argmax(adj_score))
+
         imax = int(pick_local)
-        idx = int(not_active[imax])
-        max_g = float(gvals[imax])
+        max_g = float(gvals_promo[imax])
 
         did_explore = False
         newly_activated = None
@@ -1347,20 +1332,21 @@ def streamActiveSetNNLS(
             minlength=C,
         ).astype(np.int64)
 
-        # ------------------------------------------------------------
-        # If all gradients are <= 0 we may still be stuck in a local
-        # minimum because several columns together could improve the
-        # fit even though each individually has negative gradient.
-        # Try promoting a small group of promising columns, then
-        # immediately run the reduced solve on that enlarged set.
-        # ------------------------------------------------------------
         tol_here = max(tol_grad, tol_grad_rel * grad_ref)
-        if max_g <= tol_here:
 
+        # ------------------------------------------------------------
+        # Forced exploration / negative-gradient branch
+        # ------------------------------------------------------------
+        if max_g <= tol_here:
             negative_grad_count += 1
 
-            if negative_grad_count <= explore_budget and not_active.size > 0:
-                preferred_group = min(12, max(4, CP // 120))
+            allow_explore = (negative_grad_count <= explore_budget) or force_explore
+
+            if allow_explore and not_active.size > 0:
+                if force_explore:
+                    preferred_group = min(max(8, CP // 80), 24)
+                else:
+                    preferred_group = min(12, max(4, CP // 120))
 
                 cooldown_mask = _col_cooldown_mask(it)
                 cols_to_activate = _deficit_rescue_columns(
@@ -1383,21 +1369,23 @@ def streamActiveSetNNLS(
 
                 if cols_to_activate.size == 0:
                     order = np.argsort(adj_score)[::-1]
-                    pool = order[:min(200, order.size)]
+                    pool_cap = 400 if force_explore else 200
+                    pool = order[:min(pool_cap, order.size)]
                     pool_cols = not_active[pool]
 
-                    # Prefer less-used orbits, but do not exclude crowded ones.
                     pool_occ = orbit_occ_counts[pool_cols // P]
                     pool_pen = 1.0 + orbit_occ_lambda * np.log1p(pool_occ)
 
-                    # Add a small random jitter so the same top few do not win forever.
                     pool_score = adj_score[pool] / pool_pen
-                    pool_score = pool_score + 1e-3 * np.random.standard_normal(pool_score.shape)
+                    jitter = 1e-3 if not force_explore else 5e-3
+                    pool_score = pool_score + jitter * np.random.standard_normal(
+                        pool_score.shape
+                    )
 
                     chosen = []
                     for local_i in pool[np.argsort(pool_score)[::-1]]:
                         gcol = int(not_active[local_i])
-                        if _on_cooldown(gcol, it):
+                        if _on_cooldown(gcol, it) and not force_explore:
                             continue
                         chosen.append(gcol)
                         if len(chosen) >= preferred_group:
@@ -1411,7 +1399,6 @@ def streamActiveSetNNLS(
                         f"gradients: {cols_to_activate}",
                         flush=True,
                     )
-
                 else:
                     touched_orbits = np.unique(cols_to_activate // P)
                     orbit_desc = ", ".join(
@@ -1424,110 +1411,165 @@ def streamActiveSetNNLS(
                         flush=True,
                     )
 
+                if cols_to_activate.size == 0:
+                    if _watch_progress():
+                        break
+                    continue
+
                 active[cols_to_activate] = True
                 newly_activated = np.asarray(cols_to_activate, dtype=np.int64)
                 did_explore = True
-
             else:
+                if _watch_progress():
+                    break
                 break
 
+        # ------------------------------------------------------------
+        # Positive-gradient branch
+        # ------------------------------------------------------------
         else:
-            # --------------------------------------------------------
-            # positive-gradient batch promotion
-            # --------------------------------------------------------
-            pos_mask = np.where(gvals > tol_grad)[0]
+            pos_mask = np.where(gvals_promo > tol_grad)[0]
 
             if pos_mask.size == 0:
-                break
+                if force_explore:
+                    preferred_group = min(max(8, CP // 80), 24)
 
-            preferred_group = min(positive_batch_size, pos_mask.size)
+                    cooldown_mask = _col_cooldown_mask(it)
+                    cols_to_activate = _deficit_rescue_columns(
+                        grad_vec=grad_promo,
+                        aty_scaled_vec=ATy_scaled,
+                        active_mask=active,
+                        S_flat=S_flat,
+                        w_target=w_target,
+                        deficit=orbit_deficit,
+                        C=C,
+                        P=P,
+                        total_cols=preferred_group,
+                        min_per_orbit=1,
+                        max_per_orbit=max(3, preferred_group),
+                        deficit_boost=2.0,
+                        penalty_strength=0.5,
+                        exclude_mask=cooldown_mask,
+                        occ_lambda=orbit_occ_lambda,
+                    )
 
-            cooldown_mask = _col_cooldown_mask(it)
-            cols_to_activate = _deficit_rescue_columns(
-                grad_vec=grad_promo,
-                aty_scaled_vec=ATy_scaled,
-                active_mask=active,
-                S_flat=S_flat,
-                w_target=w_target,
-                deficit=orbit_deficit,
-                C=C,
-                P=P,
-                total_cols=preferred_group,
-                min_per_orbit=1,
-                max_per_orbit=max(3, preferred_group),
-                deficit_boost=2.0,
-                penalty_strength=0.5,
-                exclude_mask=cooldown_mask,
-                occ_lambda=orbit_occ_lambda,
-            )
+                    if cols_to_activate.size == 0:
+                        order = np.argsort(adj_score)[::-1]
+                        pool = order[:min(120, order.size)]
+                        chosen = []
+                        for local_i in pool:
+                            chosen.append(int(not_active[local_i]))
+                            if len(chosen) >= preferred_group:
+                                break
+                        cols_to_activate = np.asarray(chosen, dtype=np.int64)
 
-            if cols_to_activate.size == 0:
-                order = pos_mask[np.argsort(adj_score[pos_mask])[::-1]]
-                chosen = []
-
-                # First fallback: prefer high-score positives, but respect cooldown.
-                pool = order[:min(80, order.size)]
-                pool_cols = not_active[pool]
-                pool_occ = orbit_occ_counts[pool_cols // P]
-                pool_pen = 1.0 + orbit_occ_lambda * np.log1p(pool_occ)
-                pool_score = adj_score[pool] / pool_pen
-
-                for local_i in pool[np.argsort(pool_score)[::-1]]:
-                    gcol = int(not_active[local_i])
-                    if _on_cooldown(gcol, it):
+                    if cols_to_activate.size == 0:
+                        if _watch_progress():
+                            break
                         continue
-                    chosen.append(gcol)
-                    if len(chosen) >= preferred_group:
-                        break
 
-                # Second fallback: if cooldown filtered everything, ignore cooldown once.
-                if len(chosen) == 0:
-                    for local_i in order:
-                        chosen.append(int(not_active[local_i]))
+                    print(
+                        f"[MONO][explore] forced global promotion: "
+                        f"{cols_to_activate}",
+                        flush=True,
+                    )
+                    active[cols_to_activate] = True
+                    newly_activated = np.asarray(cols_to_activate, dtype=np.int64)
+                    did_explore = True
+                else:
+                    if _watch_progress():
+                        break
+                    break
+            else:
+                if force_explore:
+                    preferred_group = min(max(8, CP // 80), 24)
+                else:
+                    preferred_group = min(positive_batch_size, pos_mask.size)
+
+                cooldown_mask = _col_cooldown_mask(it)
+                cols_to_activate = _deficit_rescue_columns(
+                    grad_vec=grad_promo,
+                    aty_scaled_vec=ATy_scaled,
+                    active_mask=active,
+                    S_flat=S_flat,
+                    w_target=w_target,
+                    deficit=orbit_deficit,
+                    C=C,
+                    P=P,
+                    total_cols=preferred_group,
+                    min_per_orbit=1,
+                    max_per_orbit=max(3, preferred_group),
+                    deficit_boost=2.0,
+                    penalty_strength=0.5,
+                    exclude_mask=cooldown_mask,
+                    occ_lambda=orbit_occ_lambda,
+                )
+
+                if cols_to_activate.size == 0:
+                    order = pos_mask[np.argsort(adj_score[pos_mask])[::-1]]
+                    pool = order[:min(80 if not force_explore else 160, order.size)]
+                    pool_cols = not_active[pool]
+                    pool_occ = orbit_occ_counts[pool_cols // P]
+                    pool_pen = 1.0 + orbit_occ_lambda * np.log1p(pool_occ)
+                    pool_score = adj_score[pool] / pool_pen
+                    chosen = []
+
+                    for local_i in pool[np.argsort(pool_score)[::-1]]:
+                        gcol = int(not_active[local_i])
+                        if _on_cooldown(gcol, it) and not force_explore:
+                            continue
+                        chosen.append(gcol)
                         if len(chosen) >= preferred_group:
                             break
 
-                cols_to_activate = np.asarray(chosen, dtype=np.int64)
+                    if len(chosen) == 0 and force_explore:
+                        for local_i in order:
+                            chosen.append(int(not_active[local_i]))
+                            if len(chosen) >= preferred_group:
+                                break
 
-            if cols_to_activate.size == 0:
-                print(
-                    "[MONO] no promotable positive columns found; "
-                    "continuing",
-                    flush=True,
-                )
-                continue
+                    cols_to_activate = np.asarray(chosen, dtype=np.int64)
 
-            print(
-                f"[MONO] orbit-aware positive promotion: {cols_to_activate}",
-                flush=True,
-            )
+                if cols_to_activate.size == 0:
+                    print(
+                        "[MONO] no promotable positive columns found; continuing",
+                        flush=True,
+                    )
+                    if _watch_progress():
+                        break
+                    continue
 
-            n_pick = int(cols_to_activate.size)
-            if n_pick == 1:
                 print(
-                    f"[MONO] promoting column {int(cols_to_activate[0])} "
-                    f"with positive gradient",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[MONO] promoting batch of {n_pick} columns with "
-                    f"positive gradients: {cols_to_activate}",
+                    f"[MONO] orbit-aware positive promotion: {cols_to_activate}",
                     flush=True,
                 )
 
-            active[cols_to_activate] = True
-            newly_activated = np.array(cols_to_activate, dtype=np.int64)
-            negative_grad_count = 0
+                if cols_to_activate.size == 1:
+                    print(
+                        f"[MONO] promoting column {int(cols_to_activate[0])} "
+                        f"with positive gradient",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[MONO] promoting batch of {int(cols_to_activate.size)} "
+                        f"columns with positive gradients: {cols_to_activate}",
+                        flush=True,
+                    )
+
+                active[cols_to_activate] = True
+                newly_activated = np.array(cols_to_activate, dtype=np.int64)
+                negative_grad_count = 0
 
         if int(np.count_nonzero(active)) > int(max_active):
             if newly_activated is not None and newly_activated.size > 0:
                 active[newly_activated] = False
+            if _watch_progress():
+                break
             break
 
         # --------------------------------------------------------
         # Enforce weighted minimum active support per orbit
-        # Orbits with larger deficit get a larger floor.
         # --------------------------------------------------------
         if w_target is not None and np.sum(orbit_pressure) > 0.0:
             pressure = orbit_pressure / (np.sum(orbit_pressure) + 1e-30)
@@ -1551,7 +1593,6 @@ def streamActiveSetNNLS(
                 if inactive_cc.size > 0:
                     scores = ATy_scaled[inactive_cc].copy()
 
-                    # bias toward underweight orbits and away from huge-S columns
                     if orbit_pressure[cc] > 0.0:
                         scores += 0.25 * orbit_pressure[cc]
 
@@ -1574,10 +1615,11 @@ def streamActiveSetNNLS(
         # --------------------------------------------------------
         # Reduced solve (assemble ATA_sub & ATy_sub) in parallel
         # --------------------------------------------------------
-        # gather active indices and their scale factors
         active_idx = np.nonzero(active)[0].astype(np.int64)
         k = int(active_idx.size)
         if k == 0:
+            if _watch_progress():
+                break
             continue
 
         orbit_occ_counts = np.bincount(
@@ -1587,17 +1629,14 @@ def streamActiveSetNNLS(
 
         S_active = S_flat[active_idx]
 
-        # zero accumulators
         ATA_sub = np.zeros((k, k), dtype=np.float64)
         ATy_sub = np.zeros((k,), dtype=np.float64)
 
-        # prepare batches (round-robin)
         n_workers = max(1, int(cfg.processes))
         batches = [[] for _ in range(n_workers)]
         for i, tile in enumerate(s_ranges):
             batches[i % n_workers].append(tile)
 
-        # submit reduced-assembly jobs to persistent executor
         futures = [
             executor.submit(
                 _worker_reduced,
@@ -1609,7 +1648,8 @@ def streamActiveSetNNLS(
                 CP,
                 P,
             )
-            for batch in batches if len(batch) > 0
+            for batch in batches
+            if len(batch) > 0
         ]
 
         for f in tqdm(
@@ -1623,53 +1663,77 @@ def streamActiveSetNNLS(
             ATy_sub += ATy_loc
 
         # ------------------ REDUCED-SOLVE DIAGNOSTICS (parent) -----------------------
-        # active_idx (k,), S_active (k,) are already defined above
         try:
-            # S_active summary
             Sact = S_active
-            print(f"[DIAG] S_active stats: min/median/max: {float(np.min(Sact)):.4e}/{float(np.median(Sact)):.4e}/{float(np.max(Sact)):.4e}", flush=True)
+            print(
+                f"[DIAG] S_active stats: min/median/max: "
+                f"{float(np.min(Sact)):.4e}/"
+                f"{float(np.median(Sact)):.4e}/"
+                f"{float(np.max(Sact)):.4e}",
+                flush=True,
+            )
 
-            # Basic norms of assembled scaled ATA / ATy
             ATA_norm = float(np.linalg.norm(ATA_sub))
             ATy_norm = float(np.linalg.norm(ATy_sub))
-            ATA_diag = np.diag(ATA_sub)[:min(6, ATA_sub.shape[0])]
-            print(f"[DIAG] ATA_sub shape, ATy_sub[0:6]: {ATA_sub.shape}, {ATy_sub[:6].tolist()}", flush=True)
-            print(f"[DIAG] ATA_sub norm / ATy_sub norm: {ATA_norm:.4e} / {ATy_norm:.4e}", flush=True)
-            print(f"[DIAG] ATA_sub diag (first 6): {ATA_diag.tolist()}", flush=True)
+            ATA_diag = np.diag(ATA_sub)[: min(6, ATA_sub.shape[0])]
+            print(
+                f"[DIAG] ATA_sub shape, ATy_sub[0:6]: "
+                f"{ATA_sub.shape}, {ATy_sub[:6].tolist()}",
+                flush=True,
+            )
+            print(
+                f"[DIAG] ATA_sub norm / ATy_sub norm: "
+                f"{ATA_norm:.4e} / {ATy_norm:.4e}",
+                flush=True,
+            )
+            print(
+                f"[DIAG] ATA_sub diag (first 6): {ATA_diag.tolist()}",
+                flush=True,
+            )
 
-            # Attempt to infer unscaled ATA/ATy (undo S scaling):
-            # ATA_sub_scaled = (S_active * S_active^T) * ATA_unscaled  (since you scaled columns)
-            # So we can approximate ATA_unscaled = ATA_sub / (S_i * S_j)
             outerS = (Sact[:, None] * Sact[None, :])
-            # avoid divide-by-zero
             outerS_safe = outerS.copy()
             outerS_safe[outerS_safe == 0.0] = 1.0
             ATA_unscaled_est = ATA_sub / outerS_safe
 
-            # similarly ATy_unscaled_est = ATy_sub / S_active
             Svec_safe = Sact.copy()
             Svec_safe[Svec_safe == 0.0] = 1.0
             ATy_unscaled_est = ATy_sub / Svec_safe
 
             ATA_unscaled_norm = float(np.linalg.norm(ATA_unscaled_est))
             ATy_unscaled_norm = float(np.linalg.norm(ATy_unscaled_est))
-            print(f"[DIAG] inferred unscaled ATA/ATy norms: {ATA_unscaled_norm:.4e} / {ATy_unscaled_norm:.4e}", flush=True)
+            print(
+                f"[DIAG] inferred unscaled ATA/ATy norms: "
+                f"{ATA_unscaled_norm:.4e} / {ATy_unscaled_norm:.4e}",
+                flush=True,
+            )
 
-            # Condition number of the scaled reduced normal (small k so cheap)
             try:
                 eigs = np.linalg.eigvalsh(ATA_sub)
                 emin = float(np.min(eigs))
                 emax = float(np.max(eigs))
                 cond = float(emax / max(1e-30, emin))
-                print(f"[DIAG] ATA_sub eigmin/emax/cond: {emin:.4e}/{emax:.4e}/{cond:.4e}", flush=True)
+                print(
+                    f"[DIAG] ATA_sub eigmin/emax/cond: "
+                    f"{emin:.4e}/{emax:.4e}/{cond:.4e}",
+                    flush=True,
+                )
             except Exception:
                 pass
 
-            # Quick "what-if": solve unscaled system (debug only) and report solution norms
             try:
                 ridge = 1e-12 * np.eye(ATA_unscaled_est.shape[0], dtype=np.float64)
-                z_unscaled = np.linalg.solve(ATA_unscaled_est + ridge, ATy_unscaled_est)
-                print(f"[DIAG] z_unscaled stats: l1, l2, max: {float(np.sum(z_unscaled)):.4e}, {float(np.linalg.norm(z_unscaled)):.4e}, {float(np.max(z_unscaled)):.4e}", flush=True)
+                z_unscaled = np.linalg.solve(
+                    ATA_unscaled_est + ridge,
+                    ATy_unscaled_est,
+                )
+                print(
+                    f"[DIAG] z_unscaled stats: l1, l2, max: "
+                    f"{float(np.sum(z_unscaled)):.4e}, "
+                    f"{float(np.linalg.norm(z_unscaled)):.4e}, "
+                    f"{float(np.max(z_unscaled)):.4e}",
+                    flush=True,
+                )
             except Exception as _e:
                 print(f"[DIAG] solving unscaled diagnostic failed: {_e}", flush=True)
 
@@ -1695,11 +1759,7 @@ def streamActiveSetNNLS(
         ATA_sub_reg = ATA_sub + ridge * np.eye(k, dtype=np.float64)
 
         # ----------------------------------------------------
-        # Soft occupancy penalty in the reduced solve
-        # ----------------------------------------------------
-        # This is deliberately weak and normalized by the current
-        # occupancy scale, so it shapes the solve without hard-capping
-        # support. It stays well-behaved for small C as well.
+        # Weak occupancy penalty in the reduced solve
         # ----------------------------------------------------
         if orbit_occ_counts.size > 0:
             occ_pos = orbit_occ_counts[orbit_occ_counts > 0]
@@ -1731,7 +1791,7 @@ def streamActiveSetNNLS(
         )
 
         # ----------------------------------------------------
-        # Robust orbit prior (soft, scale-normalized)
+        # Orbit prior in reduced solve
         # ----------------------------------------------------
         if (w_target is not None) and (orbit_beta > 0.0):
             orbit_groups = {}
@@ -1792,8 +1852,6 @@ def streamActiveSetNNLS(
         z_sub = z_sub_raw.copy()
 
         # Track promoted columns that did not survive the reduced solve.
-        # These get blacklisted for a few iterations so the solver can
-        # explore other candidates.
         failed_cols = []
 
         if newly_activated is not None and newly_activated.size > 0:
@@ -1850,14 +1908,13 @@ def streamActiveSetNNLS(
                 obj_new > obj_old + 1e-12 * (1.0 + abs(obj_old))
             )
 
-            norm_exploded = (
-                norm_old > 1e-12 and norm_new > 50.0 * norm_old
-            )
+            norm_exploded = (norm_old > 1e-12 and norm_new > 50.0 * norm_old)
 
             if obj_worsened and not orbit_improved:
                 reject = True
             if norm_exploded and not orbit_improved:
                 reject = True
+
         if did_explore and near_noop:
             _cooldown_cols(promoted_cols, it, extra_iters=5)
             print(
@@ -1865,6 +1922,7 @@ def streamActiveSetNNLS(
                 f"update: {promoted_cols}",
                 flush=True,
             )
+
         if reject:
             print(
                 "[MONO][explore] rejecting exploratory update "
@@ -1878,11 +1936,11 @@ def streamActiveSetNNLS(
                 active[newly_activated] = False
             z[active_idx] = z_old_active
 
-            if did_explore and negative_grad_count >= explore_budget:
+            if _watch_progress():
                 break
-
             continue
 
+        # Commit solution on the active subspace
         for ii, gcol in enumerate(active_idx):
             z[int(gcol)] = float(z_sub[ii])
 
@@ -1913,18 +1971,15 @@ def streamActiveSetNNLS(
                 active[:] = active_before
                 z[:] = z_before
 
-                if (
-                    newly_activated is not None
-                    and newly_activated.size > 0
-                ):
+                if newly_activated is not None and newly_activated.size > 0:
                     _cooldown_cols(newly_activated, it, extra_iters=10)
 
+                if _watch_progress():
+                    break
                 continue
 
         # --------------------------------------------------------
-        # Probation cleanup:
-        # drop only columns that stay tiny for multiple iterations.
-        # No per-orbit cap.
+        # Probation cleanup
         # --------------------------------------------------------
         x_phys = S_flat * z
 
@@ -1938,7 +1993,6 @@ def streamActiveSetNNLS(
         for c in np.nonzero(active)[0]:
             c = int(c)
 
-            # do not judge a brand-new column immediately
             if c in newly_activated_set:
                 continue
 
@@ -1972,6 +2026,10 @@ def streamActiveSetNNLS(
                 f"{drop_cols}",
                 flush=True,
             )
+
+        # Finalize progress watchdog on the committed state.
+        if _watch_progress():
+            break
 
     return S_flat * z
 
