@@ -68,6 +68,10 @@ v1.9:   Jail columns which are technically non-zero, but also not helpful to the
             `streamActiveSetNNLS`. 29 March 2026
 v1.10:  Re-implemented `orbit_beta` as a soft penalty in the objective rather
             than a hard projection, and scale it to the data. 30 March 2026
+v1.11:  Changed plateau logic to use iteration-invariant metrics instead of the
+            gradient, which is no longer a stable cross-iteration metric once the
+            orbit prior and occupancy penalty are active in
+            `streamActiveSetNNLS`. 31 March 2026
 """
 
 from __future__ import annotations, print_function
@@ -1021,9 +1025,22 @@ def streamActiveSetNNLS(
     data_scale_ref = _robust_scale_ref(ATy_scaled, fallback=grad_ref)
     tol_grad_rel = 1e-6
 
-    # --- plateau-stop controls ---
+    # --- plateau / stagnation controls ---
     grad_hist = []
+    active_delta_hist = []
+
     plateau_window = 60
+    min_plateau_iters = 50
+
+    plateau_span_rel = 5e-4
+    plateau_slope_rel = 1e-6
+    plateau_churn_max = 1
+
+    z_delta_tol = 1e-6
+    active_delta_tol = 0
+
+    z_delta_hist: list[float] = []
+    active_delta_hist: list[int] = []
 
     # --- positive-gradient batch-promotion controls ---
     positive_batch_size = 2 if C <= 3 else 9
@@ -1167,17 +1184,17 @@ def streamActiveSetNNLS(
     # ------------------------------------------------------------
     for it in range(max_iter):
         ATAz_scaled = _compute_ATAz_scaled(z)
-        grad = ATy_scaled - ATAz_scaled
+        grad_data = ATy_scaled - ATAz_scaled
+        grad_promo = grad_data.copy()
 
         # orbit state used to bias active-set growth
         orbit_s, orbit_t, orbit_deficit = _orbit_mass_and_deficit(z)
         orbit_pressure = np.maximum(orbit_deficit, 0.0)
 
-        # ---- inject prior-gradient into the promotion gradient (so prior can
-        # ---- encourage activation of columns that help meet orbit targets)
-        # ---- Prior influence on promotion gradient (revised alpha + clipping)
+        # ---- inject prior-gradient into the promotion gradient only.
+        # The data-only gradient is kept unchanged for stagnation tests.
         if (w_target is not None) and (orbit_beta > 0.0):
-            g_prior = np.zeros_like(grad)
+            g_prior = np.zeros_like(grad_promo)
 
             for cc in range(C):
                 base = cc * P
@@ -1203,32 +1220,39 @@ def streamActiveSetNNLS(
 
             clip_factor = 1.5
             g_prior_norm = np.linalg.norm(g_prior)
-            g_data_norm = np.linalg.norm(grad) + 1e-30
+            g_data_norm = np.linalg.norm(grad_data) + 1e-30
             if g_prior_norm > clip_factor * g_data_norm:
                 g_prior *= (clip_factor * g_data_norm) / (
                     g_prior_norm + 1e-30
                 )
 
-            grad = grad + g_prior
+            grad_promo = grad_promo + g_prior
 
         not_active = np.where(~active)[0]
         if not_active.size == 0:
             break
 
-        gvals = grad[not_active]
-        if gvals.size == 0:
+        gvals_data = grad_data[not_active]
+        gvals_promo = grad_promo[not_active]
+
+        if gvals_data.size == 0:
             break
 
         # diagnostic logging for the active-set iteration
-        max_grad_all = float(np.max(grad)) if grad.size else 0.0
+        max_grad_all = float(np.max(grad_data)) if grad_data.size else 0.0
         active_before = active.copy()
         z_before = z.copy()
+
         max_grad_promotable = (
-            float(np.max(gvals)) if gvals.size else 0.0
+            float(np.max(gvals_promo)) if gvals_promo.size else 0.0
         )
         avg_grad_promotable = (
-            float(np.mean(gvals)) if gvals.size else 0.0
+            float(np.mean(gvals_promo)) if gvals_promo.size else 0.0
         )
+        max_grad_data = (
+            float(np.max(gvals_data)) if gvals_data.size else 0.0
+        )
+
         n_active = int(np.count_nonzero(active))
         print(
             f"[MONO][iter {it+1}] "
@@ -1240,27 +1264,52 @@ def streamActiveSetNNLS(
         )
 
         grad_before_promotable = max_grad_promotable
+        grad_before_data = max_grad_data
 
-        # ---------------- plateau termination ----------------
-        grad_hist.append(max_grad_promotable)
+        # --------------------------------------------------------
+        # Plateau / stagnation check
+        # Compare only the data-only promotable gradient across
+        # iterations. The prior-adjusted score is used only for
+        # promotion ranking.
+        # --------------------------------------------------------
+        active_delta = int(np.count_nonzero(active ^ active_before))
+
+        grad_hist.append(max_grad_data)
+        active_delta_hist.append(active_delta)
+
         if len(grad_hist) > plateau_window:
             grad_hist.pop(0)
+            active_delta_hist.pop(0)
 
-        if len(grad_hist) == plateau_window:
+        if (it + 1) >= min_plateau_iters and len(grad_hist) == plateau_window:
             gwin = np.asarray(grad_hist, dtype=np.float64)
+            awin = np.asarray(active_delta_hist, dtype=np.int64)
+
+            gmean = float(np.mean(gwin))
             gmin = float(np.min(gwin))
             gmax = float(np.max(gwin))
-            gmean = float(np.mean(gwin))
-            spread_rel = (gmax - gmin) / (abs(gmean) + 1e-30)
 
-            # Plateau means the best inactive/promotable gradient has been
-            # flat across the full window, not just the most recent steps.
-            if spread_rel < 5e-4:
-                termination_reason = "plateau"
+            span_rel = (gmax - gmin) / (abs(gmean) + 1e-30)
+
+            xw = np.arange(plateau_window, dtype=np.float64)
+            xw -= float(np.mean(xw))
+            yw = gwin - gmean
+            slope = float(np.dot(xw, yw) / (np.dot(xw, xw) + 1e-30))
+            slope_rel = abs(slope) / (abs(gmean) + 1e-30)
+
+            churn_mean = float(np.mean(awin))
+
+            if (
+                span_rel < plateau_span_rel
+                and slope_rel < plateau_slope_rel
+                and churn_mean <= plateau_churn_max
+            ):
                 print(
-                    "[MONO] terminating on promotable max_grad plateau: "
+                    "[MONO] terminating on stagnation plateau: "
                     f"min={gmin:.3e} max={gmax:.3e} mean={gmean:.3e} "
-                    f"spread_rel={spread_rel:.3e} window={plateau_window}",
+                    f"span_rel={span_rel:.3e} slope_rel={slope_rel:.3e} "
+                    f"mean_active_delta={churn_mean:.3f} "
+                    f"window={plateau_window}",
                     flush=True,
                 )
                 break
@@ -1276,6 +1325,7 @@ def streamActiveSetNNLS(
         S_med = np.median(S_not) + 1e-30
         S_norm = S_not / S_med
         penalty_strength = 0.5
+        gvals = grad_promo[not_active]
         adj_score = gvals / (1.0 + penalty_strength * (S_norm - 1.0))
         # if many candidates have very similar adj_score, optionally prefer the one with
         # larger raw gvals among the top-k (break ties toward raw gradient)
@@ -1314,7 +1364,7 @@ def streamActiveSetNNLS(
 
                 cooldown_mask = _col_cooldown_mask(it)
                 cols_to_activate = _deficit_rescue_columns(
-                    grad_vec=grad,
+                    grad_vec=grad_promo,
                     aty_scaled_vec=ATy_scaled,
                     active_mask=active,
                     S_flat=S_flat,
@@ -1394,7 +1444,7 @@ def streamActiveSetNNLS(
 
             cooldown_mask = _col_cooldown_mask(it)
             cols_to_activate = _deficit_rescue_columns(
-                grad_vec=grad,
+                grad_vec=grad_promo,
                 aty_scaled_vec=ATy_scaled,
                 active_mask=active,
                 S_flat=S_flat,
@@ -1837,24 +1887,26 @@ def streamActiveSetNNLS(
             z[int(gcol)] = float(z_sub[ii])
 
         if did_explore:
-            grad_after = ATy_scaled - _compute_ATAz_scaled(z)
+            grad_after_data = ATy_scaled - _compute_ATAz_scaled(z)
 
             inactive_after = ~active
-            g_after_prom = grad_after[inactive_after]
-            max_grad_after_prom = (
-                float(np.max(g_after_prom)) if g_after_prom.size else -np.inf
+            g_after_prom_data = grad_after_data[inactive_after]
+            max_grad_after_prom_data = (
+                float(np.max(g_after_prom_data))
+                if g_after_prom_data.size
+                else -np.inf
             )
 
             gain_needed = max(
-                1e-3 * abs(grad_before_promotable),
+                1e-3 * abs(grad_before_data),
                 1e-6 * grad_ref,
             )
 
-            if max_grad_after_prom >= grad_before_promotable - gain_needed:
+            if max_grad_after_prom_data >= grad_before_data - gain_needed:
                 print(
                     "[MONO][explore] rolling back batch: "
-                    f"max_grad_before_prom={grad_before_promotable:.3e} "
-                    f"max_grad_after_prom={max_grad_after_prom:.3e}",
+                    f"max_grad_before_data={grad_before_data:.3e} "
+                    f"max_grad_after_data={max_grad_after_prom_data:.3e}",
                     flush=True,
                 )
 
