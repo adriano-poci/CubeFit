@@ -1141,7 +1141,7 @@ def streamActiveSetNNLS(
     committed_active = active.copy()
 
     # Soft occupancy control: discourage crowded orbits, but do not cap them.
-    orbit_occ_lambda = 0.15 if C <= 3 else 0.35
+    orbit_occ_lambda = 0.15 if C <= 3 else 0.25
 
     # Probation for newly admitted columns.
     probation_iters = 3
@@ -1151,7 +1151,7 @@ def streamActiveSetNNLS(
 
     # Column-level tabu for genuinely unhelpful promotions.
     col_cooldown_until: dict[int, int] = {}
-    cooldown_iters = 20
+    cooldown_iters = 10
     promotion_noop_rel_tol = 1e-6
     promotion_noop_abs_tol = 1e-10
 
