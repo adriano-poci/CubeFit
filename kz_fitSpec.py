@@ -2233,6 +2233,57 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             print(f"Could not make Z-alpha plot: {e}")
             pass
 
+        # metallicity vs alpha, per age
+        try:
+            chemSFH = arSOL.sum(axis=0) # shape (nMetals, nAges, nAlphas)
+
+            vmin3 = float(np.max((np.min(np.log10(chemSFH[chemSFH>0])), -12.0)))
+            vmax3 = float(np.max(np.log10(chemSFH[chemSFH>0])))
+
+            fig3 = plt.figure(figsize=plt.figaspect(3.)*0.75)
+            gs3 = gridspec.GridSpec(3, 1, wspace=0.0, hspace=0.0)
+            cuts = [(uages < 6.0), (uages < 14.0), (uages >= 10.0)]
+            labels = ['Age < 6 Gyr', 'Age < 14 Gyr', 'Age ≥ 10 Gyr']
+            for pi, mask in enumerate(cuts):
+                ax = fig3.add_subplot(gs3[pi, 0])
+                # arr shape (nMetals, nAlphas) -> transpose for imshow so y=alpha
+                im = ax.imshow(np.ma.log10(np.compress(mask, chemSFH,
+                    axis=1).sum(axis=1).T), extent=[minZ, maxZ, np.min(ualphas),
+                    np.max(ualphas)], aspect='auto', origin='lower',
+                    cmap=moncmapr, norm=Normalize(vmin=vmin3, vmax=vmax3))
+                lT = ax.text(1e-2, 1e-2, labels[pi], va='bottom', ha='left',
+                    color=POT.pgreen, transform=ax.transAxes)
+                lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                    foreground='k')])
+                if not ax.get_subplotspec().is_last_row():
+                    ax.set_xticklabels([])
+
+            BIG3 = fig3.add_subplot(gs3[:])
+            BIG3.set_frame_on(False)
+            BIG3.set_xticks([])
+            BIG3.set_yticks([])
+            BIG3.set_xlabel(r'$[Z/H]$', labelpad=20)
+            BIG3.set_ylabel(r'$[\alpha/Fe]$', labelpad=35)
+            cax3 = POT.attachAxis(BIG3, 'right', 0.1)
+            cb3 = plt.colorbar(im, cax=cax3, orientation='vertical')
+            lT3 = cax3.text(0.5, 0.5, r'$\log_{10}($Mass Weight$)$',
+                va='center', ha='center', color=POT.pgreen,
+                transform=cax3.transAxes, rotation=270)
+            lT3.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                foreground='k')])
+            cax3.text(0.45, 1.0-1e-3, f"{vmax3:.2f}", va='top', ha='center',
+                color='w', transform=cax3.transAxes, rotation=270)
+            cax3.text(0.45, 1e-3, f"{vmin3:.2f}", va='bottom', ha='center',
+                color='k', transform=cax3.transAxes, rotation=270)
+            cb3.set_ticks([])
+
+            fig3.savefig(figDir/\
+                f"orbitSFH_alphaMetalAge_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+
+        except Exception as e:
+            print(f"Could not make Z-alpha plot: {e}")
+            pass
+
 # ------------------------------------------------------------------------------
 
 def plot_sparse_spectra_from_x(
