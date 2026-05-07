@@ -72,6 +72,10 @@ v1.11:  Changed plateau logic to use iteration-invariant metrics instead of the
             gradient, which is no longer a stable cross-iteration metric once the
             orbit prior and occupancy penalty are active in
             `streamActiveSetNNLS`. 31 March 2026
+v1.12:  Updated `_worker_ATAz` and `_worker_reduced` to not stream full tiles for
+            memory efficiency. Instead, read orbit-by-orbit and use tensor
+            contractions to compute the same quantities with much lower peak
+            memory. 7 May 2026
 """
 
 from __future__ import annotations, print_function
@@ -138,48 +142,34 @@ def _worker_reduced(
     ATA_loc = np.zeros((k, k), dtype=np.float64)
     ATy_loc = np.zeros((k,), dtype=np.float64)
 
-    # decode orbit & population indices for active columns
     cc_arr = (active_idx // P).astype(np.int64)
     pp_arr = (active_idx % P).astype(np.int64)
 
     with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]         # kept for shape reference; Yt read below
+        DC = f["/DataCube"]
         M = f["/HyperCube/models"]
 
         for (s0, s1) in batch:
-            # read data tile and model tile
             Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
             if keep_idx is not None:
-                Yt = Yt[:, keep_idx]           # shape (Sblk, Lk)
+                Yt = Yt[:, keep_idx]
+            y_flat = Yt.reshape(-1)
+
             Sblk = s1 - s0
-            Lk_loc = Yt.shape[1]
+            Lk = Yt.shape[1]
+            rows = Sblk * Lk
 
-            M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
-            if keep_idx is not None:
-                M_tile = M_tile[:, :, :, keep_idx]   # shape (Sblk, C, P, Lk_loc)
+            # Only store the active columns, not the full tile.
+            A_act = np.empty((rows, k), dtype=np.float64)
 
-            # Extract the k active column slices into shape (Sblk, k, Lk_loc)
-            # M_sub[s, i, lambda] = M_tile[s, cc_arr[i], pp_arr[i], lambda]
-            # This is the minimal temporary we need (k typically much smaller than CP)
-            M_sub = M_tile[:, cc_arr, pp_arr, :]  # shape (Sblk, k, Lk_loc)
+            for j, (cc, pp) in enumerate(zip(cc_arr, pp_arr)):
+                col = np.asarray(M[s0:s1, cc, pp, :], dtype=np.float64, order="C")
+                if keep_idx is not None:
+                    col = col[:, keep_idx]
+                A_act[:, j] = S_active[j] * col.reshape(-1)
 
-            # --- compute inner products over s and lambda ---
-            # ATA_unscaled_loc[i,j] = sum_{s,lambda} M_sub[s,i,lambda] * M_sub[s,j,lambda]
-            # Use einsum for clarity and numerical stability / memory locality.
-            # result shape (k,k)
-            ATA_unscaled_loc = np.einsum("s i l, s j l -> i j", M_sub, M_sub, optimize=True)
-
-            # scale by S_active outer product: ATA_loc += (S_i * S_j) * ATA_unscaled_loc
-            outerS = (S_active[:, None] * S_active[None, :])
-            ATA_loc += outerS * ATA_unscaled_loc
-
-            # --- compute ATy contributions ---
-            # ATy_unscaled_loc[i] = sum_{s,lambda} M_sub[s,i,lambda] * Yt[s,lambda]
-            # shape (k,)
-            ATy_unscaled_loc = np.einsum("s i l, s l -> i", M_sub, Yt, optimize=True)
-
-            # scale by S_active: ATy_loc += S_i * ATy_unscaled_loc[i]
-            ATy_loc += (S_active * ATy_unscaled_loc)
+            ATA_loc += A_act.T @ A_act
+            ATy_loc += A_act.T @ y_flat
 
     return ATA_loc, ATy_loc
 
@@ -192,7 +182,67 @@ def _worker_ATAz(
     z: np.ndarray,
     CP: int,
     S_flat: np.ndarray,
+    C: int,
+    P: int,
 ):
+    """
+    Compute the exact quantity A^T A (S z) for a batch of tiles, but with
+    much lower peak memory than the original implementation.
+
+    This preserves the original mathematics:
+
+        z_s = (S_flat * z).reshape(C, P)
+
+        v = A @ z_s_flat
+        g = A.T @ v
+        partial += (S_flat.reshape(C, P) * g).reshape(-1)
+
+    The only difference is that the model cube is read orbit-by-orbit instead
+    of loading the full (Sblk, C, P, Lk) tile into memory.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the HDF5 file.
+    batch : list[tuple[int, int]]
+        List of (s0, s1) tile ranges assigned to this worker.
+    keep_idx : ndarray or None
+        Wavelength indices to keep after masking, or None for full wavelength
+        coverage.
+    z : ndarray, shape (C * P,)
+        Current reduced NNLS variable in z-space.
+    CP : int
+        Total number of columns, equal to C * P.
+    S_flat : ndarray, shape (C * P,)
+        Column scaling vector.
+    C : int
+        Number of orbit components.
+    P : int
+        Number of populations per orbit.
+
+    Returns
+    -------
+    partial : ndarray, shape (C * P,)
+        Contribution of this worker to A^T A (S z).
+    """
+    z = np.asarray(z, dtype=np.float64).ravel(order="C")
+    S_flat = np.asarray(S_flat, dtype=np.float64).ravel(order="C")
+
+    if z.size != CP:
+        raise ValueError(
+            f"z has size {z.size}, expected CP={CP}."
+        )
+    if S_flat.size != CP:
+        raise ValueError(
+            f"S_flat has size {S_flat.size}, expected CP={CP}."
+        )
+    if CP != C * P:
+        raise ValueError(
+            f"CP={CP} is inconsistent with C*P={C * P}."
+        )
+
+    # Same scaling as the original code.
+    z_cp = (S_flat * z).reshape(C, P)
 
     partial = np.zeros((CP,), dtype=np.float64)
 
@@ -200,38 +250,71 @@ def _worker_ATAz(
         M = f["/HyperCube/models"]
 
         for (s0, s1) in batch:
+            Sblk = s1 - s0
 
-            M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
+            # Read one orbit slice to determine the wavelength length after mask.
+            sample = np.asarray(
+                M[s0:s1, 0, :, :],
+                dtype=np.float64,
+                order="C",
+            )
             if keep_idx is not None:
-                M_tile = M_tile[:, :, :, keep_idx]
+                sample = sample[:, :, keep_idx]
+            if sample.ndim != 3:
+                raise RuntimeError(
+                    "Unexpected model slice shape while inferring Lk."
+                )
 
-            Sblk, C, P, Lk = M_tile.shape
+            _, Pm, Lk = sample.shape
+            if Pm != P:
+                raise RuntimeError(
+                    f"Model population dimension {Pm} != expected P={P}."
+                )
 
-            # reshape vectors
-            z_s = (S_flat * z).reshape(C, P)
-
-            # compute v = A (S z)
+            # First pass: exact v = A @ (S z), but one orbit slice at a time.
             v = np.zeros((Sblk, Lk), dtype=np.float64)
 
             for cc in range(C):
+                M_cc = np.asarray(
+                    M[s0:s1, cc, :, :],
+                    dtype=np.float64,
+                    order="C",
+                )
+                if keep_idx is not None:
+                    M_cc = M_cc[:, :, keep_idx]
+
+                # M_cc has shape (Sblk, P, Lk)
+                # z_cp[cc] has shape (P,)
+                # result has shape (Sblk, Lk)
                 v += np.tensordot(
-                    z_s[cc],
-                    M_tile[:, cc, :, :],
-                    axes=(0, 1)
+                    z_cp[cc],
+                    M_cc,
+                    axes=(0, 1),
                 )
 
-            # compute g = A^T v
-            g = np.zeros((C, P), dtype=np.float64)
-
+            # Second pass: exact g = A^T @ v, again orbit slice by orbit slice.
             for cc in range(C):
-                g[cc] = np.tensordot(
-                    M_tile[:, cc, :, :],
+                M_cc = np.asarray(
+                    M[s0:s1, cc, :, :],
+                    dtype=np.float64,
+                    order="C",
+                )
+                if keep_idx is not None:
+                    M_cc = M_cc[:, :, keep_idx]
+
+                # M_cc: (Sblk, P, Lk)
+                # v   : (Sblk, Lk)
+                # g_cc: (P,)
+                g_cc = np.tensordot(
+                    M_cc,
                     v,
-                    axes=([0, 2], [0, 1])
+                    axes=([0, 2], [0, 1]),
                 )
 
-            # apply column scaling
-            partial += (S_flat.reshape(C, P) * g).reshape(-1)
+                base = cc * P
+                partial[base:base + P] += (
+                    S_flat[base:base + P] * g_cc
+                )
 
     return partial
 
@@ -1204,7 +1287,7 @@ def streamActiveSetNNLS(
         ATAz = np.zeros((CP,), dtype=np.float64)
 
         worker_args = [
-            (h5_path, batch, keep_idx, x_cand, CP, S_flat)
+            (h5_path, batch, keep_idx, x_cand, CP, S_flat, C, P)
             for batch in batches
             if len(batch) > 0
         ]
@@ -2296,7 +2379,6 @@ def solve_streaming_nnls(
 
         # ---------- single streaming pass: build ATy_flat & D_tot -------
         ATy_flat = np.zeros((CP,), dtype=np.float64)
-        y_parts = []
         with open_h5(h5_path, role="reader") as f:
             DC = f["/DataCube"]
             M  = f["/HyperCube/models"]
@@ -2361,7 +2443,6 @@ def solve_streaming_nnls(
                 except Exception as _e:
                     print("[BC-FUSED][tile diag] error while computing tile diagnostics:", _e, flush=True)
 
-                y_parts.append(y_flat)
         # end single streaming pass
         # ------------------------ end streaming --------------------------
 

@@ -19,7 +19,7 @@
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=48
-#SBATCH --mem=400G
+#SBATCH --mem=500G
 #SBATCH --hint=nomultithread
 #SBATCH --exclusive
 #SBATCH --mail-type=ALL
