@@ -47,6 +47,8 @@ v1.11:  Removed lingering `orbit_beta`. 23 March 2026
 v1.12:  Re-implemented `orbit_beta` support in `genCubeFit` and passed it to the
             solver. 30 March 2026
 v1.13:  Fixed spectral fit plot unlinking glob in `loadCubeFit`. 31 March 2026
+v1.14:  Do not return full slab in `_reconstruct_worker`, causing extreme memory
+            requirements. 22 May 2026
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -850,47 +852,90 @@ def parallel_model_cube_global_batched(
 # Parallel model-cube reconstruction (safe HDF5 writer in parent process)
 # ---------------------------------------------------------------------------
 
+# module globals used by worker processes
+_RECON_X_CP2 = None
+_RECON_WANT_DTYPE = np.float64
+
+
+def _init_reconstruct_worker(
+    x_cp2: np.ndarray,
+    want_dtype_str: str,
+    rdcc_slots: int,
+    rdcc_bytes: int,
+    rdcc_w0: float,
+):
+    """
+    Initializer for reconstruction workers.
+
+    Stores the fixed x_cp2 vector in a module-global so it is not pickled
+    on every task.
+    """
+    global _RECON_X_CP2, _RECON_WANT_DTYPE
+
+    _RECON_X_CP2 = np.ascontiguousarray(
+        np.asarray(x_cp2, dtype=np.float64),
+        dtype=np.float64,
+    )
+    _RECON_WANT_DTYPE = (
+        np.float64 if str(want_dtype_str) == "float64" else np.float32
+    )
+
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 def _reconstruct_worker(args):
     """
-    Worker executed in a separate process. Must be top-level (pickleable).
+    Worker executed in a separate process.
+
+    Reads one spatial slab, contracts it immediately with the fixed x_cp2,
+    and returns only the reconstructed Y tile.
 
     Args tuple:
-      (h5_path, s0, s1, want_dtype_str, rdcc_slots, rdcc_bytes, rdcc_w0)
+      (h5_path, s0, s1, rdcc_slots, rdcc_bytes, rdcc_w0)
 
     Returns:
       (s0, s1, Y_tile_as_dtype) where Y_tile has shape (dS, L)
     """
     import numpy as _np
-    try:
-        h5_path, s0, s1, want_dtype_str, rdcc_slots, rdcc_bytes, rdcc_w0 = args
-    except Exception:
-        raise
 
-    want_dtype = _np.float64 if str(want_dtype_str) == "float64" else _np.float32
+    global _RECON_X_CP2, _RECON_WANT_DTYPE
+    if _RECON_X_CP2 is None:
+        raise RuntimeError(
+            "Reconstruction worker not initialised with x_cp2."
+        )
 
-    # Each worker opens the file read-only and reads its slab.
+    h5_path, s0, s1, rdcc_slots, rdcc_bytes, rdcc_w0 = args
+
     with open_h5(h5_path, role="reader") as f:
         M = f["/HyperCube/models"]
         try:
-            M.id.set_chunk_cache(int(rdcc_slots), int(rdcc_bytes),
-                                 float(rdcc_w0))
+            M.id.set_chunk_cache(
+                int(rdcc_slots),
+                int(rdcc_bytes),
+                float(rdcc_w0),
+            )
         except Exception:
             pass
 
-        # read slab: shape (dS, C, P, L)
-        slab = _np.asarray(M[s0:s1, :, :, :], dtype=_np.float64, order="C")
-        # We'll compute tensordot(slab, x_cp, axes=([1,2],[0,1])) in caller,
-        # but x_cp is not available in worker. To avoid sending full x_cp across
-        # processes repeatedly we must include it in args OR compute using a
-        # broadcast mechanism. Simpler: workers will not need x_cp if the parent
-        # sends x_cp in the args. We'll include x_cp below if present.
-    # NOTE: we return the raw slab to the parent to contract there only if
-    # we want to avoid pickling x_cp for each worker. However returning a
-    # potentially large slab increases IPC cost. Instead we will *expect*
-    # the caller to include x_cp in args (see reconstruct_modelcube_fast).
-    # For safety this worker simply returns the slab and s0,s1.
-    return (s0, s1, slab.astype(want_dtype, copy=False))
+        slab = _np.asarray(
+            M[s0:s1, :, :, :],
+            dtype=_np.float64,
+            order="C",
+        )
 
+        # Exact same contraction as in the parent version.
+        Y_tile = _np.tensordot(
+            slab,
+            _RECON_X_CP2,
+            axes=([1, 2], [0, 1]),
+        )
+
+        if _RECON_WANT_DTYPE != _np.float64:
+            Y_tile = Y_tile.astype(_RECON_WANT_DTYPE, copy=False)
+
+    return (s0, s1, Y_tile)
 
 def reconstruct_modelcube_fast_parallel(
     h5_path: str,
@@ -899,56 +944,50 @@ def reconstruct_modelcube_fast_parallel(
     s_chunk: int | None = None,
     out_dtype: str = "float64",
     rdcc_slots: int = 1_000_003,
-    rdcc_bytes: int = 512 * 1024**2,
+    rdcc_bytes: int = 32 * 1024**2,
     rdcc_w0: float = 0.90,
     n_workers: int | None = None,
     blas_threads_per_worker: int | None = None,
 ) -> None:
     """
-    Parallel reconstruction of /ModelCube.
+    Parallel reconstruction of /ModelCube with low peak memory.
 
-    Strategy:
-      - Spawn a small process pool.
-      - Each worker reads a spatial slab (s0:s1) from
-        /HyperCube/models and returns the slab.
-      - Parent contracts each slab with x_cp (tensordot) and writes the
-        completed (s0:s1, :) tile to /ModelCube.
-
-    This keeps all HDF5 write operations in the parent process and lets
-    workers do the read+heavy contraction work in parallel memory.
+    Workers read a spatial slab, contract it locally with x_cp, and return
+    only the output tile. The parent performs only HDF5 writes.
     """
-
     want_dtype = np.float64 if str(out_dtype) == "float64" else np.float32
-    x_in = np.ascontiguousarray(np.asarray(x_cp, dtype=np.float64).ravel(),
-                                dtype=np.float64)
-    # open to inspect models shape & decide tile size
+    x_in = np.ascontiguousarray(
+        np.asarray(x_cp, dtype=np.float64).ravel(),
+        dtype=np.float64,
+    )
+
     with open_h5(h5_path, role="writer") as f:
         if "/HyperCube/models" not in f:
             raise RuntimeError("No /HyperCube/models found.")
         M = f["/HyperCube/models"]
         try:
-            M.id.set_chunk_cache(int(rdcc_slots), int(rdcc_bytes),
-                                 float(rdcc_w0))
+            M.id.set_chunk_cache(int(rdcc_slots), int(rdcc_bytes), float(rdcc_w0))
         except Exception:
             pass
+
         if M.ndim != 4:
             raise RuntimeError(f"Unexpected models rank {M.ndim}")
+
         S, C, P, L = map(int, M.shape)
 
-        # choose spatial tile size consistent with file chunking
         m_chunks = M.chunks or (S, 1, P, L)
         S_chunk_file = int(m_chunks[0])
         S_blk = S_chunk_file if s_chunk is None else int(s_chunk)
         S_blk = max(1, min(S_blk, S))
         n_tiles = math.ceil(S / S_blk)
 
-        # prepare output dataset (create/overwrite like before)
         ds = f.get(out_dset, None)
         if ds is not None:
             ok = (tuple(ds.shape) == (S, L) and str(ds.dtype) == str(want_dtype))
             if not ok:
                 del f[out_dset]
                 ds = None
+
         if ds is None:
             ds = f.create_dataset(
                 out_dset,
@@ -960,23 +999,19 @@ def reconstruct_modelcube_fast_parallel(
             )
         out_ds = ds
 
-    # reshape x once in parent for contracting
     x_cp2 = x_in.reshape(C, P).astype(np.float64, copy=False)
 
-    # choose number of workers
     if n_workers is None:
         n_workers = max(1, int(mp.cpu_count() // 2))
     n_workers = max(1, int(n_workers))
 
     if n_workers == 1:
-        # single-worker (no pool) path to avoid overhead
         pbar = tqdm(total=n_tiles, desc="[Reconstruct]", mininterval=1.5)
         with open_h5(h5_path, role="writer") as f:
             M = f["/HyperCube/models"]
             for s0 in range(0, S, S_blk):
                 s1 = min(S, s0 + S_blk)
-                slab = np.asarray(M[s0:s1, :, :, :], dtype=np.float64,
-                                   order="C")
+                slab = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
                 Y_tile = np.tensordot(slab, x_cp2, axes=([1, 2], [0, 1]))
                 if want_dtype != np.float64:
                     Y_tile = Y_tile.astype(want_dtype, copy=False)
@@ -985,40 +1020,35 @@ def reconstruct_modelcube_fast_parallel(
         pbar.close()
         return
 
-    # parallel path: spawn a pool; each worker reads a slab and returns it.
     ctx = mp.get_context("spawn")
-
-    # set BLAS threads for workers
     bt = int(blas_threads_per_worker) if blas_threads_per_worker else 1
 
-    # Build tile job list
-    jobs = []
-    for s0 in range(0, S, S_blk):
-        s1 = min(S, s0 + S_blk)
-        jobs.append((h5_path, s0, s1, str(out_dtype),
-                     int(rdcc_slots), int(rdcc_bytes), float(rdcc_w0)))
+    jobs = [
+        (
+            h5_path,
+            s0,
+            min(S, s0 + S_blk),
+            int(rdcc_slots),
+            int(rdcc_bytes),
+            float(rdcc_w0),
+        )
+        for s0 in range(0, S, S_blk)
+    ]
 
     pbar = tqdm(total=n_tiles, desc="[Reconstruct]", mininterval=1.5)
 
-    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx,
-                             initializer=_init_worker,
-                             initargs=(bt,)) as exe:
-
-        # submit jobs
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        mp_context=ctx,
+        initializer=_init_reconstruct_worker,
+        initargs=(x_cp2, out_dtype, rdcc_slots, rdcc_bytes, rdcc_w0),
+    ) as exe:
         futures = {exe.submit(_reconstruct_worker, arg): arg for arg in jobs}
 
-        # as results come in, contract and write
         with open_h5(h5_path, role="writer") as f:
-            out_ds = f[out_dset]  # re-open in writer role
+            out_ds = f[out_dset]
             for fut in as_completed(futures):
-                s0, s1, slab = fut.result()
-                # contract in parent; slab dtype may be float64 or out dtype
-                # slab shape: (dS, C, P, L)
-                # ensure slab is float64 for accurate tensordot
-                slab64 = np.asarray(slab, dtype=np.float64, order="C")
-                Y_tile = np.tensordot(slab64, x_cp2, axes=([1, 2], [0, 1]))
-                if want_dtype != np.float64:
-                    Y_tile = Y_tile.astype(want_dtype, copy=False)
+                s0, s1, Y_tile = fut.result()
                 out_ds[s0:s1, :] = Y_tile
                 pbar.update(1)
 

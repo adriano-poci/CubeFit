@@ -13,12 +13,13 @@
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_3Rio.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_3Rio.log" --open-mode=append
 #SBATCH -p short
+#SBATCH -M htc,arc
 
 #SBATCH --job-name="CubeFit_3Rio"
 #SBATCH --time=0-12:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=48
-#SBATCH --mem=300G
+#SBATCH --mem=500G
 #SBATCH --hint=nomultithread
 #SBATCH --exclusive
 #SBATCH --mail-type=ALL
