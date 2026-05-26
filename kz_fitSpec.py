@@ -103,7 +103,7 @@ moncmapr = 'inferno_r'
 
 os.environ["FITTRACKER_START"] = "fork"
 
-CPU_PROCESSES = 6
+CPU_PROCESSES = 4
 BLAS_THREADS = 8
 
 # ------------------------------------------------------------------------------
@@ -856,19 +856,19 @@ def parallel_model_cube_global_batched(
 _RECON_X_CP2 = None
 _RECON_WANT_DTYPE = np.float64
 
-
 def _init_reconstruct_worker(
     x_cp2: np.ndarray,
     want_dtype_str: str,
     rdcc_slots: int,
     rdcc_bytes: int,
     rdcc_w0: float,
+    blas_threads: int,
 ):
     """
     Initializer for reconstruction workers.
 
-    Stores the fixed x_cp2 vector in a module-global so it is not pickled
-    on every task.
+    Stores the fixed x_cp2 vector in a module-global so it is not pickled on
+    every task. Also sets BLAS thread limits for the worker process.
     """
     global _RECON_X_CP2, _RECON_WANT_DTYPE
 
@@ -880,23 +880,27 @@ def _init_reconstruct_worker(
         np.float64 if str(want_dtype_str) == "float64" else np.float32
     )
 
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["OMP_NUM_THREADS"] = str(int(blas_threads))
+    os.environ["OPENBLAS_NUM_THREADS"] = str(int(blas_threads))
+    os.environ["MKL_NUM_THREADS"] = str(int(blas_threads))
+    os.environ["NUMEXPR_NUM_THREADS"] = str(int(blas_threads))
+
+    # rdcc settings are applied per file handle inside the worker.
 
 def _reconstruct_worker(args):
     """
     Worker executed in a separate process.
 
-    Reads one spatial slab, contracts it immediately with the fixed x_cp2,
-    and returns only the reconstructed Y tile.
+    Reads one spatial slab, contracts it locally with the fixed x_cp2, and
+    returns only the reconstructed Y tile.
 
     Args tuple:
       (h5_path, s0, s1, rdcc_slots, rdcc_bytes, rdcc_w0)
 
-    Returns:
-      (s0, s1, Y_tile_as_dtype) where Y_tile has shape (dS, L)
+    Returns
+    -------
+    (s0, s1, Y_tile_as_dtype)
+        Y_tile has shape (dS, L).
     """
     import numpy as _np
 
@@ -925,7 +929,6 @@ def _reconstruct_worker(args):
             order="C",
         )
 
-        # Exact same contraction as in the parent version.
         Y_tile = _np.tensordot(
             slab,
             _RECON_X_CP2,
@@ -944,10 +947,10 @@ def reconstruct_modelcube_fast_parallel(
     s_chunk: int | None = None,
     out_dtype: str = "float64",
     rdcc_slots: int = 1_000_003,
-    rdcc_bytes: int = 32 * 1024**2,
+    rdcc_bytes: int = 8 * 1024**2,
     rdcc_w0: float = 0.90,
     n_workers: int | None = None,
-    blas_threads_per_worker: int | None = None,
+    blas_threads_per_worker: int = 1,
 ) -> None:
     """
     Parallel reconstruction of /ModelCube with low peak memory.
@@ -966,7 +969,11 @@ def reconstruct_modelcube_fast_parallel(
             raise RuntimeError("No /HyperCube/models found.")
         M = f["/HyperCube/models"]
         try:
-            M.id.set_chunk_cache(int(rdcc_slots), int(rdcc_bytes), float(rdcc_w0))
+            M.id.set_chunk_cache(
+                int(rdcc_slots),
+                int(rdcc_bytes),
+                float(rdcc_w0),
+            )
         except Exception:
             pass
 
@@ -975,10 +982,16 @@ def reconstruct_modelcube_fast_parallel(
 
         S, C, P, L = map(int, M.shape)
 
-        m_chunks = M.chunks or (S, 1, P, L)
-        S_chunk_file = int(m_chunks[0])
-        S_blk = S_chunk_file if s_chunk is None else int(s_chunk)
-        S_blk = max(1, min(S_blk, S))
+        if s_chunk is None:
+            # conservative default: ~8 GiB slabs per worker
+            bytes_per_s = C * P * L * np.dtype(np.float64).itemsize
+            target_worker_gib = 8.0
+            s_chunk = max(
+                1,
+                int((target_worker_gib * 1024**3) // bytes_per_s),
+            )
+
+        S_blk = max(1, min(int(s_chunk), S))
         n_tiles = math.ceil(S / S_blk)
 
         ds = f.get(out_dset, None)
@@ -1002,17 +1015,26 @@ def reconstruct_modelcube_fast_parallel(
     x_cp2 = x_in.reshape(C, P).astype(np.float64, copy=False)
 
     if n_workers is None:
-        n_workers = max(1, int(mp.cpu_count() // 2))
+        n_workers = 2
     n_workers = max(1, int(n_workers))
 
     if n_workers == 1:
         pbar = tqdm(total=n_tiles, desc="[Reconstruct]", mininterval=1.5)
         with open_h5(h5_path, role="writer") as f:
             M = f["/HyperCube/models"]
+            out_ds = f[out_dset]
             for s0 in range(0, S, S_blk):
                 s1 = min(S, s0 + S_blk)
-                slab = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
-                Y_tile = np.tensordot(slab, x_cp2, axes=([1, 2], [0, 1]))
+                slab = np.asarray(
+                    M[s0:s1, :, :, :],
+                    dtype=np.float64,
+                    order="C",
+                )
+                Y_tile = np.tensordot(
+                    slab,
+                    x_cp2,
+                    axes=([1, 2], [0, 1]),
+                )
                 if want_dtype != np.float64:
                     Y_tile = Y_tile.astype(want_dtype, copy=False)
                 out_ds[s0:s1, :] = Y_tile
@@ -1021,7 +1043,7 @@ def reconstruct_modelcube_fast_parallel(
         return
 
     ctx = mp.get_context("spawn")
-    bt = int(blas_threads_per_worker) if blas_threads_per_worker else 1
+    bt = int(blas_threads_per_worker)
 
     jobs = [
         (
@@ -1041,7 +1063,7 @@ def reconstruct_modelcube_fast_parallel(
         max_workers=n_workers,
         mp_context=ctx,
         initializer=_init_reconstruct_worker,
-        initargs=(x_cp2, out_dtype, rdcc_slots, rdcc_bytes, rdcc_w0),
+        initargs=(x_cp2, out_dtype, rdcc_slots, rdcc_bytes, rdcc_w0, bt),
     ) as exe:
         futures = {exe.submit(_reconstruct_worker, arg): arg for arg in jobs}
 
@@ -1761,10 +1783,10 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 reconstruct_modelcube_fast_parallel(
                     h5_path=str(hdf5Path),
                     x_cp=x_global,
-                    s_chunk=None,                 # or tune tile size
+                    s_chunk=112,
                     out_dtype="float64",
                     rdcc_slots=1_000_003,
-                    rdcc_bytes=512 * 1024**2,
+                    rdcc_bytes=8 * 1024**2,
                     rdcc_w0=0.90,
                     n_workers=builtins.min(CPU_PROCESSES, nTiles, 12),
                     blas_threads_per_worker=BLAS_THREADS // max(1, CPU_PROCESSES)

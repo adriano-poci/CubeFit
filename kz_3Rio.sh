@@ -18,8 +18,8 @@
 #SBATCH --job-name="CubeFit_3Rio"
 #SBATCH --time=0-12:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=48
-#SBATCH --mem=500G
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=350G
 #SBATCH --hint=nomultithread
 #SBATCH --exclusive
 #SBATCH --mail-type=ALL
