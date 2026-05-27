@@ -103,7 +103,7 @@ moncmapr = 'inferno_r'
 
 os.environ["FITTRACKER_START"] = "fork"
 
-CPU_PROCESSES = 4
+CPU_PROCESSES = 6
 BLAS_THREADS = 8
 
 # ------------------------------------------------------------------------------
@@ -1783,7 +1783,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 reconstruct_modelcube_fast_parallel(
                     h5_path=str(hdf5Path),
                     x_cp=x_global,
-                    s_chunk=112,
+                    s_chunk=56,
                     out_dtype="float64",
                     rdcc_slots=1_000_003,
                     rdcc_bytes=8 * 1024**2,

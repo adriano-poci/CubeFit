@@ -13,7 +13,6 @@
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_3Rio.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_3Rio.log" --open-mode=append
 #SBATCH -p short
-#SBATCH -M htc,arc
 
 #SBATCH --job-name="CubeFit_3Rio"
 #SBATCH --time=0-12:00
@@ -50,8 +49,6 @@ export HDF5_USE_FILE_LOCKING=FALSE
 
 # File descriptors
 ulimit -n 8192
-
-cd /data/phys-gal-dynamics/phys2603/CubeFit
 
 # sanity print (once) to confirm cpuset and BLAS threads
 srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
@@ -165,7 +162,8 @@ fi
 
 
 
-
 # run your job as a Slurm step (gives you the full cpuset)
+cd /data/phys-gal-dynamics/phys2603/CubeFit
+echo "Submitted cluster: ${CF_CLUSTER:-unknown}"
 srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
   python -m IPython --colors=NoColor kz_rio.py -- --galaxy "$GALAXY" --redraw ${NCOMP:+--ncomp="$NCOMP"}

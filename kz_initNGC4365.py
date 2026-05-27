@@ -34,7 +34,7 @@ History
 v1.0:	12 November 2021
 """
 
-props = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=207, lOrder=12,
+props = dict(galaxy='NGC4365', mPath='hdhdc4365.fullflex', SN=100, nCuts=207, lOrder=12,
     specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI', nProcs=1,
     band='F814W', genSwitch=None, kind='SMILES', cont=True,
     smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],

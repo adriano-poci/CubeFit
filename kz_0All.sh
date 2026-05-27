@@ -34,19 +34,34 @@ IFS=$'\n\t'
 
 usage() {
     cat <<EOF
-Usage: $0 GALAXY [-n N] [--ncomp=N] [--ncomp N] [positional...]
-  GALAXY         galaxy name (string, required)
-  -n N           short form
-  --ncomp=N      long form (either form optional)
-If provided, N must be a positive integer.
+Usage: $0 --cluster CLUSTER GALAXY [-n N] [--ncomp=N] [--ncomp N]
+  --cluster CLUSTER   Slurm cluster to submit to, e.g. arc or htc
+  GALAXY              galaxy name (string, required)
+  -n N                number of components
+  --ncomp=N           same as -n
 EOF
 }
 
+CLUSTER=""
 NCOMP=""
-# Build a new argv array excluding any long-form --ncomp tokens
+
+# Parse long options first.
 new_argv=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --cluster=*)
+            CLUSTER="${1#--cluster=}"
+            shift
+            ;;
+        --cluster)
+            if [ "$#" -lt 2 ]; then
+                echo "Error: --cluster requires an argument." >&2
+                usage
+                exit 2
+            fi
+            CLUSTER="$2"
+            shift 2
+            ;;
         --ncomp=*)
             NCOMP="${1#--ncomp=}"
             shift
@@ -54,7 +69,8 @@ while [ "$#" -gt 0 ]; do
         --ncomp)
             if [ "$#" -lt 2 ]; then
                 echo "Error: --ncomp requires an argument." >&2
-                usage; exit 2
+                usage
+                exit 2
             fi
             NCOMP="$2"
             shift 2
@@ -62,7 +78,8 @@ while [ "$#" -gt 0 ]; do
         --)
             shift
             while [ "$#" -gt 0 ]; do
-                new_argv+=("$1"); shift
+                new_argv+=("$1")
+                shift
             done
             break
             ;;
@@ -73,10 +90,8 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-# Replace positional parameters with filtered args for getopts
 set -- "${new_argv[@]:-}"
 
-# Parse short options (-n)
 while getopts ":n:" opt; do
     case "$opt" in
         n) NCOMP="$OPTARG" ;;
@@ -86,9 +101,12 @@ while getopts ":n:" opt; do
 done
 shift $((OPTIND - 1))
 
-# ------------------------------------------------------------------
-# Positional arguments
-# ------------------------------------------------------------------
+if [ -z "$CLUSTER" ]; then
+    echo "Error: --cluster is required." >&2
+    usage
+    exit 2
+fi
+
 if [ "$#" -lt 1 ]; then
     echo "Error: GALAXY argument is required." >&2
     usage
@@ -98,11 +116,6 @@ fi
 GALAXY="$1"
 shift
 
-# Remaining positional args (if any) are now in "$@"
-
-# ------------------------------------------------------------------
-# Validation
-# ------------------------------------------------------------------
 if [ -n "${NCOMP:-}" ]; then
     if ! printf '%s' "$NCOMP" | grep -Eq '^[0-9]+$'; then
         echo "Error: ncomp must be a positive integer, got '$NCOMP'." >&2
@@ -112,20 +125,27 @@ if [ -n "${NCOMP:-}" ]; then
         echo "Error: ncomp must be > 0, got '$NCOMP'." >&2
         exit 2
     fi
-    echo "GALAXY = $GALAXY"
-    echo "NCOMP  = $NCOMP"
-else
-    echo "GALAXY = $GALAXY"
-    echo "NCOMP not provided; running with defaults"
 fi
-# ------------------------------------------------------------------------------
-# /Argument parsing
-# ------------------------------------------------------------------------------
-
-
-
 
 cd /data/phys-gal-dynamics/phys2603/CubeFit
-declare fSGA=$(sbatch --parsable "kz_1Gen.sh" "$GALAXY" ${NCOMP:+--ncomp="$NCOMP"})
-declare fSF=$(sbatch --parsable --dependency=afterok:"${fSGA}" "kz_2Fit.sh" "$GALAXY" ${NCOMP:+--ncomp="$NCOMP"})
-sbatch --dependency=afterok:"${fSF}" "kz_3Rio.sh" "$GALAXY" ${NCOMP:+--ncomp="$NCOMP"}
+
+common_args=("$GALAXY")
+if [ -n "${NCOMP:-}" ]; then
+    common_args+=("--ncomp=$NCOMP")
+fi
+
+fSGA_raw=$(sbatch --parsable -M "$CLUSTER" \
+    --export=ALL,CF_CLUSTER="$CLUSTER" \
+    kz_1Gen.sh "${common_args[@]}")
+fSGA=${fSGA_raw%%;*}
+
+fSF_raw=$(sbatch --parsable -M "$CLUSTER" \
+    --export=ALL,CF_CLUSTER="$CLUSTER" \
+    --dependency=afterok:"$fSGA" \
+    kz_2Fit.sh "${common_args[@]}")
+fSF=${fSF_raw%%;*}
+
+sbatch -M "$CLUSTER" \
+    --export=ALL,CF_CLUSTER="$CLUSTER" \
+    --dependency=afterok:"$fSF" \
+    kz_3Rio.sh "${common_args[@]}"

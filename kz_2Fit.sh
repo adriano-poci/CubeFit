@@ -51,8 +51,6 @@ export HDF5_USE_FILE_LOCKING=FALSE
 # File descriptors
 ulimit -n 8192
 
-cd /data/phys-gal-dynamics/phys2603/CubeFit
-
 # sanity print (once) to confirm cpuset and BLAS threads
 srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
   python - <<'PY'
@@ -165,7 +163,8 @@ fi
 
 
 
-
 # run your job as a Slurm step (gives you the full cpuset)
+cd /data/phys-gal-dynamics/phys2603/CubeFit
+echo "Submitted cluster: ${CF_CLUSTER:-unknown}"
 srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
   python -m IPython --colors=NoColor kz_run.py -- --galaxy "$GALAXY" --run-switch fit ${NCOMP:+--ncomp="$NCOMP"}
