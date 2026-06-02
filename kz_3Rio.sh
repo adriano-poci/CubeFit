@@ -13,6 +13,7 @@
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_3Rio.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_3Rio.log" --open-mode=append
 #SBATCH -p short
+#SBATCH -M htc,arc
 
 #SBATCH --job-name="CubeFit_3Rio"
 #SBATCH --time=0-12:00

@@ -103,7 +103,7 @@ moncmapr = 'inferno_r'
 
 os.environ["FITTRACKER_START"] = "fork"
 
-CPU_PROCESSES = 6
+CPU_PROCESSES = 4
 BLAS_THREADS = 8
 
 # ------------------------------------------------------------------------------
@@ -2221,14 +2221,14 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             BIG.set_ylabel(r'$[Z/H]$', labelpad=35)
             cax = POT.attachAxis(BIG, 'right', 0.05)
             cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
-            lT = cax.text(0.5, 0.5, r'$\log_{10}($Mass Weight$)$',
+            lT = cax.text(0.5, 0.5, r'Mass',
                 va='center', ha='center', color=POT.pgreen,
                 transform=cax.transAxes, rotation=270)
             lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                 foreground='k')])
-            cax.text(0.45, 1.0-5e-3, f"{wmax:.2f}", va='top', ha='center',
+            cax.text(0.45, 1.0-5e-3, f"{wmax:.2e}", va='top', ha='center',
                 color='w', transform=cax.transAxes, rotation=270)
-            cax.text(0.45, 5e-3, f"{wmin:.2f}", va='bottom', ha='center',
+            cax.text(0.45, 5e-3, f"{wmin:.2e}", va='bottom', ha='center',
                 color='k', transform=cax.transAxes, rotation=270)
             cb.set_ticks([])
 
@@ -2236,12 +2236,12 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 f"orbitSFH_full_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
 
 
-            dbmax = np.log10(np.max((
+            dbmax = np.max((
                 np.ma.max(diskSFH[diskSFH>0]) if np.ma.any(diskSFH>0) else 1e-5,
-                np.ma.max(bulgeSFH[bulgeSFH>0]) if np.ma.any(bulgeSFH>0) else 1e-5)))
-            dbsMin = np.log10(np.min((
+                np.ma.max(bulgeSFH[bulgeSFH>0]) if np.ma.any(bulgeSFH>0) else 1e-5))
+            dbsMin = np.min((
                 np.ma.min(diskSFH[diskSFH>0]) if np.ma.any(diskSFH>0) else 1e10,
-                np.ma.min(bulgeSFH[bulgeSFH>0]) if np.ma.any(bulgeSFH>0) else 1e10)))
+                np.ma.min(bulgeSFH[bulgeSFH>0]) if np.ma.any(bulgeSFH>0) else 1e10))
             dbmin = np.max((dbsMin, -12))
             print(f"SFH plot limits: {dbmin:.2f} ({dbsMin:.2f}) to {dbmax:.2f}")
             fig = plt.figure(figsize=plt.figaspect(3./4.))
@@ -2256,7 +2256,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                         transform=ax.transAxes, rotation=0,
                         path_effects=[PathEffects.withStroke(linewidth=1.5,
                             foreground='k')])
-                cnt = ax.imshow(np.ma.log10(diskSFH[:, :, ali]).filled(dbmin),
+                cnt = ax.imshow(diskSFH[:, :, ali],
                     extent=[minT, maxT, minZ, maxZ],
                     aspect='auto', interpolation='none', origin='lower',
                     cmap=moncmapr, norm=Normalize(vmin=dbmin, vmax=dbmax))
@@ -2276,7 +2276,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                         transform=ax.transAxes,
                         path_effects=[PathEffects.withStroke(linewidth=1.5, foreground='k')])
                 ax = fig.add_subplot(gs[1, ali])
-                ax.imshow(np.ma.log10(bulgeSFH[:, :, ali]).filled(dbmin),
+                ax.imshow(bulgeSFH[:, :, ali],
                     extent=[minT, maxT, minZ, maxZ],
                     aspect='auto', interpolation='none', origin='lower',
                     cmap=moncmapr, norm=Normalize(vmin=dbmin, vmax=dbmax))
@@ -2298,14 +2298,14 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             BIG.set_ylabel(r'$[Z/H]$', labelpad=35)
             cax = POT.attachAxis(BIG, 'right', 0.05)
             cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
-            lT = cax.text(0.5, 0.5, r'$\log_{10}($Mass Weight$)$',
+            lT = cax.text(0.5, 0.5, r'Mass',
                 va='center', ha='center', color=POT.pgreen,
                 transform=cax.transAxes, rotation=270)
             lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                 foreground='k')])
-            cax.text(0.45, 1.0-5e-3, f"{dbmax:.2f}", va='top', ha='center',
+            cax.text(0.45, 1.0-5e-3, f"{dbmax:.2e}", va='top', ha='center',
                 color='w', transform=cax.transAxes, rotation=270)
-            cax.text(0.45, 5e-3, f"{dbmin:.2f}", va='bottom', ha='center',
+            cax.text(0.45, 5e-3, f"{dbmin:.2e}", va='bottom', ha='center',
                 color='k', transform=cax.transAxes, rotation=270)
             cb.set_ticks([])
 
@@ -2324,9 +2324,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
             # compute log limits across panels, ignore zeros
             vals = np.hstack([
-                np.log10(coZalpha[coZalpha>0]).ravel() if np.ma.any(coZalpha>0) else np.array([]),
-                np.log10(laZalpha[laZalpha>0]).ravel() if np.ma.any(laZalpha>0) else np.array([]),
-                np.log10(boZalpha[boZalpha>0]).ravel() if np.ma.any(boZalpha>0) else np.array([]),
+                coZalpha[coZalpha>0].ravel() if np.ma.any(coZalpha>0) else np.array([]),
+                laZalpha[laZalpha>0].ravel() if np.ma.any(laZalpha>0) else np.array([]),
+                boZalpha[boZalpha>0].ravel() if np.ma.any(boZalpha>0) else np.array([]),
             ])
             if vals.size > 0:
                 vmin2 = float(np.max((np.min(vals), -12.0)))
@@ -2340,7 +2340,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             for pi, (arr, title) in enumerate(panels):
                 ax = fig2.add_subplot(gs2[0, pi])
                 # arr shape (nMetals, nAlphas) -> transpose for imshow so y=alpha
-                im = ax.imshow(np.ma.log10(arr.T),
+                im = ax.imshow(np.ma.masked_invalid(arr.T).filled(vmin2),
                     extent=[minZ, maxZ, np.min(ualphas), np.max(ualphas)],
                     aspect='auto', origin='lower', cmap=moncmapr,
                     norm=Normalize(vmin=vmin2, vmax=vmax2))
@@ -2359,14 +2359,14 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             BIG2.set_ylabel(r'$[\alpha/Fe]$', labelpad=35)
             cax2 = POT.attachAxis(BIG2, 'right', 0.03)
             cb2 = plt.colorbar(im, cax=cax2, orientation='vertical')
-            lT2 = cax2.text(0.5, 0.5, r'$\log_{10}($Mass Weight$)$',
+            lT2 = cax2.text(0.5, 0.5, r'Mass',
                 va='center', ha='center', color=POT.pgreen,
                 transform=cax2.transAxes, rotation=270)
             lT2.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                 foreground='k')])
-            cax2.text(0.45, 1.0-1e-3, f"{vmax2:.2f}", va='top', ha='center',
+            cax2.text(0.45, 1.0-1e-3, f"{vmax2:.2e}", va='top', ha='center',
                 color='w', transform=cax2.transAxes, rotation=270)
-            cax2.text(0.45, 1e-3, f"{vmin2:.2f}", va='bottom', ha='center',
+            cax2.text(0.45, 1e-3, f"{vmin2:.2e}", va='bottom', ha='center',
                 color='k', transform=cax2.transAxes, rotation=270)
             cb2.set_ticks([])
 
@@ -2381,19 +2381,21 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         try:
             chemSFH = arSOL.sum(axis=0) # shape (nMetals, nAges, nAlphas)
 
-            vmin3 = float(np.max((np.min(np.log10(chemSFH[chemSFH>0])), -12.0)))
-            vmax3 = float(np.max(np.log10(chemSFH[chemSFH>0])))
+            vmin3 = float(np.max((np.min(chemSFH[chemSFH>0]), -12.0)))
+            vmax3 = float(np.max(chemSFH[chemSFH>0]))
 
             fig3 = plt.figure(figsize=plt.figaspect(3.)*0.75)
             gs3 = gridspec.GridSpec(3, 1, wspace=0.0, hspace=0.0)
-            cuts = [(uages < 6.0), (uages < 14.0), (uages >= 10.0)]
-            labels = ['Age < 6 Gyr', 'Age < 14 Gyr', 'Age ≥ 10 Gyr']
+            print(uages)
+            cuts = [(uages < 6.0), (uages >= 10.0), (uages <= 14.0)]
+            labels = ['Age < 6 Gyr', 'Age ≥ 10 Gyr', 'Age < 14 Gyr']
             for pi, mask in enumerate(cuts):
                 ax = fig3.add_subplot(gs3[pi, 0])
                 # arr shape (nMetals, nAlphas) -> transpose for imshow so y=alpha
-                im = ax.imshow(np.ma.log10(np.compress(mask, chemSFH,
-                    axis=1).sum(axis=1).T), extent=[minZ, maxZ, np.min(ualphas),
-                    np.max(ualphas)], aspect='auto', origin='lower',
+                im = ax.imshow(np.compress(mask, chemSFH,
+                    axis=1).sum(axis=1).T,
+                    extent=[minZ, maxZ, np.min(ualphas), np.max(ualphas)],
+                    aspect='auto', origin='lower',
                     cmap=moncmapr, norm=Normalize(vmin=vmin3, vmax=vmax3))
                 lT = ax.text(1e-2, 1e-2, labels[pi], va='bottom', ha='left',
                     color=POT.pgreen, transform=ax.transAxes)
@@ -2410,14 +2412,14 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             BIG3.set_ylabel(r'$[\alpha/Fe]$', labelpad=35)
             cax3 = POT.attachAxis(BIG3, 'right', 0.1)
             cb3 = plt.colorbar(im, cax=cax3, orientation='vertical')
-            lT3 = cax3.text(0.5, 0.5, r'$\log_{10}($Mass Weight$)$',
+            lT3 = cax3.text(0.5, 0.5, r'Mass',
                 va='center', ha='center', color=POT.pgreen,
                 transform=cax3.transAxes, rotation=270)
             lT3.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                 foreground='k')])
-            cax3.text(0.45, 1.0-1e-3, f"{vmax3:.2f}", va='top', ha='center',
+            cax3.text(0.45, 1.0-1e-3, f"{vmax3:.2e}", va='top', ha='center',
                 color='w', transform=cax3.transAxes, rotation=270)
-            cax3.text(0.45, 1e-3, f"{vmin3:.2f}", va='bottom', ha='center',
+            cax3.text(0.45, 1e-3, f"{vmin3:.2e}", va='bottom', ha='center',
                 color='k', transform=cax3.transAxes, rotation=270)
             cb3.set_ticks([])
 
