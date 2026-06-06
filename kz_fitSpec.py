@@ -103,7 +103,7 @@ moncmapr = 'inferno_r'
 
 os.environ["FITTRACKER_START"] = "fork"
 
-CPU_PROCESSES = 4
+CPU_PROCESSES = 6
 BLAS_THREADS = 8
 
 # ------------------------------------------------------------------------------
@@ -1788,7 +1788,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     rdcc_slots=1_000_003,
                     rdcc_bytes=8 * 1024**2,
                     rdcc_w0=0.90,
-                    n_workers=builtins.min(CPU_PROCESSES, nTiles, 12),
+                    n_workers=builtins.min(CPU_PROCESSES, nTiles, 4),
                     blas_threads_per_worker=BLAS_THREADS // max(1, CPU_PROCESSES)
                 )
         except Exception as e:
