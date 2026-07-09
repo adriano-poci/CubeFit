@@ -60,7 +60,7 @@ logger = get_logger(lfn, mode='w')
 logger.log(f"[CubeFit] CubeFit logger initialised to {logger.logfile}",
     flush=True)
 
-import os, pdb, math, ctypes, sys, builtins
+import os, pdb, math, ctypes, sys, builtins, traceback
 import numpy as np
 import hashlib
 from tqdm.auto import tqdm
@@ -154,6 +154,26 @@ def _worker_compute_tile(h5_path, s0, s1, x_cp64):
             xblk = x_cp64[:, p0:p1] # (C,Pb) f64
             Y   += np.tensordot(A64, xblk, axes=([1, 2], [0, 1])) # (dS,L)
     return s0, Y
+
+#------------------------------------------------------------------------------
+
+def _MWProp(prop, aperMass):
+    """
+    This function computes a mass-weighted map of the given property
+    Args
+    ----
+        prop (arr:float): the property to be mass-weighted, of shape `(nComp,)`
+        aperMass (arr:float): an array of the aperture masses from the
+            Schwarzschild model, of shape `(nSpat, nComp)`
+    Returns
+    -------
+        mwP (arr:float): an array of the mass-weighting per component, as well
+            as the total mass-weighted value, of shape `(nSpat, nComp+1)`
+    """
+
+    mwP = np.ma.sum((aperMass/np.ma.sum(aperMass, axis=1)[:, np.newaxis])*\
+        prop[np.newaxis, :], axis=1)
+    return mwP
 
 # ------------------------------------------------------------------------------
 
@@ -1461,8 +1481,8 @@ def _init_worker(blas_threads: int):
 def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     full=False, slope=1.30, IMF='KB', iso='pad', weighting='luminosity',
     lOrder=4, rescale=False, specRange=None, lsf=False, band='r', smask=None,
-    method='fsf', varIMF=False, source='ppxf', pplots=['sfh', 'spec', 'mw'],
-    redraw=False, **kwargs):
+    method='fsf', varIMF=False, source='ppxf', redraw=False,
+    pplots=['sfh', 'spec', 'mw', 'proj'], **kwargs):
     """
     Load the CubeFit data for a given galaxy and model path.
     """
@@ -1933,6 +1953,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     plt.close(fig)
 
 
+
     if 'mw' in pplots:
 
         fmin, fmax = np.log10(np.min(data_sb)), np.log10(np.max(data_sb))
@@ -2129,6 +2150,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 laSFH = arSOL[latube, :, :, :].sum(axis=0)
             if boxess.sum() > 0:
                 boSFH = arSOL[boxess, :, :, :].sum(axis=0)
+            diskSFH = np.full_like(coSFH, 0.0)
+            bulgeSFH = np.full_like(coSFH, 0.0)
             if not isinstance(diskComps, type(None)) and diskComps.size > 0:
                 diskSFH = arSOL[diskComps, :, :, :].sum(axis=0)
             if not isinstance(bulgeComps, type(None)) and bulgeComps.size > 0:
@@ -2236,81 +2259,82 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 f"orbitSFH_full_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
 
 
-            dbmax = np.max((
-                np.ma.max(diskSFH[diskSFH>0]) if np.ma.any(diskSFH>0) else 1e-5,
-                np.ma.max(bulgeSFH[bulgeSFH>0]) if np.ma.any(bulgeSFH>0) else 1e-5))
-            dbsMin = np.min((
-                np.ma.min(diskSFH[diskSFH>0]) if np.ma.any(diskSFH>0) else 1e10,
-                np.ma.min(bulgeSFH[bulgeSFH>0]) if np.ma.any(bulgeSFH>0) else 1e10))
-            dbmin = np.max((dbsMin, -12))
-            print(f"SFH plot limits: {dbmin:.2f} ({dbsMin:.2f}) to {dbmax:.2f}")
-            fig = plt.figure(figsize=plt.figaspect(3./4.))
-            gs = gridspec.GridSpec(2, nAlphas, hspace=0., wspace=0.)
-            # one column per alpha, 3 orbit types
-            print(nAlphas, ualphas)
-            for ali in range(nAlphas):
-                ax = fig.add_subplot(gs[0, ali])
-                if nAlphas > 1 and ax.get_subplotspec().is_first_col() and \
-                    ax.get_subplotspec().is_first_row():
-                    ax.text(1e-2, 1.05, r'$[\alpha/Fe]=$', va='bottom', ha='right', color=POT.pgreen,
-                        transform=ax.transAxes, rotation=0,
-                        path_effects=[PathEffects.withStroke(linewidth=1.5,
+            if (np.ma.any(diskSFH>0) or np.ma.any(bulgeSFH>0)):
+                dbmax = np.max((
+                    np.ma.max(diskSFH[diskSFH>0]) if np.ma.any(diskSFH>0) else 1e-5,
+                    np.ma.max(bulgeSFH[bulgeSFH>0]) if np.ma.any(bulgeSFH>0) else 1e-5))
+                dbsMin = np.min((
+                    np.ma.min(diskSFH[diskSFH>0]) if np.ma.any(diskSFH>0) else 1e10,
+                    np.ma.min(bulgeSFH[bulgeSFH>0]) if np.ma.any(bulgeSFH>0) else 1e10))
+                dbmin = np.max((dbsMin, -12))
+                print(f"SFH plot limits: {dbmin:.2f} ({dbsMin:.2f}) to {dbmax:.2f}")
+                fig = plt.figure(figsize=plt.figaspect(3./4.))
+                gs = gridspec.GridSpec(2, nAlphas, hspace=0., wspace=0.)
+                # one column per alpha, 3 orbit types
+                print(nAlphas, ualphas)
+                for ali in range(nAlphas):
+                    ax = fig.add_subplot(gs[0, ali])
+                    if nAlphas > 1 and ax.get_subplotspec().is_first_col() and \
+                        ax.get_subplotspec().is_first_row():
+                        ax.text(1e-2, 1.05, r'$[\alpha/Fe]=$', va='bottom', ha='right', color=POT.pgreen,
+                            transform=ax.transAxes, rotation=0,
+                            path_effects=[PathEffects.withStroke(linewidth=1.5,
+                                foreground='k')])
+                    cnt = ax.imshow(diskSFH[:, :, ali],
+                        extent=[minT, maxT, minZ, maxZ],
+                        aspect='auto', interpolation='none', origin='lower',
+                        cmap=moncmapr, norm=Normalize(vmin=dbmin, vmax=dbmax))
+                    if not ax.get_subplotspec().is_last_row():
+                        ax.set_xticklabels([])
+                    if not ax.get_subplotspec().is_first_col():
+                        ax.set_yticklabels([])
+                    if ax.get_subplotspec().is_first_col():
+                        lT = ax.text(1e-2, 1.0-1e-2, r'Disk', va='top',
+                            ha='left', color=POT.pgreen, transform=ax.transAxes)
+                        lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                             foreground='k')])
-                cnt = ax.imshow(diskSFH[:, :, ali],
-                    extent=[minT, maxT, minZ, maxZ],
-                    aspect='auto', interpolation='none', origin='lower',
-                    cmap=moncmapr, norm=Normalize(vmin=dbmin, vmax=dbmax))
-                if not ax.get_subplotspec().is_last_row():
-                    ax.set_xticklabels([])
-                if not ax.get_subplotspec().is_first_col():
-                    ax.set_yticklabels([])
-                if ax.get_subplotspec().is_first_col():
-                    lT = ax.text(1e-2, 1.0-1e-2, r'Disk', va='top',
-                        ha='left', color=POT.pgreen, transform=ax.transAxes)
-                    lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
-                        foreground='k')])
-                if nAlphas > 1:
-                    lT = ax.text(0.5, 1.05,
-                        rf"${ualphas[ali]:.2f}$",
-                        va='bottom', ha='center', color=POT.pgreen,
-                        transform=ax.transAxes,
-                        path_effects=[PathEffects.withStroke(linewidth=1.5, foreground='k')])
-                ax = fig.add_subplot(gs[1, ali])
-                ax.imshow(bulgeSFH[:, :, ali],
-                    extent=[minT, maxT, minZ, maxZ],
-                    aspect='auto', interpolation='none', origin='lower',
-                    cmap=moncmapr, norm=Normalize(vmin=dbmin, vmax=dbmax))
-                if not ax.get_subplotspec().is_last_row():
-                    ax.set_xticklabels([])
-                if not ax.get_subplotspec().is_first_col():
-                    ax.set_yticklabels([])
-                if ax.get_subplotspec().is_first_col():
-                    lT = ax.text(1e-2, 1.0-1e-2, r'Bulge', va='top', ha='left',
-                        color=POT.pgreen, transform=ax.transAxes)
-                    lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
-                        foreground='k')])
+                    if nAlphas > 1:
+                        lT = ax.text(0.5, 1.05,
+                            rf"${ualphas[ali]:.2f}$",
+                            va='bottom', ha='center', color=POT.pgreen,
+                            transform=ax.transAxes,
+                            path_effects=[PathEffects.withStroke(linewidth=1.5, foreground='k')])
+                    ax = fig.add_subplot(gs[1, ali])
+                    ax.imshow(bulgeSFH[:, :, ali],
+                        extent=[minT, maxT, minZ, maxZ],
+                        aspect='auto', interpolation='none', origin='lower',
+                        cmap=moncmapr, norm=Normalize(vmin=dbmin, vmax=dbmax))
+                    if not ax.get_subplotspec().is_last_row():
+                        ax.set_xticklabels([])
+                    if not ax.get_subplotspec().is_first_col():
+                        ax.set_yticklabels([])
+                    if ax.get_subplotspec().is_first_col():
+                        lT = ax.text(1e-2, 1.0-1e-2, r'Bulge', va='top', ha='left',
+                            color=POT.pgreen, transform=ax.transAxes)
+                        lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                            foreground='k')])
 
-            BIG = fig.add_subplot(gs[:])
-            BIG.set_frame_on(False)
-            BIG.set_xticks([])
-            BIG.set_yticks([])
-            BIG.set_xlabel(r'$t\ [{\rm Gyr}]$', labelpad=20)
-            BIG.set_ylabel(r'$[Z/H]$', labelpad=35)
-            cax = POT.attachAxis(BIG, 'right', 0.05)
-            cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
-            lT = cax.text(0.5, 0.5, r'Mass',
-                va='center', ha='center', color=POT.pgreen,
-                transform=cax.transAxes, rotation=270)
-            lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
-                foreground='k')])
-            cax.text(0.45, 1.0-5e-3, f"{dbmax:.2e}", va='top', ha='center',
-                color='w', transform=cax.transAxes, rotation=270)
-            cax.text(0.45, 5e-3, f"{dbmin:.2e}", va='bottom', ha='center',
-                color='k', transform=cax.transAxes, rotation=270)
-            cb.set_ticks([])
+                BIG = fig.add_subplot(gs[:])
+                BIG.set_frame_on(False)
+                BIG.set_xticks([])
+                BIG.set_yticks([])
+                BIG.set_xlabel(r'$t\ [{\rm Gyr}]$', labelpad=20)
+                BIG.set_ylabel(r'$[Z/H]$', labelpad=35)
+                cax = POT.attachAxis(BIG, 'right', 0.05)
+                cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
+                lT = cax.text(0.5, 0.5, r'Mass',
+                    va='center', ha='center', color=POT.pgreen,
+                    transform=cax.transAxes, rotation=270)
+                lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                    foreground='k')])
+                cax.text(0.45, 1.0-5e-3, f"{dbmax:.2e}", va='top', ha='center',
+                    color='w', transform=cax.transAxes, rotation=270)
+                cax.text(0.45, 5e-3, f"{dbmin:.2e}", va='bottom', ha='center',
+                    color='k', transform=cax.transAxes, rotation=270)
+                cb.set_ticks([])
 
-            plt.savefig(figDir/\
-                f"orbitSFH_diskbulge_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+                plt.savefig(figDir/\
+                    f"orbitSFH_diskbulge_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
                 
         except AssertionError as e:
             print(f"Could not make orbital SFH plot: {e}")
@@ -2429,6 +2453,91 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         except Exception as e:
             print(f"Could not make Z-alpha plot: {e}")
             pass
+    
+    if 'proj' in pplots:
+        logger.log("Generating projected maps...")
+        with logger.capture_all_output():
+            try:
+                saSOL = arSOL[satube, :, :, :]
+                laSOL = arSOL[latube, :, :, :]
+                boSOL = arSOL[boxess, :, :, :]
+
+                saAge = np.nansum(np.nansum(saSOL, axis=(1,3))*\
+                    uages[np.newaxis, :] / np.nansum(saSOL, axis=(1,2,3))[:, np.newaxis],
+                    axis=1)
+                laAge = np.nansum(np.nansum(laSOL, axis=(1,3))*\
+                    uages[np.newaxis, :] / np.nansum(laSOL, axis=(1,2,3))[:, np.newaxis],
+                    axis=1)
+                boAge = np.nansum(np.nansum(boSOL, axis=(1,3))*uages[np.newaxis, :] / np.nansum(boSOL, axis=(1,2,3))[:, np.newaxis], axis=1)
+
+                saMetal = np.nansum(np.nansum(saSOL, axis=(2,3))*\
+                    umetals[np.newaxis, :] / np.nansum(saSOL, axis=(1,2,3))[:, np.newaxis],
+                    axis=1)
+                laMetal = np.nansum(np.nansum(laSOL, axis=(2,3))*\
+                    umetals[np.newaxis, :] / np.nansum(laSOL, axis=(1,2,3))[:, np.newaxis],
+                    axis=1)
+                boMetal = np.nansum(np.nansum(boSOL, axis=(2,3))*\
+                    umetals[np.newaxis, :] / np.nansum(boSOL, axis=(1,2,3))[:, np.newaxis],
+                    axis=1)
+
+                saAlpha = np.nansum(np.nansum(saSOL, axis=(1,2))*\
+                    ualphas[np.newaxis, :] / np.nansum(saSOL, axis=(1,2,3))[:, np.newaxis],
+                    axis=1)
+                laAlpha = np.nansum(np.nansum(laSOL, axis=(1,2))*\
+                    ualphas[np.newaxis, :] / np.nansum(laSOL, axis=(1,2,3))[:, np.newaxis],
+                    axis=1)
+                boAlpha = np.nansum(np.nansum(boSOL, axis=(1,2))*\
+                    ualphas[np.newaxis, :] / np.nansum(boSOL, axis=(1,2,3))[:, np.newaxis],
+                    axis=1)
+
+                maps = dict(age=dict(sa=_MWProp(saAge, np.compress(satube, aperMass, axis=1)),
+                    la=_MWProp(laAge, np.compress(latube, aperMass, axis=1)),
+                    bo=_MWProp(boAge, np.compress(boxess, aperMass, axis=1))),
+                    metal=dict(sa=_MWProp(saMetal, np.compress(satube, aperMass, axis=1)),
+                    la=_MWProp(laMetal, np.compress(latube, aperMass, axis=1)),
+                    bo=_MWProp(boMetal, np.compress(boxess, aperMass, axis=1))),
+                    alpha=dict(sa=_MWProp(saAlpha, np.compress(satube, aperMass, axis=1)),
+                    la=_MWProp(laAlpha, np.compress(latube, aperMass, axis=1)),
+                    bo=_MWProp(boAlpha, np.compress(boxess, aperMass, axis=1))),)
+                
+                amin = np.min([np.nanmin(maps['age'][otype]) for otype in maps['age'].keys()])
+                amax = np.max([np.nanmax(maps['age'][otype]) for otype in maps['age'].keys()])
+                mmin = np.min([np.nanmin(maps['metal'][otype]) for otype in maps['metal'].keys()])
+                mmax = np.max([np.nanmax(maps['metal'][otype]) for otype in maps['metal'].keys()])
+                lmin = np.min([np.nanmin(maps['alpha'][otype]) for otype in maps['alpha'].keys()])
+                lmax = np.max([np.nanmax(maps['alpha'][otype]) for otype in maps['alpha'].keys()])
+                print(f"Age map limits: {amin:.2f} to {amax:.2f}")
+                print(f"Metal map limits: {mmin:.2f} to {mmax:.2f}")
+                print(f"Alpha map limits: {lmin:.2f} to {lmax:.2f}")
+
+                fig = plt.figure(figsize=plt.figaspect(3./4.)*0.75)
+                gs = gridspec.GridSpec(3, 3, hspace=0., wspace=0.)
+                for pi, prop in enumerate(['age', 'metal', 'alpha']):
+                    for oi, otype in enumerate(['sa', 'la', 'bo']):
+                        ax = fig.add_subplot(gs[oi, pi])
+                        arr = maps[prop][otype]
+                        arr = np.ma.masked_invalid(arr)[binNum]
+                        dbi(xpix, ypix, arr, pixelsize=pixs, angle=PA,
+                            cmap=moncmapr,
+                            # vmin={'age':amin, 'metal':mmin, 'alpha':lmin}[prop],
+                            # vmax={'age':amax, 'metal':mmax, 'alpha':lmax}[prop]
+                        )
+                        ax.text(1e-2, 1-1e-2, rf"{np.nanmin(arr):.2f}/{np.nanmax(arr):.2f}",
+                            va='top', ha='left', color=POT.pgreen, transform=ax.transAxes, path_effects=[PathEffects.withStroke(linewidth=1.5, foreground='k')])
+                        if not ax.get_subplotspec().is_last_row():
+                            ax.set_xticklabels([])
+                        if not ax.get_subplotspec().is_first_col():
+                            ax.set_yticklabels([])
+                        lT = ax.text(1e-2, 1e-2, f"{prop} {otype}", va='bottom', ha='left',
+                            color=POT.pgreen, transform=ax.transAxes)
+                        lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                            foreground='k')])
+                fig.savefig(figDir/\
+                    f"orbitMaps_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+            except Exception as e:
+                print(f"Could not make projection plots: {e}")
+                traceback.print_exc()
+                pass
 
 # ------------------------------------------------------------------------------
 
