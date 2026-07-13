@@ -76,11 +76,17 @@ v1.12:  Updated `_worker_ATAz` and `_worker_reduced` to not stream full tiles fo
             memory efficiency. Instead, read orbit-by-orbit and use tensor
             contractions to compute the same quantities with much lower peak
             memory. 7 May 2026
+v1.13:  Added periodic restart checkpoints to `streamActiveSetNNLS`;
+            checkpoint the committed `x` vector and minimal solver state at a
+            configurable iteration interval, with a forced final flush on exit,
+            so truncated or cancelled runs can resume from the latest saved
+            state. 13 July 2026 
 """
 
 from __future__ import annotations, print_function
 
 import os, sys, traceback
+import signal
 import math, builtins
 import time
 from tqdm.auto import tqdm
@@ -1085,6 +1091,8 @@ def streamActiveSetNNLS(
     max_active: int = 1000,
     tol_grad: float = 1e-8,
     max_iter: int = 5000,
+    checkpoint_cb=None,
+    checkpoint_every: int = 0,
 ):
     """
     TRUE MONOLITHIC streaming active-set NNLS.
@@ -1257,6 +1265,42 @@ def streamActiveSetNNLS(
     def _current_x_from_z(z_vec: np.ndarray) -> np.ndarray:
         return S_flat * z_vec
 
+    checkpoint_error_logged = False
+
+    def _log_checkpoint_error(where: str, exc: Exception) -> None:
+        nonlocal checkpoint_error_logged
+        if not checkpoint_error_logged:
+            print(f"[MONO][checkpoint] {where}: {exc}", flush=True)
+            checkpoint_error_logged = True
+
+    def _emit_checkpoint(
+        it: int,
+        *,
+        final: bool = False,
+        phase: str = "solve",
+    ) -> None:
+        if checkpoint_cb is None:
+            return
+
+        every = int(checkpoint_every)
+        if (not final) and (every > 0) and ((it + 1) % every != 0):
+            return
+
+        try:
+            checkpoint_cb(
+                _current_x_from_z(z),
+                {
+                    "iter": int(it + 1),
+                    "max_iter": int(max_iter),
+                    "phase": str(phase),
+                    "final": bool(final),
+                    "active": int(np.count_nonzero(active)),
+                    "stall_count": int(no_progress_count),
+                },
+            )
+        except Exception as exc:
+            _log_checkpoint_error("checkpoint callback failed", exc)
+
     def _orbit_mass_and_deficit(z_vec: np.ndarray):
         """
         Compute current per-orbit masses and deficits relative to alpha_ref*w_target.
@@ -1357,11 +1401,13 @@ def streamActiveSetNNLS(
 
         not_active = np.where(~active)[0]
         if not_active.size == 0:
+            _emit_checkpoint(it, final=True, phase="no_active_exit")
             break
 
         gvals_data = grad_data[not_active]
         gvals_promo = grad_promo[not_active]
         if gvals_data.size == 0:
+            _emit_checkpoint(it, final=True, phase="no_gradient_exit")
             break
 
         max_grad_all = float(np.max(grad_data)) if grad_data.size else 0.0
@@ -1504,7 +1550,9 @@ def streamActiveSetNNLS(
                 did_explore = True
             else:
                 if _watch_progress():
+                    _emit_checkpoint(it, final=True, phase="stall_exit")
                     break
+                _emit_checkpoint(it, final=True, phase="no_promotable_exit")
                 break
 
         # ------------------------------------------------------------
@@ -1548,6 +1596,7 @@ def streamActiveSetNNLS(
 
                     if cols_to_activate.size == 0:
                         if _watch_progress():
+                            _emit_checkpoint(it, final=True, phase="stall_exit")
                             break
                         continue
 
@@ -1561,6 +1610,7 @@ def streamActiveSetNNLS(
                     did_explore = True
                 else:
                     if _watch_progress():
+                        _emit_checkpoint(it, final=True, phase="stall_exit")
                         break
                     break
             else:
@@ -1649,6 +1699,7 @@ def streamActiveSetNNLS(
                 active[newly_activated] = False
             if _watch_progress():
                 break
+            _emit_checkpoint(it, final=True, phase="max_active_exit")
             break
 
         # --------------------------------------------------------
@@ -1703,6 +1754,7 @@ def streamActiveSetNNLS(
         if k == 0:
             if _watch_progress():
                 break
+            _emit_checkpoint(it, final=True, phase="k_zero_exit")
             continue
 
         orbit_occ_counts = np.bincount(
@@ -2021,6 +2073,7 @@ def streamActiveSetNNLS(
 
             if _watch_progress():
                 break
+            _emit_checkpoint(it, final=True, phase="reject_exit")
             continue
 
         # Commit solution on the active subspace
@@ -2059,6 +2112,7 @@ def streamActiveSetNNLS(
 
                 if _watch_progress():
                     break
+                _emit_checkpoint(it, final=True, phase="rollback_exit")
                 continue
 
         # --------------------------------------------------------
@@ -2111,9 +2165,20 @@ def streamActiveSetNNLS(
             )
 
         # Finalize progress watchdog on the committed state.
-        if _watch_progress():
+        stalled = _watch_progress()
+
+        if stalled:
+            _emit_checkpoint(it, final=True, phase="stall_exit")
             break
 
+        _emit_checkpoint(it, final=False)
+
+    try:
+        final_it = int(it)
+    except Exception:
+        final_it = 0
+
+    _emit_checkpoint(final_it, final=True, phase="complete")
     return S_flat * z
 
 # ------------------------------------------------------------------------------
@@ -2569,6 +2634,80 @@ def solve_streaming_nnls(
         ATy_sub_local = A2_small.T @ Yt.reshape(-1)
         print(f"[DIAG] ATA_sub_local shape, ATy_sub_local[0:6]: {ATA_sub_local.shape} {ATy_sub_local[:6]}", flush=True)
 
+        checkpoint_every = int(
+            os.environ.get("CUBEFIT_SOLVER_CHECKPOINT_EVERY", "50")
+        )
+
+        latest_ckpt = {
+            "x": np.asarray(x, dtype=np.float64).ravel(order="C").copy(),
+            "stats": {
+                "iter": 0,
+                "max_iter": 0,
+                "phase": "init",
+                "final": False,
+                "active": int(np.count_nonzero(x > 0.0)),
+                "stall_count": 0,
+            },
+        }
+
+        checkpoint_error_logged = False
+
+        def _checkpoint_cb(x_vec: np.ndarray, stats: dict) -> None:
+            nonlocal checkpoint_error_logged
+
+            latest_ckpt["x"] = np.asarray(
+                x_vec, dtype=np.float64
+            ).ravel(order="C").copy()
+            latest_ckpt["stats"] = dict(stats)
+
+            if tracker is None:
+                return
+
+            try:
+                tracker.maybe_snapshot_x(
+                    latest_ckpt["x"],
+                    epoch=int(stats.get("iter", -1)),
+                    rmse=None,
+                    force=True,
+                )
+            except Exception as exc:
+                if not checkpoint_error_logged:
+                    print(
+                        f"[MONO][checkpoint] maybe_snapshot_x failed: {exc}",
+                        flush=True,
+                    )
+                    checkpoint_error_logged = True
+                return
+
+            save_state = getattr(tracker, "save_state", None)
+            if callable(save_state):
+                try:
+                    save_state(
+                        {
+                            "iter": int(stats.get("iter", -1)),
+                            "max_iter": int(stats.get("max_iter", -1)),
+                            "phase": str(stats.get("phase", "solve")),
+                            "final": bool(stats.get("final", False)),
+                            "active": int(stats.get("active", -1)),
+                            "stall_count": int(stats.get("stall_count", -1)),
+                        },
+                    )
+                except Exception as exc:
+                    if not checkpoint_error_logged:
+                        print(
+                            f"[MONO][checkpoint] save_state failed: {exc}",
+                            flush=True,
+                        )
+                        checkpoint_error_logged = True
+            else:
+                if not checkpoint_error_logged:
+                    print(
+                        "[MONO][checkpoint] tracker has no save_state(); "
+                        "x snapshots will still be written",
+                        flush=True,
+                    )
+                    checkpoint_error_logged = True
+
         try:
             x_flat_unscaled = streamActiveSetNNLS(
                 h5_path=h5_path,
@@ -2586,6 +2725,8 @@ def solve_streaming_nnls(
                 max_active=monolithic_max_active,
                 tol_grad=1e-8,
                 max_iter=5 * monolithic_max_active,
+                checkpoint_cb=_checkpoint_cb,
+                checkpoint_every=checkpoint_every,
             )
 
             x = x_flat_unscaled.reshape(C, P).copy()
@@ -2764,6 +2905,19 @@ def solve_streaming_nnls(
         rmse_proxy_best=float(best_proxy),
         known_zero_mask=known_zero.copy(),
     )
+
+    if tracker is not None:
+        try:
+            tracker.save_state({
+                "iter": int(stats.get("epochs", -1)),
+                "phase": "final",
+                "final": True,
+                "best_proxy": float(stats.get("rmse_proxy_best", np.nan)),
+            }, block=True)
+            tracker.maybe_save(best_x, stats, block=True)
+        except Exception:
+            pass
+
     return best_x, stats
 
 # ------------------------------------------------------------------------------

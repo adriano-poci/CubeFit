@@ -23,6 +23,7 @@ r"""
 History
 -------
 v1.0:   Added `maybe_snapshot_x` to `NullTracker` for consistency. 1 January 2026
+v1.1:   Added `save_state` to `*Tracker` classes. 1 January 2026
 """
 
 from __future__ import annotations
@@ -146,7 +147,14 @@ def _writer_main(h5_path: str, cfg: TrackerConfig, rx: MPQueue) -> None:
             except Exception as e:
                 logger.log("[FitTracker] x_best update failed:")
                 logger.log_exc(e)
-        # ---------- helpers for x snapshots ----------
+        def _save_state(state: dict) -> None:
+            """Persist a small restart marker in the sidecar."""
+            try:
+                gfit.attrs["solver_state_json"] = json.dumps(state, sort_keys=True)
+                gfit.attrs["solver_state_ts"] = float(time.time())
+            except Exception as e:
+                logger.log("[FitTracker] solver state update failed:")
+                logger.log_exc(e)
         def _ensure_x_ds(N: int) -> None:
             """Create ring + last datasets if absent, sized by N."""
             if N <= 0:
@@ -242,6 +250,18 @@ def _writer_main(h5_path: str, cfg: TrackerConfig, rx: MPQueue) -> None:
                         msg.get("epoch"),
                         msg.get("rmse"),
                     )
+                    pending += 1
+
+                elif op == "x_snapshot":
+                    _append_x(
+                        np.asarray(msg["x"], np.float32),
+                        msg.get("epoch"),
+                        msg.get("rmse"),
+                    )
+                    pending += 1
+
+                elif op == "save_state":
+                    _save_state(dict(msg.get("state", {})))
                     pending += 1
 
                 # batch/interval flush
@@ -397,6 +417,13 @@ class FitTracker:
             "rmse": float(rmse) if (rmse is not None and np.isfinite(rmse)) else None},
             block=False)
 
+    def save_state(self, state: dict, *, block: bool = False) -> bool:
+        """Persist a small JSON-serialisable solver state marker."""
+        try:
+            payload = dict(state)
+        except Exception:
+            payload = {}
+        return self._try_put({"op": "save_state", "state": payload}, block=block)
 
     def close(self, timeout: float = 2.0) -> None:
         # send a real sentinel the writer understands
@@ -442,4 +469,5 @@ class NullTracker:
     def on_epoch_end(self, *a, **k): pass
     def maybe_save(self, *a, **k): pass
     def maybe_snapshot_x(self, *a, **k): pass
+    def save_state(self, *a, **k): pass
     def close(self, *a, **k): pass

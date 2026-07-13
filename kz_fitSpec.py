@@ -645,6 +645,37 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
+    xPath = hdf5Dir/hdf5Path.name.replace('hypercube', 'x')
+    logger.log("[Pipeline] Writing final /X_global to ...")
+    with open_h5(xPath, role="writer") as f_wr:
+
+        assert x_global.ndim == 2, "Xcp must be (C, P) before writing /X_global"
+
+        if "/X_global" in f_wr:
+            del f_wr["/X_global"]
+
+        f_wr.create_dataset(
+            "/X_global",
+            data=x_global.astype(np.float64),
+            compression="gzip",
+            compression_opts=4,
+        )
+
+        f_wr["/X_global"].attrs["layout"] = "C_P"
+        f_wr["/X_global"].attrs["P"] = x_global.shape[1]
+
+        if "known_zero_mask" in stats:
+            print("[pipeline] writing KNOWN_ZERO mask to /HyperCube/known_zero_mask",
+                flush=True)
+            grp = f_wr.require_group("/HyperCube")
+            if "known_zero_mask" in grp:
+                del grp["known_zero_mask"]
+            grp.create_dataset(
+                "known_zero_mask",
+                data=stats["known_zero_mask"].astype(bool),
+                dtype="bool",
+            )
+
     logger.log("[CubeFit] Global fit completed.")
 
 # ------------------------------------------------------------------------------
