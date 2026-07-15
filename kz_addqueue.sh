@@ -18,5 +18,5 @@ printf "Running ${nCPU} cores on ${QUEUE},\n using ${memPerCPU} GB per core.\n\n
 
 addqueue --sbatch --requeue --serial -n "${nCPU}" -q "${QUEUE}" \
     -m "${memPerCPU}" -c "genAper_${galax}" -g "CubeFit${galax}" \
-    -o "${curdir}/log.log" "${curdir}/kz_rio.sh"
-    # -o "${curdir}/log.log" "${curdir}/kz_run.sh"
+    -o "${curdir}/log.log" "${curdir}/kz_run.sh"
+    # 64-o "${curdir}/log.log" "${curdir}/kz_rio.sh"

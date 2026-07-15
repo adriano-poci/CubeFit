@@ -519,6 +519,10 @@ def preflight_hypercube_convolution(
     >>> res["all_pass"]
     True
     """
+    try:
+        trapezoid = np.trapezoid
+    except AttributeError:
+        trapezoid = np.trapz
     with open_h5(h5_path, role="reader") as f:
         if "/Templates" not in f or "/TemPix" not in f:
             raise RuntimeError("Missing /Templates or /TemPix.")
@@ -600,9 +604,9 @@ def preflight_hypercube_convolution(
             if verbose:
                 # expected pixel shift from LOSVD first moment
                 Hpos = np.maximum(Hk, 0.0)
-                denom = float(np.trapezoid(Hpos, VelPix))
+                denom = float(trapezoid(Hpos, VelPix))
                 if denom > 0.0:
-                    mu_v = float(np.trapezoid(Hpos * VelPix, VelPix) / denom)
+                    mu_v = float(trapezoid(Hpos * VelPix, VelPix) / denom)
                     exp_px = float(np.log1p(mu_v / 299792.458) / km.dlog)
                 else:
                     exp_px = 0.0
@@ -691,6 +695,10 @@ def estimate_global_velocity_bias_prebuild(h5_path: str,
           "quality": "ok" | "warn",
         }
     """
+    try:
+        trapezoid = np.trapezoid
+    except AttributeError:
+        trapezoid = np.trapz
     # ---------- read static arrays into RAM ----------
     with open_h5(h5_path, role="reader") as f:
         Templates = np.asarray(f["/Templates"][...], dtype=np.float64, order="C")
@@ -728,7 +736,7 @@ def estimate_global_velocity_bias_prebuild(h5_path: str,
     Tbar = np.mean(Templates, axis=0).astype(np.float64, copy=False)
 
     if amp_mode == "trapz":
-        dH = np.trapezoid(LOSVD, VelPix, axis=1)   # (S, C)
+        dH = trapezoid(LOSVD, VelPix, axis=1)   # (S, C)
     else:
         dH = np.sum(LOSVD, axis=1)             # (S, C)
 
