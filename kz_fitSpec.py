@@ -1889,6 +1889,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     compVel = np.ma.ones((nComp, nSRad), dtype=float)*np.nan
     for nc in range(nComp):
         cnData = np.take(intData, nc, axis=1).reshape(18, -1)
+        print(orbSOL.shape)
+        print(cnData.shape)
         drad, svR, svRe, dweights, dcirc = Cgh.broadBetaCompsCyl(cnData,
             np.append(cRadius, 1e15), 'z', -np.inf, 0.0)
         _drad, vMean, vErr, _dweights, _dcirc = Cgh.broadVelCompsSph(cnData,
