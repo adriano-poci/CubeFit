@@ -2889,7 +2889,7 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     zIdx = np.asarray([np.argmin(np.abs(umetals-xc)) for xc in
         [-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26, 0.4]])
         # [-1.0, -0.6, 0.0, 0.15, 0.26, 0.4]])
-    zIdx = np.arange(umetals.size) # use all metallicities
+    # zIdx = np.arange(umetals.size) # use all metallicities
     if not isinstance(talphas, type(None)):
         talphas = talphas[selIso]
         ualphas = np.unique(talphas)
