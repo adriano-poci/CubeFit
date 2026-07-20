@@ -2056,10 +2056,28 @@ def live_prefit_snapshot_from_models(
         # TR: choose some templates (global)
         TDS = f["/Templates"]
         print(f"Templates shape: {TDS.shape}")
+        t_rows = int(TDS.shape[0]) if len(TDS.shape) > 0 else 0
+        if t_rows <= 0:
+            raise RuntimeError("/Templates is empty")
+
         p_pool = np.arange(P)
         rng.shuffle(p_pool)
         p_sel_tr = np.array(sorted(p_pool[:min(max_templates, P)]), dtype=int)
-        T_sel = np.asarray(TDS[p_sel_tr, :], dtype=float)
+        p_sel_tr = np.clip(p_sel_tr, 0, max(0, t_rows - 1))
+        if p_sel_tr.size == 0:
+            p_sel_tr = np.array([0], dtype=int)
+
+        # Select template rows safely even when the template dataset is shorter
+        # than the populated model dimension P.
+        if p_sel_tr.size > 0:
+            p_sel_tr = np.asarray(p_sel_tr, dtype=np.int64)
+            if p_sel_tr.max() >= t_rows:
+                p_sel_tr = np.array([min(int(i), t_rows - 1) for i in p_sel_tr], dtype=np.int64)
+            p_sel_tr = np.unique(np.sort(p_sel_tr))
+            T_sel = np.asarray(TDS[p_sel_tr, :], dtype=float)
+        else:
+            T_sel = np.asarray(TDS[0:1, :], dtype=float)
+
         # SAFE (BLAS-free) path: (B,T) x (T,L) -> (B,L) via broadcast & sum
         TR_mat = np.sum(T_sel[:, :, None] * R_T[None, :, :], axis=1, dtype=np.float64)
 

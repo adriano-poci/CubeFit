@@ -940,7 +940,6 @@ class PipelineRunner:
         processes=2,
         blas_threads=12,
         orbit_weights=None,
-        orbit_beta=0.0,
         x0=None,
         warm_start="zeros",  # default to the new seed
         seed_cfg=None,
@@ -1197,8 +1196,7 @@ class PipelineRunner:
             project_nonneg=bool(project_nonneg),
             processes=int(processes),
             blas_threads=int(blas_threads),
-            apply_mask=bool(reader_apply_mask),
-            orbit_beta=float(orbit_beta)
+            apply_mask=bool(reader_apply_mask)
         )
 
         try:

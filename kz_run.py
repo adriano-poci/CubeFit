@@ -9,8 +9,26 @@ import os, re, sys
 import pathlib as plp
 import argparse
 
-# Custom modules
-from CubeFit.kz_fitSpec import genCubeFit
+
+def _configure_solver_environment():
+    """Set the solver-related environment variables used by the current wrapper."""
+    os.environ["CUBEFIT_LAMBDA_WEIGHTS_ENABLE"] = "1"
+    os.environ["CUBEFIT_GLOBAL_TAU"] = "0.3"
+    os.environ["CUBEFIT_GLOBAL_ENERGY_BLEND"] = str(3e-2)
+    os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-5)
+    os.environ["CUBEFIT_LAMBDA_AGE"] = str(9.0)
+    os.environ["CUBEFIT_LAMBDA_ASMOOTH"] = str(0.0)
+    os.environ["CUBEFIT_LAMBDA_FLAT"] = str(0.0)
+    os.environ["CUBEFIT_LAMBDA_FLAT_MAX_SCALE"] = str(5e4)
+    os.environ["CUBEFIT_LAMBDA_GROUP"] = str(1e-2)
+    os.environ["CUBEFIT_LAMBDA_L1"] = "0.0"
+    os.environ["CUBEFIT_LAMBDA_GROUP_SCALE"] = "mass_norm"
+    os.environ["CUBEFIT_LAMBDA_L2"] = str(0.0)
+    os.environ["CUBEFIT_MAX_INV_D"] = "1e6"
+    os.environ["CUBEFIT_ZERO_COL_DATAFLOOR_MUL"] = "1e-8"
+    os.environ["CUBEFIT_ZERO_COL_ABS"] = "1e-30"
+    os.environ["CUBEFIT_ORBIT_PRIOR_DELTA"] = "1e-6"
+
 
 def main():
     ap = argparse.ArgumentParser(description="Thin wrapper around genCubeFit")
@@ -65,55 +83,13 @@ def main():
     props['redraw'] = bool(args.redraw)
     print(f"redraw = {props['redraw']}")
 
-    os.environ['CUBEFIT_NNLS_ENABLE']=str(0)
-    os.environ['CUBEFIT_NNLS_EVERY']=str(5)
-    os.environ['CUBEFIT_NNLS_MIN_IMPROVE']=str(0.9995)
-    os.environ['CUBEFIT_NNLS_MAX_COLS']=str(64)
-    os.environ['CUBEFIT_NNLS_SUB_L']=str(512)
-    os.environ['CUBEFIT_NNLS_SOLVER']='nnls'
-    os.environ["CUBEFIT_USE_NNLS_PRIOR"] = "0"
-    os.environ["CUBEFIT_LAMBDA_WEIGHTS_ENABLE"] = "1"
-    os.environ["CUBEFIT_RMSE_PROXY_GUARD"] = "0"
-    os.environ["CUBEFIT_NNLS_PROP_PER_BAND"] = "0"
-    os.environ["CUBEFIT_NNLS_ENABLE"] = "0"
-    os.environ["CUBEFIT_ORBIT_BETA"] = str(0.1)
-    os.environ["CUBEFIT_GLOBAL_STEP_FRAC"] = "1.0"
-    os.environ["CUBEFIT_GLOBAL_TAU"] = "0.3"
-    os.environ["CUBEFIT_GLOBAL_ENERGY_BLEND"] = str(3e-2)
-    os.environ["CUBEFIT_ZERO_COL_FREEZE"] = str(1)
-    os.environ["CUBEFIT_ZERO_COL_REL"] = str(5e-5)
-    # os.environ["CUBEFIT_LAMBDA_ORBIT"] = str(50.0)
-    # os.environ["CUBEFIT_LAMBDA_POP"] = str(6.0)
-    os.environ["CUBEFIT_LAMBDA_AGE"] = str(9.0)
-    # os.environ["CUBEFIT_LAMBDA_MIX"] = str(5e-3)
-    os.environ["CUBEFIT_LAMBDA_ASMOOTH"] = str(0.0) # small non-zero
-    os.environ["CUBEFIT_LAMBDA_FLAT"] = str(0.0)
-    os.environ["CUBEFIT_LAMBDA_FLAT_MAX_SCALE"] = str(5e4)
-    os.environ["CUBEFIT_LAMBDA_GROUP"] = str(1e-2)
-    os.environ["CUBEFIT_LAMBDA_L1"] = "0.0"
-    os.environ["CUBEFIT_LAMBDA_GROUP_SCALE"] = "mass_norm"
-    os.environ["CUBEFIT_LAMBDA_L2"] = str(0.0)
-    # os.environ["CUBEFIT_LR_Y"] = str(0.05)
-    # os.environ["CUBEFIT_SEED_JITTER"] = str(1)
-    # os.environ["CUBEFIT_SEED_SIGMA_C"] = str(1.0)
-    # os.environ["CUBEFIT_SEED_SIGMA_P"] = str(1.0)
-    # --- Augmented Lagrangian (orbit ratios) ---
-    # os.environ["CUBEFIT_ORBIT_RHO0"] = "1e-3"
-    # os.environ["CUBEFIT_ORBIT_RHO_GROWTH"] = "2.0"
-    # os.environ["CUBEFIT_ORBIT_RHO_MAX"] = "1e6"
-    # --- SPG step control ---
-    os.environ["CUBEFIT_MAX_INV_D"] = "1e6"
-    os.environ["CUBEFIT_MAX_FRAC"] = "0.005"
-    # --- y-update (SFH internal) ---
-    # os.environ["CUBEFIT_LAMBDA_Y"] = "5e-4"
-    # os.environ["CUBEFIT_Y_MAX_L1"] = "0.05"
-    # --- freezing thresholds ---
-    os.environ["CUBEFIT_ZERO_COL_DATAFLOOR_MUL"] = "1e-8"
-    os.environ["CUBEFIT_ZERO_COL_ABS"] = "1e-30"
+    _configure_solver_environment()
 
     if args.ncomp is not None:
         props['nCuts'] = args.ncomp
     print(props)
+
+    from CubeFit.kz_fitSpec import genCubeFit
 
     try:
         genCubeFit(**props)

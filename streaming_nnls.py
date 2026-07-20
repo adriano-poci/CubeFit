@@ -80,7 +80,10 @@ v1.13:  Added periodic restart checkpoints to `streamActiveSetNNLS`;
             checkpoint the committed `x` vector and minimal solver state at a
             configurable iteration interval, with a forced final flush on exit,
             so truncated or cancelled runs can resume from the latest saved
-            state. 13 July 2026 
+            state. 13 July 2026
+v1.14:  Enforced the orbit prior by projecting each orbit's mass onto the
+            target prior almost exactly within a small delta tolerance. 20 July
+            2026
 """
 
 from __future__ import annotations, print_function
@@ -347,7 +350,7 @@ class MPConfig:
     dset_slots: int = 1_000_003
     dset_bytes: int = 256 * 1024**2
     dset_w0: float = 0.90
-    orbit_beta: float = 0.0 # strength of rank-1 orbit penalisation (if > 0)
+    orbit_prior_delta: float = 1e-6
     s_tile_override: Optional[int] = None
     pixels_per_aperture: int = 256
     max_tiles: Optional[int] = None
@@ -675,27 +678,92 @@ def _robust_scale_ref(values: np.ndarray, fallback: float = 1.0) -> float:
 
 # ------------------------------------------------------------------------------
 
-def _orbit_prior_beta_eff(
-    orbit_beta: float,
-    target_mass: float,
-    data_scale_ref: float,
-) -> float:
+# ------------------------------------------------------------------------------
+
+def _should_enforce_orbit_prior(
+    orbit_weights: np.ndarray | None,
+    delta: float,
+) -> bool:
+    """Return True when the orbit prior should be enforced by projection."""
+    if orbit_weights is None:
+        return False
+    if not np.any(np.asarray(orbit_weights, dtype=np.float64).ravel() > 0.0):
+        return False
+    if not np.isfinite(float(delta)) or float(delta) <= 0.0:
+        return False
+    return True
+
+
+def _enforce_orbit_prior_mass(
+    x_cp: np.ndarray,
+    orbit_weights: np.ndarray | None,
+    *,
+    delta: float = 1e-6,
+) -> np.ndarray:
     """
-    Convert the user-facing orbit_beta into a problem-scale prior weight.
+    Enforce per-orbit mass targets almost exactly while preserving
+    non-negativity and the total mass scale.
 
-    The normalization is:
-        beta_eff = orbit_beta * data_scale_ref / target_mass**2
-
-    so orbit_beta is dimensionless and comparable across problem sizes.
+    The projection is a per-orbit scaling step. For orbits that currently have
+    zero mass but a positive target, a uniform seed is created so the target can
+    be reached without violating non-negativity.
     """
-    orbit_beta = float(orbit_beta)
-    if (not np.isfinite(orbit_beta)) or orbit_beta <= 0.0:
-        return 0.0
+    x_cp = np.asarray(x_cp, dtype=np.float64).copy()
+    if x_cp.ndim != 2:
+        raise ValueError("x_cp must be a 2D array of shape (C, P)")
 
-    target_mass = max(float(target_mass), 1e-30)
-    data_scale_ref = max(float(data_scale_ref), 1.0)
+    if orbit_weights is None:
+        return np.maximum(x_cp, 0.0)
 
-    return orbit_beta * data_scale_ref / (target_mass * target_mass)
+    w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
+    if w.size != x_cp.shape[0]:
+        raise ValueError(
+            f"orbit_weights size {w.size} incompatible with orbit dimension {x_cp.shape[0]}"
+        )
+
+    w = np.maximum(w, 0.0)
+    w_sum = float(np.sum(w))
+    if (not np.isfinite(w_sum)) or w_sum <= 0.0:
+        return np.maximum(x_cp, 0.0)
+
+    total_mass = float(np.sum(x_cp))
+    if (not np.isfinite(total_mass)) or total_mass <= 0.0:
+        return np.zeros_like(x_cp, dtype=np.float64)
+
+    alpha = total_mass / w_sum
+    target_mass = alpha * w
+
+    x_cp = np.maximum(x_cp, 0.0)
+    C, P = x_cp.shape
+    delta = max(float(delta), 1e-12)
+
+    for cc in range(C):
+        orbit = x_cp[cc]
+        target = float(target_mass[cc])
+        if target <= 0.0:
+            orbit.fill(0.0)
+            continue
+
+        mass = float(np.sum(orbit))
+        if mass <= 0.0:
+            orbit.fill(target / max(P, 1))
+            continue
+
+        scale = target / mass
+        if (not np.isfinite(scale)) or scale <= 0.0:
+            orbit.fill(target / max(P, 1))
+            continue
+
+        orbit *= scale
+        # One more pass to remove tiny residuals caused by roundoff.
+        mass_new = float(np.sum(orbit))
+        if abs(mass_new - target) > delta:
+            if mass_new <= 0.0:
+                orbit.fill(target / max(P, 1))
+            else:
+                orbit *= target / mass_new
+
+    return np.maximum(x_cp, 0.0)
 
 # ------------------------------------------------------------------------------
 
@@ -1086,7 +1154,6 @@ def streamActiveSetNNLS(
     executor,
     cfg: MPConfig,
     orbit_weights: Optional[np.ndarray] = None,
-    orbit_beta_eff: float = 0.0,
     x0_flat: Optional[np.ndarray] = None,
     max_active: int = 1000,
     tol_grad: float = 1e-8,
@@ -1108,30 +1175,6 @@ def streamActiveSetNNLS(
         if (not np.isfinite(ref)) or (ref <= 0.0):
             return float(max(1.0, fallback))
         return ref
-
-    def _orbit_prior_beta_eff(
-        *,
-        orbit_beta: float,
-        target_mass: float,
-        data_scale_ref: float,
-    ) -> float:
-        """
-        Conservative, scale-aware orbit-prior weight.
-
-        The knob the user should increase is still `orbit_beta_eff`, but this
-        keeps the prior on a problem-scale-aware footing.
-        """
-        if orbit_beta <= 0.0:
-            return 0.0
-
-        target_mass = max(1e-30, float(target_mass))
-        data_scale_ref = max(1.0, float(data_scale_ref))
-
-        # Soft normalization: stronger than a pure 1/target_mass^2 penalty,
-        # but still conservative when the data scale is large.
-        return float(orbit_beta) / (
-            np.sqrt(target_mass) * np.sqrt(data_scale_ref)
-        )
 
     def _watch_progress() -> bool:
         """
@@ -1208,7 +1251,17 @@ def streamActiveSetNNLS(
     w_target = None
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
-    orbit_beta = float(orbit_beta_eff)
+    orbit_prior_delta = float(
+        getattr(
+            cfg,
+            "orbit_prior_delta",
+            os.environ.get("CUBEFIT_ORBIT_PRIOR_DELTA", "1e-6"),
+        )
+    )
+    enforce_orbit_prior = _should_enforce_orbit_prior(
+        w_target,
+        orbit_prior_delta,
+    )
 
     if x0_flat is None:
         z = np.zeros((CP,), dtype=np.float64)
@@ -1364,40 +1417,11 @@ def streamActiveSetNNLS(
         orbit_s, orbit_t, orbit_deficit = _orbit_mass_and_deficit(z)
         orbit_pressure = np.maximum(orbit_deficit, 0.0)
 
-        # Prior affects promotion ranking and reduced solve, but data-only
-        # gradient remains the reference for watchdog / rollback.
-        if (w_target is not None) and (orbit_beta > 0.0):
-            g_prior = np.zeros_like(grad_promo)
-
-            for cc in range(C):
-                base = cc * P
-                idxs = np.arange(base, base + P, dtype=np.int64)
-
-                S_local = S_flat[idxs]
-                z_local = z[idxs]
-
-                w_cc = float(w_target[cc])
-                target_mass = max(1e-30, alpha_ref * w_cc)
-
-                resid = float(np.dot(S_local, z_local) - target_mass)
-                if not np.isfinite(resid):
-                    continue
-
-                beta_eff = _orbit_prior_beta_eff(
-                    orbit_beta=orbit_beta,
-                    target_mass=target_mass,
-                    data_scale_ref=data_scale_ref,
-                )
-
-                g_prior[idxs] = beta_eff * resid * S_local
-
-            clip_factor = 1.5
-            g_prior_norm = np.linalg.norm(g_prior)
-            g_data_norm = np.linalg.norm(grad_data) + 1e-30
-            if g_prior_norm > clip_factor * g_data_norm:
-                g_prior *= (clip_factor * g_data_norm) / (g_prior_norm + 1e-30)
-
-            grad_promo = grad_promo + g_prior
+        # The prior is enforced by the projection step, so promotion ranking
+        # only needs the data gradient; the projection tolerance controls the
+        # strictness of the orbit match.
+        if enforce_orbit_prior:
+            grad_promo = grad_promo.copy()
 
         not_active = np.where(~active)[0]
         if not_active.size == 0:
@@ -1925,50 +1949,9 @@ def streamActiveSetNNLS(
             flush=True,
         )
 
-        # ----------------------------------------------------
-        # Orbit prior in reduced solve
-        # ----------------------------------------------------
-        if (w_target is not None) and (orbit_beta > 0.0):
-            orbit_groups = {}
-            for local_i, gcol in enumerate(active_idx):
-                cc = int(gcol // P)
-                orbit_groups.setdefault(cc, []).append(local_i)
-
-            for cc, idx_list in orbit_groups.items():
-                idx = np.asarray(idx_list, dtype=np.int64)
-                if idx.size == 0:
-                    continue
-
-                S_local = S_active[idx]
-                w_cc = float(w_target[cc])
-                target_mass = max(1e-30, alpha_ref * w_cc)
-
-                beta_eff = _orbit_prior_beta_eff(
-                    orbit_beta=orbit_beta,
-                    target_mass=target_mass,
-                    data_scale_ref=data_scale_ref,
-                )
-
-                ATA_sub_reg[np.ix_(idx, idx)] += (
-                    beta_eff * np.outer(S_local, S_local)
-                )
-                ATy_sub[idx] += beta_eff * target_mass * S_local
-
-                try:
-                    print(
-                        f"[DIAG][orbit_prior_soft] orbit={cc} "
-                        f"cols={len(idx)} target_mass={target_mass:.3e} "
-                        f"data_scale={data_scale_ref:.3e} "
-                        f"beta_eff={beta_eff:.3e}",
-                        flush=True,
-                    )
-                except Exception:
-                    pass
-
+        # The orbit prior is enforced by the projection step; the reduced solve
+        # remains data-driven and only uses the active-set structure.
         z_old_active = z[active_idx].copy()
-
-        def _quad_obj(A, b, x):
-            return 0.5 * float(x @ (A @ x)) - float(b @ x)
 
         z_sub_raw = None
         try:
@@ -1985,6 +1968,30 @@ def streamActiveSetNNLS(
 
         z_sub_raw = np.maximum(z_sub_raw, 0.0)
         z_sub = z_sub_raw.copy()
+
+        if enforce_orbit_prior:
+            z_candidate = z.copy()
+            z_candidate[active_idx] = z_sub
+            x_candidate = (S_flat * z_candidate).reshape(C, P)
+            x_candidate = _enforce_orbit_prior_mass(
+                x_candidate,
+                w_target,
+                delta=orbit_prior_delta,
+            )
+            z_candidate = np.divide(
+                x_candidate.reshape(-1),
+                S_flat,
+                out=np.zeros_like(z_candidate, dtype=np.float64),
+                where=S_flat > 0.0,
+            )
+            np.maximum(z_candidate, 0.0, out=z_candidate)
+            z_sub = z_candidate[active_idx]
+            z = z_candidate
+        else:
+            z[active_idx] = z_sub
+
+        def _quad_obj(A, b, x):
+            return 0.5 * float(x @ (A @ x)) - float(b @ x)
 
         # Track promoted columns that did not survive the reduced solve.
         failed_cols = []
@@ -2075,10 +2082,6 @@ def streamActiveSetNNLS(
                 break
             _emit_checkpoint(it, final=True, phase="reject_exit")
             continue
-
-        # Commit solution on the active subspace
-        for ii, gcol in enumerate(active_idx):
-            z[int(gcol)] = float(z_sub[ii])
 
         if did_explore:
             grad_after_data = ATy_scaled - _compute_ATAz_scaled(z)
@@ -2172,6 +2175,21 @@ def streamActiveSetNNLS(
             break
 
         _emit_checkpoint(it, final=False)
+
+    if enforce_orbit_prior:
+        x_final = (S_flat * z).reshape(C, P)
+        x_final = _enforce_orbit_prior_mass(
+            x_final,
+            w_target,
+            delta=orbit_prior_delta,
+        )
+        z = np.divide(
+            x_final.reshape(-1),
+            S_flat,
+            out=np.zeros_like(z, dtype=np.float64),
+            where=S_flat > 0.0,
+        )
+        np.maximum(z, 0.0, out=z)
 
     try:
         final_it = int(it)
@@ -2307,16 +2325,14 @@ def monolithic_nnls_scipy(
     if enforce_orbit_projection and (orbit_weights is not None):
         w_t = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
         if w_t is not None:
-            known_zero_orbit = np.all(np.zeros((C, P), dtype=bool), axis=1)  # no known_zero info here
-            # compute per-orbit sums on current x
-            s = np.sum(x, axis=1)
-            w = np.asarray(w_t, dtype=np.float64)
-            w_sum = float(np.sum(w))
-            alpha = float(np.sum(s)) / w_sum if (w_sum > 0.0) else 1.0
-            s_proj = alpha * w
-            ratio = s_proj / np.maximum(s, 1e-30)
-            x *= ratio[:, None]
-            np.maximum(x, 0.0, out=x)
+            delta = float(
+                getattr(
+                    cfg,
+                    "orbit_prior_delta",
+                    os.environ.get("CUBEFIT_ORBIT_PRIOR_DELTA", "1e-6"),
+                )
+            )
+            x = _enforce_orbit_prior_mass(x, w_t, delta=delta)
 
     elapsed = time.perf_counter() - t0
     stats = dict(
@@ -2346,7 +2362,8 @@ def solve_streaming_nnls(
       epoch (no repeated HDF5 reads per block).
     - Solves small quadratic NNLS problems per block using a projected-gradient
       solver on the quadratic form ATA/ATy.
-    - Supports soft orbit prior (orbit_beta) via augmentation of ATA/ATy.
+    - Supports orbit-prior enforcement by projecting the solution onto the
+      requested orbit-mass targets within the configured delta tolerance.
     - Applies hard rank-1 orbit projection at epoch end (using D_tot).
     """
     t0 = time.perf_counter()
@@ -2552,12 +2569,8 @@ def solve_streaming_nnls(
         inv_sqrt_energy = S_temp
         inv_sqrt_energy_flat = inv_sqrt_energy.ravel(order="C")
 
-        beta_eff = 0.0
-        if orbit_weights is not None and cfg.orbit_beta > 0.0:
-            beta_eff = float(cfg.orbit_beta)
-
         print(
-            f"[DIAG] orbit prior : cfg.orbit_beta = {beta_eff:.4e}",
+            "[DIAG] orbit prior : projection-based enforcement",
             flush=True,
         )
 
@@ -2720,8 +2733,7 @@ def solve_streaming_nnls(
                 executor=executor,
                 cfg=cfg,
                 orbit_weights=orbit_weights,
-                orbit_beta_eff=beta_eff,
-                x0_flat=x.ravel(order="C"),
+                    x0_flat=x.ravel(order="C"),
                 max_active=monolithic_max_active,
                 tol_grad=1e-8,
                 max_iter=5 * monolithic_max_active,

@@ -624,8 +624,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # )
     # logger.log(f"[CubeFit] Loaded `x0` from sidecar {sidecar} at ring {ridx}.")
 
-    orbit_beta = kwargs.pop('orbit_beta', 0.0)
-    
     #####################################
     # Multi-processing Batched Kaczmarz #
     #####################################
@@ -636,7 +634,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         project_nonneg=True,
         # orbit_weights=None, # or None for “free” fit
         orbit_weights=cWeights,
-        orbit_beta=float(orbit_beta),
         processes=CPU_PROCESSES,
         blas_threads=BLAS_THREADS,
         reader_s_tile=128, # match /HyperCube/models chunking on S

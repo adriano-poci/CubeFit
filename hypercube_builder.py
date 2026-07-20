@@ -931,7 +931,11 @@ def build_hypercube(
         if g is not None and "models" in g and "_done" in g:
             done = np.asarray(g["_done"][...], dtype=np.uint8)
             all_done = (done.size > 0 and int(done.sum()) == int(done.size))
-            if bool(g.attrs.get("complete", False)) and all_done:
+            models_ds = g["models"]
+            shape_matches = (
+                models_ds.shape == (S, C, P, L)
+            )
+            if bool(g.attrs.get("complete", False)) and all_done and shape_matches:
                 print("[HyperCube] already complete; skip build (no writer).")
                 return
 
@@ -989,11 +993,19 @@ def build_hypercube(
     # -------- Prepare destination dataset, normalization, and resume bitmap
     with open_h5(base_h5, "writer") as f:
         g = f.require_group("/HyperCube")
-        # create models if absent
+        # create models if absent, or recreate if shape no longer matches
         if "models" not in g:
             chunks = (min(S_chunk, S), min(C_chunk, C), min(P_chunk, P), L)
             g.create_dataset("models", shape=(S, C, P, L), dtype="f4",
                              chunks=chunks, compression=compression or None)
+        else:
+            existing_shape = tuple(int(x) for x in g["models"].shape)
+            expected_shape = (S, C, P, L)
+            if existing_shape != expected_shape:
+                del g["models"]
+                chunks = (min(S_chunk, S), min(C_chunk, C), min(P_chunk, P), L)
+                g.create_dataset("models", shape=expected_shape, dtype="f4",
+                                 chunks=chunks, compression=compression or None)
         models = g["models"]
         # Load per-spaxel data-flux mean (required in data mode)
         if norm_mode == "data":
