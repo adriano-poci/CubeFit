@@ -18,6 +18,7 @@ v1.5:   Fixed bug in `_glob*MILES` where the metallicity parsing was not
             and sorting logic. 9 February 2026
 v1.6:   Fixed bug in `_glob*MILES` where age sorting was neglected, so added
             `parseAgeFromPath` and updated sorting logic. 30 March 2026
+v1.7:   Moved template-reading functions to `dynamics.IFU.FileIO`. 21 July 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -2356,190 +2357,6 @@ def build_working_template_grid_from_losvd(
 
 # ------------------------------------------------------------------------------
 
-def _fnMILES(dirs):
-    metals, ages, alphas = [], [], []
-    for lmd in dirs:
-        # expr = r'Z([mp][0-9.]+)T([0-9.]+).i.([mp][0-9.]+).{0,2}([mp][0-9.]+|'\
-        #     'baseFe)'
-        expr = r'Z([mp][0-9.]+)T([0-9.]+).i.([mp][0-9.]+).{0,2}([mp][0-9.]+)'
-        matches = re.search(expr, lmd.stem).groups()
-        metals += [float(matches[0].replace('p', '+').replace('m', '-'))]
-        ages += [float(matches[1].replace('p', '+').replace('m', '-'))]
-        alphas += [float(matches[3].replace('p', '+').replace('m', '-'))]
-
-    return np.asarray(metals), np.asarray(ages), np.asarray(alphas)
-
-# ------------------------------------------------------------------------------
-
-def _fnEMILES(dirs):
-    metals, ages = [], []
-    for lmd in dirs:
-        expr = r'Z([mp][0-9.]+)T([0-9.]+).i.([mp][0-9.]+).{0,2}([mp][0-9.]+|'\
-            'baseFe)'
-        matches = re.search(expr, lmd.stem).groups()
-        metals += [float(matches[0].replace('p', '+').replace('m', '-'))]
-        ages += [float(matches[1].replace('p', '+').replace('m', '-'))]
-
-    return np.asarray(metals), np.asarray(ages), None
-
-# ------------------------------------------------------------------------------
-
-def _fnSMILES(dirs):
-    metals, ages, alphas = [], [], []
-    for lmd in dirs:
-        expr = r'Z([mp][0-9.]+)T([0-9.]+).*aFe([mp][0-9]+)'
-        matches = re.search(expr, lmd.stem).groups()
-        metals += [float(matches[0].replace('p', '+').replace('m', '-'))]
-        ages += [float(matches[1].replace('p', '+').replace('m', '-'))]
-        alphas += [float(matches[2].replace('p', '+').replace('m', '-'))/10.0]
-
-    return np.asarray(metals), np.asarray(ages), np.asarray(alphas)
-
-# ------------------------------------------------------------------------------
-
-def _readSSP(fn):
-    hdu = pf.open(fn)
-    hdr = hdu[0].header
-    ssp = np.squeeze(hdu[0].data)
-    hdu.close()
-    tPix = hdr['CRVAL1']+np.arange(hdr['NAXIS1'])*hdr['CDELT1']
-
-    return tPix, ssp
-
-# ------------------------------------------------------------------------------
-
-def parseMetallicityFromPath(pth: plp.Path) -> float:
-    """
-    Parse metallicity token like 'Zm1.26' or 'Zp0.06' from the filename and
-    return a signed float (e.g. -1.26 or +0.06). Raises ValueError if not found.
-    """
-    s = pth.name
-    # Look for Z then either p or m, then a number (integer or decimal)
-    m = re.search(r"Z([pm])(\d+(?:\.\d+)?)", s)
-    if not m:
-        raise ValueError(f"Could not parse metallicity from '{s}'")
-    sign, val = m.group(1), m.group(2)
-    val_f = float(val)
-    return -val_f if sign == "m" else val_f
-
-# ------------------------------------------------------------------------------
-
-def parseAgeFromPath(pth: plp.Path) -> float:
-    """
-    Parse temperature/age token like 'T00.000' from filename and return float.
-    Raises ValueError if not found.
-    """
-    s = pth.name
-    m = re.search(r"T(\d+(?:\.\d+)?)", s)
-    if not m:
-        raise ValueError(f"Could not parse T from '{s}'")
-    return float(m.group(1))
-
-# ------------------------------------------------------------------------------
-
-def _globEMILES(iso, IMF, slope):
-    """
-    This function generates the glob pattern for the EMILES templates
-    Args
-    ----
-        iso (str): choice of `['BaSTI', 'pad']` to use either the BaSTI or
-            Padova (Girardi et al., 2000) isochrones, respectively
-        IMF (str): the IMF abbreviation
-        slope (float): the slope of the assumed IMF
-    Returns
-    -------
-        glob (str): the glob pattern for the EMILES templates
-    """
-    tglob = np.array(list(dDir.rglob(str(plp.Path(
-        f"EMILES*{iso.upper()}*{IMF}*", f"E{IMF.lower()}{slope:.2f}*.fits")))))
-
-    mpairs = [
-        (parseMetallicityFromPath(tpath),
-        parseAgeFromPath(tpath),
-        tpath)
-        for tpath in tglob
-    ]
-
-    sortMpairs = sorted(mpairs, key=lambda x: (x[0], x[1]))
-
-    sortedTemplates = np.array([t[2] for t in sortMpairs])
-
-    return sortedTemplates
-
-# ------------------------------------------------------------------------------
-
-def _globMILES(iso, IMF, slope):
-    """
-    This function generates the glob pattern for the MILES templates
-    Args
-    ----
-        iso (str): choice of `['BaSTI', 'pad']` to use either the BaSTI or
-            Padova (Girardi et al., 2000) isochrones, respectively
-        IMF (str): the IMF abbreviation
-        slope (float): the slope of the assumed IMF
-    Returns
-    -------
-        glob (str): the glob pattern for the MILES templates
-    """
-    p1 = str(plp.Path(
-        f"MILES*{iso.upper()}*{IMF}*",
-        f"M{IMF.lower()}{slope:.2f}*E*0.00.fits"
-    ))
-    p2 = str(plp.Path(
-        f"MILES*{iso.upper()}*{IMF}*",
-        f"M{IMF.lower()}{slope:.2f}*E*0.40.fits"
-    ))
-    paths = list(dDir.rglob(p1)) + list(dDir.rglob(p2))
-    tglob = np.array(paths)
-
-    mpairs = [
-        (parseMetallicityFromPath(tpath),
-        parseAgeFromPath(tpath),
-        tpath)
-        for tpath in tglob
-    ]
-
-    sortMpairs = sorted(mpairs, key=lambda x: (x[0], x[1]))
-
-    sortedTemplates = np.array([t[2] for t in sortMpairs])
-
-    return sortedTemplates
-
-# ------------------------------------------------------------------------------
-
-def _globSMILES(iso, IMF, slope):
-    """
-    This function generates the glob pattern for the SMILES templates
-    Args
-    ----
-        iso (str): choice of `['BaSTI', 'pad']` to use either the BaSTI or
-            Padova (Girardi et al., 2000) isochrones, respectively
-        IMF (str): the IMF abbreviation
-        slope (float): the slope of the assumed IMF
-    Returns
-    -------
-        glob (str): the glob pattern for the SMILES templates
-    """
-    imfDict = dict(KB='Revised_Kroupa', KU='Universal_Kroupa', BI='Bimodal',
-        CH='Chabrier_1.3', UN='Unimodel')
-    tglob = np.array(list(dDir.rglob(str(plp.Path('sMILES_SSPs',
-        imfDict[IMF], 'aFe*', f"M{IMF.lower()}{slope:.2f}*.fits")))))
-
-    mpairs = [
-        (parseMetallicityFromPath(tpath),
-        parseAgeFromPath(tpath),
-        tpath)
-        for tpath in tglob
-    ]
-
-    sortMpairs = sorted(mpairs, key=lambda x: (x[0], x[1]))
-
-    sortedTemplates = np.array([t[2] for t in sortMpairs])
-
-    return sortedTemplates
-
-# ------------------------------------------------------------------------------
-
 def legendre_detrend(
     lam,
     arr,
@@ -2857,8 +2674,12 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # pixOff = int(laGrid.shape[0]*0.01)
     pixOff = 5
 
-    gFuncs = dict(MILES=_globMILES, EMILES=_globEMILES, SMILES=_globSMILES)
-    fFuncs = dict(MILES=_fnMILES, EMILES=_fnEMILES, SMILES=_fnSMILES)
+    RD = Read()
+    gFuncs = dict(MILES=RD._globMILES, EMILES=RD._globEMILES,
+        SMILES=RD._globSMILES)
+    fFuncs = dict(MILES=Read._fnSMILES, EMILES=RD._fnEMILES,
+        SMILES=RD._fnSMILES)
+    # fn functions for SMILES and MILES are identical.
 
     assert kind in gFuncs.keys(), f"Unknown template library: {kind}"
     gFunc = gFuncs[kind]
@@ -2877,6 +2698,8 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         selIso = np.where((tages >= 0.1) & (tmetals >= -2.0))[0]
     tages = tages[selIso]
     tmetals = tmetals[selIso]
+    talphas = talphas[selIso] if not isinstance(talphas, type(None)) else \
+        None
     teDir = teDir[selIso]
     umetals, uages = np.unique(tmetals), np.unique(tages)
     ualphas = np.unique(talphas) if not isinstance(talphas, type(None)) else \
@@ -2891,8 +2714,6 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         # [-1.0, -0.6, 0.0, 0.15, 0.26, 0.4]])
     # zIdx = np.arange(umetals.size) # use all metallicities
     if not isinstance(talphas, type(None)):
-        talphas = talphas[selIso]
-        ualphas = np.unique(talphas)
         if ualphas.size > 5:
             lIdx = np.asarray([np.argmin(np.abs(ualphas-xc)) for xc in
                 [-0.2, 0.0, 0.2, 0.4, 0.6]])
