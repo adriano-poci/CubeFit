@@ -2747,7 +2747,6 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
         print('Generating SSP template library...')
         try:
-            nTemps = teDir.size
             hdu = pf.open(teDir[0, 0, 0])
             thdr = hdu[0].header
             ossp = np.squeeze(hdu[0].data)
@@ -2767,8 +2766,8 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
             if lsf:
                 dWave, dLSF = np.loadtxt(dDir/'MUSE.lsf', unpack=True)
-                # mWave, mLSF = np.loadtxt(dDir/'EMILES.lsf', unpack=True)
-                mWave, mLSF = np.loadtxt(dDir/'MILES_star.lsf', unpack=True)
+                mWave, mLSF = np.loadtxt(dDir/'EMILES.lsf', unpack=True)
+                # mWave, mLSF = np.loadtxt(dDir/'MILES_star.lsf', unpack=True)
 
                 dLSFFunc = interp1d(dWave, dLSF, 'linear',
                     fill_value='extrapolate')
@@ -2778,10 +2777,15 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 milesLSF = mLSFFunc(tPix)
                 assert np.all(museLSF >= milesLSF), 'Data resolution '\
                     'better than templates resolution; can not convolve.'
+                outsideMask = np.where(museLSF < milesLSF)[0]
+                milesLSF[outsideMask] = museLSF[outsideMask]
+                # Just provide a non-negative convolution in regions outside of
+                # where the fit will take place.
+                # The fit region has already passed the test with the `assert`.
                 delFWHM = np.sqrt(museLSF**2 - milesLSF**2)
                 sigma = delFWHM/2.355/thdr['CDELT1']
 
-                tssp = pxu.gaussian_filter1d(ossp, sigma)[tmask]
+                tssp = pxu.varsmooth(tPix, ossp, sigma)[tmask]
                 # broaden the template
 
             else:
@@ -2808,7 +2812,7 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                         with pf.open(tGlob) as hdu:
                             ssp = np.squeeze(hdu[0].data)
                         if lsf:
-                            ssp = pxu.gaussian_filter1d(ssp, sigma)[tmask]
+                            ssp = pxu.varsmooth(tPix, ssp, sigma)[tmask]
                             # broaden the template
                         else:
                             ssp = ssp[tmask]
