@@ -2752,6 +2752,7 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             ossp = np.squeeze(hdu[0].data)
             hdu.close()
             tPix = thdr['CRVAL1']+np.arange(thdr['NAXIS1'])*thdr['CDELT1']
+            print(f"Templates: λ: {tPix.size}, F: {ossp.size}")
 
             assert (np.min(tPix) <= smin) and\
                 (np.max(tPix) >= smax), 'Template range does not cover '\
@@ -2763,6 +2764,8 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 np.min((np.min(tPix[np.where(tPix >= smax+thdr['CDELT1']
                     )[0]])+thdr['CDELT1']*1000, np.max(tPix)))
             tmask = (tPix >= rmin) & (tPix <= rmax)
+            tPix = tPix[tmask]
+            ossp = ossp[tmask]
 
             if lsf:
                 dWave, dLSF = np.loadtxt(dDir/'MUSE.lsf', unpack=True)
@@ -2775,28 +2778,28 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     fill_value='extrapolate')
                 museLSF  = dLSFFunc(tPix)
                 milesLSF = mLSFFunc(tPix)
-                assert np.all(museLSF >= milesLSF), 'Data resolution '\
-                    'better than templates resolution; can not convolve.'
+                assert np.all(museLSF >= milesLSF),\
+                    'Data resolution better than templates resolution; '\
+                    'can not convolve.'
                 outsideMask = np.where(museLSF < milesLSF)[0]
                 milesLSF[outsideMask] = museLSF[outsideMask]
                 # Just provide a non-negative convolution in regions outside of
                 # where the fit will take place.
                 # The fit region has already passed the test with the `assert`.
                 delFWHM = np.sqrt(museLSF**2 - milesLSF**2)
-                sigma = delFWHM/2.355/thdr['CDELT1']
+                sigma = (delFWHM/2.355/thdr['CDELT1'])
 
-                tssp = pxu.varsmooth(tPix, ossp, sigma)[tmask]
+                tssp = pxu.varsmooth(tPix, ossp, sigma)
                 # broaden the template
 
             else:
-                tssp = ossp[tmask]
+                tssp = ossp
 
-            tPix = tPix[tmask]
-            lsTL = [np.amin(tPix), np.amax(tPix)]
-            print(f"Template Range=[{lsTL[0]: .3f}, {lsTL[1]: .3f}]", flush=True)
+            print(f"Template Range=[{tPix.min(): .3f}, {tPix.max(): .3f}]",
+                flush=True)
 
             # Use v_scale_kms for pxu.log_rebin for templates
-            tSpec, teLL, _vs = pxu.log_rebin(lsTL, tssp, velscale=histBinSize)
+            tSpec, teLL, _vs = pxu.log_rebin(tPix, tssp, velscale=histBinSize)
             # log-rebin to the same wavelength range as data
 
             lnGrid = np.ma.ones([tSpec.size, nMetals, nAges, nAlphas])*np.nan
@@ -2812,7 +2815,7 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                         with pf.open(tGlob) as hdu:
                             ssp = np.squeeze(hdu[0].data)
                         if lsf:
-                            ssp = pxu.varsmooth(tPix, ssp, sigma)[tmask]
+                            ssp = pxu.varsmooth(tPix, ssp[tmask], sigma)
                             # broaden the template
                         else:
                             ssp = ssp[tmask]
@@ -2825,12 +2828,9 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                         # teGrid[:, aa, mm] = ssp
                         lnGrid[:, mm, aa, bb] = teSpec/scale
                         # lnScales[mm, aa, bb] = scale
-            # lnScales = _specNorm( teLL, lnGrid )
             # lnGrid /= lnScales
             print('\n')
             # Write.lzma(tfn, [teLL, lnGrid, lnScales])
-            # del ssp, tssp, thdr, tPix, lsfPix, teSpec, newt, bttssp, btssp,\
-                # bssp#, tMask, truPix
         except Exception as e:
             # logging.exception('Exception generating SSP library.')
             traceback.print_exc()
@@ -2872,5 +2872,274 @@ def zero_floor_inplace(x_arr, rel_tol=1e-12, abs_tol=0.0):
     thresh = max(abs_tol, rel_tol * max(1.0, maxv))
     x_arr[np.abs(x_arr) <= thresh] = 0.0
     return thresh
+
+# ------------------------------------------------------------------------------
+
+def recommend_streaming_architecture(
+    C: int,
+    P: int,
+    total_ram_gb: float,
+    n_cpu: int | None = None,
+    *,
+    mode: str = "reduced",
+    active_k: int | None = None,
+    active_k_grid: tuple[int, ...] | None = None,
+    tile_rows_grid: tuple[int, ...] = (32, 64, 128, 256),
+    l_eff: int = 4200,
+    band_L: int = 128,
+    parent_ram_gb: float = 2.5,
+    per_worker_misc_gb: float = 0.20,
+    per_worker_hdf5_gb: float = 16.0,
+    blas_threads_max: int = 8,
+    blas_threads_min: int = 1,
+    safety_margin: float = 0.92,
+    max_processes: int | None = None,
+    io_parallel_knee: int | None = None,
+) -> dict[str, Any]:
+    """
+    Recommend a memory-aware multiprocessing layout for CubeFit.
+
+    The key difference from the earlier version is the ranking objective:
+    this one uses a saturating wall-time proxy rather than a linear process
+    reward, so it will not keep preferring the maximum worker count once the
+    useful parallelism is already saturated.
+
+    Parameters
+    ----------
+    C, P, total_ram_gb, n_cpu, mode, active_k, active_k_grid,
+    tile_rows_grid, l_eff, band_L, parent_ram_gb, per_worker_misc_gb,
+    per_worker_hdf5_gb, blas_threads_max, blas_threads_min, safety_margin,
+    max_processes
+        See previous helper.
+
+    io_parallel_knee : int or None, optional
+        Process-count knee for I/O contention. If None, uses a conservative
+        default based on CPU count.
+
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - recommended
+        - candidates
+        - assumptions
+        - ram_limit_gb
+    """
+    C = int(C)
+    P = int(P)
+    total_ram_gb = float(total_ram_gb)
+    l_eff = int(l_eff)
+    band_L = int(band_L)
+
+    if C <= 0 or P <= 0:
+        raise ValueError("C and P must be positive.")
+    if total_ram_gb <= 0.0:
+        raise ValueError("total_ram_gb must be positive.")
+
+    mode = str(mode).lower().strip()
+    if mode not in {"reduced", "reconstruct"}:
+        raise ValueError("mode must be 'reduced' or 'reconstruct'.")
+
+    gb = float(1024**3)
+    ram_limit_gb = total_ram_gb * float(safety_margin)
+
+    if max_processes is None:
+        if n_cpu is not None:
+            max_processes = int(n_cpu)
+        else:
+            max_processes = int(os.cpu_count() or 1)
+    max_processes = max(1, int(max_processes))
+
+    blas_threads_min = max(1, int(blas_threads_min))
+    blas_threads_max = max(blas_threads_min, int(blas_threads_max))
+
+    if io_parallel_knee is None:
+        # Conservative I/O knee: beyond this, extra workers are penalized.
+        io_parallel_knee = max(4, min(max_processes, 16 if n_cpu is None else max(4, n_cpu // 4)))
+    io_parallel_knee = max(1, int(io_parallel_knee))
+
+    def _default_active_k_grid() -> tuple[int, ...]:
+        cp = int(C * P)
+        # Orbit-scaled guesses; tune if you have better empirical priors.
+        cand = [
+            max(32, 1 * C),
+            max(64, 2 * C),
+            max(96, 4 * C),
+            max(128, 8 * C),
+            max(256, 16 * C),
+        ]
+        cand = [min(cp, int(x)) for x in cand if int(x) > 0]
+        return tuple(sorted(set(cand)))
+
+    if mode == "reduced":
+        if active_k is not None:
+            active_k_scenarios = (int(active_k),)
+        elif active_k_grid is not None:
+            active_k_scenarios = tuple(int(x) for x in active_k_grid if int(x) > 0)
+        else:
+            active_k_scenarios = _default_active_k_grid()
+    else:
+        active_k_scenarios = (1,)
+
+    tile_rows_grid = tuple(int(x) for x in tile_rows_grid if int(x) > 0)
+    if not tile_rows_grid:
+        tile_rows_grid = (128,)
+
+    def _worker_ram_gb(tile_rows: int, k: int, t: int) -> float:
+        tile_rows = int(tile_rows)
+        k = int(max(1, k))
+        t = int(max(1, t))
+
+        if mode == "reduced":
+            rows = tile_rows * l_eff
+            a_act = 1.15 * rows * k * 8.0
+            ata = 1.10 * k * k * 8.0
+            aty = 1.00 * k * 8.0
+            ytmp = 2.00 * rows * 8.0
+            base = a_act + ata + aty + ytmp
+        else:
+            band = 1.10 * band_L * C * P * 4.0
+            out = tile_rows * l_eff * 8.0
+            scratch = C * P * 8.0
+            base = band + out + scratch
+
+        blas_scratch = 0.03 * t * gb
+        return (
+            base / gb
+            + float(per_worker_misc_gb)
+            + float(per_worker_hdf5_gb)
+            + blas_scratch / gb
+        )
+
+    def _thread_grid(p: int) -> list[int]:
+        if n_cpu is None:
+            # Explore a few useful BLAS thread counts.
+            return sorted(set([1, 2, 4, 8, blas_threads_max]))
+        t_max = max(1, min(blas_threads_max, int(n_cpu) // int(p)))
+        return list(range(blas_threads_min, t_max + 1))
+
+    def _wall_time_proxy(tile_rows: int, p: int, t: int, worst_ram_gb: float) -> float:
+        """
+        Smaller is better.
+
+        This is intentionally concave in p:
+          - workers help up to the I/O knee,
+          - then benefit saturates,
+          - then extra workers are penalized.
+        """
+        p = int(p)
+        t = int(t)
+        tile_rows = int(tile_rows)
+
+        # Saturating process benefit.
+        p0 = float(io_parallel_knee)
+        p_gain = 1.0 - np.exp(-p / p0)
+
+        # Diminishing returns for BLAS threads.
+        t_gain = 1.0 + 0.35 * np.log2(float(t))
+
+        # Smaller tiles reduce per-tile latency only to a point.
+        # Larger tiles better amortize HDF5/process overhead.
+        # This prefers moderate tiles, not the minimum possible.
+        tile0 = 128.0
+        tile_gain = 1.0 - 0.20 * np.exp(-float(tile_rows) / tile0)
+
+        # Explicit overhead penalty for too many processes.
+        # This is the missing term that prevents 64 x 1 from always winning.
+        io_pen = 1.0 + 0.015 * max(0, p - io_parallel_knee) ** 2
+
+        # RAM pressure should matter, but only as a penalty, not as a reward.
+        ram_util = worst_ram_gb / max(ram_limit_gb, 1e-12)
+        ram_pen = 1.0 + 2.0 * max(0.0, ram_util - 0.65) ** 2
+
+        return io_pen * ram_pen / (p_gain * t_gain * tile_gain)
+
+    candidates: list[dict[str, Any]] = []
+
+    for tile_rows in tile_rows_grid:
+        for p in range(1, max_processes + 1):
+            if n_cpu is not None and p > int(n_cpu):
+                break
+
+            for t in _thread_grid(p):
+                if n_cpu is not None and (p * t) > int(n_cpu):
+                    continue
+
+                if mode == "reduced":
+                    scenario_rams = [
+                        float(parent_ram_gb) + p * _worker_ram_gb(tile_rows, k, t)
+                        for k in active_k_scenarios
+                    ]
+                    worst_k = int(active_k_scenarios[int(np.argmax(scenario_rams))])
+                else:
+                    scenario_rams = [
+                        float(parent_ram_gb) + p * _worker_ram_gb(tile_rows, 1, t)
+                    ]
+                    worst_k = None
+
+                worst_ram_gb = float(max(scenario_rams))
+                feasible = worst_ram_gb <= ram_limit_gb
+                wt = _wall_time_proxy(tile_rows, p, t, worst_ram_gb)
+
+                candidates.append(
+                    dict(
+                        processes=int(p),
+                        blas_threads=int(t),
+                        tile_rows=int(tile_rows),
+                        estimated_ram_gb=worst_ram_gb,
+                        ram_headroom_gb=float(ram_limit_gb - worst_ram_gb),
+                        feasible=bool(feasible),
+                        wall_time_score=float(wt),
+                        cpu_use=int(p * t),
+                        active_k_worst=worst_k,
+                        mode=mode,
+                    )
+                )
+
+    feasible_candidates = [c for c in candidates if c["feasible"]]
+    if feasible_candidates:
+        feasible_candidates.sort(
+            key=lambda d: (d["wall_time_score"], -d["ram_headroom_gb"])
+        )
+        picked = feasible_candidates[:10]
+    else:
+        candidates.sort(
+            key=lambda d: (d["estimated_ram_gb"], d["wall_time_score"])
+        )
+        picked = candidates[:10]
+
+    recommended = picked[0] if picked else {
+        "processes": 1,
+        "blas_threads": 1,
+        "tile_rows": 128,
+        "estimated_ram_gb": float("nan"),
+        "ram_headroom_gb": float("nan"),
+        "feasible": False,
+        "wall_time_score": float("nan"),
+        "cpu_use": 1,
+        "active_k_worst": None,
+        "mode": mode,
+    }
+
+    return {
+        "recommended": recommended,
+        "candidates": picked,
+        "assumptions": {
+            "mode": mode,
+            "active_k_scenarios": active_k_scenarios,
+            "tile_rows_grid": tile_rows_grid,
+            "l_eff": int(l_eff),
+            "band_L": int(band_L),
+            "parent_ram_gb": float(parent_ram_gb),
+            "per_worker_misc_gb": float(per_worker_misc_gb),
+            "per_worker_hdf5_gb": float(per_worker_hdf5_gb),
+            "blas_threads_min": int(blas_threads_min),
+            "blas_threads_max": int(blas_threads_max),
+            "safety_margin": float(safety_margin),
+            "n_cpu": None if n_cpu is None else int(n_cpu),
+            "io_parallel_knee": int(io_parallel_knee),
+        },
+        "ram_limit_gb": float(ram_limit_gb),
+    }
 
 # ------------------------------------------------------------------------------

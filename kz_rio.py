@@ -1,21 +1,11 @@
+#!/usr/bin/env python3
 """
-#!/apps/skylake/software/core/anaconda3/5.1.0/bin/python3
-#SBATCH -A oz059
-#SBATCH --job-name="slurmSpecNGC4365"
-#SBATCH --time=2-00:00
-#SBATCH -D "/fred/oz059/poci/muse"
-#SBATCH --output="/fred/oz059/poci/muse/slurmSpecNGC4365.log"
-#SBATCH --error="/fred/oz059/poci/muse/slurmSpecNGC4365.log"
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=200GB
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=adriano.poci@students.mq.edu.au
-
-    slurmSpecNGC4365.py
+    kz_rio.py
     Adriano Poci
-    Durham University
-    2021
+    University of Oxford
+    2026
+
+    <adriano.poci@physics.ox.ac.uk>
 
     Platforms
     ---------
@@ -23,43 +13,37 @@
 
     Synopsis
     --------
-    This module executes some function in the `SLURM` queueing environment
+    Light Python wrapper around execution tasks for `CubeFit`.
 
-    Authors
-    -------
-    Adriano Poci <adriano.poci@durham.ac.uk>
+    Author
+    ------
+    Adriano Poci <adriano.poci@physics.ox.ac.uk>
 
 History
 -------
 v1.0:	12 November 2021
 v1.1:   Capture exceptions around `loadCubeFit` call. 4 December 2025
+v1.2:   Use universal `props` function. 22 July 2026
 """
 
-# from site import addsitedir as sas
-# import pathlib as plp
-# sas(str(plp.Path(plp.os.sep, 'fred', 'oz059', 'poci')))
-# sas(str(plp.Path(plp.os.sep, 'fred', 'oz059', 'poci', 'dynamics')))
-# sas(str(plp.Path(plp.os.sep, 'fred', 'oz059', 'poci', 'pxf')))
-# sas(str(plp.Path(plp.os.sep, 'fred', 'oz059', 'poci', 'muse')))
-# do not need to add to paths, if run with
-#   mpiexec -usize <nProcs+1> -n 1 ipython slurmSpecFCC170.py
-
 import os
-t = os.environ.get("SLURM_CPUS_PER_TASK", "12")
-os.environ["OMP_NUM_THREADS"]      = t
-os.environ["MKL_NUM_THREADS"]      = t
-os.environ["OPENBLAS_NUM_THREADS"] = t
-os.environ["OMP_DYNAMIC"]          = "FALSE"
-os.environ["MKL_DYNAMIC"]          = "FALSE"
-
 import numpy as np
 import re, sys
 import pathlib as plp
 import argparse
 
 # Custom modules
+from CubeFit.kz_init import props
 from CubeFit.kz_fitSpec import loadCubeFit
-from CubeFit.kz_initNGC4365 import props
+
+def _configure_solver_environment():
+    """Set the solver-related environment variables used by the current wrapper."""
+    t = os.environ.get("SLURM_CPUS_PER_TASK", "12")
+    os.environ["OMP_NUM_THREADS"]      = t
+    os.environ["MKL_NUM_THREADS"]      = t
+    os.environ["OPENBLAS_NUM_THREADS"] = t
+    os.environ["OMP_DYNAMIC"]          = "FALSE"
+    os.environ["MKL_DYNAMIC"]          = "FALSE"
 
 def main():
     ap = argparse.ArgumentParser(description="Thin wrapper around genCubeFit")
@@ -76,12 +60,7 @@ def main():
     ap.set_defaults(redraw=False)
 
     args = ap.parse_args()
-    if 'NGC4365' in args.galaxy:
-        from CubeFit.kz_initNGC4365 import props
-    elif 'FCC170' in args.galaxy:
-        from CubeFit.kz_initFCC170 import props
-    else:
-        raise ValueError(f"Unknown galaxy '{args.galaxy}'")
+    propDict = props(args.galaxy)
 
     # Detect CPUs
     slurm_cpu = os.environ.get('SLURM_CPUS_PER_TASK')
@@ -98,18 +77,20 @@ def main():
             nCPU = 20
 
     print(f"Setting nCPU to {nCPU} from SLURM_CPUS_PER_TASK or kz_addqueue.sh")
-    props['nProcs'] = nCPU
+    propDict['nProcs'] = nCPU
 
     # Pass-through args
-    props['redraw'] = bool(args.redraw)
-    print(f"redraw = {props['redraw']}")
+    propDict['redraw'] = bool(args.redraw)
+    print(f"redraw = {propDict['redraw']}")
+
+    _configure_solver_environment()
 
     if args.ncomp is not None:
-        props['nCuts'] = args.ncomp
-    print(props)
+        propDict['nCuts'] = args.ncomp
+    print(propDict)
 
     try:
-        loadCubeFit(**props)
+        loadCubeFit(**propDict)
     except SystemExit:
         # Let explicit sys.exit()s behave normally
         raise

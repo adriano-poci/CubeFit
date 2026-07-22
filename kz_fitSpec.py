@@ -68,6 +68,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.patheffects as PathEffects
 from matplotlib.colors import Normalize
+from matplotlib import colormaps, colors as mcolors
 from copy import copy
 import h5py
 import subprocess
@@ -1948,6 +1949,16 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     print(f"Best fit:  aperture {best} (χ² = {rms_resid_raw[best]:.2f})")
     print(f"[CubeFit] All plots and maps saved in {str(figDir)}")
 
+
+    divcmap = colormaps.get_cmap('GECKOSdr')
+    if isinstance(divcmap, mcolors.ListedColormap):
+        divcmap = mcolors.LinearSegmentedColormap.from_list(
+            f"{divcmap.name}_fixed", divcmap.colors, N=256
+        )
+    heat = colormaps.get_cmap('cet_fire')
+    if not hasattr(heat, "n_variates"):
+        heat.n_variates = 1
+
     # ---------------------------------------------
     # Plot
     # ---------------------------------------------
@@ -1982,8 +1993,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     )
     plt.close(fig)
 
-
-
     if 'mw' in pplots:
 
         fmin, fmax = np.log10(np.min(data_sb)), np.log10(np.max(data_sb))
@@ -1996,7 +2005,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         cnt = dbi(
             xpix, ypix, np.log10(data_sb[binNum]),
             pixelsize=pixs, angle=PA,
-            cmap="cet_fire", vmin=fmin, vmax=fmax
+            cmap=heat, vmin=fmin, vmax=fmax
         )
         ax.set_xticklabels([])
         ax.set_xlim(xmin, xmax)
@@ -2017,7 +2026,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         dbi(
             xpix, ypix, np.log10(model_sb[binNum]),
             pixelsize=pixs, angle=PA,
-            cmap="cet_fire", vmin=fmin, vmax=fmax
+            cmap=heat, vmin=fmin, vmax=fmax
         )
         ax.set_xticklabels([])
         ax.set_xlim(xmin, xmax)
@@ -2066,7 +2075,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         cnt = dbi(
             xpix, ypix, np.log10(data_raw[binNum]),
             pixelsize=pixs, angle=PA,
-            cmap="cet_fire", vmin=fmin, vmax=fmax
+            cmap=heat, vmin=fmin, vmax=fmax
         )
         ax.set_xticklabels([])
         ax.set_xlim(xmin, xmax)
@@ -2087,7 +2096,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         dbi(
             xpix, ypix, np.log10(model_raw[binNum]),
             pixelsize=pixs, angle=PA,
-            cmap="cet_fire", vmin=fmin, vmax=fmax
+            cmap=heat, vmin=fmin, vmax=fmax
         )
         ax.set_xticklabels([])
         ax.set_xlim(xmin, xmax)
@@ -2484,7 +2493,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             print(f"Could not make Z-alpha plot: {e}")
             pass
     
-    if 'proj' in pplots:
+    if 'proj' in pplots and nComp > 3:
         logger.log("Generating projected maps...")
         with logger.capture_all_output():
             try:
@@ -2552,16 +2561,18 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                             # vmin={'age':amin, 'metal':mmin, 'alpha':lmin}[prop],
                             # vmax={'age':amax, 'metal':mmax, 'alpha':lmax}[prop]
                         )
+                        ax.set_xlim(xmin, xmax)
+                        ax.set_ylim(ymin, ymax)
                         ax.text(1e-2, 1-1e-2, rf"{np.nanmin(arr):.2f}/{np.nanmax(arr):.2f}",
                             va='top', ha='left', color=POT.pgreen, transform=ax.transAxes, path_effects=[PathEffects.withStroke(linewidth=1.5, foreground='k')])
                         if not ax.get_subplotspec().is_last_row():
                             ax.set_xticklabels([])
                         if not ax.get_subplotspec().is_first_col():
                             ax.set_yticklabels([])
-                        lT = ax.text(1e-2, 1e-2, f"{prop} {otype}", va='bottom', ha='left',
-                            color=POT.pgreen, transform=ax.transAxes)
-                        lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
-                            foreground='k')])
+                        lT = ax.text(1e-2, 1e-2, f"{prop} {otype}", va='bottom',
+                            ha='left', color=POT.pgreen, transform=ax.transAxes,
+                            path_effects=PathEffects.withStroke(linewidth=1.5,
+                            foreground='k'))
                 fig.savefig(figDir/\
                     f"orbitMaps_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
             except Exception as e:

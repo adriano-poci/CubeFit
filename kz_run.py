@@ -1,7 +1,28 @@
+#!/usr/bin/env python3
 """
+    kz_run.py
+    Adriano Poci
+    University of Oxford
+    2026
+
+    <adriano.poci@physics.ox.ac.uk>
+
+    Platforms
+    ---------
+    Unix, Windows
+
+    Synopsis
+    --------
+    Light Python wrapper around execution tasks for `CubeFit`.
+
+    Author
+    ------
+    Adriano Poci <adriano.poci@physics.ox.ac.uk>
+
 History
 -------
 v1.0:	Capture exceptions around `genCubeFit` call. 4 December 2025
+v1.1:   Use universal `props` function. 22 July 2026
 """
 
 import numpy as np
@@ -9,6 +30,8 @@ import os, re, sys
 import pathlib as plp
 import argparse
 
+from CubeFit.kz_init import props
+from CubeFit.kz_fitSpec import genCubeFit
 
 def _configure_solver_environment():
     """Set the solver-related environment variables used by the current wrapper."""
@@ -27,7 +50,7 @@ def _configure_solver_environment():
     os.environ["CUBEFIT_MAX_INV_D"] = "1e6"
     os.environ["CUBEFIT_ZERO_COL_DATAFLOOR_MUL"] = "1e-8"
     os.environ["CUBEFIT_ZERO_COL_ABS"] = "1e-30"
-    os.environ["CUBEFIT_ORBIT_PRIOR_DELTA"] = "1e-6"
+    os.environ["CUBEFIT_ORBIT_PRIOR_DELTA"] = "1e-3"
 
 
 def main():
@@ -51,13 +74,7 @@ def main():
     ap.set_defaults(redraw=False)
 
     args = ap.parse_args()
-
-    if 'NGC4365' in args.galaxy:
-        from CubeFit.kz_initNGC4365 import props
-    elif 'FCC170' in args.galaxy:
-        from CubeFit.kz_initFCC170 import props
-    else:
-        raise ValueError(f"Unknown galaxy '{args.galaxy}'")
+    propDict = props(args.galaxy)
 
     # Detect CPUs
     slurm_cpu = os.environ.get('SLURM_CPUS_PER_TASK')
@@ -74,25 +91,23 @@ def main():
             nCPU = 20
 
     print(f"Setting nCPU to {nCPU} from SLURM_CPUS_PER_TASK or kz_addqueue.sh")
-    props['nProcs'] = nCPU
+    propDict['nProcs'] = nCPU
 
     # Pass-through args
     if args.run_switch is not None:
-        props['runSwitch'] = args.run_switch
-        print(f"runSwitch = {props['runSwitch']}")
-    props['redraw'] = bool(args.redraw)
-    print(f"redraw = {props['redraw']}")
+        propDict['runSwitch'] = args.run_switch
+        print(f"runSwitch = {propDict['runSwitch']}")
+    propDict['redraw'] = bool(args.redraw)
+    print(f"redraw = {propDict['redraw']}")
 
     _configure_solver_environment()
 
     if args.ncomp is not None:
-        props['nCuts'] = args.ncomp
-    print(props)
-
-    from CubeFit.kz_fitSpec import genCubeFit
+        propDict['nCuts'] = args.ncomp
+    print(propDict)
 
     try:
-        genCubeFit(**props)
+        genCubeFit(**propDict)
     except SystemExit:
         # Let explicit sys.exit()s behave normally
         raise

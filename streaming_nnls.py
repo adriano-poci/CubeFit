@@ -678,8 +678,6 @@ def _robust_scale_ref(values: np.ndarray, fallback: float = 1.0) -> float:
 
 # ------------------------------------------------------------------------------
 
-# ------------------------------------------------------------------------------
-
 def _should_enforce_orbit_prior(
     orbit_weights: np.ndarray | None,
     delta: float,
@@ -692,7 +690,6 @@ def _should_enforce_orbit_prior(
     if not np.isfinite(float(delta)) or float(delta) <= 0.0:
         return False
     return True
-
 
 def _enforce_orbit_prior_mass(
     x_cp: np.ndarray,
@@ -767,6 +764,37 @@ def _enforce_orbit_prior_mass(
 
 # ------------------------------------------------------------------------------
 
+def _population_diversity_bonus(
+    cand_cols: np.ndarray,
+    active_mask: np.ndarray,
+    P: int,
+) -> np.ndarray:
+    """
+    Prefer candidates far from already-active populations in the same orbit.
+    """
+    cand_cols = np.asarray(cand_cols, dtype=np.int64).ravel()
+    if cand_cols.size == 0:
+        return np.zeros((0,), dtype=np.float64)
+
+    bonus = np.empty(cand_cols.size, dtype=np.float64)
+
+    for i, gcol in enumerate(cand_cols):
+        cc = int(gcol // P)
+        base = cc * P
+        p = int(gcol - base)
+        active_p = np.flatnonzero(active_mask[base:base + P])
+
+        if active_p.size == 0:
+            bonus[i] = 1.0
+            continue
+
+        d = np.min(np.abs(active_p - p))
+        bonus[i] = np.sqrt((d + 1.0) / float(max(1, P)))
+
+    return bonus
+
+# ------------------------------------------------------------------------------
+
 def _quota_rescue_columns(
     grad_vec: np.ndarray,
     aty_scaled_vec: np.ndarray,
@@ -777,18 +805,29 @@ def _quota_rescue_columns(
     P: int,
     total_cols: int,
     *,
-    min_per_orbit: int = 1,
+    min_per_orbit: int = 2,
     max_per_orbit: int = 12,
     penalty_strength: float = 0.5,
     orbit_occ_counts: np.ndarray | None = None,
     occ_lambda: float = 0.0,
+    diversity_strength: float = 0.8,
+    exploration_pool: int = 32,
 ) -> np.ndarray:
     """
     Select rescue columns using per-orbit promotion quotas derived from
-    the orbit prior weights.
+    the orbit prior weights, while explicitly encouraging diversity in
+    population index within each orbit.
 
-    The prior biases *which columns are tested*, not the final solution.
+    The prior biases which columns are tested, not the final solution.
     The reduced NNLS solve still determines which columns survive.
+
+    This version differs from the previous implementation in two ways:
+
+    1) It replaces tiny random sampling from a narrow candidate pool with a
+       diversity-aware greedy selection.
+    2) It rewards columns whose population index is far from populations
+       already active in the same orbit, which helps the solver explore
+       richer within-orbit mixtures.
 
     Parameters
     ----------
@@ -814,6 +853,15 @@ def _quota_rescue_columns(
         Maximum quota per orbit.
     penalty_strength : float, optional
         Penalty against very large-S columns.
+    orbit_occ_counts : ndarray or None, optional
+        Current active count per orbit.
+    occ_lambda : float, optional
+        Weak penalty for already-crowded orbits.
+    diversity_strength : float, optional
+        Weight of the within-orbit population diversity bonus.
+    exploration_pool : int, optional
+        Number of top-scoring candidates per orbit to consider before
+        greedy diversity selection.
 
     Returns
     -------
@@ -823,53 +871,55 @@ def _quota_rescue_columns(
     if total_cols <= 0:
         return np.zeros((0,), dtype=np.int64)
 
+    grad_vec = np.asarray(grad_vec, dtype=np.float64).ravel(order="C")
+    aty_scaled_vec = np.asarray(aty_scaled_vec, dtype=np.float64).ravel(order="C")
+    active_mask = np.asarray(active_mask, dtype=bool).ravel(order="C")
+    S_flat = np.asarray(S_flat, dtype=np.float64).ravel(order="C")
+
     if w_target is None:
-        # fallback: global selection
+        # Fallback: global selection with the same diversity-aware scoring.
         not_active = np.where(~active_mask)[0]
         if not_active.size == 0:
             return np.zeros((0,), dtype=np.int64)
 
         gvals = grad_vec[not_active]
         svals = S_flat[not_active]
+        atyvals = aty_scaled_vec[not_active]
+
         s_med = np.median(svals) + 1e-30
-        occ = 0 if orbit_occ_counts is None else int(orbit_occ_counts[not_active // P])
-        occ_pen = 1.0 + occ_lambda * np.log1p(occ)
         score = gvals / (1.0 + penalty_strength * (svals / s_med - 1.0))
-        score = score / occ_pen
+
+        aty_scale = np.max(np.abs(atyvals)) + 1e-30
+        score = score + 0.10 * (atyvals / aty_scale)
+
+        if orbit_occ_counts is not None:
+            occ = np.asarray(orbit_occ_counts, dtype=np.float64).ravel()
+            occ = np.maximum(occ, 0.0)
+            occ = occ[not_active // P]
+            score = score / (1.0 + occ_lambda * np.log1p(occ))
 
         order = np.argsort(score)[::-1]
         pick = not_active[order[:min(total_cols, order.size)]]
         return np.asarray(pick, dtype=np.int64)
 
-    w = np.asarray(w_target, dtype=np.float64).ravel()
-    if w.size != C:
-        return np.zeros((0,), dtype=np.int64)
-
+    w = np.asarray(w_target, dtype=np.float64).ravel(order="C")
     w = np.maximum(w, 0.0)
     w_sum = float(np.sum(w))
-
     if w_sum <= 0.0:
         return np.zeros((0,), dtype=np.int64)
-
     w = w / w_sum
 
-    # ----------------------------
-    # initial quotas from weights
-    # ----------------------------
+    # Quotas from weights.
     raw = total_cols * w
     quotas = np.floor(raw).astype(np.int64)
 
-    # guarantee minimum quota on non-zero-weight orbits
     nz = np.where(w > 0.0)[0]
     for cc in nz:
         quotas[cc] = max(quotas[cc], min_per_orbit)
 
-    # cap quotas
     quotas = np.minimum(quotas, max_per_orbit)
 
-    # adjust total quota to requested total_cols
     qsum = int(np.sum(quotas))
-
     if qsum < total_cols:
         frac = raw - np.floor(raw)
         order = np.argsort(frac)[::-1]
@@ -879,9 +929,8 @@ def _quota_rescue_columns(
             if quotas[cc] < max_per_orbit:
                 quotas[cc] += 1
                 qsum += 1
-
     elif qsum > total_cols:
-        order = np.argsort(w)  # remove from weakest-target orbits first
+        order = np.argsort(w)
         for cc in order:
             while (qsum > total_cols) and (quotas[cc] > 0):
                 quotas[cc] -= 1
@@ -889,27 +938,53 @@ def _quota_rescue_columns(
                 if qsum <= total_cols:
                     break
 
-    chosen = []
-    chosen_set = set()
+    chosen: list[int] = []
+    chosen_set: set[int] = set()
 
-    for cc in np.argsort(w)[::-1]:
-        q = int(quotas[cc])
-        if q <= 0:
-            continue
+    def _orbit_diversity_bonus(
+        cand_cols: np.ndarray,
+        active_mask_local: np.ndarray,
+        P_local: int,
+    ) -> np.ndarray:
+        """
+        Reward population indices that are far from currently active
+        populations in the same orbit.
+        """
+        cand_cols = np.asarray(cand_cols, dtype=np.int64).ravel()
+        if cand_cols.size == 0:
+            return np.zeros((0,), dtype=np.float64)
 
+        out = np.empty(cand_cols.size, dtype=np.float64)
+        for i, gcol in enumerate(cand_cols):
+            cc = int(gcol // P_local)
+            base = cc * P_local
+            p = int(gcol - base)
+
+            active_p = np.flatnonzero(active_mask_local[base:base + P_local])
+            if active_p.size == 0:
+                out[i] = 1.0
+            else:
+                dmin = int(np.min(np.abs(active_p - p)))
+                out[i] = np.sqrt((dmin + 1.0) / float(max(1, P_local)))
+        return out
+
+    def _pick_from_orbit(cc: int, max_take: int) -> np.ndarray:
         base = int(cc * P)
         cols_cc = np.arange(base, base + P, dtype=np.int64)
         inactive_cc = cols_cc[~active_mask[cols_cc]]
 
+        if exclude_mask is not None:
+            inactive_cc = inactive_cc[~exclude_mask[inactive_cc]]
+
         if inactive_cc.size == 0:
-            continue
+            return np.zeros((0,), dtype=np.int64)
 
         g_cc = grad_vec[inactive_cc]
         s_cc = S_flat[inactive_cc]
         aty_cc = aty_scaled_vec[inactive_cc]
 
         occ = 0 if orbit_occ_counts is None else int(orbit_occ_counts[cc])
-        occ_pen = 1.0 + occ_lambda * np.log1p(occ)
+        occ_pen = 1.0 + occ_lambda * np.log1p(max(0, occ))
 
         s_med = np.median(s_cc) + 1e-30
         score_cc = g_cc / (1.0 + penalty_strength * (s_cc / s_med - 1.0))
@@ -918,27 +993,89 @@ def _quota_rescue_columns(
         score_cc = score_cc + 0.10 * (aty_cc / aty_scale)
 
         score_cc = score_cc / occ_pen
-        score_cc += 1e-6 * np.random.standard_normal(score_cc.shape)
 
-        aty_scale = np.max(np.abs(aty_cc)) + 1e-30
-        score_cc = score_cc + 0.10 * (aty_cc / aty_scale)
-        score_cc += 1e-6 * np.random.standard_normal(score_cc.shape)
+        # Diversity bonus: prefer populations not yet represented in this orbit.
+        score_cc = score_cc + diversity_strength * _orbit_diversity_bonus(
+            inactive_cc,
+            active_mask,
+            P,
+        )
+
+        # Small noise only to break exact ties.
+        score_cc = score_cc + 1e-8 * np.random.standard_normal(score_cc.shape)
 
         order = np.argsort(score_cc)[::-1]
-        pool_size = min(10, order.size)   # exploration pool
+        pool_size = min(max(1, int(exploration_pool)), order.size)
         pool = order[:pool_size]
-        take = min(q, pool.size)
-        chosen_local = np.random.choice(pool, size=take, replace=False)
-        for j in chosen_local:
-            gcol = int(inactive_cc[j])
-            if gcol not in chosen_set:
+        take = min(max_take, pool.size)
+
+        # replace uniform random choice with diversity-aware greedy selection
+        picked = []
+        available = list(map(int, pool))
+        for _ in range(take):
+            if not available:
+                break
+            pool_cols = inactive_cc[np.asarray(available, dtype=np.int64)]
+            pool_score = score_cc[np.asarray(available, dtype=np.int64)]
+            pool_score += diversity_strength * _orbit_diversity_bonus(
+                pool_cols, active_mask, P
+            )
+            j = int(np.argmax(pool_score))
+            picked.append(int(inactive_cc[available[j]]))
+            available.pop(j)
+
+        return np.asarray(picked, dtype=np.int64)
+
+    orbit_order = np.argsort(w)[::-1]
+    remaining = int(total_cols)
+
+    # Pass 1: touch as many distinct orbits as possible.
+    for cc in orbit_order:
+        if remaining <= 0:
+            break
+
+        q = int(quotas[cc])
+        if q <= 0:
+            continue
+
+        picks = _pick_from_orbit(int(cc), 1)
+        if picks.size == 0:
+            continue
+
+        gcol = int(picks[0])
+        if gcol in chosen_set:
+            continue
+
+        chosen.append(gcol)
+        chosen_set.add(gcol)
+        quotas[cc] -= 1
+        remaining -= 1
+
+    # Pass 2: fill remaining quota, still orbit-aware and diversity-aware.
+    if remaining > 0:
+        for cc in orbit_order:
+            if remaining <= 0:
+                break
+
+            q = int(min(quotas[cc], remaining))
+            if q <= 0:
+                continue
+
+            picks = _pick_from_orbit(int(cc), q)
+            for gcol in picks:
+                gcol = int(gcol)
+                if gcol in chosen_set:
+                    continue
                 chosen.append(gcol)
                 chosen_set.add(gcol)
+                quotas[cc] -= 1
+                remaining -= 1
+                if remaining <= 0:
+                    break
 
     if len(chosen) == 0:
         return np.zeros((0,), dtype=np.int64)
 
-    # hard trim if rounding produced a few extra
     if len(chosen) > total_cols:
         chosen = chosen[:total_cols]
 
@@ -957,10 +1094,10 @@ def _deficit_rescue_columns(
     P: int,
     total_cols: int,
     *,
-    min_per_orbit: int = 1,
+    min_per_orbit: int = 2,
     max_per_orbit: int = 12,
     deficit_boost: float = 2.0,
-    penalty_strength: float = 0.5,
+    penalty_strength: float = 0.2,
     exclude_mask: np.ndarray | None = None,
     orbit_occ_counts: np.ndarray | None = None,
     occ_lambda: float = 0.0,
@@ -1213,9 +1350,36 @@ def streamActiveSetNNLS(
 
         return False
 
+
+    # ##########################################################################
+    # Constants controlling orbit occupation and exploration landscape
+    #
+    # ##########################################################################
     CP = int(C * P)
     negative_grad_count = 0
     explore_budget = max(1, min(20, CP // 50))
+    # committed-state watchdog
+    z_delta_tol = 1e-6
+    active_delta_tol = 0
+    progress_window = 20
+    force_explore_after = 4
+    hard_stall_patience = 20
+    no_progress_count = 0
+    # positive-gradient batch-promotion controls
+    positive_batch_size = 24 if C <= 3 else 32
+    # Soft occupancy control: discourage crowded orbits, but do not cap them.
+    orbit_occ_lambda = 0.0 if C <= 3 else 0.01
+    # Probation for newly admitted columns.
+    probation_iters = 6
+    probation_rel = 1e-6
+    probation_abs = 1e-12
+    provisional_hits: dict[int, int] = {}
+    # Column-level tabu for genuinely unhelpful promotions.
+    col_cooldown_until: dict[int, int] = {}
+    cooldown_iters = 24
+    promotion_noop_rel_tol = 1e-8
+    promotion_noop_abs_tol = 1e-12
+    topk = 24
 
     S_flat = np.asarray(inv_sqrt_energy_flat, dtype=np.float64).ravel()
     ATy_scaled = S_flat * ATy_flat
@@ -1223,17 +1387,6 @@ def streamActiveSetNNLS(
     grad_ref = max(1.0, float(np.max(np.abs(ATy_scaled))))
     data_scale_ref = _robust_scale_ref(ATy_scaled, fallback=grad_ref)
     tol_grad_rel = 1e-6
-
-    # --- committed-state watchdog ---
-    z_delta_tol = 1e-6
-    active_delta_tol = 0
-    progress_window = 20
-    force_explore_after = 4
-    hard_stall_patience = 20
-    no_progress_count = 0
-
-    # --- positive-gradient batch-promotion controls ---
-    positive_batch_size = 2 if C <= 3 else 9
 
     # robust prior mass reference scale
     ATy_pos = ATy_flat[np.isfinite(ATy_flat) & (ATy_flat > 0.0)]
@@ -1283,21 +1436,6 @@ def streamActiveSetNNLS(
     # initialize committed baseline
     committed_z = z.copy()
     committed_active = active.copy()
-
-    # Soft occupancy control: discourage crowded orbits, but do not cap them.
-    orbit_occ_lambda = 0.15 if C <= 3 else 0.25
-
-    # Probation for newly admitted columns.
-    probation_iters = 3
-    probation_rel = 1e-6
-    probation_abs = 1e-12
-    provisional_hits: dict[int, int] = {}
-
-    # Column-level tabu for genuinely unhelpful promotions.
-    col_cooldown_until: dict[int, int] = {}
-    cooldown_iters = 10
-    promotion_noop_rel_tol = 1e-6
-    promotion_noop_abs_tol = 1e-10
 
     def _on_cooldown(col: int, it: int) -> bool:
         return it < col_cooldown_until.get(int(col), -1)
@@ -1468,7 +1606,6 @@ def streamActiveSetNNLS(
         penalty_strength = 0.5
         adj_score = gvals_promo / (1.0 + penalty_strength * (S_norm - 1.0))
 
-        topk = 5
         if adj_score.size > topk:
             top_idxs = np.argsort(adj_score)[-topk:]
             pick_local = top_idxs[np.argmax(gvals_promo[top_idxs])]
@@ -1512,10 +1649,10 @@ def streamActiveSetNNLS(
                     C=C,
                     P=P,
                     total_cols=preferred_group,
-                    min_per_orbit=1,
+                    min_per_orbit=2,
                     max_per_orbit=max(3, preferred_group),
-                    deficit_boost=2.0,
-                    penalty_strength=0.5,
+                    deficit_boost=3.0,
+                    penalty_strength=0.2,
                     exclude_mask=cooldown_mask,
                     occ_lambda=orbit_occ_lambda,
                 )
@@ -1600,10 +1737,10 @@ def streamActiveSetNNLS(
                         C=C,
                         P=P,
                         total_cols=preferred_group,
-                        min_per_orbit=1,
+                        min_per_orbit=2,
                         max_per_orbit=max(3, preferred_group),
                         deficit_boost=2.0,
-                        penalty_strength=0.5,
+                        penalty_strength=0.2,
                         exclude_mask=cooldown_mask,
                         occ_lambda=orbit_occ_lambda,
                     )
@@ -1654,10 +1791,10 @@ def streamActiveSetNNLS(
                     C=C,
                     P=P,
                     total_cols=preferred_group,
-                    min_per_orbit=1,
+                    min_per_orbit=2,
                     max_per_orbit=max(3, preferred_group),
                     deficit_boost=2.0,
-                    penalty_strength=0.5,
+                    penalty_strength=0.2,
                     exclude_mask=cooldown_mask,
                     occ_lambda=orbit_occ_lambda,
                 )
@@ -1929,7 +2066,7 @@ def streamActiveSetNNLS(
         if not np.isfinite(occ_scale) or occ_scale <= 0.0:
             occ_scale = 1.0
 
-        occ_lambda = 0.02 if C <= 3 else 0.06
+        occ_lambda = 0.0 if C <= 3 else 0.01
 
         occ_pen = np.zeros((k,), dtype=np.float64)
         for local_i, gcol in enumerate(active_idx):
@@ -2034,13 +2171,28 @@ def streamActiveSetNNLS(
             old_l1 = float(np.sum(np.abs(deficit_old)))
             new_l1 = float(np.sum(np.abs(deficit_new)))
             orbit_improved = new_l1 < (0.995 * old_l1)
+        diversity_improved = False
+        if did_explore:
+            before = 0.0
+            after = 0.0
+            for cc in np.unique(newly_activated // P):
+                base = cc * P
+                pre = np.flatnonzero(active_before[base:base + P])
+                post = np.flatnonzero(active[base:base + P])
+                before += float(pre.size)
+                after += float(post.size)
 
+            diversity_improved = after > before
+
+        # when deciding whether a newly promoted set is a "near-noop",
+        # only cool it down if it also fails diversity.
         near_noop = (
             did_explore
             and promoted_cols.size > 0
             and (obj_gain <= promotion_noop_abs_tol
-                 or rel_gain <= promotion_noop_rel_tol)
+                or rel_gain <= promotion_noop_rel_tol)
             and not orbit_improved
+            and not diversity_improved
         )
 
         reject = False
