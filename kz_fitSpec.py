@@ -2764,7 +2764,7 @@ def compare_orbit_vs_solution(
         ax.plot(plotw, plotx, '.', alpha=0.6)
         lim = [min(plotw.min(), plotx.min()),
             max(plotw.max(), plotx.max())]
-        ax.plot(lim, lim, 'k-')
+        ax.plot(lim, lim, 'k-', lw=0.3)
         ax.set_xlabel("$\\log_{10}(\\text{orbit prior (scaled)})$")
         ax.set_ylabel("$\\log_{10}(\\text{solution } \\sum_p x[c,p])$")
         if save:
