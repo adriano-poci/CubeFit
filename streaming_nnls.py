@@ -89,6 +89,11 @@ v1.15: Replaced hard per-orbit mass projection with an exact active-set KKT
         data-driven solution as much as possible while enforcing the orbit
         prior, with best-effort fallback when the current active set cannot
         satisfy the orbit constraints exactly. 23 July 2026
+v1.15: Replaced the blind hard per-orbit mass projection with a data-aware
+        active-set KKT delta-x correction using the reduced Hessian
+        (ATA_sub), preserving the data-driven solution as much as possible
+        while enforcing the orbit prior through a best-effort constrained
+        correction instead of unconditional orbit rescaling. 24 July 2026
 """
 
 from __future__ import annotations, print_function
@@ -2347,12 +2352,12 @@ def streamActiveSetNNLS(
         z_sub = z_sub_raw.copy()
 
         if enforce_orbit_prior:
-            z_candidate = z.copy()
-            z_candidate[active_idx] = z_sub
+            z_base = z.copy()
+            z_base[active_idx] = z_sub
 
-            z_candidate, delta_x_orbit, orbit_proj_info = (
+            z_prior, delta_x_orbit, orbit_proj_info = (
                 _apply_orbit_prior_delta_x_best_effort(
-                    z_candidate,
+                    z_base,
                     active_idx,
                     ATA_sub_reg,
                     ATy_sub,
@@ -2363,16 +2368,57 @@ def streamActiveSetNNLS(
                 )
             )
 
-            last_orbit_delta_x = delta_x_orbit.copy()
-            last_orbit_info = dict(orbit_proj_info)
-            z = z_candidate
-            z_sub = z_candidate[active_idx]
+            # Trust-region gate: only accept the orbit correction if it does not
+            # materially worsen the reduced objective.
+            def _reduced_obj(z_vec: np.ndarray) -> float:
+                zz = np.asarray(z_vec[active_idx], dtype=np.float64)
+                return 0.5 * float(zz @ (ATA_sub_reg @ zz)) - float(ATy_sub @ zz)
 
+            obj_base = _reduced_obj(z_base)
+            obj_prior = _reduced_obj(z_prior)
+
+            accept = (obj_prior <= obj_base + 1e-8 * (1.0 + abs(obj_base)))
+
+            if not accept:
+                eta = 0.5
+                z_best = z_base
+                delta_best = np.zeros_like(delta_x_orbit)
+                info_best = dict(orbit_proj_info)
+                info_best["accepted"] = False
+
+                for _ in range(8):
+                    z_try = z_base + eta * (z_prior - z_base)
+                    np.maximum(z_try, 0.0, out=z_try)
+
+                    obj_try = _reduced_obj(z_try)
+                    if obj_try <= obj_base + 1e-8 * (1.0 + abs(obj_base)):
+                        z_best = z_try
+                        delta_best = S_flat * (z_best - z_base)
+                        info_best = dict(orbit_proj_info)
+                        info_best["accepted"] = True
+                        info_best["eta"] = float(eta)
+                        break
+
+                    eta *= 0.5
+
+                z = z_best
+                last_orbit_delta_x = delta_best.copy()
+                last_orbit_info = dict(info_best)
+            else:
+                z = z_prior
+                last_orbit_delta_x = delta_x_orbit.copy()
+                last_orbit_info = dict(orbit_proj_info)
+                last_orbit_info["accepted"] = True
+                last_orbit_info["eta"] = 1.0
+
+            z_sub = z[active_idx]
             print(
-                "[MONO][orbit-prior] best-effort correction: "
-                f"exact={orbit_proj_info['exact']} "
-                f"mass_resid={orbit_proj_info['mass_resid']:.3e} "
-                f"delta_x_norm={orbit_proj_info['delta_x_norm']:.3e}",
+                "[MONO][orbit-prior] correction: "
+                f"accepted={last_orbit_info.get('accepted', False)} "
+                f"eta={last_orbit_info.get('eta', 1.0):.3f} "
+                f"exact={last_orbit_info['exact']} "
+                f"mass_resid={last_orbit_info['mass_resid']:.3e} "
+                f"delta_x_norm={last_orbit_info['delta_x_norm']:.3e}",
                 flush=True,
             )
         else:
@@ -2380,6 +2426,8 @@ def streamActiveSetNNLS(
             last_orbit_delta_x.fill(0.0)
             last_orbit_info = {
                 "exact": False,
+                "accepted": False,
+                "eta": 0.0,
                 "mass_resid": 0.0,
                 "delta_x_norm": 0.0,
                 "delta_z_norm": 0.0,

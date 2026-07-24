@@ -2571,8 +2571,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                             ax.set_yticklabels([])
                         lT = ax.text(1e-2, 1e-2, f"{prop} {otype}", va='bottom',
                             ha='left', color=POT.pgreen, transform=ax.transAxes,
-                            path_effects=PathEffects.withStroke(linewidth=1.5,
-                            foreground='k'))
+                            path_effects=[PathEffects.withStroke(linewidth=1.5,
+                            foreground='k')])
                 fig.savefig(figDir/\
                     f"orbitMaps_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
             except Exception as e:
