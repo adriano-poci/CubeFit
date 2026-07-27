@@ -50,7 +50,7 @@ def _configure_solver_environment():
     os.environ["CUBEFIT_MAX_INV_D"] = "1e6"
     os.environ["CUBEFIT_ZERO_COL_DATAFLOOR_MUL"] = "1e-8"
     os.environ["CUBEFIT_ZERO_COL_ABS"] = "1e-30"
-    os.environ["CUBEFIT_ORBIT_PRIOR_DELTA"] = "1e-3"
+    os.environ["CUBEFIT_ORBIT_PRIOR_DELTA"] = "1e1"
 
 
 def main():

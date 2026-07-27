@@ -84,6 +84,16 @@ v1.13:  Added periodic restart checkpoints to `streamActiveSetNNLS`;
 v1.14:  Enforced the orbit prior by projecting each orbit's mass onto the
             target prior almost exactly within a small delta tolerance. 20 July
             2026
+v1.15: Replaced hard per-orbit mass projection with an exact active-set KKT
+        delta-x correction using the reduced Hessian (ATA_sub), preserving the
+        data-driven solution as much as possible while enforcing the orbit
+        prior, with best-effort fallback when the current active set cannot
+        satisfy the orbit constraints exactly. 23 July 2026
+v1.15: Replaced the blind hard per-orbit mass projection with a data-aware
+        active-set KKT delta-x correction using the reduced Hessian
+        (ATA_sub), preserving the data-driven solution as much as possible
+        while enforcing the orbit prior through a best-effort constrained
+        correction instead of unconditional orbit rescaling. 24 July 2026
 """
 
 from __future__ import annotations, print_function
@@ -691,6 +701,340 @@ def _should_enforce_orbit_prior(
         return False
     return True
 
+def _orbit_mass_targets(
+    orbit_weights: np.ndarray,
+    total_mass: float,
+) -> np.ndarray:
+    """
+    Scale a normalized orbit prior to the requested total mass.
+    """
+    w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
+    w = np.maximum(w, 0.0)
+    w_sum = float(np.sum(w))
+
+    if (not np.isfinite(w_sum)) or w_sum <= 0.0:
+        raise RuntimeError("orbit prior has no positive mass.")
+
+    if not np.isfinite(total_mass):
+        raise RuntimeError("total_mass is not finite.")
+
+    return (float(total_mass) / w_sum) * w
+
+def _maybe_apply_orbit_prior_delta_x(
+    z_base: np.ndarray,
+    active_idx: np.ndarray,
+    ATA_sub_reg: np.ndarray,
+    ATy_sub: np.ndarray,
+    S_flat: np.ndarray,
+    w_target: np.ndarray | None,
+    P: int,
+    *,
+    h5_path: str,
+    rmse_tiles: list,
+    keep_idx,
+    rmse_rel_tol: float = 1e-2,
+    ls_max_steps: int = 8,
+    delta: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Apply the orbit-prior delta-x correction only if it does not materially
+    worsen a cheap RMSE proxy.
+    """
+    z_base = np.asarray(z_base, dtype=np.float64).ravel(order="C")
+    z_prior, delta_x, info = _apply_orbit_prior_delta_x_best_effort(
+        z_base,
+        active_idx,
+        ATA_sub_reg,
+        ATy_sub,
+        S_flat,
+        w_target,
+        P,
+        delta=delta,
+    )
+
+    rmse_base = _rmse_proxy_for_z(
+        h5_path=h5_path,
+        z_vec=z_base,
+        S_flat=S_flat,
+        rmse_tiles=rmse_tiles,
+        keep_idx=keep_idx,
+    )
+
+    z_best = z_base
+    delta_x_best = np.zeros_like(delta_x)
+    rmse_best = float(rmse_base)
+    accepted = False
+    eta_best = 0.0
+
+    eta = 1.0
+    for _ in range(int(ls_max_steps)):
+        z_try = z_base + eta * (z_prior - z_base)
+        np.maximum(z_try, 0.0, out=z_try)
+
+        rmse_try = _rmse_proxy_for_z(
+            h5_path=h5_path,
+            z_vec=z_try,
+            S_flat=S_flat,
+            rmse_tiles=rmse_tiles,
+            keep_idx=keep_idx,
+        )
+
+        if rmse_try <= rmse_base * (1.0 + float(rmse_rel_tol)):
+            z_best = z_try
+            delta_x_best = S_flat * (z_best - z_base)
+            rmse_best = float(rmse_try)
+            accepted = True
+            eta_best = float(eta)
+            break
+
+        if rmse_try < rmse_best:
+            z_best = z_try
+            delta_x_best = S_flat * (z_best - z_base)
+            rmse_best = float(rmse_try)
+            eta_best = float(eta)
+
+        eta *= 0.5
+
+    info = dict(info)
+    info["accepted"] = bool(accepted)
+    info["eta"] = float(eta_best)
+    info["rmse_base"] = float(rmse_base)
+    info["rmse_try"] = float(rmse_best)
+
+    if accepted:
+        return z_best, delta_x_best, info
+
+    return z_base, np.zeros_like(delta_x), info
+
+def _apply_orbit_prior_delta_x_best_effort(
+    z_full: np.ndarray,
+    active_idx: np.ndarray,
+    ATA_sub_reg: np.ndarray,
+    ATy_sub: np.ndarray,
+    S_flat: np.ndarray,
+    w_target: np.ndarray | None,
+    P: int,
+    *,
+    delta: float = 1e-6,
+    max_outer: int = 64,
+    neg_tol: float = 1e-12,
+    kkt_ridge: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Best-effort orbit-prior correction on the current active set.
+
+    The correction is solved in z-space using the exact reduced Hessian
+    ``ATA_sub_reg`` and right-hand side ``ATy_sub``. The induced
+    coefficient-space correction is returned as ``delta_x``.
+
+    The solver first tries to satisfy the orbit-mass constraints exactly
+    with an active-set KKT solve. If exact matching is not feasible on the
+    current active set, it returns the best effort produced by the same
+    exact reduced system, without raising.
+
+    Returns
+    -------
+    z_out : ndarray, shape (C*P,)
+        Corrected z vector.
+    delta_x : ndarray, shape (C*P,)
+        Coefficient-space correction, i.e. ``x_out - x_in``.
+    info : dict
+        Diagnostics:
+        - ``exact`` : bool
+        - ``mass_resid`` : float
+        - ``delta_x_norm`` : float
+        - ``delta_z_norm`` : float
+    """
+    z_full = np.asarray(z_full, dtype=np.float64).ravel(order="C").copy()
+    active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
+    S_flat = np.asarray(S_flat, dtype=np.float64).ravel(order="C")
+    H = np.asarray(ATA_sub_reg, dtype=np.float64, order="C")
+    g = np.asarray(ATy_sub, dtype=np.float64, order="C")
+
+    if w_target is None:
+        delta_x = np.zeros_like(z_full, dtype=np.float64)
+        return z_full, delta_x, {
+            "exact": False,
+            "mass_resid": 0.0,
+            "delta_x_norm": 0.0,
+            "delta_z_norm": 0.0,
+        }
+
+    if active_idx.size == 0:
+        delta_x = np.zeros_like(z_full, dtype=np.float64)
+        return z_full, delta_x, {
+            "exact": False,
+            "mass_resid": 0.0,
+            "delta_x_norm": 0.0,
+            "delta_z_norm": 0.0,
+        }
+
+    w = np.asarray(w_target, dtype=np.float64).ravel(order="C")
+    w = np.maximum(w, 0.0)
+    if w.size == 0:
+        delta_x = np.zeros_like(z_full, dtype=np.float64)
+        return z_full, delta_x, {
+            "exact": False,
+            "mass_resid": 0.0,
+            "delta_x_norm": 0.0,
+            "delta_z_norm": 0.0,
+        }
+
+    C = int(w.size)
+    if H.shape != (active_idx.size, active_idx.size):
+        raise ValueError("ATA_sub_reg shape does not match active_idx size")
+    if g.size != active_idx.size:
+        raise ValueError("ATy_sub length does not match active_idx size")
+
+    z0_active = z_full[active_idx].copy()
+    S_active = S_flat[active_idx]
+    orbit_ids = (active_idx // P).astype(np.int64)
+    x0_active = S_active * z0_active
+
+    current_mass = np.bincount(
+        orbit_ids,
+        weights=x0_active,
+        minlength=C,
+    ).astype(np.float64)
+
+    target_mass = _orbit_mass_targets(w, float(np.sum(current_mass)))
+    rhs_mass = target_mass - current_mass
+
+    B = np.zeros((C, active_idx.size), dtype=np.float64)
+    B[orbit_ids, np.arange(active_idx.size)] = S_active
+
+    grad0 = H @ z0_active - g
+    free = np.ones(active_idx.size, dtype=bool)
+
+    best_z_active = z0_active.copy()
+    best_mass_resid = np.inf
+    best_exact = False
+
+    for _ in range(int(max_outer)):
+        free_idx = np.flatnonzero(free)
+        fixed_idx = np.flatnonzero(~free)
+
+        delta_fixed = np.zeros((fixed_idx.size,), dtype=np.float64)
+        rhs_free_mass = rhs_mass.copy()
+
+        if fixed_idx.size > 0:
+            delta_fixed = -z0_active[fixed_idx]
+            rhs_free_mass -= B[:, fixed_idx] @ delta_fixed
+
+        if free_idx.size == 0:
+            candidate = z0_active + 0.0
+            if fixed_idx.size > 0:
+                candidate[fixed_idx] = 0.0
+
+            mass_resid = float(np.max(np.abs(B @ (candidate - z0_active)
+                                             - rhs_mass)))
+            if mass_resid < best_mass_resid:
+                best_mass_resid = mass_resid
+                best_z_active = candidate.copy()
+
+            break
+
+        H_ff = H[np.ix_(free_idx, free_idx)]
+        B_f = B[:, free_idx]
+        g_f = grad0[free_idx]
+
+        n_free = free_idx.size
+        K = np.zeros((n_free + C, n_free + C), dtype=np.float64)
+        K[:n_free, :n_free] = H_ff
+
+        if kkt_ridge > 0.0:
+            K[np.arange(n_free), np.arange(n_free)] += float(kkt_ridge)
+
+        K[:n_free, n_free:] = B_f.T
+        K[n_free:, :n_free] = B_f
+
+        rhs = np.concatenate((-g_f, rhs_free_mass))
+
+        solved_exact = True
+        try:
+            sol = np.linalg.solve(K, rhs)
+        except np.linalg.LinAlgError:
+            sol, *_ = np.linalg.lstsq(K, rhs, rcond=None)
+            solved_exact = False
+
+        delta_full = np.zeros_like(z0_active)
+        delta_full[fixed_idx] = delta_fixed
+        delta_full[free_idx] = sol[:n_free]
+
+        candidate = z0_active + delta_full
+        bad = free_idx[candidate[free_idx] < -neg_tol]
+
+        if bad.size > 0:
+            free[bad] = False
+            continue
+
+        np.maximum(candidate, 0.0, out=candidate)
+
+        mass_resid = float(
+            np.max(np.abs(B @ (candidate - z0_active) - rhs_mass))
+        )
+        if mass_resid < best_mass_resid:
+            best_mass_resid = mass_resid
+            best_z_active = candidate.copy()
+            best_exact = bool(solved_exact and mass_resid <= max(
+                float(delta), 1e-12
+            ) * max(
+                1.0,
+                float(np.max(np.abs(target_mass))) if target_mass.size else 1.0,
+            ))
+
+        # If we solved exactly and the mass residual is small, stop.
+        if solved_exact and best_exact:
+            break
+
+        # If the exact solve was impossible, still keep the best effort and
+        # exit without raising.
+        if not solved_exact:
+            break
+
+    z_out = z_full.copy()
+    z_out[active_idx] = best_z_active
+
+    x_before = S_flat * z_full
+    x_after = S_flat * z_out
+    delta_x = x_after - x_before
+
+    info = {
+        "exact": bool(best_exact),
+        "mass_resid": float(best_mass_resid),
+        "delta_x_norm": float(np.linalg.norm(delta_x)),
+        "delta_z_norm": float(np.linalg.norm(z_out - z_full)),
+    }
+    return z_out, delta_x, info
+
+def _rmse_proxy_for_z(
+    h5_path: str,
+    z_vec: np.ndarray,
+    S_flat: np.ndarray,
+    rmse_tiles: list,
+    keep_idx,
+) -> float:
+    """
+    Compute a cheap RMSE proxy for the current solution vector.
+
+    The proxy is evaluated on a small fixed subset of tiles so it is cheap
+    enough to use inside the orbit-prior line search.
+    """
+    x_phys = (
+        np.asarray(S_flat, dtype=np.float64).ravel(order="C")
+        * np.asarray(z_vec, dtype=np.float64).ravel(order="C")
+    )
+    return float(
+        rmse_proxy_subset(
+            h5_path=h5_path,
+            x_CP=x_phys,
+            tile_ranges=rmse_tiles,
+            keep_idx=keep_idx,
+            inv_cp_flux_ref=None,
+            w_lam_sqrt=None,
+        )
+    )
+
 def _enforce_orbit_prior_mass(
     x_cp: np.ndarray,
     orbit_weights: np.ndarray | None,
@@ -761,37 +1105,6 @@ def _enforce_orbit_prior_mass(
                 orbit *= target / mass_new
 
     return np.maximum(x_cp, 0.0)
-
-# ------------------------------------------------------------------------------
-
-def _population_diversity_bonus(
-    cand_cols: np.ndarray,
-    active_mask: np.ndarray,
-    P: int,
-) -> np.ndarray:
-    """
-    Prefer candidates far from already-active populations in the same orbit.
-    """
-    cand_cols = np.asarray(cand_cols, dtype=np.int64).ravel()
-    if cand_cols.size == 0:
-        return np.zeros((0,), dtype=np.float64)
-
-    bonus = np.empty(cand_cols.size, dtype=np.float64)
-
-    for i, gcol in enumerate(cand_cols):
-        cc = int(gcol // P)
-        base = cc * P
-        p = int(gcol - base)
-        active_p = np.flatnonzero(active_mask[base:base + P])
-
-        if active_p.size == 0:
-            bonus[i] = 1.0
-            continue
-
-        d = np.min(np.abs(active_p - p))
-        bonus[i] = np.sqrt((d + 1.0) / float(max(1, P)))
-
-    return bonus
 
 # ------------------------------------------------------------------------------
 
@@ -1400,6 +1713,18 @@ def streamActiveSetNNLS(
 
     print(f"[DIAG] alpha_ref = {alpha_ref:.4e}", flush=True)
 
+    if len(s_ranges) <= 3:
+        rmse_tiles = list(s_ranges)
+    else:
+        rmse_tiles = [
+            s_ranges[0],
+            s_ranges[len(s_ranges) // 2],
+            s_ranges[-1],
+        ]
+
+    rmse_rel_tol = float(os.environ.get("CUBEFIT_ORBIT_RMSE_REL_TOL", "1e-2"))
+    ls_max_steps = int(os.environ.get("CUBEFIT_ORBIT_LS_STEPS", "8"))
+
     # --- orbit prior setup ---
     w_target = None
     if orbit_weights is not None:
@@ -1436,6 +1761,14 @@ def streamActiveSetNNLS(
     # initialize committed baseline
     committed_z = z.copy()
     committed_active = active.copy()
+
+    last_orbit_delta_x = np.zeros((CP,), dtype=np.float64)
+    last_orbit_info = {
+        "exact": False,
+        "mass_resid": 0.0,
+        "delta_x_norm": 0.0,
+        "delta_z_norm": 0.0,
+    }
 
     def _on_cooldown(col: int, it: int) -> bool:
         return it < col_cooldown_until.get(int(col), -1)
@@ -2107,23 +2440,38 @@ def streamActiveSetNNLS(
         z_sub = z_sub_raw.copy()
 
         if enforce_orbit_prior:
-            z_candidate = z.copy()
-            z_candidate[active_idx] = z_sub
-            x_candidate = (S_flat * z_candidate).reshape(C, P)
-            x_candidate = _enforce_orbit_prior_mass(
-                x_candidate,
-                w_target,
-                delta=orbit_prior_delta,
+            z_base = z.copy()
+            z_base[active_idx] = z_sub
+
+            z, last_orbit_delta_x, last_orbit_info = (
+                _maybe_apply_orbit_prior_delta_x(
+                    z_base,
+                    active_idx,
+                    ATA_sub_reg,
+                    ATy_sub,
+                    S_flat,
+                    w_target,
+                    P,
+                    h5_path=h5_path,
+                    rmse_tiles=rmse_tiles,
+                    keep_idx=keep_idx,
+                    rmse_rel_tol=rmse_rel_tol,
+                    ls_max_steps=ls_max_steps,
+                    delta=orbit_prior_delta,
+                )
             )
-            z_candidate = np.divide(
-                x_candidate.reshape(-1),
-                S_flat,
-                out=np.zeros_like(z_candidate, dtype=np.float64),
-                where=S_flat > 0.0,
+            z_sub = z[active_idx]
+            print(
+                "[MONO][orbit-prior] correction: "
+                f"accepted={last_orbit_info['accepted']} "
+                f"eta={last_orbit_info['eta']:.3f} "
+                f"rmse_base={last_orbit_info['rmse_base']:.3e} "
+                f"rmse_try={last_orbit_info['rmse_try']:.3e} "
+                f"exact={last_orbit_info['exact']} "
+                f"mass_resid={last_orbit_info['mass_resid']:.3e} "
+                f"delta_x_norm={last_orbit_info['delta_x_norm']:.3e}",
+                flush=True,
             )
-            np.maximum(z_candidate, 0.0, out=z_candidate)
-            z_sub = z_candidate[active_idx]
-            z = z_candidate
         else:
             z[active_idx] = z_sub
 
@@ -2329,19 +2677,11 @@ def streamActiveSetNNLS(
         _emit_checkpoint(it, final=False)
 
     if enforce_orbit_prior:
-        x_final = (S_flat * z).reshape(C, P)
-        x_final = _enforce_orbit_prior_mass(
-            x_final,
-            w_target,
-            delta=orbit_prior_delta,
+        print(
+            "[MONO][orbit-prior][final] no deferred correction; "
+            "returned x is the last committed iterate",
+            flush=True,
         )
-        z = np.divide(
-            x_final.reshape(-1),
-            S_flat,
-            out=np.zeros_like(z, dtype=np.float64),
-            where=S_flat > 0.0,
-        )
-        np.maximum(z, 0.0, out=z)
 
     try:
         final_it = int(it)
