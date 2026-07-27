@@ -31,13 +31,13 @@ def props(galaxy):
             specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI', nProcs=1,
             band='F814W', genSwitch=None, kind='SMILES', cont=False,
             smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],
-            lam=1e-12, warm='zeros')
+            lam=1e-12, warm='resume')
     elif 'FCC170' in galaxy:
         propDict = dict(galaxy='FCC170', mPath='hd170', SN=100, nCuts=3,
             lOrder=0, specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI',
             nProcs=1, band='r', genSwitch=None, kind='SMILES', cont=False,
             smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],
-            lam=1e-12, warm='zeros')
+            lam=1e-12, warm='resume')
     else:
         raise ValueError(f"Unknown galaxy '{galaxy}'")
     

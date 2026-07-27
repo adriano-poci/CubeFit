@@ -720,6 +720,92 @@ def _orbit_mass_targets(
 
     return (float(total_mass) / w_sum) * w
 
+def _maybe_apply_orbit_prior_delta_x(
+    z_base: np.ndarray,
+    active_idx: np.ndarray,
+    ATA_sub_reg: np.ndarray,
+    ATy_sub: np.ndarray,
+    S_flat: np.ndarray,
+    w_target: np.ndarray | None,
+    P: int,
+    *,
+    h5_path: str,
+    rmse_tiles: list,
+    keep_idx,
+    rmse_rel_tol: float = 1e-2,
+    ls_max_steps: int = 8,
+    delta: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Apply the orbit-prior delta-x correction only if it does not materially
+    worsen a cheap RMSE proxy.
+    """
+    z_base = np.asarray(z_base, dtype=np.float64).ravel(order="C")
+    z_prior, delta_x, info = _apply_orbit_prior_delta_x_best_effort(
+        z_base,
+        active_idx,
+        ATA_sub_reg,
+        ATy_sub,
+        S_flat,
+        w_target,
+        P,
+        delta=delta,
+    )
+
+    rmse_base = _rmse_proxy_for_z(
+        h5_path=h5_path,
+        z_vec=z_base,
+        S_flat=S_flat,
+        rmse_tiles=rmse_tiles,
+        keep_idx=keep_idx,
+    )
+
+    z_best = z_base
+    delta_x_best = np.zeros_like(delta_x)
+    rmse_best = float(rmse_base)
+    accepted = False
+    eta_best = 0.0
+
+    eta = 1.0
+    for _ in range(int(ls_max_steps)):
+        z_try = z_base + eta * (z_prior - z_base)
+        np.maximum(z_try, 0.0, out=z_try)
+
+        rmse_try = _rmse_proxy_for_z(
+            h5_path=h5_path,
+            z_vec=z_try,
+            S_flat=S_flat,
+            rmse_tiles=rmse_tiles,
+            keep_idx=keep_idx,
+        )
+
+        if rmse_try <= rmse_base * (1.0 + float(rmse_rel_tol)):
+            z_best = z_try
+            delta_x_best = S_flat * (z_best - z_base)
+            rmse_best = float(rmse_try)
+            accepted = True
+            eta_best = float(eta)
+            break
+
+        if rmse_try < rmse_best:
+            z_best = z_try
+            delta_x_best = S_flat * (z_best - z_base)
+            rmse_best = float(rmse_try)
+            eta_best = float(eta)
+
+        eta *= 0.5
+
+    info = dict(info)
+    info["accepted"] = bool(accepted)
+    info["eta"] = float(eta_best)
+    info["rmse_base"] = float(rmse_base)
+    info["rmse_try"] = float(rmse_best)
+
+    if accepted:
+        return z_best, delta_x_best, info
+
+    return z_base, np.zeros_like(delta_x), info
+
 def _apply_orbit_prior_delta_x_best_effort(
     z_full: np.ndarray,
     active_idx: np.ndarray,
@@ -921,6 +1007,34 @@ def _apply_orbit_prior_delta_x_best_effort(
     }
     return z_out, delta_x, info
 
+def _rmse_proxy_for_z(
+    h5_path: str,
+    z_vec: np.ndarray,
+    S_flat: np.ndarray,
+    rmse_tiles: list,
+    keep_idx,
+) -> float:
+    """
+    Compute a cheap RMSE proxy for the current solution vector.
+
+    The proxy is evaluated on a small fixed subset of tiles so it is cheap
+    enough to use inside the orbit-prior line search.
+    """
+    x_phys = (
+        np.asarray(S_flat, dtype=np.float64).ravel(order="C")
+        * np.asarray(z_vec, dtype=np.float64).ravel(order="C")
+    )
+    return float(
+        rmse_proxy_subset(
+            h5_path=h5_path,
+            x_CP=x_phys,
+            tile_ranges=rmse_tiles,
+            keep_idx=keep_idx,
+            inv_cp_flux_ref=None,
+            w_lam_sqrt=None,
+        )
+    )
+
 def _enforce_orbit_prior_mass(
     x_cp: np.ndarray,
     orbit_weights: np.ndarray | None,
@@ -991,37 +1105,6 @@ def _enforce_orbit_prior_mass(
                 orbit *= target / mass_new
 
     return np.maximum(x_cp, 0.0)
-
-# ------------------------------------------------------------------------------
-
-def _population_diversity_bonus(
-    cand_cols: np.ndarray,
-    active_mask: np.ndarray,
-    P: int,
-) -> np.ndarray:
-    """
-    Prefer candidates far from already-active populations in the same orbit.
-    """
-    cand_cols = np.asarray(cand_cols, dtype=np.int64).ravel()
-    if cand_cols.size == 0:
-        return np.zeros((0,), dtype=np.float64)
-
-    bonus = np.empty(cand_cols.size, dtype=np.float64)
-
-    for i, gcol in enumerate(cand_cols):
-        cc = int(gcol // P)
-        base = cc * P
-        p = int(gcol - base)
-        active_p = np.flatnonzero(active_mask[base:base + P])
-
-        if active_p.size == 0:
-            bonus[i] = 1.0
-            continue
-
-        d = np.min(np.abs(active_p - p))
-        bonus[i] = np.sqrt((d + 1.0) / float(max(1, P)))
-
-    return bonus
 
 # ------------------------------------------------------------------------------
 
@@ -1630,6 +1713,18 @@ def streamActiveSetNNLS(
 
     print(f"[DIAG] alpha_ref = {alpha_ref:.4e}", flush=True)
 
+    if len(s_ranges) <= 3:
+        rmse_tiles = list(s_ranges)
+    else:
+        rmse_tiles = [
+            s_ranges[0],
+            s_ranges[len(s_ranges) // 2],
+            s_ranges[-1],
+        ]
+
+    rmse_rel_tol = float(os.environ.get("CUBEFIT_ORBIT_RMSE_REL_TOL", "1e-2"))
+    ls_max_steps = int(os.environ.get("CUBEFIT_ORBIT_LS_STEPS", "8"))
+
     # --- orbit prior setup ---
     w_target = None
     if orbit_weights is not None:
@@ -1667,7 +1762,6 @@ def streamActiveSetNNLS(
     committed_z = z.copy()
     committed_active = active.copy()
 
-    last_orbit_state = None
     last_orbit_delta_x = np.zeros((CP,), dtype=np.float64)
     last_orbit_info = {
         "exact": False,
@@ -2355,8 +2449,8 @@ def streamActiveSetNNLS(
             z_base = z.copy()
             z_base[active_idx] = z_sub
 
-            z_prior, delta_x_orbit, orbit_proj_info = (
-                _apply_orbit_prior_delta_x_best_effort(
+            z, last_orbit_delta_x, last_orbit_info = (
+                _maybe_apply_orbit_prior_delta_x(
                     z_base,
                     active_idx,
                     ATA_sub_reg,
@@ -2364,58 +2458,21 @@ def streamActiveSetNNLS(
                     S_flat,
                     w_target,
                     P,
+                    h5_path=h5_path,
+                    rmse_tiles=rmse_tiles,
+                    keep_idx=keep_idx,
+                    rmse_rel_tol=rmse_rel_tol,
+                    ls_max_steps=ls_max_steps,
                     delta=orbit_prior_delta,
                 )
             )
-
-            # Trust-region gate: only accept the orbit correction if it does not
-            # materially worsen the reduced objective.
-            def _reduced_obj(z_vec: np.ndarray) -> float:
-                zz = np.asarray(z_vec[active_idx], dtype=np.float64)
-                return 0.5 * float(zz @ (ATA_sub_reg @ zz)) - float(ATy_sub @ zz)
-
-            obj_base = _reduced_obj(z_base)
-            obj_prior = _reduced_obj(z_prior)
-
-            accept = (obj_prior <= obj_base + 1e-8 * (1.0 + abs(obj_base)))
-
-            if not accept:
-                eta = 0.5
-                z_best = z_base
-                delta_best = np.zeros_like(delta_x_orbit)
-                info_best = dict(orbit_proj_info)
-                info_best["accepted"] = False
-
-                for _ in range(8):
-                    z_try = z_base + eta * (z_prior - z_base)
-                    np.maximum(z_try, 0.0, out=z_try)
-
-                    obj_try = _reduced_obj(z_try)
-                    if obj_try <= obj_base + 1e-8 * (1.0 + abs(obj_base)):
-                        z_best = z_try
-                        delta_best = S_flat * (z_best - z_base)
-                        info_best = dict(orbit_proj_info)
-                        info_best["accepted"] = True
-                        info_best["eta"] = float(eta)
-                        break
-
-                    eta *= 0.5
-
-                z = z_best
-                last_orbit_delta_x = delta_best.copy()
-                last_orbit_info = dict(info_best)
-            else:
-                z = z_prior
-                last_orbit_delta_x = delta_x_orbit.copy()
-                last_orbit_info = dict(orbit_proj_info)
-                last_orbit_info["accepted"] = True
-                last_orbit_info["eta"] = 1.0
-
             z_sub = z[active_idx]
             print(
                 "[MONO][orbit-prior] correction: "
-                f"accepted={last_orbit_info.get('accepted', False)} "
-                f"eta={last_orbit_info.get('eta', 1.0):.3f} "
+                f"accepted={last_orbit_info['accepted']} "
+                f"eta={last_orbit_info['eta']:.3f} "
+                f"rmse_base={last_orbit_info['rmse_base']:.3e} "
+                f"rmse_try={last_orbit_info['rmse_try']:.3e} "
                 f"exact={last_orbit_info['exact']} "
                 f"mass_resid={last_orbit_info['mass_resid']:.3e} "
                 f"delta_x_norm={last_orbit_info['delta_x_norm']:.3e}",
@@ -2634,25 +2691,10 @@ def streamActiveSetNNLS(
 
         _emit_checkpoint(it, final=False)
 
-    if enforce_orbit_prior and (last_orbit_state is not None):
-        z, last_orbit_delta_x, last_orbit_info = (
-            _apply_orbit_prior_delta_x_best_effort(
-                last_orbit_state["z_full"],
-                last_orbit_state["active_idx"],
-                last_orbit_state["ATA_sub_reg"],
-                last_orbit_state["ATy_sub"],
-                S_flat,
-                w_target,
-                P,
-                delta=orbit_prior_delta,
-            )
-        )
-
+    if enforce_orbit_prior:
         print(
-            "[MONO][orbit-prior][final] best-effort correction: "
-            f"exact={last_orbit_info['exact']} "
-            f"mass_resid={last_orbit_info['mass_resid']:.3e} "
-            f"delta_x_norm={last_orbit_info['delta_x_norm']:.3e}",
+            "[MONO][orbit-prior][final] no deferred correction; "
+            "returned x is the last committed iterate",
             flush=True,
         )
 

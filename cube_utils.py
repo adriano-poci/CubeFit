@@ -2690,17 +2690,6 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     teDir = gFunc(iso, IMF, slope)
     tmetals, tages, talphas = fFunc(teDir)
 
-    # Template library trimming
-    if iso == 'pad':
-        selIso = np.where((tages >= 0.1) & (tages <= 14.2) &\
-            (tmetals >= -1.71) & (tmetals <= 0.22))[0]
-    else:
-        selIso = np.where((tages >= 0.1) & (tmetals >= -2.0))[0]
-    tages = tages[selIso]
-    tmetals = tmetals[selIso]
-    talphas = talphas[selIso] if not isinstance(talphas, type(None)) else \
-        None
-    teDir = teDir[selIso]
     umetals, uages = np.unique(tmetals), np.unique(tages)
     ualphas = np.unique(talphas) if not isinstance(talphas, type(None)) else \
         np.array([0.0]) # no alphas in EMILES
