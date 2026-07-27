@@ -2408,12 +2408,6 @@ def streamActiveSetNNLS(
             occ_pen[local_i] = occ_lambda * crowd / occ_scale
 
         ATA_sub_reg[np.diag_indices(k)] += occ_pen
-        last_orbit_state = dict(
-            z_full=z.copy(),
-            active_idx=active_idx.copy(),
-            ATA_sub_reg=ATA_sub_reg.copy(),
-            ATy_sub=ATy_sub.copy(),
-        )
 
         print(
             "[DIAG][occupancy_penalty] "
@@ -2480,15 +2474,6 @@ def streamActiveSetNNLS(
             )
         else:
             z[active_idx] = z_sub
-            last_orbit_delta_x.fill(0.0)
-            last_orbit_info = {
-                "exact": False,
-                "accepted": False,
-                "eta": 0.0,
-                "mass_resid": 0.0,
-                "delta_x_norm": 0.0,
-                "delta_z_norm": 0.0,
-            }
 
         def _quad_obj(A, b, x):
             return 0.5 * float(x @ (A @ x)) - float(b @ x)

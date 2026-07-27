@@ -58,6 +58,7 @@ v1.16:  Fixed bug in `PipelineRunner._read_latest_from_main` which incorrectly
 v1.17:  Removed lingering `orbit_beta`. 23 March 2026
 v1.18:  Re-implemented `orbit_beta` support in `solve_all_mp_batched` and passed
             it to the solver. 30 March 2026
+v1.19:  Resolve `orbit_prior_delta`. 27 July 2026
 """
 
 from __future__ import annotations
@@ -1196,7 +1197,10 @@ class PipelineRunner:
             project_nonneg=bool(project_nonneg),
             processes=int(processes),
             blas_threads=int(blas_threads),
-            apply_mask=bool(reader_apply_mask)
+            apply_mask=bool(reader_apply_mask),
+            orbit_prior_delta=float(
+                os.environ.get("CUBEFIT_ORBIT_PRIOR_DELTA", "1e-6")
+            ),
         )
 
         try:

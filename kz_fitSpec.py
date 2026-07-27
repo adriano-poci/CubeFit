@@ -2571,8 +2571,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                             ax.set_yticklabels([])
                         lT = ax.text(1e-2, 1e-2, f"{prop} {otype}", va='bottom',
                             ha='left', color=POT.pgreen, transform=ax.transAxes,
-                            path_effects=[PathEffects.withStroke(linewidth=1.5,
-                            foreground='k')])
+                            path_effects=PathEffects.withStroke(linewidth=1.5,
+                            foreground='k'))
                 fig.savefig(figDir/\
                     f"orbitMaps_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
             except Exception as e:
@@ -2764,7 +2764,7 @@ def compare_orbit_vs_solution(
         ax.plot(plotw, plotx, '.', alpha=0.6)
         lim = [min(plotw.min(), plotx.min()),
             max(plotw.max(), plotx.max())]
-        ax.plot(lim, lim, 'k-', lw=0.3)
+        ax.plot(lim, lim, 'k-')
         ax.set_xlabel("$\\log_{10}(\\text{orbit prior (scaled)})$")
         ax.set_ylabel("$\\log_{10}(\\text{solution } \\sum_p x[c,p])$")
         if save:
