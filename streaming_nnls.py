@@ -97,7 +97,11 @@ v1.16:  Replaced the blind hard per-orbit mass projection with a data-aware
             while enforcing the orbit prior through a best-effort constrained
             correction instead of unconditional orbit rescaling. 24 July 2026
 v1.17:  Fixed history versioning;
-        Reverted to v1.13 soft projection. 28 July 2026
+        Reverted to v1.13 soft projection;
+        Refined orbit-prior support recovery by applying promotion bias only to
+            under-represented orbits and widening the rescue candidate pool to
+            improve orbit diversity without degrading the spectral fit. 28 July
+            2026
 """
 
 from __future__ import annotations, print_function
@@ -869,14 +873,10 @@ def _quota_rescue_columns(
         score_cc = score_cc / occ_pen
         score_cc += 1e-6 * np.random.standard_normal(score_cc.shape)
 
-        aty_scale = np.max(np.abs(aty_cc)) + 1e-30
-        score_cc = score_cc + 0.10 * (aty_cc / aty_scale)
-        score_cc += 1e-6 * np.random.standard_normal(score_cc.shape)
-
         order = np.argsort(score_cc)[::-1]
-        pool_size = min(10, order.size)   # exploration pool
+        pool_size = builtins.min(24, order.size)
         pool = order[:pool_size]
-        take = min(q, pool.size)
+        take = builtins.min(q, pool.size)
         chosen_local = np.random.choice(pool, size=take, replace=False)
         for j in chosen_local:
             gcol = int(inactive_cc[j])
@@ -1381,8 +1381,8 @@ def streamActiveSetNNLS(
         orbit_s, orbit_t, orbit_deficit = _orbit_mass_and_deficit(z)
         orbit_pressure = np.maximum(orbit_deficit, 0.0)
 
-        # Prior affects promotion ranking and reduced solve, but data-only
-        # gradient remains the reference for watchdog / rollback.
+        # Prior should help under-represented orbits re-enter the active set,
+        # not suppress them.
         if (w_target is not None) and (orbit_beta > 0.0):
             g_prior = np.zeros_like(grad_promo)
 
@@ -1390,25 +1390,23 @@ def streamActiveSetNNLS(
                 base = cc * P
                 idxs = np.arange(base, base + P, dtype=np.int64)
 
-                S_local = S_flat[idxs]
-                z_local = z[idxs]
+                target_mass = float(orbit_t[cc])
+                current_mass = float(orbit_s[cc])
+                support_deficit = max(target_mass - current_mass, 0.0)
 
-                w_cc = float(w_target[cc])
-                target_mass = max(1e-30, alpha_ref * w_cc)
-
-                resid = float(np.dot(S_local, z_local) - target_mass)
-                if not np.isfinite(resid):
+                if support_deficit <= 0.0:
                     continue
 
+                S_local = S_flat[idxs]
                 beta_eff = _orbit_prior_beta_eff(
                     orbit_beta=orbit_beta,
                     target_mass=target_mass,
                     data_scale_ref=data_scale_ref,
                 )
 
-                g_prior[idxs] = beta_eff * resid * S_local
+                g_prior[idxs] = beta_eff * support_deficit * S_local
 
-            clip_factor = 1.5
+            clip_factor = 0.75
             g_prior_norm = np.linalg.norm(g_prior)
             g_data_norm = np.linalg.norm(grad_data) + 1e-30
             if g_prior_norm > clip_factor * g_data_norm:
@@ -1461,7 +1459,7 @@ def streamActiveSetNNLS(
         penalty_strength = 0.5
         adj_score = gvals_promo / (1.0 + penalty_strength * (S_norm - 1.0))
 
-        topk = 5
+        topk = 16
         if adj_score.size > topk:
             top_idxs = np.argsort(adj_score)[-topk:]
             pick_local = top_idxs[np.argmax(gvals_promo[top_idxs])]

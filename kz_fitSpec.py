@@ -2558,13 +2558,13 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                         arr = np.ma.masked_invalid(arr)[binNum]
                         dbi(xpix, ypix, arr, pixelsize=pixs, angle=PA,
                             cmap=moncmapr,
-                            # vmin={'age':amin, 'metal':mmin, 'alpha':lmin}[prop],
-                            # vmax={'age':amax, 'metal':mmax, 'alpha':lmax}[prop]
+                            vmin={'age':amin, 'metal':mmin, 'alpha':lmin}[prop],
+                            vmax={'age':amax, 'metal':mmax, 'alpha':lmax}[prop]
                         )
                         ax.set_xlim(xmin, xmax)
                         ax.set_ylim(ymin, ymax)
-                        ax.text(1e-2, 1-1e-2, rf"{np.nanmin(arr):.2f}/{np.nanmax(arr):.2f}",
-                            va='top', ha='left', color=POT.pgreen, transform=ax.transAxes, path_effects=[PathEffects.withStroke(linewidth=1.5, foreground='k')])
+                        # ax.text(1e-2, 1-1e-2, rf"{np.nanmin(arr):.2f}/{np.nanmax(arr):.2f}",
+                        #     va='top', ha='left', color=POT.pgreen, transform=ax.transAxes, path_effects=[PathEffects.withStroke(linewidth=1.5, foreground='k')])
                         if not ax.get_subplotspec().is_last_row():
                             ax.set_xticklabels([])
                         if not ax.get_subplotspec().is_first_col():

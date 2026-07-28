@@ -37,7 +37,7 @@ def props(galaxy):
             lOrder=0, specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI',
             nProcs=1, band='r', genSwitch=None, kind='SMILES', cont=False,
             smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],
-            warm='resume')
+            warm='zeros')
     else:
         raise ValueError(f"Unknown galaxy '{galaxy}'")
     
