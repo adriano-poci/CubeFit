@@ -1198,9 +1198,12 @@ class PipelineRunner:
             processes=int(processes),
             blas_threads=int(blas_threads),
             apply_mask=bool(reader_apply_mask),
-            orbit_prior_delta=float(
-                os.environ.get("CUBEFIT_ORBIT_PRIOR_DELTA", "1e-6")
+            orbit_beta=float(
+                os.environ.get("CUBEFIT_ORBIT_BETA", "1e-2")
             ),
+            # orbit_prior_delta=float(
+            #     os.environ.get("CUBEFIT_ORBIT_PRIOR_DELTA", "1e-6")
+            # ),
         )
 
         try:

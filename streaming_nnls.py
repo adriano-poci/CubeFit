@@ -11,7 +11,9 @@ r"""
 
     Synopsis
     --------
-    Implementation of a TRUE MONOLITHIC streaming active-set NNLS solver for the CubeFit problem, with hybrid parallelism (process-level over tile batches + BLAS threads inside workers).
+    Implementation of a TRUE MONOLITHIC streaming active-set NNLS solver for the
+        CubeFit problem, with hybrid parallelism (process-level over tile batches
+        + BLAS threads inside workers).
 
     Authors
     -------
@@ -69,8 +71,8 @@ v1.9:   Jail columns which are technically non-zero, but also not helpful to the
 v1.10:  Re-implemented `orbit_beta` as a soft penalty in the objective rather
             than a hard projection, and scale it to the data. 30 March 2026
 v1.11:  Changed plateau logic to use iteration-invariant metrics instead of the
-            gradient, which is no longer a stable cross-iteration metric once the
-            orbit prior and occupancy penalty are active in
+            gradient, which is no longer a stable cross-iteration metric once
+            the orbit prior and occupancy penalty are active in
             `streamActiveSetNNLS`. 31 March 2026
 v1.12:  Updated `_worker_ATAz` and `_worker_reduced` to not stream full tiles for
             memory efficiency. Instead, read orbit-by-orbit and use tensor
@@ -84,16 +86,18 @@ v1.13:  Added periodic restart checkpoints to `streamActiveSetNNLS`;
 v1.14:  Enforced the orbit prior by projecting each orbit's mass onto the
             target prior almost exactly within a small delta tolerance. 20 July
             2026
-v1.15: Replaced hard per-orbit mass projection with an exact active-set KKT
-        delta-x correction using the reduced Hessian (ATA_sub), preserving the
-        data-driven solution as much as possible while enforcing the orbit
-        prior, with best-effort fallback when the current active set cannot
-        satisfy the orbit constraints exactly. 23 July 2026
-v1.15: Replaced the blind hard per-orbit mass projection with a data-aware
-        active-set KKT delta-x correction using the reduced Hessian
-        (ATA_sub), preserving the data-driven solution as much as possible
-        while enforcing the orbit prior through a best-effort constrained
-        correction instead of unconditional orbit rescaling. 24 July 2026
+v1.15:  Replaced hard per-orbit mass projection with an exact active-set KKT
+            delta-x correction using the reduced Hessian (ATA_sub), preserving
+            the data-driven solution as much as possible while enforcing the
+            orbit prior, with best-effort fallback when the current active set
+            cannot satisfy the orbit constraints exactly. 23 July 2026
+v1.16:  Replaced the blind hard per-orbit mass projection with a data-aware
+            active-set KKT delta-x correction using the reduced Hessian
+            (ATA_sub), preserving the data-driven solution as much as possible
+            while enforcing the orbit prior through a best-effort constrained
+            correction instead of unconditional orbit rescaling. 24 July 2026
+v1.17:  Fixed history versioning;
+        Reverted to v1.13 soft projection. 28 July 2026
 """
 
 from __future__ import annotations, print_function
@@ -360,7 +364,7 @@ class MPConfig:
     dset_slots: int = 1_000_003
     dset_bytes: int = 256 * 1024**2
     dset_w0: float = 0.90
-    orbit_prior_delta: float = 1e-6
+    orbit_beta: float = 0.0 # strength of rank-1 orbit penalisation (if > 0)
     s_tile_override: Optional[int] = None
     pixels_per_aperture: int = 256
     max_tiles: Optional[int] = None
@@ -688,423 +692,27 @@ def _robust_scale_ref(values: np.ndarray, fallback: float = 1.0) -> float:
 
 # ------------------------------------------------------------------------------
 
-def _should_enforce_orbit_prior(
-    orbit_weights: np.ndarray | None,
-    delta: float,
-) -> bool:
-    """Return True when the orbit prior should be enforced by projection."""
-    if orbit_weights is None:
-        return False
-    if not np.any(np.asarray(orbit_weights, dtype=np.float64).ravel() > 0.0):
-        return False
-    if not np.isfinite(float(delta)) or float(delta) <= 0.0:
-        return False
-    return True
-
-def _orbit_mass_targets(
-    orbit_weights: np.ndarray,
-    total_mass: float,
-) -> np.ndarray:
-    """
-    Scale a normalized orbit prior to the requested total mass.
-    """
-    w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
-    w = np.maximum(w, 0.0)
-    w_sum = float(np.sum(w))
-
-    if (not np.isfinite(w_sum)) or w_sum <= 0.0:
-        raise RuntimeError("orbit prior has no positive mass.")
-
-    if not np.isfinite(total_mass):
-        raise RuntimeError("total_mass is not finite.")
-
-    return (float(total_mass) / w_sum) * w
-
-def _maybe_apply_orbit_prior_delta_x(
-    z_base: np.ndarray,
-    active_idx: np.ndarray,
-    ATA_sub_reg: np.ndarray,
-    ATy_sub: np.ndarray,
-    S_flat: np.ndarray,
-    w_target: np.ndarray | None,
-    P: int,
-    *,
-    h5_path: str,
-    rmse_tiles: list,
-    keep_idx,
-    rmse_rel_tol: float = 1e-2,
-    ls_max_steps: int = 8,
-    delta: float = 1e-6,
-) -> tuple[np.ndarray, np.ndarray, dict]:
-    """
-    Apply the orbit-prior delta-x correction only if it does not materially
-    worsen a cheap RMSE proxy.
-    """
-    z_base = np.asarray(z_base, dtype=np.float64).ravel(order="C")
-    z_prior, delta_x, info = _apply_orbit_prior_delta_x_best_effort(
-        z_base,
-        active_idx,
-        ATA_sub_reg,
-        ATy_sub,
-        S_flat,
-        w_target,
-        P,
-        delta=delta,
-    )
-
-    rmse_base = _rmse_proxy_for_z(
-        h5_path=h5_path,
-        z_vec=z_base,
-        S_flat=S_flat,
-        rmse_tiles=rmse_tiles,
-        keep_idx=keep_idx,
-    )
-
-    z_best = z_base
-    delta_x_best = np.zeros_like(delta_x)
-    rmse_best = float(rmse_base)
-    accepted = False
-    eta_best = 0.0
-
-    eta = 1.0
-    for _ in range(int(ls_max_steps)):
-        z_try = z_base + eta * (z_prior - z_base)
-        np.maximum(z_try, 0.0, out=z_try)
-
-        rmse_try = _rmse_proxy_for_z(
-            h5_path=h5_path,
-            z_vec=z_try,
-            S_flat=S_flat,
-            rmse_tiles=rmse_tiles,
-            keep_idx=keep_idx,
-        )
-
-        if rmse_try <= rmse_base * (1.0 + float(rmse_rel_tol)):
-            z_best = z_try
-            delta_x_best = S_flat * (z_best - z_base)
-            rmse_best = float(rmse_try)
-            accepted = True
-            eta_best = float(eta)
-            break
-
-        if rmse_try < rmse_best:
-            z_best = z_try
-            delta_x_best = S_flat * (z_best - z_base)
-            rmse_best = float(rmse_try)
-            eta_best = float(eta)
-
-        eta *= 0.5
-
-    info = dict(info)
-    info["accepted"] = bool(accepted)
-    info["eta"] = float(eta_best)
-    info["rmse_base"] = float(rmse_base)
-    info["rmse_try"] = float(rmse_best)
-
-    if accepted:
-        return z_best, delta_x_best, info
-
-    return z_base, np.zeros_like(delta_x), info
-
-def _apply_orbit_prior_delta_x_best_effort(
-    z_full: np.ndarray,
-    active_idx: np.ndarray,
-    ATA_sub_reg: np.ndarray,
-    ATy_sub: np.ndarray,
-    S_flat: np.ndarray,
-    w_target: np.ndarray | None,
-    P: int,
-    *,
-    delta: float = 1e-6,
-    max_outer: int = 64,
-    neg_tol: float = 1e-12,
-    kkt_ridge: float = 1e-12,
-) -> tuple[np.ndarray, np.ndarray, dict]:
-    """
-    Best-effort orbit-prior correction on the current active set.
-
-    The correction is solved in z-space using the exact reduced Hessian
-    ``ATA_sub_reg`` and right-hand side ``ATy_sub``. The induced
-    coefficient-space correction is returned as ``delta_x``.
-
-    The solver first tries to satisfy the orbit-mass constraints exactly
-    with an active-set KKT solve. If exact matching is not feasible on the
-    current active set, it returns the best effort produced by the same
-    exact reduced system, without raising.
-
-    Returns
-    -------
-    z_out : ndarray, shape (C*P,)
-        Corrected z vector.
-    delta_x : ndarray, shape (C*P,)
-        Coefficient-space correction, i.e. ``x_out - x_in``.
-    info : dict
-        Diagnostics:
-        - ``exact`` : bool
-        - ``mass_resid`` : float
-        - ``delta_x_norm`` : float
-        - ``delta_z_norm`` : float
-    """
-    z_full = np.asarray(z_full, dtype=np.float64).ravel(order="C").copy()
-    active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
-    S_flat = np.asarray(S_flat, dtype=np.float64).ravel(order="C")
-    H = np.asarray(ATA_sub_reg, dtype=np.float64, order="C")
-    g = np.asarray(ATy_sub, dtype=np.float64, order="C")
-
-    if w_target is None:
-        delta_x = np.zeros_like(z_full, dtype=np.float64)
-        return z_full, delta_x, {
-            "exact": False,
-            "mass_resid": 0.0,
-            "delta_x_norm": 0.0,
-            "delta_z_norm": 0.0,
-        }
-
-    if active_idx.size == 0:
-        delta_x = np.zeros_like(z_full, dtype=np.float64)
-        return z_full, delta_x, {
-            "exact": False,
-            "mass_resid": 0.0,
-            "delta_x_norm": 0.0,
-            "delta_z_norm": 0.0,
-        }
-
-    w = np.asarray(w_target, dtype=np.float64).ravel(order="C")
-    w = np.maximum(w, 0.0)
-    if w.size == 0:
-        delta_x = np.zeros_like(z_full, dtype=np.float64)
-        return z_full, delta_x, {
-            "exact": False,
-            "mass_resid": 0.0,
-            "delta_x_norm": 0.0,
-            "delta_z_norm": 0.0,
-        }
-
-    C = int(w.size)
-    if H.shape != (active_idx.size, active_idx.size):
-        raise ValueError("ATA_sub_reg shape does not match active_idx size")
-    if g.size != active_idx.size:
-        raise ValueError("ATy_sub length does not match active_idx size")
-
-    z0_active = z_full[active_idx].copy()
-    S_active = S_flat[active_idx]
-    orbit_ids = (active_idx // P).astype(np.int64)
-    x0_active = S_active * z0_active
-
-    current_mass = np.bincount(
-        orbit_ids,
-        weights=x0_active,
-        minlength=C,
-    ).astype(np.float64)
-
-    target_mass = _orbit_mass_targets(w, float(np.sum(current_mass)))
-    rhs_mass = target_mass - current_mass
-
-    B = np.zeros((C, active_idx.size), dtype=np.float64)
-    B[orbit_ids, np.arange(active_idx.size)] = S_active
-
-    grad0 = H @ z0_active - g
-    free = np.ones(active_idx.size, dtype=bool)
-
-    best_z_active = z0_active.copy()
-    best_mass_resid = np.inf
-    best_exact = False
-
-    for _ in range(int(max_outer)):
-        free_idx = np.flatnonzero(free)
-        fixed_idx = np.flatnonzero(~free)
-
-        delta_fixed = np.zeros((fixed_idx.size,), dtype=np.float64)
-        rhs_free_mass = rhs_mass.copy()
-
-        if fixed_idx.size > 0:
-            delta_fixed = -z0_active[fixed_idx]
-            rhs_free_mass -= B[:, fixed_idx] @ delta_fixed
-
-        if free_idx.size == 0:
-            candidate = z0_active + 0.0
-            if fixed_idx.size > 0:
-                candidate[fixed_idx] = 0.0
-
-            mass_resid = float(np.max(np.abs(B @ (candidate - z0_active)
-                                             - rhs_mass)))
-            if mass_resid < best_mass_resid:
-                best_mass_resid = mass_resid
-                best_z_active = candidate.copy()
-
-            break
-
-        H_ff = H[np.ix_(free_idx, free_idx)]
-        B_f = B[:, free_idx]
-        g_f = grad0[free_idx]
-
-        n_free = free_idx.size
-        K = np.zeros((n_free + C, n_free + C), dtype=np.float64)
-        K[:n_free, :n_free] = H_ff
-
-        if kkt_ridge > 0.0:
-            K[np.arange(n_free), np.arange(n_free)] += float(kkt_ridge)
-
-        K[:n_free, n_free:] = B_f.T
-        K[n_free:, :n_free] = B_f
-
-        rhs = np.concatenate((-g_f, rhs_free_mass))
-
-        solved_exact = True
-        try:
-            sol = np.linalg.solve(K, rhs)
-        except np.linalg.LinAlgError:
-            sol, *_ = np.linalg.lstsq(K, rhs, rcond=None)
-            solved_exact = False
-
-        delta_full = np.zeros_like(z0_active)
-        delta_full[fixed_idx] = delta_fixed
-        delta_full[free_idx] = sol[:n_free]
-
-        candidate = z0_active + delta_full
-        bad = free_idx[candidate[free_idx] < -neg_tol]
-
-        if bad.size > 0:
-            free[bad] = False
-            continue
-
-        np.maximum(candidate, 0.0, out=candidate)
-
-        mass_resid = float(
-            np.max(np.abs(B @ (candidate - z0_active) - rhs_mass))
-        )
-        if mass_resid < best_mass_resid:
-            best_mass_resid = mass_resid
-            best_z_active = candidate.copy()
-            best_exact = bool(solved_exact and mass_resid <= max(
-                float(delta), 1e-12
-            ) * max(
-                1.0,
-                float(np.max(np.abs(target_mass))) if target_mass.size else 1.0,
-            ))
-
-        # If we solved exactly and the mass residual is small, stop.
-        if solved_exact and best_exact:
-            break
-
-        # If the exact solve was impossible, still keep the best effort and
-        # exit without raising.
-        if not solved_exact:
-            break
-
-    z_out = z_full.copy()
-    z_out[active_idx] = best_z_active
-
-    x_before = S_flat * z_full
-    x_after = S_flat * z_out
-    delta_x = x_after - x_before
-
-    info = {
-        "exact": bool(best_exact),
-        "mass_resid": float(best_mass_resid),
-        "delta_x_norm": float(np.linalg.norm(delta_x)),
-        "delta_z_norm": float(np.linalg.norm(z_out - z_full)),
-    }
-    return z_out, delta_x, info
-
-def _rmse_proxy_for_z(
-    h5_path: str,
-    z_vec: np.ndarray,
-    S_flat: np.ndarray,
-    rmse_tiles: list,
-    keep_idx,
+def _orbit_prior_beta_eff(
+    orbit_beta: float,
+    target_mass: float,
+    data_scale_ref: float,
 ) -> float:
     """
-    Compute a cheap RMSE proxy for the current solution vector.
+    Convert the user-facing orbit_beta into a problem-scale prior weight.
 
-    The proxy is evaluated on a small fixed subset of tiles so it is cheap
-    enough to use inside the orbit-prior line search.
+    The normalization is:
+        beta_eff = orbit_beta * data_scale_ref / target_mass**2
+
+    so orbit_beta is dimensionless and comparable across problem sizes.
     """
-    x_phys = (
-        np.asarray(S_flat, dtype=np.float64).ravel(order="C")
-        * np.asarray(z_vec, dtype=np.float64).ravel(order="C")
-    )
-    return float(
-        rmse_proxy_subset(
-            h5_path=h5_path,
-            x_CP=x_phys,
-            tile_ranges=rmse_tiles,
-            keep_idx=keep_idx,
-            inv_cp_flux_ref=None,
-            w_lam_sqrt=None,
-        )
-    )
+    orbit_beta = float(orbit_beta)
+    if (not np.isfinite(orbit_beta)) or orbit_beta <= 0.0:
+        return 0.0
 
-def _enforce_orbit_prior_mass(
-    x_cp: np.ndarray,
-    orbit_weights: np.ndarray | None,
-    *,
-    delta: float = 1e-6,
-) -> np.ndarray:
-    """
-    Enforce per-orbit mass targets almost exactly while preserving
-    non-negativity and the total mass scale.
+    target_mass = max(float(target_mass), 1e-30)
+    data_scale_ref = max(float(data_scale_ref), 1.0)
 
-    The projection is a per-orbit scaling step. For orbits that currently have
-    zero mass but a positive target, a uniform seed is created so the target can
-    be reached without violating non-negativity.
-    """
-    x_cp = np.asarray(x_cp, dtype=np.float64).copy()
-    if x_cp.ndim != 2:
-        raise ValueError("x_cp must be a 2D array of shape (C, P)")
-
-    if orbit_weights is None:
-        return np.maximum(x_cp, 0.0)
-
-    w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
-    if w.size != x_cp.shape[0]:
-        raise ValueError(
-            f"orbit_weights size {w.size} incompatible with orbit dimension {x_cp.shape[0]}"
-        )
-
-    w = np.maximum(w, 0.0)
-    w_sum = float(np.sum(w))
-    if (not np.isfinite(w_sum)) or w_sum <= 0.0:
-        return np.maximum(x_cp, 0.0)
-
-    total_mass = float(np.sum(x_cp))
-    if (not np.isfinite(total_mass)) or total_mass <= 0.0:
-        return np.zeros_like(x_cp, dtype=np.float64)
-
-    alpha = total_mass / w_sum
-    target_mass = alpha * w
-
-    x_cp = np.maximum(x_cp, 0.0)
-    C, P = x_cp.shape
-    delta = max(float(delta), 1e-12)
-
-    for cc in range(C):
-        orbit = x_cp[cc]
-        target = float(target_mass[cc])
-        if target <= 0.0:
-            orbit.fill(0.0)
-            continue
-
-        mass = float(np.sum(orbit))
-        if mass <= 0.0:
-            orbit.fill(target / max(P, 1))
-            continue
-
-        scale = target / mass
-        if (not np.isfinite(scale)) or scale <= 0.0:
-            orbit.fill(target / max(P, 1))
-            continue
-
-        orbit *= scale
-        # One more pass to remove tiny residuals caused by roundoff.
-        mass_new = float(np.sum(orbit))
-        if abs(mass_new - target) > delta:
-            if mass_new <= 0.0:
-                orbit.fill(target / max(P, 1))
-            else:
-                orbit *= target / mass_new
-
-    return np.maximum(x_cp, 0.0)
+    return orbit_beta * data_scale_ref / (target_mass * target_mass)
 
 # ------------------------------------------------------------------------------
 
@@ -1118,29 +726,18 @@ def _quota_rescue_columns(
     P: int,
     total_cols: int,
     *,
-    min_per_orbit: int = 2,
+    min_per_orbit: int = 1,
     max_per_orbit: int = 12,
     penalty_strength: float = 0.5,
     orbit_occ_counts: np.ndarray | None = None,
     occ_lambda: float = 0.0,
-    diversity_strength: float = 0.8,
-    exploration_pool: int = 32,
 ) -> np.ndarray:
     """
     Select rescue columns using per-orbit promotion quotas derived from
-    the orbit prior weights, while explicitly encouraging diversity in
-    population index within each orbit.
+    the orbit prior weights.
 
-    The prior biases which columns are tested, not the final solution.
+    The prior biases *which columns are tested*, not the final solution.
     The reduced NNLS solve still determines which columns survive.
-
-    This version differs from the previous implementation in two ways:
-
-    1) It replaces tiny random sampling from a narrow candidate pool with a
-       diversity-aware greedy selection.
-    2) It rewards columns whose population index is far from populations
-       already active in the same orbit, which helps the solver explore
-       richer within-orbit mixtures.
 
     Parameters
     ----------
@@ -1166,15 +763,6 @@ def _quota_rescue_columns(
         Maximum quota per orbit.
     penalty_strength : float, optional
         Penalty against very large-S columns.
-    orbit_occ_counts : ndarray or None, optional
-        Current active count per orbit.
-    occ_lambda : float, optional
-        Weak penalty for already-crowded orbits.
-    diversity_strength : float, optional
-        Weight of the within-orbit population diversity bonus.
-    exploration_pool : int, optional
-        Number of top-scoring candidates per orbit to consider before
-        greedy diversity selection.
 
     Returns
     -------
@@ -1184,55 +772,53 @@ def _quota_rescue_columns(
     if total_cols <= 0:
         return np.zeros((0,), dtype=np.int64)
 
-    grad_vec = np.asarray(grad_vec, dtype=np.float64).ravel(order="C")
-    aty_scaled_vec = np.asarray(aty_scaled_vec, dtype=np.float64).ravel(order="C")
-    active_mask = np.asarray(active_mask, dtype=bool).ravel(order="C")
-    S_flat = np.asarray(S_flat, dtype=np.float64).ravel(order="C")
-
     if w_target is None:
-        # Fallback: global selection with the same diversity-aware scoring.
+        # fallback: global selection
         not_active = np.where(~active_mask)[0]
         if not_active.size == 0:
             return np.zeros((0,), dtype=np.int64)
 
         gvals = grad_vec[not_active]
         svals = S_flat[not_active]
-        atyvals = aty_scaled_vec[not_active]
-
         s_med = np.median(svals) + 1e-30
+        occ = 0 if orbit_occ_counts is None else int(orbit_occ_counts[not_active // P])
+        occ_pen = 1.0 + occ_lambda * np.log1p(occ)
         score = gvals / (1.0 + penalty_strength * (svals / s_med - 1.0))
-
-        aty_scale = np.max(np.abs(atyvals)) + 1e-30
-        score = score + 0.10 * (atyvals / aty_scale)
-
-        if orbit_occ_counts is not None:
-            occ = np.asarray(orbit_occ_counts, dtype=np.float64).ravel()
-            occ = np.maximum(occ, 0.0)
-            occ = occ[not_active // P]
-            score = score / (1.0 + occ_lambda * np.log1p(occ))
+        score = score / occ_pen
 
         order = np.argsort(score)[::-1]
         pick = not_active[order[:min(total_cols, order.size)]]
         return np.asarray(pick, dtype=np.int64)
 
-    w = np.asarray(w_target, dtype=np.float64).ravel(order="C")
+    w = np.asarray(w_target, dtype=np.float64).ravel()
+    if w.size != C:
+        return np.zeros((0,), dtype=np.int64)
+
     w = np.maximum(w, 0.0)
     w_sum = float(np.sum(w))
+
     if w_sum <= 0.0:
         return np.zeros((0,), dtype=np.int64)
+
     w = w / w_sum
 
-    # Quotas from weights.
+    # ----------------------------
+    # initial quotas from weights
+    # ----------------------------
     raw = total_cols * w
     quotas = np.floor(raw).astype(np.int64)
 
+    # guarantee minimum quota on non-zero-weight orbits
     nz = np.where(w > 0.0)[0]
     for cc in nz:
         quotas[cc] = max(quotas[cc], min_per_orbit)
 
+    # cap quotas
     quotas = np.minimum(quotas, max_per_orbit)
 
+    # adjust total quota to requested total_cols
     qsum = int(np.sum(quotas))
+
     if qsum < total_cols:
         frac = raw - np.floor(raw)
         order = np.argsort(frac)[::-1]
@@ -1242,8 +828,9 @@ def _quota_rescue_columns(
             if quotas[cc] < max_per_orbit:
                 quotas[cc] += 1
                 qsum += 1
+
     elif qsum > total_cols:
-        order = np.argsort(w)
+        order = np.argsort(w)  # remove from weakest-target orbits first
         for cc in order:
             while (qsum > total_cols) and (quotas[cc] > 0):
                 quotas[cc] -= 1
@@ -1251,53 +838,27 @@ def _quota_rescue_columns(
                 if qsum <= total_cols:
                     break
 
-    chosen: list[int] = []
-    chosen_set: set[int] = set()
+    chosen = []
+    chosen_set = set()
 
-    def _orbit_diversity_bonus(
-        cand_cols: np.ndarray,
-        active_mask_local: np.ndarray,
-        P_local: int,
-    ) -> np.ndarray:
-        """
-        Reward population indices that are far from currently active
-        populations in the same orbit.
-        """
-        cand_cols = np.asarray(cand_cols, dtype=np.int64).ravel()
-        if cand_cols.size == 0:
-            return np.zeros((0,), dtype=np.float64)
+    for cc in np.argsort(w)[::-1]:
+        q = int(quotas[cc])
+        if q <= 0:
+            continue
 
-        out = np.empty(cand_cols.size, dtype=np.float64)
-        for i, gcol in enumerate(cand_cols):
-            cc = int(gcol // P_local)
-            base = cc * P_local
-            p = int(gcol - base)
-
-            active_p = np.flatnonzero(active_mask_local[base:base + P_local])
-            if active_p.size == 0:
-                out[i] = 1.0
-            else:
-                dmin = int(np.min(np.abs(active_p - p)))
-                out[i] = np.sqrt((dmin + 1.0) / float(max(1, P_local)))
-        return out
-
-    def _pick_from_orbit(cc: int, max_take: int) -> np.ndarray:
         base = int(cc * P)
         cols_cc = np.arange(base, base + P, dtype=np.int64)
         inactive_cc = cols_cc[~active_mask[cols_cc]]
 
-        if exclude_mask is not None:
-            inactive_cc = inactive_cc[~exclude_mask[inactive_cc]]
-
         if inactive_cc.size == 0:
-            return np.zeros((0,), dtype=np.int64)
+            continue
 
         g_cc = grad_vec[inactive_cc]
         s_cc = S_flat[inactive_cc]
         aty_cc = aty_scaled_vec[inactive_cc]
 
         occ = 0 if orbit_occ_counts is None else int(orbit_occ_counts[cc])
-        occ_pen = 1.0 + occ_lambda * np.log1p(max(0, occ))
+        occ_pen = 1.0 + occ_lambda * np.log1p(occ)
 
         s_med = np.median(s_cc) + 1e-30
         score_cc = g_cc / (1.0 + penalty_strength * (s_cc / s_med - 1.0))
@@ -1306,89 +867,27 @@ def _quota_rescue_columns(
         score_cc = score_cc + 0.10 * (aty_cc / aty_scale)
 
         score_cc = score_cc / occ_pen
+        score_cc += 1e-6 * np.random.standard_normal(score_cc.shape)
 
-        # Diversity bonus: prefer populations not yet represented in this orbit.
-        score_cc = score_cc + diversity_strength * _orbit_diversity_bonus(
-            inactive_cc,
-            active_mask,
-            P,
-        )
-
-        # Small noise only to break exact ties.
-        score_cc = score_cc + 1e-8 * np.random.standard_normal(score_cc.shape)
+        aty_scale = np.max(np.abs(aty_cc)) + 1e-30
+        score_cc = score_cc + 0.10 * (aty_cc / aty_scale)
+        score_cc += 1e-6 * np.random.standard_normal(score_cc.shape)
 
         order = np.argsort(score_cc)[::-1]
-        pool_size = min(max(1, int(exploration_pool)), order.size)
+        pool_size = min(10, order.size)   # exploration pool
         pool = order[:pool_size]
-        take = min(max_take, pool.size)
-
-        # replace uniform random choice with diversity-aware greedy selection
-        picked = []
-        available = list(map(int, pool))
-        for _ in range(take):
-            if not available:
-                break
-            pool_cols = inactive_cc[np.asarray(available, dtype=np.int64)]
-            pool_score = score_cc[np.asarray(available, dtype=np.int64)]
-            pool_score += diversity_strength * _orbit_diversity_bonus(
-                pool_cols, active_mask, P
-            )
-            j = int(np.argmax(pool_score))
-            picked.append(int(inactive_cc[available[j]]))
-            available.pop(j)
-
-        return np.asarray(picked, dtype=np.int64)
-
-    orbit_order = np.argsort(w)[::-1]
-    remaining = int(total_cols)
-
-    # Pass 1: touch as many distinct orbits as possible.
-    for cc in orbit_order:
-        if remaining <= 0:
-            break
-
-        q = int(quotas[cc])
-        if q <= 0:
-            continue
-
-        picks = _pick_from_orbit(int(cc), 1)
-        if picks.size == 0:
-            continue
-
-        gcol = int(picks[0])
-        if gcol in chosen_set:
-            continue
-
-        chosen.append(gcol)
-        chosen_set.add(gcol)
-        quotas[cc] -= 1
-        remaining -= 1
-
-    # Pass 2: fill remaining quota, still orbit-aware and diversity-aware.
-    if remaining > 0:
-        for cc in orbit_order:
-            if remaining <= 0:
-                break
-
-            q = int(min(quotas[cc], remaining))
-            if q <= 0:
-                continue
-
-            picks = _pick_from_orbit(int(cc), q)
-            for gcol in picks:
-                gcol = int(gcol)
-                if gcol in chosen_set:
-                    continue
+        take = min(q, pool.size)
+        chosen_local = np.random.choice(pool, size=take, replace=False)
+        for j in chosen_local:
+            gcol = int(inactive_cc[j])
+            if gcol not in chosen_set:
                 chosen.append(gcol)
                 chosen_set.add(gcol)
-                quotas[cc] -= 1
-                remaining -= 1
-                if remaining <= 0:
-                    break
 
     if len(chosen) == 0:
         return np.zeros((0,), dtype=np.int64)
 
+    # hard trim if rounding produced a few extra
     if len(chosen) > total_cols:
         chosen = chosen[:total_cols]
 
@@ -1407,10 +906,10 @@ def _deficit_rescue_columns(
     P: int,
     total_cols: int,
     *,
-    min_per_orbit: int = 2,
+    min_per_orbit: int = 1,
     max_per_orbit: int = 12,
     deficit_boost: float = 2.0,
-    penalty_strength: float = 0.2,
+    penalty_strength: float = 0.5,
     exclude_mask: np.ndarray | None = None,
     orbit_occ_counts: np.ndarray | None = None,
     occ_lambda: float = 0.0,
@@ -1604,6 +1103,7 @@ def streamActiveSetNNLS(
     executor,
     cfg: MPConfig,
     orbit_weights: Optional[np.ndarray] = None,
+    orbit_beta_eff: float = 0.0,
     x0_flat: Optional[np.ndarray] = None,
     max_active: int = 1000,
     tol_grad: float = 1e-8,
@@ -1625,6 +1125,30 @@ def streamActiveSetNNLS(
         if (not np.isfinite(ref)) or (ref <= 0.0):
             return float(max(1.0, fallback))
         return ref
+
+    def _orbit_prior_beta_eff(
+        *,
+        orbit_beta: float,
+        target_mass: float,
+        data_scale_ref: float,
+    ) -> float:
+        """
+        Conservative, scale-aware orbit-prior weight.
+
+        The knob the user should increase is still `orbit_beta_eff`, but this
+        keeps the prior on a problem-scale-aware footing.
+        """
+        if orbit_beta <= 0.0:
+            return 0.0
+
+        target_mass = max(1e-30, float(target_mass))
+        data_scale_ref = max(1.0, float(data_scale_ref))
+
+        # Soft normalization: stronger than a pure 1/target_mass^2 penalty,
+        # but still conservative when the data scale is large.
+        return float(orbit_beta) / (
+            np.sqrt(target_mass) * np.sqrt(data_scale_ref)
+        )
 
     def _watch_progress() -> bool:
         """
@@ -1663,36 +1187,9 @@ def streamActiveSetNNLS(
 
         return False
 
-
-    # ##########################################################################
-    # Constants controlling orbit occupation and exploration landscape
-    #
-    # ##########################################################################
     CP = int(C * P)
     negative_grad_count = 0
     explore_budget = max(1, min(20, CP // 50))
-    # committed-state watchdog
-    z_delta_tol = 1e-6
-    active_delta_tol = 0
-    progress_window = 20
-    force_explore_after = 4
-    hard_stall_patience = 20
-    no_progress_count = 0
-    # positive-gradient batch-promotion controls
-    positive_batch_size = 24 if C <= 3 else 32
-    # Soft occupancy control: discourage crowded orbits, but do not cap them.
-    orbit_occ_lambda = 0.0 if C <= 3 else 0.01
-    # Probation for newly admitted columns.
-    probation_iters = 6
-    probation_rel = 1e-6
-    probation_abs = 1e-12
-    provisional_hits: dict[int, int] = {}
-    # Column-level tabu for genuinely unhelpful promotions.
-    col_cooldown_until: dict[int, int] = {}
-    cooldown_iters = 24
-    promotion_noop_rel_tol = 1e-8
-    promotion_noop_abs_tol = 1e-12
-    topk = 24
 
     S_flat = np.asarray(inv_sqrt_energy_flat, dtype=np.float64).ravel()
     ATy_scaled = S_flat * ATy_flat
@@ -1700,6 +1197,17 @@ def streamActiveSetNNLS(
     grad_ref = max(1.0, float(np.max(np.abs(ATy_scaled))))
     data_scale_ref = _robust_scale_ref(ATy_scaled, fallback=grad_ref)
     tol_grad_rel = 1e-6
+
+    # --- committed-state watchdog ---
+    z_delta_tol = 1e-6
+    active_delta_tol = 0
+    progress_window = 20
+    force_explore_after = 4
+    hard_stall_patience = 20
+    no_progress_count = 0
+
+    # --- positive-gradient batch-promotion controls ---
+    positive_batch_size = 2 if C <= 3 else 9
 
     # robust prior mass reference scale
     ATy_pos = ATy_flat[np.isfinite(ATy_flat) & (ATy_flat > 0.0)]
@@ -1713,33 +1221,11 @@ def streamActiveSetNNLS(
 
     print(f"[DIAG] alpha_ref = {alpha_ref:.4e}", flush=True)
 
-    if len(s_ranges) <= 3:
-        rmse_tiles = list(s_ranges)
-    else:
-        rmse_tiles = [
-            s_ranges[0],
-            s_ranges[len(s_ranges) // 2],
-            s_ranges[-1],
-        ]
-
-    rmse_rel_tol = float(os.environ.get("CUBEFIT_ORBIT_RMSE_REL_TOL", "1e-2"))
-    ls_max_steps = int(os.environ.get("CUBEFIT_ORBIT_LS_STEPS", "8"))
-
     # --- orbit prior setup ---
     w_target = None
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
-    orbit_prior_delta = float(
-        getattr(
-            cfg,
-            "orbit_prior_delta",
-            os.environ.get("CUBEFIT_ORBIT_PRIOR_DELTA", "1e-6"),
-        )
-    )
-    enforce_orbit_prior = _should_enforce_orbit_prior(
-        w_target,
-        orbit_prior_delta,
-    )
+    orbit_beta = float(orbit_beta_eff)
 
     if x0_flat is None:
         z = np.zeros((CP,), dtype=np.float64)
@@ -1762,13 +1248,20 @@ def streamActiveSetNNLS(
     committed_z = z.copy()
     committed_active = active.copy()
 
-    last_orbit_delta_x = np.zeros((CP,), dtype=np.float64)
-    last_orbit_info = {
-        "exact": False,
-        "mass_resid": 0.0,
-        "delta_x_norm": 0.0,
-        "delta_z_norm": 0.0,
-    }
+    # Soft occupancy control: discourage crowded orbits, but do not cap them.
+    orbit_occ_lambda = 0.15 if C <= 3 else 0.25
+
+    # Probation for newly admitted columns.
+    probation_iters = 3
+    probation_rel = 1e-6
+    probation_abs = 1e-12
+    provisional_hits: dict[int, int] = {}
+
+    # Column-level tabu for genuinely unhelpful promotions.
+    col_cooldown_until: dict[int, int] = {}
+    cooldown_iters = 10
+    promotion_noop_rel_tol = 1e-6
+    promotion_noop_abs_tol = 1e-10
 
     def _on_cooldown(col: int, it: int) -> bool:
         return it < col_cooldown_until.get(int(col), -1)
@@ -1888,11 +1381,40 @@ def streamActiveSetNNLS(
         orbit_s, orbit_t, orbit_deficit = _orbit_mass_and_deficit(z)
         orbit_pressure = np.maximum(orbit_deficit, 0.0)
 
-        # The prior is enforced by the projection step, so promotion ranking
-        # only needs the data gradient; the projection tolerance controls the
-        # strictness of the orbit match.
-        if enforce_orbit_prior:
-            grad_promo = grad_promo.copy()
+        # Prior affects promotion ranking and reduced solve, but data-only
+        # gradient remains the reference for watchdog / rollback.
+        if (w_target is not None) and (orbit_beta > 0.0):
+            g_prior = np.zeros_like(grad_promo)
+
+            for cc in range(C):
+                base = cc * P
+                idxs = np.arange(base, base + P, dtype=np.int64)
+
+                S_local = S_flat[idxs]
+                z_local = z[idxs]
+
+                w_cc = float(w_target[cc])
+                target_mass = max(1e-30, alpha_ref * w_cc)
+
+                resid = float(np.dot(S_local, z_local) - target_mass)
+                if not np.isfinite(resid):
+                    continue
+
+                beta_eff = _orbit_prior_beta_eff(
+                    orbit_beta=orbit_beta,
+                    target_mass=target_mass,
+                    data_scale_ref=data_scale_ref,
+                )
+
+                g_prior[idxs] = beta_eff * resid * S_local
+
+            clip_factor = 1.5
+            g_prior_norm = np.linalg.norm(g_prior)
+            g_data_norm = np.linalg.norm(grad_data) + 1e-30
+            if g_prior_norm > clip_factor * g_data_norm:
+                g_prior *= (clip_factor * g_data_norm) / (g_prior_norm + 1e-30)
+
+            grad_promo = grad_promo + g_prior
 
         not_active = np.where(~active)[0]
         if not_active.size == 0:
@@ -1939,6 +1461,7 @@ def streamActiveSetNNLS(
         penalty_strength = 0.5
         adj_score = gvals_promo / (1.0 + penalty_strength * (S_norm - 1.0))
 
+        topk = 5
         if adj_score.size > topk:
             top_idxs = np.argsort(adj_score)[-topk:]
             pick_local = top_idxs[np.argmax(gvals_promo[top_idxs])]
@@ -1982,10 +1505,10 @@ def streamActiveSetNNLS(
                     C=C,
                     P=P,
                     total_cols=preferred_group,
-                    min_per_orbit=2,
+                    min_per_orbit=1,
                     max_per_orbit=max(3, preferred_group),
-                    deficit_boost=3.0,
-                    penalty_strength=0.2,
+                    deficit_boost=2.0,
+                    penalty_strength=0.5,
                     exclude_mask=cooldown_mask,
                     occ_lambda=orbit_occ_lambda,
                 )
@@ -2070,10 +1593,10 @@ def streamActiveSetNNLS(
                         C=C,
                         P=P,
                         total_cols=preferred_group,
-                        min_per_orbit=2,
+                        min_per_orbit=1,
                         max_per_orbit=max(3, preferred_group),
                         deficit_boost=2.0,
-                        penalty_strength=0.2,
+                        penalty_strength=0.5,
                         exclude_mask=cooldown_mask,
                         occ_lambda=orbit_occ_lambda,
                     )
@@ -2124,10 +1647,10 @@ def streamActiveSetNNLS(
                     C=C,
                     P=P,
                     total_cols=preferred_group,
-                    min_per_orbit=2,
+                    min_per_orbit=1,
                     max_per_orbit=max(3, preferred_group),
                     deficit_boost=2.0,
-                    penalty_strength=0.2,
+                    penalty_strength=0.5,
                     exclude_mask=cooldown_mask,
                     occ_lambda=orbit_occ_lambda,
                 )
@@ -2399,7 +1922,7 @@ def streamActiveSetNNLS(
         if not np.isfinite(occ_scale) or occ_scale <= 0.0:
             occ_scale = 1.0
 
-        occ_lambda = 0.0 if C <= 3 else 0.01
+        occ_lambda = 0.02 if C <= 3 else 0.06
 
         occ_pen = np.zeros((k,), dtype=np.float64)
         for local_i, gcol in enumerate(active_idx):
@@ -2419,9 +1942,50 @@ def streamActiveSetNNLS(
             flush=True,
         )
 
-        # The orbit prior is enforced by the projection step; the reduced solve
-        # remains data-driven and only uses the active-set structure.
+        # ----------------------------------------------------
+        # Orbit prior in reduced solve
+        # ----------------------------------------------------
+        if (w_target is not None) and (orbit_beta > 0.0):
+            orbit_groups = {}
+            for local_i, gcol in enumerate(active_idx):
+                cc = int(gcol // P)
+                orbit_groups.setdefault(cc, []).append(local_i)
+
+            for cc, idx_list in orbit_groups.items():
+                idx = np.asarray(idx_list, dtype=np.int64)
+                if idx.size == 0:
+                    continue
+
+                S_local = S_active[idx]
+                w_cc = float(w_target[cc])
+                target_mass = max(1e-30, alpha_ref * w_cc)
+
+                beta_eff = _orbit_prior_beta_eff(
+                    orbit_beta=orbit_beta,
+                    target_mass=target_mass,
+                    data_scale_ref=data_scale_ref,
+                )
+
+                ATA_sub_reg[np.ix_(idx, idx)] += (
+                    beta_eff * np.outer(S_local, S_local)
+                )
+                ATy_sub[idx] += beta_eff * target_mass * S_local
+
+                try:
+                    print(
+                        f"[DIAG][orbit_prior_soft] orbit={cc} "
+                        f"cols={len(idx)} target_mass={target_mass:.3e} "
+                        f"data_scale={data_scale_ref:.3e} "
+                        f"beta_eff={beta_eff:.3e}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+
         z_old_active = z[active_idx].copy()
+
+        def _quad_obj(A, b, x):
+            return 0.5 * float(x @ (A @ x)) - float(b @ x)
 
         z_sub_raw = None
         try:
@@ -2438,45 +2002,6 @@ def streamActiveSetNNLS(
 
         z_sub_raw = np.maximum(z_sub_raw, 0.0)
         z_sub = z_sub_raw.copy()
-
-        if enforce_orbit_prior:
-            z_base = z.copy()
-            z_base[active_idx] = z_sub
-
-            z, last_orbit_delta_x, last_orbit_info = (
-                _maybe_apply_orbit_prior_delta_x(
-                    z_base,
-                    active_idx,
-                    ATA_sub_reg,
-                    ATy_sub,
-                    S_flat,
-                    w_target,
-                    P,
-                    h5_path=h5_path,
-                    rmse_tiles=rmse_tiles,
-                    keep_idx=keep_idx,
-                    rmse_rel_tol=rmse_rel_tol,
-                    ls_max_steps=ls_max_steps,
-                    delta=orbit_prior_delta,
-                )
-            )
-            z_sub = z[active_idx]
-            print(
-                "[MONO][orbit-prior] correction: "
-                f"accepted={last_orbit_info['accepted']} "
-                f"eta={last_orbit_info['eta']:.3f} "
-                f"rmse_base={last_orbit_info['rmse_base']:.3e} "
-                f"rmse_try={last_orbit_info['rmse_try']:.3e} "
-                f"exact={last_orbit_info['exact']} "
-                f"mass_resid={last_orbit_info['mass_resid']:.3e} "
-                f"delta_x_norm={last_orbit_info['delta_x_norm']:.3e}",
-                flush=True,
-            )
-        else:
-            z[active_idx] = z_sub
-
-        def _quad_obj(A, b, x):
-            return 0.5 * float(x @ (A @ x)) - float(b @ x)
 
         # Track promoted columns that did not survive the reduced solve.
         failed_cols = []
@@ -2519,28 +2044,13 @@ def streamActiveSetNNLS(
             old_l1 = float(np.sum(np.abs(deficit_old)))
             new_l1 = float(np.sum(np.abs(deficit_new)))
             orbit_improved = new_l1 < (0.995 * old_l1)
-        diversity_improved = False
-        if did_explore:
-            before = 0.0
-            after = 0.0
-            for cc in np.unique(newly_activated // P):
-                base = cc * P
-                pre = np.flatnonzero(active_before[base:base + P])
-                post = np.flatnonzero(active[base:base + P])
-                before += float(pre.size)
-                after += float(post.size)
 
-            diversity_improved = after > before
-
-        # when deciding whether a newly promoted set is a "near-noop",
-        # only cool it down if it also fails diversity.
         near_noop = (
             did_explore
             and promoted_cols.size > 0
             and (obj_gain <= promotion_noop_abs_tol
-                or rel_gain <= promotion_noop_rel_tol)
+                 or rel_gain <= promotion_noop_rel_tol)
             and not orbit_improved
-            and not diversity_improved
         )
 
         reject = False
@@ -2582,6 +2092,10 @@ def streamActiveSetNNLS(
                 break
             _emit_checkpoint(it, final=True, phase="reject_exit")
             continue
+
+        # Commit solution on the active subspace
+        for ii, gcol in enumerate(active_idx):
+            z[int(gcol)] = float(z_sub[ii])
 
         if did_explore:
             grad_after_data = ATy_scaled - _compute_ATAz_scaled(z)
@@ -2675,13 +2189,6 @@ def streamActiveSetNNLS(
             break
 
         _emit_checkpoint(it, final=False)
-
-    if enforce_orbit_prior:
-        print(
-            "[MONO][orbit-prior][final] no deferred correction; "
-            "returned x is the last committed iterate",
-            flush=True,
-        )
 
     try:
         final_it = int(it)
@@ -2817,14 +2324,16 @@ def monolithic_nnls_scipy(
     if enforce_orbit_projection and (orbit_weights is not None):
         w_t = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
         if w_t is not None:
-            delta = float(
-                getattr(
-                    cfg,
-                    "orbit_prior_delta",
-                    os.environ.get("CUBEFIT_ORBIT_PRIOR_DELTA", "1e-6"),
-                )
-            )
-            x = _enforce_orbit_prior_mass(x, w_t, delta=delta)
+            known_zero_orbit = np.all(np.zeros((C, P), dtype=bool), axis=1)  # no known_zero info here
+            # compute per-orbit sums on current x
+            s = np.sum(x, axis=1)
+            w = np.asarray(w_t, dtype=np.float64)
+            w_sum = float(np.sum(w))
+            alpha = float(np.sum(s)) / w_sum if (w_sum > 0.0) else 1.0
+            s_proj = alpha * w
+            ratio = s_proj / np.maximum(s, 1e-30)
+            x *= ratio[:, None]
+            np.maximum(x, 0.0, out=x)
 
     elapsed = time.perf_counter() - t0
     stats = dict(
@@ -2854,8 +2363,7 @@ def solve_streaming_nnls(
       epoch (no repeated HDF5 reads per block).
     - Solves small quadratic NNLS problems per block using a projected-gradient
       solver on the quadratic form ATA/ATy.
-    - Supports orbit-prior enforcement by projecting the solution onto the
-      requested orbit-mass targets within the configured delta tolerance.
+    - Supports soft orbit prior (orbit_beta) via augmentation of ATA/ATy.
     - Applies hard rank-1 orbit projection at epoch end (using D_tot).
     """
     t0 = time.perf_counter()
@@ -3061,8 +2569,12 @@ def solve_streaming_nnls(
         inv_sqrt_energy = S_temp
         inv_sqrt_energy_flat = inv_sqrt_energy.ravel(order="C")
 
+        beta_eff = 0.0
+        if orbit_weights is not None and cfg.orbit_beta > 0.0:
+            beta_eff = float(cfg.orbit_beta)
+
         print(
-            "[DIAG] orbit prior : projection-based enforcement",
+            f"[DIAG] orbit prior : cfg.orbit_beta = {beta_eff:.4e}",
             flush=True,
         )
 
@@ -3225,7 +2737,8 @@ def solve_streaming_nnls(
                 executor=executor,
                 cfg=cfg,
                 orbit_weights=orbit_weights,
-                    x0_flat=x.ravel(order="C"),
+                orbit_beta_eff=beta_eff,
+                x0_flat=x.ravel(order="C"),
                 max_active=monolithic_max_active,
                 tol_grad=1e-8,
                 max_iter=5 * monolithic_max_active,
