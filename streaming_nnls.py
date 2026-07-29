@@ -2894,11 +2894,17 @@ def solve_streaming_nnls(
                         [f"{int(i)}:{r[i]:+.3e}({frac[i]:+.2%})" for i in idx_sort]
                     )
 
-                    print("[DIAG][orbit_weights] residuals: L1={:.3e} L2={:.3e} "
-                        "max_abs={:.3e} median_frac={:+.2%}".format(
-                            l1, l2, maxabs, mean_frac), flush=True)
-                    print("[DIAG][orbit_weights] top offenders (idx:resid(frac)): "
-                        + offenders, flush=True)
+                    print("[DIAG][orbit_weights]")
+                    for cc in range(C):
+                        nz = np.count_nonzero(x[cc] > 0.0)
+                        print(
+                            f"orbit {cc:2d}: "
+                            f"mass={s_full[cc]:.3e} "
+                            f"target={s_proj[cc]:.3e} "
+                            f"ratio={s_full[cc]/builtins.max(s_proj[cc],1e-30):6.3f} "
+                            f"nz={nz:3d}",
+                            flush=True,
+                        )
                 else:
                     # no prior available
                     print("[DIAG][orbit_weights] no w_target present; skipping "
