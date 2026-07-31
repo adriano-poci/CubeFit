@@ -129,6 +129,8 @@ from CubeFit.hdf5_manager import open_h5
 from CubeFit import cube_utils as cu
 from CubeFit.hypercube_builder import read_global_column_energy
 
+vprint = cu.vprint
+
 def _init_worker(blas_threads: int):
     # called once per process; set BLAS env vars
     os.environ["OMP_NUM_THREADS"] = str(blas_threads)
@@ -1170,6 +1172,7 @@ def streamActiveSetNNLS(
     orbit_weights: Optional[np.ndarray] = None,
     orbit_beta_eff: float = 0.0,
     x0_flat: Optional[np.ndarray] = None,
+    resume_state: Optional[dict] = None,
     max_active: int = 1000,
     tol_grad: float = 1e-8,
     max_iter: int = 5000,
@@ -1284,6 +1287,13 @@ def streamActiveSetNNLS(
     if (not np.isfinite(alpha_ref)) or (alpha_ref <= 0.0):
         alpha_ref = 1.0
 
+    # --- orbit prior setup ---
+    w_target = None
+    if orbit_weights is not None:
+        w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
+    orbit_beta = float(orbit_beta_eff)
+    orbit_occ_lambda = 0.15 if C <= 3 else 0.25
+
     diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
     diag_stride = max(1, int(os.environ.get("CUBEFIT_DIAG_STRIDE", "1")))
     diag_jsonl_path = os.environ.get("CUBEFIT_DIAG_JSONL", "").strip() or None
@@ -1318,11 +1328,24 @@ def streamActiveSetNNLS(
         }
     )
 
-    # --- orbit prior setup ---
-    w_target = None
-    if orbit_weights is not None:
-        w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
-    orbit_beta = float(orbit_beta_eff)
+    if x0_flat is None:
+        z = np.zeros((CP,), dtype=np.float64)
+    else:
+        x0_flat = np.asarray(x0_flat, dtype=np.float64).ravel(order="C")
+        if x0_flat.size != CP:
+            raise ValueError("x0_flat has wrong size in monolithic solver")
+        z = np.divide(
+            x0_flat,
+            S_flat,
+            out=np.zeros_like(x0_flat, dtype=np.float64),
+            where=S_flat > 0.0,
+        )
+        np.maximum(z, 0.0, out=z)
+
+    resume_state = dict(resume_state or {})
+    start_iter = int(resume_state.get("iter", 0) or 0)
+    if start_iter < 0:
+        start_iter = 0
 
     if x0_flat is None:
         z = np.zeros((CP,), dtype=np.float64)
@@ -1345,9 +1368,6 @@ def streamActiveSetNNLS(
     committed_z = z.copy()
     committed_active = active.copy()
 
-    # Soft occupancy control: discourage crowded orbits, but do not cap them.
-    orbit_occ_lambda = 0.15 if C <= 3 else 0.25
-
     # Probation for newly admitted columns.
     probation_iters = 3
     probation_rel = 1e-6
@@ -1359,6 +1379,51 @@ def streamActiveSetNNLS(
     cooldown_iters = 10
     promotion_noop_rel_tol = 1e-6
     promotion_noop_abs_tol = 1e-10
+
+    negative_grad_count = 0
+    no_progress_count = 0
+
+    if resume_state:
+        no_progress_count = int(resume_state.get("no_progress_count", 0))
+        negative_grad_count = int(resume_state.get("negative_grad_count", 0))
+
+        if "active_mask" in resume_state:
+            am = np.asarray(
+                resume_state["active_mask"], dtype=bool
+            ).ravel(order="C")
+            if am.size == CP:
+                active = am.copy()
+
+        if "committed_active_mask" in resume_state:
+            cam = np.asarray(
+                resume_state["committed_active_mask"], dtype=bool
+            ).ravel(order="C")
+            if cam.size == CP:
+                committed_active = cam.copy()
+
+        if "committed_z" in resume_state:
+            cz = np.asarray(
+                resume_state["committed_z"], dtype=np.float64
+            ).ravel(order="C")
+            if cz.size == CP:
+                committed_z = cz.copy()
+
+        def _pairs_to_dict(pairs):
+            out = {}
+            for item in pairs or []:
+                try:
+                    k, v = item
+                    out[int(k)] = int(v)
+                except Exception:
+                    pass
+            return out
+
+        provisional_hits = _pairs_to_dict(
+            resume_state.get("provisional_hits", [])
+        )
+        col_cooldown_until = _pairs_to_dict(
+            resume_state.get("col_cooldown_until", [])
+        )
 
     def _on_cooldown(col: int, it: int) -> bool:
         return it < col_cooldown_until.get(int(col), -1)
@@ -1379,6 +1444,14 @@ def streamActiveSetNNLS(
     def _current_x_from_z(z_vec: np.ndarray) -> np.ndarray:
         return S_flat * z_vec
 
+    if start_iter >= max_iter:
+        print(
+            "[MONO] resume_state already reached max_iter; returning the "
+            "committed solution without entering the outer loop.",
+            flush=True,
+        )
+        return _current_x_from_z(z)
+
     checkpoint_error_logged = False
 
     def _log_checkpoint_error(where: str, exc: Exception) -> None:
@@ -1386,7 +1459,26 @@ def streamActiveSetNNLS(
         if not checkpoint_error_logged:
             print(f"[MONO][checkpoint] {where}: {exc}", flush=True)
             checkpoint_error_logged = True
-
+    
+    def _pack_resume_state(it: int, phase: str, final: bool) -> dict:
+        return {
+            "iter": int(it + 1),
+            "max_iter": int(max_iter),
+            "phase": str(phase),
+            "final": bool(final),
+            "no_progress_count": int(no_progress_count),
+            "negative_grad_count": int(negative_grad_count),
+            "active_mask": active.astype(bool).tolist(),
+            "committed_active_mask": committed_active.astype(bool).tolist(),
+            "committed_z": committed_z.astype(np.float64).tolist(),
+            "provisional_hits": [
+                [int(k), int(v)] for k, v in provisional_hits.items()
+            ],
+            "col_cooldown_until": [
+                [int(k), int(v)] for k, v in col_cooldown_until.items()
+            ],
+        }
+    
     def _emit_checkpoint(
         it: int,
         *,
@@ -1410,6 +1502,7 @@ def streamActiveSetNNLS(
                     "final": bool(final),
                     "active": int(np.count_nonzero(active)),
                     "stall_count": int(no_progress_count),
+                    "resume_state": _pack_resume_state(it, phase, final),
                 },
             )
         except Exception as exc:
@@ -1468,7 +1561,7 @@ def streamActiveSetNNLS(
     # ------------------------------------------------------------
     # Active-set outer loop
     # ------------------------------------------------------------
-    for it in range(max_iter):
+    for it in range(start_iter, max_iter):
         t_iter = time.perf_counter()
         force_explore = no_progress_count >= force_explore_after
 
@@ -1479,13 +1572,37 @@ def streamActiveSetNNLS(
         orbit_s, orbit_t, orbit_deficit = _orbit_mass_and_deficit(z)
         orbit_pressure = np.maximum(orbit_deficit, 0.0)
 
+        not_active = np.where(~active)[0]
+        gvals_data = grad_data[not_active]
+        gvals_promo = grad_promo[not_active]
+        if gvals_data.size == 0:
+            _emit_checkpoint(it, final=True, phase="no_gradient_exit")
+            break
+
+        max_grad_all = float(np.max(grad_data)) if grad_data.size else 0.0
+        active_before = active.copy()
+        z_before = z.copy()
+
+        max_grad_promotable = (
+            float(np.max(gvals_promo)) if gvals_promo.size else 0.0
+        )
+        avg_grad_promotable = (
+            float(np.mean(gvals_promo)) if gvals_promo.size else 0.0
+        )
+        max_grad_data = (
+            float(np.max(gvals_data)) if gvals_data.size else 0.0
+        )
+        grad_before_data = max_grad_data
+
         if diag_level >= 1 and ((it % diag_stride) == 0):
             x_phys_now = _current_x_from_z(z).reshape(C, P)
             orbit_mass = np.sum(x_phys_now, axis=1)
             orbit_target = orbit_t.copy()
             orbit_resid = orbit_mass - orbit_target
             orbit_ratio = orbit_mass / np.maximum(orbit_target, 1e-30)
-            orbit_nz = np.count_nonzero(x_phys_now > 0.0, axis=1).astype(np.int64)
+            orbit_nz = np.count_nonzero(x_phys_now > 0.0, axis=1).astype(
+                np.int64
+            )
 
             eff_support = np.zeros((C,), dtype=np.float64)
             entropy = np.zeros((C,), dtype=np.float64)
@@ -1549,32 +1666,6 @@ def streamActiveSetNNLS(
                 g_prior *= (clip_factor * g_data_norm) / (g_prior_norm + 1e-30)
 
             grad_promo = grad_promo + g_prior
-
-        not_active = np.where(~active)[0]
-        if not_active.size == 0:
-            _emit_checkpoint(it, final=True, phase="no_active_exit")
-            break
-
-        gvals_data = grad_data[not_active]
-        gvals_promo = grad_promo[not_active]
-        if gvals_data.size == 0:
-            _emit_checkpoint(it, final=True, phase="no_gradient_exit")
-            break
-
-        max_grad_all = float(np.max(grad_data)) if grad_data.size else 0.0
-        active_before = active.copy()
-        z_before = z.copy()
-
-        max_grad_promotable = (
-            float(np.max(gvals_promo)) if gvals_promo.size else 0.0
-        )
-        avg_grad_promotable = (
-            float(np.mean(gvals_promo)) if gvals_promo.size else 0.0
-        )
-        max_grad_data = (
-            float(np.max(gvals_data)) if gvals_data.size else 0.0
-        )
-        grad_before_data = max_grad_data
 
         n_active = int(np.count_nonzero(active))
         print(
@@ -2560,10 +2651,11 @@ def solve_streaming_nnls(
     *,
     orbit_weights: Optional[np.ndarray] = None,
     x0: Optional[np.ndarray] = None,
+    resume_state: Optional[dict] = None,
     tracker: Optional[object] = None,
     block_size: Optional[int] = None,
     monolithic_max_active: int = 1000,
-    ):
+):
     """
     Fused single-pass block-coordinate NNLS solver (BLAS-friendly).
 
@@ -2600,6 +2692,8 @@ def solve_streaming_nnls(
     w_target = None
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
+    orbit_beta = float(cfg.orbit_beta)
+    orbit_occ_lambda = 0.15 if C <= 3 else 0.25
 
     # ---------------------------- diagnostics --------------------------
     diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
@@ -2628,7 +2722,8 @@ def solve_streaming_nnls(
             "n_ranges": int(len(s_ranges)),
             "processes": int(cfg.processes),
             "blas_threads": int(cfg.blas_threads),
-            "orbit_beta": float(cfg.orbit_beta),
+            "orbit_beta": float(orbit_beta),
+            "orbit_occ_lambda": float(orbit_occ_lambda),
             "diag_level": int(diag_level),
             "diag_stride": int(diag_stride),
             "diag_topk": int(diag_topk),
@@ -2942,16 +3037,17 @@ def solve_streaming_nnls(
             save_state = getattr(tracker, "save_state", None)
             if callable(save_state):
                 try:
-                    save_state(
-                        {
+                    state = dict(stats.get("resume_state", {}))
+                    if not state:
+                        state = {
                             "iter": int(stats.get("iter", -1)),
                             "max_iter": int(stats.get("max_iter", -1)),
                             "phase": str(stats.get("phase", "solve")),
                             "final": bool(stats.get("final", False)),
                             "active": int(stats.get("active", -1)),
                             "stall_count": int(stats.get("stall_count", -1)),
-                        },
-                    )
+                        }
+                    save_state(state)
                 except Exception as exc:
                     if not checkpoint_error_logged:
                         print(
@@ -2982,6 +3078,7 @@ def solve_streaming_nnls(
                 orbit_weights=orbit_weights,
                 orbit_beta_eff=beta_eff,
                 x0_flat=x.ravel(order="C"),
+                resume_state=resume_state,
                 max_active=monolithic_max_active,
                 tol_grad=1e-8,
                 max_iter=5 * monolithic_max_active,

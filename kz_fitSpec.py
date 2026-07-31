@@ -630,7 +630,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     #####################################
     x_global, stats = runner.solve_all_mp_batched(
         epochs=1,
-        # x0=x0,
         lr=0.1,
         project_nonneg=True,
         # orbit_weights=None, # or None for “free” fit
@@ -638,7 +637,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         processes=CPU_PROCESSES,
         blas_threads=BLAS_THREADS,
         reader_s_tile=128, # match /HyperCube/models chunking on S
-        verbose=True,
         warm_start=warm_start,
         seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )

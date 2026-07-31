@@ -19,6 +19,7 @@ v1.5:   Fixed bug in `_glob*MILES` where the metallicity parsing was not
 v1.6:   Fixed bug in `_glob*MILES` where age sorting was neglected, so added
             `parseAgeFromPath` and updated sorting logic. 30 March 2026
 v1.7:   Moved template-reading functions to `dynamics.IFU.FileIO`. 21 July 2026
+v1.8:   Added `vprint` to globally manage diagnostic level. 31 July 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -71,31 +72,21 @@ def rReplace(s, old, new, occurrence):
 
 # ------------------------------------------------------------------------------
 
-def _deetExtr(fnKey):
-    # temp = rReplace(fnKey, os.sep, keySep, 1).split(keySep)
-    rstru = ''
-    for ji in range(len(freez)-1):
-        rstru += r'([a-z]+)([+-]?[0-9]{1,}(?:\.[0-9]+))'
-        if ji < len(freez)-2:
-            rstru += keySep
-        else:
-            rstru += r'[\/\\]?(?:([a-z]+)([+-]?[0-9]{1,}(?:\.[0-9]+)))?'
-            # optional group with either path sep for M/L
+_DIAG_LEVEL = None
 
-    # Join `temp` instead of using `fnKey` to get rid of the `keySep`
-    rmat = re.search(rstru, str(fnKey))
-    if isinstance(rmat, type(None)):
-        # warnings.warn(f"Key did not return matches for:\n{fnKey}\n{rstru}",
-            # RuntimeWarning)
-        return None
+def diag_level():
+    global _DIAG_LEVEL
+    if _DIAG_LEVEL is None:
+        try:
+            _DIAG_LEVEL = int(os.environ.get(
+                "CUBEFIT_DIAG_LEVEL", "1"))
+        except Exception:
+            _DIAG_LEVEL = 1
+    return _DIAG_LEVEL
 
-    fpDict = dict()
-    gpKeys = list(rmat.groups())[::2]
-    gpVals = list(rmat.groups())[1::2]
-    for key, val in zip(gpKeys, gpVals):
-        if key:
-            fpDict[key] = float(val)
-    return fpDict
+def vprint(*args, level=1, **kwargs):
+    if diag_level() >= level:
+        print(*args, **kwargs)
 
 # ------------------------------------------------------------------------------
 

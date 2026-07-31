@@ -59,6 +59,7 @@ v1.17:  Removed lingering `orbit_beta`. 23 March 2026
 v1.18:  Re-implemented `orbit_beta` support in `solve_all_mp_batched` and passed
             it to the solver. 30 March 2026
 v1.19:  Resolve `orbit_prior_delta`. 27 July 2026
+v1.20:  Use `cube_utils.vprint` for diagnostic prints. 31 July 2026
 """
 
 from __future__ import annotations
@@ -83,6 +84,7 @@ from CubeFit.cube_utils import RatioCfg
 from CubeFit.logger import get_logger
 
 logger = get_logger()
+vprint = cu.vprint
 
 # ----------------------------------------------------------------------
 # Jacobi seeder
@@ -529,6 +531,32 @@ class PipelineRunner:
 
         return None, None
 
+    @staticmethod
+    def _read_solver_state(sidecar_path: str | None) -> dict:
+        """
+        Read the JSON-serialized streaming NNLS resume state from a sidecar.
+        """
+        if (sidecar_path is None) or (not os.path.exists(sidecar_path)):
+            return {}
+
+        try:
+            with open_h5(sidecar_path, role="reader", swmr=True) as f:
+                fit = f.get("/Fit", None)
+                if fit is None:
+                    return {}
+
+                raw = fit.attrs.get("solver_state_json", None)
+                if raw is None:
+                    return {}
+
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode("utf-8", errors="replace")
+
+                state = json.loads(raw)
+                return state if isinstance(state, dict) else {}
+        except Exception:
+            return {}
+
     def _read_seed_from_h5(self,
                         h5_path: str,
                         N_expected: int,
@@ -945,7 +973,6 @@ class PipelineRunner:
         warm_start="zeros",  # default to the new seed
         seed_cfg=None,
         tracker_mode="on",
-        verbose=True,
     ):
 
         # --------------- Warm-start (same policy as SP path) -----------
@@ -960,20 +987,18 @@ class PipelineRunner:
                 N_expected, dset=path)
             if x_seed is not None:
                 x0_effective = x_seed
-                if verbose:
-                    logger.log(f"[Pipeline] Warm-start from seed {src_seed} "
+                vprint(f"[Pipeline] Warm-start from seed {src_seed} "
                                f"(n={x0_effective.size}).")
             else:
                 x0_effective = None
-                if verbose:
-                    logger.log(f"[Pipeline] No seed found at {path}; "
-                               f"continuing without warm-start.")
+                vprint(f"[Pipeline] No seed found at {path}; "
+                    f"continuing without warm-start.")
 
         elif warm_start == "resume":
             sidecar = cu._find_latest_sidecar(self.h5_path)
 
-            logger.log(f"[Pipeline] Warm-start mode: resume; "
-                       f"sidecar found: {sidecar if sidecar else 'none'}")
+            vprint(f"[Pipeline] Warm-start mode: resume; "
+                f"sidecar found: {sidecar if sidecar else 'none'}")
             # Always define these (avoids UnboundLocalError patterns).
             x_side, src_side = (None, None)
             x_main, src_main = (None, None)
@@ -1029,10 +1054,10 @@ class PipelineRunner:
                 else:
                     choose_side = (_safe_mtime(sidecar) > _safe_mtime(self.h5_path))
 
-            logger.log(f"[Pipeline] Warm-start resume candidates: "
-                       f"sidecar: {src_side if src_side else 'none'}, "
-                       f"main: {src_main if src_main else 'none'}; "
-                       f"choosing {'sidecar' if choose_side else 'main' if (x_main is not None) else 'none'}.")
+            vprint(f"[Pipeline] Warm-start resume candidates: "
+                f"sidecar: {src_side if src_side else 'none'}, "
+                f"main: {src_main if src_main else 'none'}; "
+                f"choosing {'sidecar' if choose_side else 'main' if (x_main is not None) else 'none'}.")
             x0_effective, src_label, src_file = (
                 (x_side, src_side, sidecar) if choose_side
                 else (x_main, src_main, self.h5_path)
@@ -1052,16 +1077,13 @@ class PipelineRunner:
                     src_file = self.h5_path
                     choose_side = False
                     seed_used = True
-                    if verbose:
-                        logger.log(
-                            "[Pipeline] Warm-start fallback from seed "
-                            f"{src_seed} (n={x0_effective.size})."
-                        )
+                    vprint("[Pipeline] Warm-start fallback from seed "
+                        f"{src_seed} (n={x0_effective.size}).")
 
-            if x0_effective is not None and verbose and (not seed_used):
+            if x0_effective is not None and (not seed_used):
                 t_side = _safe_mtime(sidecar) if sidecar else -np.inf
                 t_main = _safe_mtime(self.h5_path)
-                logger.log(
+                vprint(
                     f"[Pipeline] Warm-start from {src_label} "
                     f"({'sidecar' if choose_side else 'main'}: {src_file}) "
                     f"(n={x0_effective.size}); "
@@ -1069,8 +1091,7 @@ class PipelineRunner:
                 )
 
         elif warm_start == "nnls":
-            if verbose:
-                logger.log("[Pipeline] Warm-start mode: nnls_patch seed")
+            vprint("[Pipeline] Warm-start mode: nnls_patch seed")
 
             with logger.capture_all_output():
                 res = _nnls_patch_run(
@@ -1088,22 +1109,20 @@ class PipelineRunner:
             Xcp = np.asarray(res["x_CP"], np.float64, order="C")
 
             x0_effective = Xcp.ravel(order="C")
-            if verbose:
-                meta = res.get("meta", {})
-                logger.log(f"[Pipeline] nnls_patch seed: rows={meta.get('rows')}, cols={meta.get('cols')}, "
-                        f"mask={meta.get('mask_used')}, lambda={meta.get('lambda_used')}, "
-                        f"solver={meta.get('solver')}, normcols={True}")
-            logger.log(f"[Pipeline] seed: ||x||_1={float(np.sum(x0_effective)):.3e}, "
+            meta = res.get("meta", {})
+            vprint(f"[Pipeline] nnls_patch seed: rows={meta.get('rows')}, cols={meta.get('cols')}, "
+                f"mask={meta.get('mask_used')}, lambda={meta.get('lambda_used')}, "
+                f"solver={meta.get('solver')}, normcols={True}")
+            vprint(f"[Pipeline] seed: ||x||_1={float(np.sum(x0_effective)):.3e}, "
                 f"max={float(np.max(x0_effective)):.3e}, min={float(np.min(x0_effective)):.3e}")
             with open_h5(self.h5_path, role="reader") as f:
                 if "/Seeds/x0_nnls_patch" in f:
                     ds = f["/Seeds/x0_nnls_patch"]
-                    logger.log(f"[Pipeline] seed_model_flux={ds.attrs.get('seed_model_flux', None)}, "
+                    vprint(f"[Pipeline] seed_model_flux={ds.attrs.get('seed_model_flux', None)}, "
                         f"data_flux={ds.attrs.get('data_flux', None)}")
 
         elif warm_start == "jacobi":
-            if verbose:
-                logger.log("[Pipeline] Warm-start mode: fresh Jacobi")
+            vprint("[Pipeline] Warm-start mode: fresh Jacobi")
             x0_effective, jacobi_stats = _build_streaming_jacobi_seed(
                 self.h5_path, **(seed_cfg or {})
             )
@@ -1161,22 +1180,19 @@ class PipelineRunner:
             apply_mask=bool(reader_apply_mask),
         )
         reader = HyperCubeReader(self.h5_path, cfg=reader_cfg)
-        if verbose:
-            logger.log(
-                "[Pipeline] Initialized from HDF5:"
-                f" S={reader.nSpat}, C={reader.nComp}, P={reader.nPop}, "
-                f"L={reader.nLSpec}; "
-                f"mask={'yes' if reader.has_mask else 'no'}; "
-                f"models={'yes' if reader.has_models else 'no'}; "
-                f"complete={reader.models_complete}"
-            )
+        vprint("[Pipeline] Initialized from HDF5:"
+            f" S={reader.nSpat}, C={reader.nComp}, P={reader.nPop}, "
+            f"L={reader.nLSpec}; "
+            f"mask={'yes' if reader.has_mask else 'no'}; "
+            f"models={'yes' if reader.has_models else 'no'}; "
+            f"complete={reader.models_complete}")
 
         # ---------------- Tracker wiring ----------------
         tracker = NullTracker()
         if tracker_mode != "off":
             tracker = FitTracker(self.h5_path)
-            logger.log("[Pipeline] Using tracker with mode:", tracker_mode)
-            logger.log('[Pipeline] Need to infer shapes...')
+            vprint("[Pipeline] Using tracker with mode:", tracker_mode)
+            vprint('[Pipeline] Need to infer shapes...')
             with open_h5(self.h5_path, role="reader") as f:
                 g = f.get("/HyperCube", None)
                 if g is not None:
@@ -1188,7 +1204,7 @@ class PipelineRunner:
                 if "/LOSVD" in f and "/Templates" in f:
                     _, _, C = map(int, f["/LOSVD"].shape)
                     P = int(f["/Templates"].shape[0])
-            logger.log(f"[Pipeline] Inferred C={C}, P={P} from HDF5")
+            vprint(f"[Pipeline] Inferred C={C}, P={P} from HDF5")
             tracker.set_meta(N=int(C)*int(P))
 
         cfg = MPConfig(
@@ -1201,20 +1217,24 @@ class PipelineRunner:
             orbit_beta=float(
                 os.environ.get("CUBEFIT_ORBIT_BETA", "1e-2")
             ),
-            # orbit_prior_delta=float(
-            #     os.environ.get("CUBEFIT_ORBIT_PRIOR_DELTA", "1e-6")
-            # ),
         )
 
         try:
             with logger.capture_all_output():
+                resume_state = {}
+                if warm_start == "resume" and choose_side and \
+                    (src_file is not None):
+                    resume_state = self._read_solver_state(src_file)
+
                 x_solver, stats = solve_streaming_nnls(
                     self.h5_path,
                     cfg,
                     orbit_weights=orbit_weights,
                     x0=x0_effective,
+                    resume_state=resume_state,
                     tracker=tracker,
-                    monolithic_max_active=500)
+                    monolithic_max_active=500,
+                )
                 # x_solver, stats = solve_monolithic_nnls(self.h5_path,
                     # orbit_weights=orbit_weights, 
                     # hard_project=True)
@@ -1228,14 +1248,13 @@ class PipelineRunner:
                 reader.close()
             except Exception:
                 pass
+            if tracker is not None:
+                try:
+                    tracker.close()
+                except Exception:
+                    pass
 
-        if tracker is not None:
-            try:
-                tracker.close()
-            except Exception:
-                pass
-
-        logger.log("[Pipeline] Writing final /X_global to main HDF5...")
+        vprint("[Pipeline] Writing final /X_global to main HDF5...")
         with open_h5(self.h5_path, role="writer") as f_wr:
 
             assert x_solver.ndim == 2, "Xcp must be (C, P) before writing /X_global"
