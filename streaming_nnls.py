@@ -102,11 +102,12 @@ v1.17:  Fixed history versioning;
             under-represented orbits and widening the rescue candidate pool to
             improve orbit diversity without degrading the spectral fit. 28 July
             2026
+v1.18:  Added robust diagnostic machinery. 30 July 2026
 """
 
 from __future__ import annotations, print_function
 
-import os, sys, traceback
+import os, sys, traceback, json
 import signal
 import math, builtins
 import time
@@ -134,6 +135,70 @@ def _init_worker(blas_threads: int):
     os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
     os.environ["MKL_NUM_THREADS"] = str(blas_threads)
     os.environ["NUMEXPR_NUM_THREADS"] = str(max(1, blas_threads // 2))
+
+# ------------------------------------------------------------------------------
+
+def _diag_json_default(obj):
+    """
+    Make NumPy values JSON-serialisable.
+    """
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (set, tuple)):
+        return list(obj)
+    return str(obj)
+
+
+def _diag_append_jsonl(path: str | None, record: dict) -> None:
+    """
+    Append one JSON record to a JSONL file.
+    """
+    if not path:
+        return
+
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                record,
+                default=_diag_json_default,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+
+
+def _support_stats_1d(vec: np.ndarray) -> dict:
+    """
+    Summarise within-orbit coefficient diversity.
+    """
+    v = np.asarray(vec, dtype=np.float64).ravel(order="C")
+    v = v[np.isfinite(v) & (v > 0.0)]
+
+    if v.size == 0:
+        return {
+            "nnz": 0,
+            "eff_support": 0.0,
+            "entropy": 0.0,
+            "top_share": 0.0,
+            "gini_proxy": 0.0,
+        }
+
+    mass = float(np.sum(v))
+    p = v / max(mass, 1e-30)
+    eff_support = float(1.0 / np.sum(p * p))
+    entropy = float(-np.sum(p * np.log(np.maximum(p, 1e-300))))
+    top_share = float(np.max(p))
+    gini_proxy = float(1.0 - np.sum(p * p))
+
+    return {
+        "nnz": int(v.size),
+        "eff_support": eff_support,
+        "entropy": entropy,
+        "top_share": top_share,
+        "gini_proxy": gini_proxy,
+    }
 
 # ------------------------------------------------------------------------------
 
@@ -1219,7 +1284,39 @@ def streamActiveSetNNLS(
     if (not np.isfinite(alpha_ref)) or (alpha_ref <= 0.0):
         alpha_ref = 1.0
 
-    print(f"[DIAG] alpha_ref = {alpha_ref:.4e}", flush=True)
+    diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
+    diag_stride = max(1, int(os.environ.get("CUBEFIT_DIAG_STRIDE", "1")))
+    diag_jsonl_path = os.environ.get("CUBEFIT_DIAG_JSONL", "").strip() or None
+    diag_topk = max(1, int(os.environ.get("CUBEFIT_DIAG_TOPK", "12")))
+    diag_t0 = time.perf_counter()
+
+    def _emit_diag(record: dict) -> None:
+        if diag_level <= 0:
+            return
+        rec = dict(record)
+        rec.setdefault("t_sec", float(time.perf_counter() - diag_t0))
+        _diag_append_jsonl(diag_jsonl_path, rec)
+
+    _emit_diag(
+        {
+            "kind": "mono_setup",
+            "C": int(C),
+            "P": int(P),
+            "CP": int(CP),
+            "processes": int(cfg.processes),
+            "blas_threads": int(cfg.blas_threads),
+            "orbit_beta": float(orbit_beta),
+            "alpha_ref": float(alpha_ref),
+            "data_scale_ref": float(data_scale_ref),
+            "grad_ref": float(grad_ref),
+            "tol_grad": float(tol_grad),
+            "tol_grad_rel": float(tol_grad_rel),
+            "orbit_occ_lambda": float(orbit_occ_lambda),
+            "diag_level": int(diag_level),
+            "diag_stride": int(diag_stride),
+            "diag_topk": int(diag_topk),
+        }
+    )
 
     # --- orbit prior setup ---
     w_target = None
@@ -1372,6 +1469,7 @@ def streamActiveSetNNLS(
     # Active-set outer loop
     # ------------------------------------------------------------
     for it in range(max_iter):
+        t_iter = time.perf_counter()
         force_explore = no_progress_count >= force_explore_after
 
         ATAz_scaled = _compute_ATAz_scaled(z)
@@ -1380,6 +1478,44 @@ def streamActiveSetNNLS(
 
         orbit_s, orbit_t, orbit_deficit = _orbit_mass_and_deficit(z)
         orbit_pressure = np.maximum(orbit_deficit, 0.0)
+
+        if diag_level >= 1 and ((it % diag_stride) == 0):
+            x_phys_now = _current_x_from_z(z).reshape(C, P)
+            orbit_mass = np.sum(x_phys_now, axis=1)
+            orbit_target = orbit_t.copy()
+            orbit_resid = orbit_mass - orbit_target
+            orbit_ratio = orbit_mass / np.maximum(orbit_target, 1e-30)
+            orbit_nz = np.count_nonzero(x_phys_now > 0.0, axis=1).astype(np.int64)
+
+            eff_support = np.zeros((C,), dtype=np.float64)
+            entropy = np.zeros((C,), dtype=np.float64)
+            top_share = np.zeros((C,), dtype=np.float64)
+            for cc in range(C):
+                st = _support_stats_1d(x_phys_now[cc, :])
+                eff_support[cc] = st["eff_support"]
+                entropy[cc] = st["entropy"]
+                top_share[cc] = st["top_share"]
+
+            _emit_diag(
+                {
+                    "kind": "iter_pre",
+                    "iter": int(it + 1),
+                    "n_active": int(np.count_nonzero(active)),
+                    "max_grad_data": float(max_grad_data),
+                    "max_grad_promo": float(max_grad_promotable),
+                    "avg_grad_promo": float(avg_grad_promotable),
+                    "orbit_deficit_l1": float(np.sum(np.abs(orbit_deficit))),
+                    "orbit_deficit_l2": float(np.linalg.norm(orbit_deficit)),
+                    "orbit_mass": orbit_mass.tolist(),
+                    "orbit_target": orbit_target.tolist(),
+                    "orbit_resid": orbit_resid.tolist(),
+                    "orbit_ratio": orbit_ratio.tolist(),
+                    "orbit_nz": orbit_nz.tolist(),
+                    "orbit_eff_support": eff_support.tolist(),
+                    "orbit_entropy": entropy.tolist(),
+                    "orbit_top_share": top_share.tolist(),
+                }
+            )
 
         # Prior should help under-represented orbits re-enter the active set,
         # not suppress them.
@@ -1928,6 +2064,8 @@ def streamActiveSetNNLS(
             crowd = max(0.0, float(orbit_occ_counts[cc]) - occ_scale)
             occ_pen[local_i] = occ_lambda * crowd / occ_scale
 
+        occ_pen_norm = float(np.linalg.norm(occ_pen))
+
         ATA_sub_reg[np.diag_indices(k)] += occ_pen
 
         print(
@@ -1940,6 +2078,9 @@ def streamActiveSetNNLS(
             flush=True,
         )
 
+        beta_eff_orbit = np.zeros((C,), dtype=np.float64)
+        prior_block_norm = np.zeros((C,), dtype=np.float64)
+        prior_block_trace = np.zeros((C,), dtype=np.float64)
         # ----------------------------------------------------
         # Orbit prior in reduced solve
         # ----------------------------------------------------
@@ -1979,6 +2120,10 @@ def streamActiveSetNNLS(
                     )
                 except Exception:
                     pass
+                beta_eff_orbit[cc] = beta_eff
+                prior_block = beta_eff * np.outer(S_local, S_local)
+                prior_block_norm[cc] = float(np.linalg.norm(prior_block))
+                prior_block_trace[cc] = float(np.trace(prior_block))
 
         z_old_active = z[active_idx].copy()
 
@@ -2177,6 +2322,71 @@ def streamActiveSetNNLS(
                 f"[MONO][probation] dropped {drop_cols.size} stale columns: "
                 f"{drop_cols}",
                 flush=True,
+            )
+
+
+        if diag_level >= 1 and ((it % diag_stride) == 0):
+            x_phys_now = _current_x_from_z(z).reshape(C, P)
+            orbit_mass = np.sum(x_phys_now, axis=1)
+            orbit_target = orbit_t.copy()
+            orbit_resid = orbit_mass - orbit_target
+            orbit_ratio = orbit_mass / np.maximum(orbit_target, 1e-30)
+            orbit_nz = np.count_nonzero(x_phys_now > 0.0, axis=1).astype(np.int64)
+
+            eff_support = np.zeros((C,), dtype=np.float64)
+            entropy = np.zeros((C,), dtype=np.float64)
+            top_share = np.zeros((C,), dtype=np.float64)
+            for cc in range(C):
+                st = _support_stats_1d(x_phys_now[cc, :])
+                eff_support[cc] = st["eff_support"]
+                entropy[cc] = st["entropy"]
+                top_share[cc] = st["top_share"]
+
+            beta_pos = beta_eff_orbit[beta_eff_orbit > 0.0]
+            _emit_diag(
+                {
+                    "kind": "iter_post",
+                    "iter": int(it + 1),
+                    "t_iter_sec": float(time.perf_counter() - t_iter),
+                    "k_active": int(k),
+                    "ATA_norm": float(np.linalg.norm(ATA_sub)),
+                    "ATA_reg_norm": float(np.linalg.norm(ATA_sub_reg)),
+                    "ATy_norm": float(np.linalg.norm(ATy_sub)),
+                    "diag_med": float(diag_med),
+                    "diag_min": float(np.min(diag)) if diag.size else 0.0,
+                    "diag_max": float(np.max(diag)) if diag.size else 0.0,
+                    "emin": float(emin),
+                    "emax": float(emax),
+                    "ridge": float(ridge),
+                    "occ_lambda": float(occ_lambda),
+                    "occ_scale": float(occ_scale),
+                    "occ_pen_norm": float(occ_pen_norm),
+                    "beta_eff_min": float(np.min(beta_pos)) if beta_pos.size else 0.0,
+                    "beta_eff_med": float(np.median(beta_pos)) if beta_pos.size else 0.0,
+                    "beta_eff_max": float(np.max(beta_eff_orbit)) if beta_eff_orbit.size else 0.0,
+                    "prior_block_norm_max": float(np.max(prior_block_norm)) if prior_block_norm.size else 0.0,
+                    "prior_block_norm_med": float(np.median(prior_block_norm[prior_block_norm > 0])) if np.any(prior_block_norm > 0) else 0.0,
+                    "prior_block_trace_max": float(np.max(prior_block_trace)) if prior_block_trace.size else 0.0,
+                    "did_explore": bool(did_explore),
+                    "reject": bool(reject),
+                    "orbit_improved": bool(orbit_improved),
+                    "n_promoted": int(promoted_cols.size),
+                    "n_failed": int(len(failed_cols)),
+                    "n_dropped": int(len(drop_cols)),
+                    "obj_old": float(obj_old),
+                    "obj_new": float(obj_new),
+                    "obj_gain": float(obj_gain),
+                    "norm_old": float(norm_old),
+                    "norm_new": float(norm_new),
+                    "orbit_mass": orbit_mass.tolist(),
+                    "orbit_target": orbit_target.tolist(),
+                    "orbit_resid": orbit_resid.tolist(),
+                    "orbit_ratio": orbit_ratio.tolist(),
+                    "orbit_nz": orbit_nz.tolist(),
+                    "orbit_eff_support": eff_support.tolist(),
+                    "orbit_entropy": entropy.tolist(),
+                    "orbit_top_share": top_share.tolist(),
+                }
             )
 
         # Finalize progress watchdog on the committed state.
@@ -2391,6 +2601,40 @@ def solve_streaming_nnls(
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
 
+    # ---------------------------- diagnostics --------------------------
+    diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
+    diag_stride = max(1, int(os.environ.get("CUBEFIT_DIAG_STRIDE", "1")))
+    diag_jsonl_path = os.environ.get("CUBEFIT_DIAG_JSONL", "").strip() or None
+    diag_topk = max(1, int(os.environ.get("CUBEFIT_DIAG_TOPK", "12")))
+    diag_t0 = time.perf_counter()
+
+    def _emit_diag(record: dict) -> None:
+        if diag_level <= 0:
+            return
+        rec = dict(record)
+        rec.setdefault("t_sec", float(time.perf_counter() - diag_t0))
+        _diag_append_jsonl(diag_jsonl_path, rec)
+
+    _emit_diag(
+        {
+            "kind": "setup",
+            "S": int(S),
+            "L": int(L),
+            "C": int(C),
+            "P": int(P),
+            "CP": int(CP),
+            "keep_idx": int(keep_idx.size) if keep_idx is not None else None,
+            "s_tile": int(s_tile),
+            "n_ranges": int(len(s_ranges)),
+            "processes": int(cfg.processes),
+            "blas_threads": int(cfg.blas_threads),
+            "orbit_beta": float(cfg.orbit_beta),
+            "diag_level": int(diag_level),
+            "diag_stride": int(diag_stride),
+            "diag_topk": int(diag_topk),
+        }
+    )
+
     # ---------------------------- initial x ----------------------------
     if x0 is None:
         x = np.zeros((C, P), dtype=np.float64)
@@ -2523,6 +2767,7 @@ def solve_streaming_nnls(
                 except Exception as _e:
                     print("[BC-FUSED][tile diag] error while computing tile diagnostics:", _e, flush=True)
 
+        # end single streaming pass
         # end single streaming pass
         # ------------------------ end streaming --------------------------
 
@@ -2869,46 +3114,46 @@ def solve_streaming_nnls(
             # --- orbit_weights residual diagnostic (if prior provided) -----
             try:
                 if (w_target is not None) and (np.sum(w_target) > 0.0):
-                    # s_full: per-orbit sums of current x (shape (C,))
+                    s_full = np.sum(x, axis=1)
                     w = np.asarray(w_target, dtype=np.float64)
                     w_sum = float(np.sum(w))
-                    # same alpha as projection: scale target to current total mass
                     alpha = float(np.sum(s_full)) / max(1e-30, w_sum)
                     s_proj = alpha * w
 
-                    # residuals (un-normalised) and fractional relative to s_proj
-                    r = s_full - s_proj
-                    eps = 1e-30
-                    frac = r / np.maximum(np.abs(s_proj), eps)
-
-                    # summary norms
-                    l1 = float(np.sum(np.abs(r)))
-                    l2 = float(np.linalg.norm(r))
-                    maxabs = float(np.max(np.abs(r))) if r.size else 0.0
-                    mean_frac = float(np.median(frac)) if frac.size else 0.0
-
-                    # top offenders by absolute residual
-                    nshow = min(8, r.size)
-                    idx_sort = np.argsort(np.abs(r))[::-1][:nshow]
-                    offenders = ", ".join(
-                        [f"{int(i)}:{r[i]:+.3e}({frac[i]:+.2%})" for i in idx_sort]
-                    )
-
-                    print("[DIAG][orbit_weights]")
+                    print("[DIAG][orbit_weights]", flush=True)
                     for cc in range(C):
-                        nz = np.count_nonzero(x[cc] > 0.0)
+                        st = _support_stats_1d(x[cc, :])
+                        resid = float(s_full[cc] - s_proj[cc])
+                        ratio = float(s_full[cc] / max(s_proj[cc], 1e-30))
                         print(
                             f"orbit {cc:2d}: "
                             f"mass={s_full[cc]:.3e} "
                             f"target={s_proj[cc]:.3e} "
-                            f"ratio={s_full[cc]/builtins.max(s_proj[cc],1e-30):6.3f} "
-                            f"nz={nz:3d}",
+                            f"resid={resid:+.3e} "
+                            f"ratio={ratio:7.3f} "
+                            f"nz={int(np.count_nonzero(x[cc, :] > 0.0)):3d} "
+                            f"eff={st['eff_support']:.2f} "
+                            f"top={st['top_share']:.2f}",
                             flush=True,
                         )
+
+                    _emit_diag(
+                        {
+                            "kind": "epoch_orbit_table",
+                            "epoch": int(ep + 1),
+                            "alpha": float(alpha),
+                            "orbit_mass": s_full.tolist(),
+                            "orbit_target": s_proj.tolist(),
+                            "orbit_resid": (s_full - s_proj).tolist(),
+                            "orbit_ratio": (s_full / np.maximum(s_proj, 1e-30)).tolist(),
+                            "orbit_nz": np.count_nonzero(x > 0.0, axis=1).astype(int).tolist(),
+                        }
+                    )
                 else:
-                    # no prior available
-                    print("[DIAG][orbit_weights] no w_target present; skipping "
-                        "orbit-residual diagnostic.", flush=True)
+                    print(
+                        "[DIAG][orbit_weights] no w_target present; skipping orbit table.",
+                        flush=True,
+                    )
             except Exception as _e:
                 print("[DIAG][orbit_weights] diagnostic failed:", _e, flush=True)
 

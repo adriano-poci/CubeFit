@@ -23,6 +23,8 @@ History
 -------
 v1.0:	Capture exceptions around `genCubeFit` call. 4 December 2025
 v1.1:   Use universal `props` function. 22 July 2026
+v1.2:   Added `galaxy` argument to `_configure_solver_environment` to specify
+            paths. 30 July 2026
 """
 
 import numpy as np
@@ -30,10 +32,12 @@ import os, re, sys
 import pathlib as plp
 import argparse
 
+curdir = plp.Path(__file__).parent
+
 from CubeFit.kz_init import props
 from CubeFit.kz_fitSpec import genCubeFit
 
-def _configure_solver_environment():
+def _configure_solver_environment(galaxy):
     """Set the solver-related environment variables used by the current wrapper."""
     os.environ["CUBEFIT_LAMBDA_WEIGHTS_ENABLE"] = "1"
     os.environ["CUBEFIT_GLOBAL_TAU"] = "0.3"
@@ -52,6 +56,10 @@ def _configure_solver_environment():
     os.environ["CUBEFIT_ZERO_COL_ABS"] = "1e-30"
     os.environ["CUBEFIT_ORBIT_PRIOR_DELTA"] = "1e-3"
     os.environ["CUBEFIT_ORBIT_BETA"] = "1e-5"
+    os.environ["CUBEFIT_DIAG_LEVEL"] = str(2)
+    os.environ["CUBEFIT_DIAG_STRIDE"] = str(1)
+    os.environ["CUBEFIT_DIAG_TOPK"] = str(12)
+    os.environ["CUBEFIT_DIAG_JSONL"] = str(curdir/galaxy/'diagnostics.jsonl')
 
 
 def main():
@@ -101,7 +109,7 @@ def main():
     propDict['redraw'] = bool(args.redraw)
     print(f"redraw = {propDict['redraw']}")
 
-    _configure_solver_environment()
+    _configure_solver_environment(args.galaxy)
 
     if args.ncomp is not None:
         propDict['nCuts'] = args.ncomp
