@@ -107,7 +107,9 @@ v1.19:  Replaced one-sided orbit-deficit rescue with a symmetric orbit-mass prio
             acting on both under- and over-represented orbits, while relaxing
             active-set promotion, probation, and cooldown to encourage richer
             per-orbit population mixtures and improve orbit-prior adherence
-            without sacrificing data fidelity. 2 August 2026
+            without sacrificing data fidelity;
+        Removed orbit support heuristics in favour of unified global support. 2
+            August 2026
 """
 
 from __future__ import annotations, print_function
@@ -767,6 +769,69 @@ def _robust_scale_ref(values: np.ndarray, fallback: float = 1.0) -> float:
 
 # ------------------------------------------------------------------------------
 
+def _combined_promotion_score(
+    grad_vec: np.ndarray,
+    aty_scaled_vec: np.ndarray,
+    active_mask: np.ndarray,
+    S_flat: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Unified promotion score.
+
+    Promotion is driven entirely by the combined gradient already containing
+    both the data term and the orbit prior.
+
+    Only a mild normalization by column scale and a small ATy tie-breaker are
+    retained. No orbit quotas, occupancy penalties, diversity bonuses or other
+    heuristics are applied.
+    """
+    grad_vec = np.asarray(
+        grad_vec,
+        dtype=np.float64,
+    ).ravel(order="C")
+
+    aty_scaled_vec = np.asarray(
+        aty_scaled_vec,
+        dtype=np.float64,
+    ).ravel(order="C")
+
+    active_mask = np.asarray(
+        active_mask,
+        dtype=bool,
+    ).ravel(order="C")
+
+    S_flat = np.asarray(
+        S_flat,
+        dtype=np.float64,
+    ).ravel(order="C")
+
+    not_active = np.where(~active_mask)[0]
+
+    if not_active.size == 0:
+        return (
+            not_active,
+            np.zeros((0,), dtype=np.float64),
+        )
+
+    score = grad_vec[not_active].copy()
+
+    svals = S_flat[not_active]
+    s_med = np.median(svals) + 1e-30
+
+    score /= (
+        1.0
+        + 0.25 * (svals / s_med - 1.0)
+    )
+
+    aty = aty_scaled_vec[not_active]
+    aty_scale = np.max(np.abs(aty)) + 1e-30
+
+    score += 0.10 * (aty / aty_scale)
+
+    return not_active, score
+
+# ------------------------------------------------------------------------------
+
 def _quota_rescue_columns(
     grad_vec: np.ndarray,
     aty_scaled_vec: np.ndarray,
@@ -777,364 +842,39 @@ def _quota_rescue_columns(
     P: int,
     total_cols: int,
     *,
-    min_per_orbit: int = 1,
+    min_per_orbit: int = 2,
     max_per_orbit: int = 12,
     penalty_strength: float = 0.5,
     orbit_occ_counts: np.ndarray | None = None,
     occ_lambda: float = 0.0,
+    diversity_strength: float = 0.05,
+    exploration_pool: int = 32,
 ) -> np.ndarray:
     """
-    Select rescue columns using per-orbit promotion quotas derived from
-    the orbit prior weights.
+    Select rescue columns using one combined promotion score only.
 
-    The prior biases *which columns are tested*, not the final solution.
-    The reduced NNLS solve still determines which columns survive.
-
-    Parameters
-    ----------
-    grad_vec : ndarray, shape (C*P,)
-        Current full gradient vector.
-    aty_scaled_vec : ndarray, shape (C*P,)
-        Scaled A^T y vector, used as a secondary data-support score.
-    active_mask : ndarray, shape (C*P,)
-        Boolean active mask.
-    S_flat : ndarray, shape (C*P,)
-        Column scaling vector.
-    w_target : ndarray or None, shape (C,)
-        Normalized orbit prior weights.
-    C : int
-        Number of orbit components.
-    P : int
-        Number of populations per orbit.
-    total_cols : int
-        Total number of columns to promote.
-    min_per_orbit : int, optional
-        Minimum quota per orbit with non-zero target weight.
-    max_per_orbit : int, optional
-        Maximum quota per orbit.
-    penalty_strength : float, optional
-        Penalty against very large-S columns.
-
-    Returns
-    -------
-    cols : ndarray of int64
-        Global column indices to activate.
+    Orbit weights, quotas, occupancy penalties, and random sampling are
+    intentionally ignored in this simplified version. The function keeps the
+    old signature for backward compatibility.
     """
     if total_cols <= 0:
         return np.zeros((0,), dtype=np.int64)
 
-    if w_target is None:
-        # fallback: global selection
-        not_active = np.where(~active_mask)[0]
-        if not_active.size == 0:
-            return np.zeros((0,), dtype=np.int64)
+    not_active, score = _combined_promotion_score(
+        grad_vec=grad_vec,
+        aty_scaled_vec=aty_scaled_vec,
+        active_mask=active_mask,
+        S_flat=S_flat,
+        P=P,
+        diversity_strength=diversity_strength,
+    )
 
-        gvals = grad_vec[not_active]
-        svals = S_flat[not_active]
-        s_med = np.median(svals) + 1e-30
-        occ = 0 if orbit_occ_counts is None else int(orbit_occ_counts[not_active // P])
-        occ_pen = 1.0 + occ_lambda * np.log1p(occ)
-        score = gvals / (1.0 + penalty_strength * (svals / s_med - 1.0))
-        score = score / occ_pen
-
-        order = np.argsort(score)[::-1]
-        pick = not_active[order[:min(total_cols, order.size)]]
-        return np.asarray(pick, dtype=np.int64)
-
-    w = np.asarray(w_target, dtype=np.float64).ravel()
-    if w.size != C:
+    if not_active.size == 0:
         return np.zeros((0,), dtype=np.int64)
 
-    w = np.maximum(w, 0.0)
-    w_sum = float(np.sum(w))
-
-    if w_sum <= 0.0:
-        return np.zeros((0,), dtype=np.int64)
-
-    w = w / w_sum
-
-    # ----------------------------
-    # initial quotas from weights
-    # ----------------------------
-    raw = total_cols * w
-    quotas = np.floor(raw).astype(np.int64)
-
-    # guarantee minimum quota on non-zero-weight orbits
-    nz = np.where(w > 0.0)[0]
-    for cc in nz:
-        quotas[cc] = max(quotas[cc], min_per_orbit)
-
-    # cap quotas
-    quotas = np.minimum(quotas, max_per_orbit)
-
-    # adjust total quota to requested total_cols
-    qsum = int(np.sum(quotas))
-
-    if qsum < total_cols:
-        frac = raw - np.floor(raw)
-        order = np.argsort(frac)[::-1]
-        for cc in order:
-            if qsum >= total_cols:
-                break
-            if quotas[cc] < max_per_orbit:
-                quotas[cc] += 1
-                qsum += 1
-
-    elif qsum > total_cols:
-        order = np.argsort(w)  # remove from weakest-target orbits first
-        for cc in order:
-            while (qsum > total_cols) and (quotas[cc] > 0):
-                quotas[cc] -= 1
-                qsum -= 1
-                if qsum <= total_cols:
-                    break
-
-    chosen = []
-    chosen_set = set()
-
-    for cc in np.argsort(w)[::-1]:
-        q = int(quotas[cc])
-        if q <= 0:
-            continue
-
-        base = int(cc * P)
-        cols_cc = np.arange(base, base + P, dtype=np.int64)
-        inactive_cc = cols_cc[~active_mask[cols_cc]]
-
-        if inactive_cc.size == 0:
-            continue
-
-        g_cc = grad_vec[inactive_cc]
-        s_cc = S_flat[inactive_cc]
-        aty_cc = aty_scaled_vec[inactive_cc]
-
-        occ = 0 if orbit_occ_counts is None else int(orbit_occ_counts[cc])
-        occ_pen = 1.0 + occ_lambda * np.log1p(occ)
-
-        s_med = np.median(s_cc) + 1e-30
-        score_cc = g_cc / (1.0 + penalty_strength * (s_cc / s_med - 1.0))
-
-        aty_scale = np.max(np.abs(aty_cc)) + 1e-30
-        score_cc = score_cc + 0.10 * (aty_cc / aty_scale)
-
-        score_cc = score_cc / occ_pen
-        score_cc += 1e-6 * np.random.standard_normal(score_cc.shape)
-
-        order = np.argsort(score_cc)[::-1]
-        pool_size = builtins.min(24, order.size)
-        pool = order[:pool_size]
-        take = builtins.min(q, pool.size)
-        chosen_local = np.random.choice(pool, size=take, replace=False)
-        for j in chosen_local:
-            gcol = int(inactive_cc[j])
-            if gcol not in chosen_set:
-                chosen.append(gcol)
-                chosen_set.add(gcol)
-
-    if len(chosen) == 0:
-        return np.zeros((0,), dtype=np.int64)
-
-    # hard trim if rounding produced a few extra
-    if len(chosen) > total_cols:
-        chosen = chosen[:total_cols]
-
-    return np.asarray(chosen, dtype=np.int64)
-
-# ------------------------------------------------------------------------------
-
-def _deficit_rescue_columns(
-    grad_vec: np.ndarray,
-    aty_scaled_vec: np.ndarray,
-    active_mask: np.ndarray,
-    S_flat: np.ndarray,
-    w_target: np.ndarray | None,
-    deficit: np.ndarray,
-    C: int,
-    P: int,
-    total_cols: int,
-    *,
-    min_per_orbit: int = 1,
-    max_per_orbit: int = 12,
-    deficit_boost: float = 2.0,
-    penalty_strength: float = 0.5,
-    exclude_mask: np.ndarray | None = None,
-    orbit_occ_counts: np.ndarray | None = None,
-    occ_lambda: float = 0.0,
-) -> np.ndarray:
-    """
-    Select rescue columns with quotas driven by orbit deficit.
-
-    Orbits with larger positive deficit are promoted first.
-    """
-    if total_cols <= 0:
-        return np.zeros((0,), dtype=np.int64)
-
-    if (w_target is None) or (not np.any(np.isfinite(deficit))):
-        return _quota_rescue_columns(
-            grad_vec=grad_vec,
-            aty_scaled_vec=aty_scaled_vec,
-            active_mask=active_mask,
-            S_flat=S_flat,
-            w_target=w_target,
-            C=C,
-            P=P,
-            total_cols=total_cols,
-            min_per_orbit=min_per_orbit,
-            max_per_orbit=max_per_orbit,
-            penalty_strength=penalty_strength,
-        )
-
-    deficit = np.asarray(deficit, dtype=np.float64).ravel()
-    deficit = np.maximum(deficit, 0.0)
-
-    if np.sum(deficit) <= 0.0:
-        return np.zeros((0,), dtype=np.int64)
-
-    w = np.asarray(w_target, dtype=np.float64).ravel()
-    w = np.maximum(w, 0.0)
-    w_sum = float(np.sum(w))
-    if w_sum <= 0.0:
-        return np.zeros((0,), dtype=np.int64)
-    w = w / w_sum
-
-    # Orbit priority combines target weight and current deficit.
-    d_norm = deficit / (np.max(deficit) + 1e-30)
-    orbit_priority = w + deficit_boost * d_norm
-    orbit_priority = np.maximum(orbit_priority, 0.0)
-    orbit_priority /= np.sum(orbit_priority) + 1e-30
-
-    raw = total_cols * orbit_priority
-    quotas = np.floor(raw).astype(np.int64)
-
-    nz = np.where(orbit_priority > 0.0)[0]
-    for cc in nz:
-        quotas[cc] = max(quotas[cc], min_per_orbit)
-
-    quotas = np.minimum(quotas, max_per_orbit)
-
-    qsum = int(np.sum(quotas))
-    if qsum < total_cols:
-        frac = raw - np.floor(raw)
-        order = np.argsort(frac)[::-1]
-        for cc in order:
-            if qsum >= total_cols:
-                break
-            if quotas[cc] < max_per_orbit:
-                quotas[cc] += 1
-                qsum += 1
-
-    chosen = []
-    chosen_set = set()
-
-    def _pick_from_orbit(cc: int, max_take: int) -> np.ndarray:
-        base = int(cc * P)
-        cols_cc = np.arange(base, base + P, dtype=np.int64)
-        inactive_cc = cols_cc[~active_mask[cols_cc]]
-
-        if exclude_mask is not None:
-            inactive_cc = inactive_cc[~exclude_mask[inactive_cc]]
-
-        if inactive_cc.size == 0 or max_take <= 0:
-            return np.zeros((0,), dtype=np.int64)
-
-        g_cc = grad_vec[inactive_cc]
-        s_cc = S_flat[inactive_cc]
-        aty_cc = aty_scaled_vec[inactive_cc]
-
-        occ = 0 if orbit_occ_counts is None else int(orbit_occ_counts[cc])
-        occ_pen = 1.0 + occ_lambda * np.log1p(occ)
-
-        s_med = np.median(s_cc) + 1e-30
-        score_cc = g_cc / (1.0 + penalty_strength * (s_cc / s_med - 1.0))
-
-        aty_scale = np.max(np.abs(aty_cc)) + 1e-30
-        score_cc = score_cc + 0.10 * (aty_cc / aty_scale)
-
-        score_cc = score_cc / occ_pen
-        score_cc = score_cc + 1e-2 * np.random.standard_normal(score_cc.shape)
-
-        order = np.argsort(score_cc)[::-1]
-
-        pool_size = min(max(30, 10 * max_take), order.size)
-        pool = order[:pool_size]
-
-        if pool.size == 0:
-            return np.zeros((0,), dtype=np.int64)
-
-        take = min(max_take, pool.size)
-
-        weights = np.exp(
-            (score_cc[pool] - np.max(score_cc[pool]))
-            / max(np.std(score_cc[pool]), 1e-12)
-        )
-        weights_sum = float(np.sum(weights))
-        if weights_sum <= 0.0 or not np.isfinite(weights_sum):
-            chosen_local = np.random.choice(pool, size=take, replace=False)
-        else:
-            weights /= weights_sum
-            chosen_local = np.random.choice(
-                pool,
-                size=take,
-                replace=False,
-                p=weights,
-            )
-
-        return inactive_cc[np.asarray(chosen_local, dtype=np.int64)]
-
-    orbit_order = np.argsort(orbit_priority)[::-1]
-    remaining = int(total_cols)
-
-    # Pass 1: touch as many distinct orbits as possible.
-    for cc in orbit_order:
-        if remaining <= 0:
-            break
-
-        q = int(quotas[cc])
-        if q <= 0:
-            continue
-
-        picks = _pick_from_orbit(int(cc), 1)
-        if picks.size == 0:
-            continue
-
-        gcol = int(picks[0])
-        if gcol in chosen_set:
-            continue
-
-        chosen.append(gcol)
-        chosen_set.add(gcol)
-        quotas[cc] -= 1
-        remaining -= 1
-
-    # Pass 2: fill any leftover quota, still orbit-aware.
-    if remaining > 0:
-        for cc in orbit_order:
-            if remaining <= 0:
-                break
-
-            q = int(min(quotas[cc], remaining))
-            if q <= 0:
-                continue
-
-            picks = _pick_from_orbit(int(cc), q)
-            for gcol in picks:
-                gcol = int(gcol)
-                if gcol in chosen_set:
-                    continue
-                chosen.append(gcol)
-                chosen_set.add(gcol)
-                quotas[cc] -= 1
-                remaining -= 1
-                if remaining <= 0:
-                    break
-
-    if len(chosen) == 0:
-        return np.zeros((0,), dtype=np.int64)
-
-    if len(chosen) > total_cols:
-        chosen = chosen[:total_cols]
-
-    return np.asarray(chosen, dtype=np.int64)
+    order = np.argsort(score)[::-1]
+    pick = not_active[order[:min(total_cols, order.size)]]
+    return np.asarray(pick, dtype=np.int64)
 
 # ------------------------------------------------------------------------------
 
@@ -1251,7 +991,7 @@ def streamActiveSetNNLS(
     no_progress_count = 0
 
     # --- positive-gradient batch-promotion controls ---
-    positive_batch_size = 4 if C <= 3 else 16
+    positive_batch_size = 8 if C <= 3 else 24
     orbit_occ_lambda = 0.05 if C <= 3 else 0.10
 
     # robust prior mass reference scale
@@ -1660,264 +1400,63 @@ def streamActiveSetNNLS(
             flush=True,
         )
 
-        # --------------------------------------------------------
-        # Promotion score
-        # --------------------------------------------------------
-        S_not = S_flat[not_active]
-        S_med = np.median(S_not) + 1e-30
-        S_norm = S_not / S_med
-        topk = 32
-        penalty_strength = 0.35
-        adj_score = gvals_promo / (1.0 + penalty_strength * (S_norm - 1.0))
-
-        if adj_score.size > topk:
-            top_idxs = np.argsort(adj_score)[-topk:]
-            pick_local = top_idxs[np.argmax(gvals_promo[top_idxs])]
-        else:
-            pick_local = int(np.argmax(adj_score))
-
-        imax = int(pick_local)
-        max_g = float(gvals_promo[imax])
-
-        did_explore = False
-        newly_activated = None
-        orbit_occ_counts = np.bincount(
-            (np.nonzero(active)[0] // P),
-            minlength=C,
-        ).astype(np.int64)
-
         tol_here = max(tol_grad, tol_grad_rel * grad_ref)
 
-        # ------------------------------------------------------------
-        # Forced exploration / negative-gradient branch
-        # ------------------------------------------------------------
+        # Unified promotion score: data gradient + symmetric orbit prior.
+        not_active, score = _combined_promotion_score(
+            grad_vec=grad_promo,
+            aty_scaled_vec=ATy_scaled,
+            active_mask=active,
+            S_flat=S_flat,
+        )
+
+        if not_active.size == 0:
+            if _watch_progress():
+                break
+            _emit_checkpoint(it, final=True, phase="no_candidate_exit")
+            continue
+
+        max_g = float(np.max(score)) if score.size else -np.inf
+        did_explore = bool(max_g <= tol_here)
+        newly_activated = None
+
         if max_g <= tol_here:
             negative_grad_count += 1
+            allow_explore = (
+                negative_grad_count <= explore_budget
+            ) or force_explore
 
-            allow_explore = (negative_grad_count <= explore_budget) or force_explore
-
-            if allow_explore and not_active.size > 0:
-                if force_explore:
-                    preferred_group = min(max(12, CP // 64), 32)
-                else:
-                    preferred_group = min(16, max(8, CP // 128))
-
-                cooldown_mask = _col_cooldown_mask(it)
-                cols_to_activate = _deficit_rescue_columns(
-                    grad_vec=grad_promo,
-                    aty_scaled_vec=ATy_scaled,
-                    active_mask=active,
-                    S_flat=S_flat,
-                    w_target=w_target,
-                    deficit=orbit_deficit,
-                    C=C,
-                    P=P,
-                    total_cols=preferred_group,
-                    min_per_orbit=2,
-                    max_per_orbit=max(6, preferred_group),
-                    deficit_boost=3.0,
-                    penalty_strength=0.35,
-                    exclude_mask=cooldown_mask,
-                    occ_lambda=orbit_occ_lambda,
-                )
-
-                if cols_to_activate.size == 0:
-                    order = np.argsort(adj_score)[::-1]
-                    pool_cap = 400 if force_explore else 200
-                    pool = order[:min(pool_cap, order.size)]
-                    pool_cols = not_active[pool]
-
-                    pool_occ = orbit_occ_counts[pool_cols // P]
-                    pool_pen = 1.0 + orbit_occ_lambda * np.log1p(pool_occ)
-
-                    pool_score = adj_score[pool] / pool_pen
-                    jitter = 1e-3 if not force_explore else 5e-3
-                    pool_score = pool_score + jitter * np.random.standard_normal(
-                        pool_score.shape
-                    )
-
-                    chosen = []
-                    for local_i in pool[np.argsort(pool_score)[::-1]]:
-                        gcol = int(not_active[local_i])
-                        if _on_cooldown(gcol, it) and not force_explore:
-                            continue
-                        chosen.append(gcol)
-                        if len(chosen) >= preferred_group:
-                            break
-
-                    cols_to_activate = np.asarray(chosen, dtype=np.int64)
-
-                    print(
-                        f"[MONO][explore] fallback global promotion of "
-                        f"{len(cols_to_activate)} columns despite negative "
-                        f"gradients: {cols_to_activate}",
-                        flush=True,
-                    )
-                else:
-                    touched_orbits = np.unique(cols_to_activate // P)
-                    orbit_desc = ", ".join(
-                        [f"{int(cc)}" for cc in touched_orbits.tolist()]
-                    )
-                    print(
-                        f"[MONO][explore] quota-based orbit promotion of "
-                        f"{len(cols_to_activate)} columns: {cols_to_activate} "
-                        f"| orbits: {orbit_desc}",
-                        flush=True,
-                    )
-
-                if cols_to_activate.size == 0:
-                    if _watch_progress():
-                        break
-                    continue
-
-                active[cols_to_activate] = True
-                newly_activated = np.asarray(cols_to_activate, dtype=np.int64)
-                did_explore = True
-            else:
+            if not allow_explore:
                 if _watch_progress():
                     _emit_checkpoint(it, final=True, phase="stall_exit")
                     break
                 _emit_checkpoint(it, final=True, phase="no_promotable_exit")
                 break
 
-        # ------------------------------------------------------------
-        # Positive-gradient branch
-        # ------------------------------------------------------------
+            preferred_group = min(max(12, CP // 64), 32)
         else:
-            pos_mask = np.where(gvals_promo > tol_grad)[0]
+            negative_grad_count = 0
+            preferred_group = min(positive_batch_size, not_active.size)
 
-            if pos_mask.size == 0:
-                if force_explore:
-                    preferred_group = min(max(8, CP // 80), 24)
+        order = np.argsort(score)[::-1]
+        chosen = []
+        for local_i in order:
+            gcol = int(not_active[local_i])
+            if _on_cooldown(gcol, it) and not force_explore:
+                continue
+            chosen.append(gcol)
+            if len(chosen) >= preferred_group:
+                break
 
-                    cooldown_mask = _col_cooldown_mask(it)
-                    cols_to_activate = _deficit_rescue_columns(
-                        grad_vec=grad_promo,
-                        aty_scaled_vec=ATy_scaled,
-                        active_mask=active,
-                        S_flat=S_flat,
-                        w_target=w_target,
-                        deficit=orbit_deficit,
-                        C=C,
-                        P=P,
-                        total_cols=preferred_group,
-                        min_per_orbit=2,
-                        max_per_orbit=max(6, preferred_group),
-                        deficit_boost=3.0,
-                        penalty_strength=0.35,
-                        exclude_mask=cooldown_mask,
-                        occ_lambda=orbit_occ_lambda,
-                    )
+        if len(chosen) == 0:
+            if _watch_progress():
+                _emit_checkpoint(it, final=True, phase="no_promotable_exit")
+                break
+            continue
 
-                    if cols_to_activate.size == 0:
-                        order = np.argsort(adj_score)[::-1]
-                        pool = order[:min(120, order.size)]
-                        chosen = []
-                        for local_i in pool:
-                            chosen.append(int(not_active[local_i]))
-                            if len(chosen) >= preferred_group:
-                                break
-                        cols_to_activate = np.asarray(chosen, dtype=np.int64)
-
-                    if cols_to_activate.size == 0:
-                        if _watch_progress():
-                            _emit_checkpoint(it, final=True, phase="stall_exit")
-                            break
-                        continue
-
-                    print(
-                        f"[MONO][explore] forced global promotion: "
-                        f"{cols_to_activate}",
-                        flush=True,
-                    )
-                    active[cols_to_activate] = True
-                    newly_activated = np.asarray(cols_to_activate, dtype=np.int64)
-                    did_explore = True
-                else:
-                    if _watch_progress():
-                        _emit_checkpoint(it, final=True, phase="stall_exit")
-                        break
-                    break
-            else:
-                if force_explore:
-                    preferred_group = min(max(12, CP // 64), 32)
-                else:
-                    preferred_group = min(positive_batch_size, pos_mask.size)
-
-                cooldown_mask = _col_cooldown_mask(it)
-                cols_to_activate = _deficit_rescue_columns(
-                    grad_vec=grad_promo,
-                    aty_scaled_vec=ATy_scaled,
-                    active_mask=active,
-                    S_flat=S_flat,
-                    w_target=w_target,
-                    deficit=orbit_deficit,
-                    C=C,
-                    P=P,
-                    total_cols=preferred_group,
-                    min_per_orbit=2,
-                    max_per_orbit=max(6, preferred_group),
-                    deficit_boost=3.0,
-                    penalty_strength=0.35,
-                    exclude_mask=cooldown_mask,
-                    occ_lambda=orbit_occ_lambda,
-                )
-
-                if cols_to_activate.size == 0:
-                    order = pos_mask[np.argsort(adj_score[pos_mask])[::-1]]
-                    pool = order[:min(80 if not force_explore else 160, order.size)]
-                    pool_cols = not_active[pool]
-                    pool_occ = orbit_occ_counts[pool_cols // P]
-                    pool_pen = 1.0 + orbit_occ_lambda * np.log1p(pool_occ)
-                    pool_score = adj_score[pool] / pool_pen
-                    chosen = []
-
-                    for local_i in pool[np.argsort(pool_score)[::-1]]:
-                        gcol = int(not_active[local_i])
-                        if _on_cooldown(gcol, it) and not force_explore:
-                            continue
-                        chosen.append(gcol)
-                        if len(chosen) >= preferred_group:
-                            break
-
-                    if len(chosen) == 0 and force_explore:
-                        for local_i in order:
-                            chosen.append(int(not_active[local_i]))
-                            if len(chosen) >= preferred_group:
-                                break
-
-                    cols_to_activate = np.asarray(chosen, dtype=np.int64)
-
-                if cols_to_activate.size == 0:
-                    print(
-                        "[MONO] no promotable positive columns found; continuing",
-                        flush=True,
-                    )
-                    if _watch_progress():
-                        break
-                    continue
-
-                print(
-                    f"[MONO] orbit-aware positive promotion: {cols_to_activate}",
-                    flush=True,
-                )
-
-                if cols_to_activate.size == 1:
-                    print(
-                        f"[MONO] promoting column {int(cols_to_activate[0])} "
-                        f"with positive gradient",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[MONO] promoting batch of {int(cols_to_activate.size)} "
-                        f"columns with positive gradients: {cols_to_activate}",
-                        flush=True,
-                    )
-
-                active[cols_to_activate] = True
-                newly_activated = np.array(cols_to_activate, dtype=np.int64)
-                negative_grad_count = 0
+        cols_to_activate = np.asarray(chosen, dtype=np.int64)
+        active[cols_to_activate] = True
+        newly_activated = cols_to_activate.copy()
 
         if int(np.count_nonzero(active)) > int(max_active):
             if newly_activated is not None and newly_activated.size > 0:
@@ -1926,50 +1465,6 @@ def streamActiveSetNNLS(
                 break
             _emit_checkpoint(it, final=True, phase="max_active_exit")
             break
-
-        # --------------------------------------------------------
-        # Enforce weighted minimum active support per orbit
-        # --------------------------------------------------------
-        if w_target is not None and np.sum(orbit_pressure) > 0.0:
-            pressure = orbit_pressure / (np.sum(orbit_pressure) + 1e-30)
-            min_per_orbit_vec = np.maximum(
-                1,
-                np.ceil(1.0 + 4.0 * pressure).astype(np.int64),
-            )
-        else:
-            min_per_orbit_vec = np.ones((C,), dtype=np.int64)
-
-        for cc in range(C):
-            base = cc * P
-            idxs = np.arange(base, base + P, dtype=np.int64)
-
-            active_cc = idxs[active[idxs]]
-            min_req = int(min_per_orbit_vec[cc])
-
-            if active_cc.size < min_req:
-                inactive_cc = idxs[~active[idxs]]
-
-                if inactive_cc.size > 0:
-                    scores = ATy_scaled[inactive_cc].copy()
-
-                    if orbit_pressure[cc] > 0.0:
-                        scores += 0.25 * orbit_pressure[cc]
-
-                    s_loc = S_flat[inactive_cc]
-                    s_med = np.median(s_loc) + 1e-30
-                    scores = scores / (1.0 + 0.5 * (s_loc / s_med - 1.0))
-
-                    order = np.argsort(scores)[::-1]
-                    n_add = min(min_req - active_cc.size, order.size)
-                    chosen = inactive_cc[order[:n_add]]
-
-                    active[chosen] = True
-
-                    print(
-                        f"[MONO][enforce] orbit {cc}: adding {n_add} columns "
-                        f"to meet weighted minimum support: {chosen}",
-                        flush=True,
-                    )
 
         # --------------------------------------------------------
         # Reduced solve (assemble ATA_sub & ATy_sub) in parallel
@@ -2117,40 +1612,6 @@ def streamActiveSetNNLS(
         ridge_rel = 1e-2 if cond_bad else 1e-3
         ridge = max(1e-10, ridge_rel * max(1.0, diag_med))
         ATA_sub_reg = ATA_sub + ridge * np.eye(k, dtype=np.float64)
-
-        # ----------------------------------------------------
-        # Weak occupancy penalty in the reduced solve
-        # ----------------------------------------------------
-        if orbit_occ_counts.size > 0:
-            occ_pos = orbit_occ_counts[orbit_occ_counts > 0]
-            occ_scale = float(np.median(occ_pos)) if occ_pos.size else 1.0
-        else:
-            occ_scale = 1.0
-
-        if not np.isfinite(occ_scale) or occ_scale <= 0.0:
-            occ_scale = 1.0
-
-        occ_lambda = 0.02 if C <= 3 else 0.06
-
-        occ_pen = np.zeros((k,), dtype=np.float64)
-        for local_i, gcol in enumerate(active_idx):
-            cc = int(gcol // P)
-            crowd = max(0.0, float(orbit_occ_counts[cc]) - occ_scale)
-            occ_pen[local_i] = occ_lambda * crowd / occ_scale
-
-        occ_pen_norm = float(np.linalg.norm(occ_pen))
-
-        ATA_sub_reg[np.diag_indices(k)] += occ_pen
-
-        print(
-            "[DIAG][occupancy_penalty] "
-            f"lambda={occ_lambda:.3e} "
-            f"scale={occ_scale:.3e} "
-            f"min/med/max={float(np.min(occ_pen)):.3e}/"
-            f"{float(np.median(occ_pen)):.3e}/"
-            f"{float(np.max(occ_pen)):.3e}",
-            flush=True,
-        )
 
         beta_eff_orbit = np.zeros((C,), dtype=np.float64)
         prior_block_norm = np.zeros((C,), dtype=np.float64)
@@ -2432,9 +1893,6 @@ def streamActiveSetNNLS(
                     "emin": float(emin),
                     "emax": float(emax),
                     "ridge": float(ridge),
-                    "occ_lambda": float(occ_lambda),
-                    "occ_scale": float(occ_scale),
-                    "occ_pen_norm": float(occ_pen_norm),
                     "beta_eff_min": float(np.min(beta_pos)) if beta_pos.size else 0.0,
                     "beta_eff_med": float(np.median(beta_pos)) if beta_pos.size else 0.0,
                     "beta_eff_max": float(np.max(beta_eff_orbit)) if beta_eff_orbit.size else 0.0,
