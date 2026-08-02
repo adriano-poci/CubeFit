@@ -103,6 +103,11 @@ v1.17:  Fixed history versioning;
             improve orbit diversity without degrading the spectral fit. 28 July
             2026
 v1.18:  Added robust diagnostic machinery. 30 July 2026
+v1.19:  Replaced one-sided orbit-deficit rescue with a symmetric orbit-mass prior
+            acting on both under- and over-represented orbits, while relaxing
+            active-set promotion, probation, and cooldown to encourage richer
+            per-orbit population mixtures and improve orbit-prior adherence
+            without sacrificing data fidelity. 2 August 2026
 """
 
 from __future__ import annotations, print_function
@@ -127,7 +132,6 @@ except Exception:
 
 from CubeFit.hdf5_manager import open_h5
 from CubeFit import cube_utils as cu
-from CubeFit.hypercube_builder import read_global_column_energy
 
 vprint = cu.vprint
 
@@ -763,30 +767,6 @@ def _robust_scale_ref(values: np.ndarray, fallback: float = 1.0) -> float:
 
 # ------------------------------------------------------------------------------
 
-def _orbit_prior_beta_eff(
-    orbit_beta: float,
-    target_mass: float,
-    data_scale_ref: float,
-) -> float:
-    """
-    Convert the user-facing orbit_beta into a problem-scale prior weight.
-
-    The normalization is:
-        beta_eff = orbit_beta * data_scale_ref / target_mass**2
-
-    so orbit_beta is dimensionless and comparable across problem sizes.
-    """
-    orbit_beta = float(orbit_beta)
-    if (not np.isfinite(orbit_beta)) or orbit_beta <= 0.0:
-        return 0.0
-
-    target_mass = max(float(target_mass), 1e-30)
-    data_scale_ref = max(float(data_scale_ref), 1.0)
-
-    return orbit_beta * data_scale_ref / (target_mass * target_mass)
-
-# ------------------------------------------------------------------------------
-
 def _quota_rescue_columns(
     grad_vec: np.ndarray,
     aty_scaled_vec: np.ndarray,
@@ -1195,28 +1175,24 @@ def streamActiveSetNNLS(
         return ref
 
     def _orbit_prior_beta_eff(
-        *,
         orbit_beta: float,
-        target_mass: float,
+        target_mass_ref: float,
         data_scale_ref: float,
     ) -> float:
         """
-        Conservative, scale-aware orbit-prior weight.
+        Convert the user-facing orbit_beta into a problem-scale prior weight.
 
-        The knob the user should increase is still `orbit_beta_eff`, but this
-        keeps the prior on a problem-scale-aware footing.
+        The weight is made orbit-invariant by using a single reference mass
+        instead of the per-orbit target mass.
         """
-        if orbit_beta <= 0.0:
+        orbit_beta = float(orbit_beta)
+        if (not np.isfinite(orbit_beta)) or orbit_beta <= 0.0:
             return 0.0
 
-        target_mass = max(1e-30, float(target_mass))
-        data_scale_ref = max(1.0, float(data_scale_ref))
+        target_mass_ref = max(float(target_mass_ref), 1e-30)
+        data_scale_ref = max(float(data_scale_ref), 1.0)
 
-        # Soft normalization: stronger than a pure 1/target_mass^2 penalty,
-        # but still conservative when the data scale is large.
-        return float(orbit_beta) / (
-            np.sqrt(target_mass) * np.sqrt(data_scale_ref)
-        )
+        return orbit_beta * data_scale_ref / (target_mass_ref * target_mass_ref)
 
     def _watch_progress() -> bool:
         """
@@ -1275,7 +1251,8 @@ def streamActiveSetNNLS(
     no_progress_count = 0
 
     # --- positive-gradient batch-promotion controls ---
-    positive_batch_size = 2 if C <= 3 else 9
+    positive_batch_size = 4 if C <= 3 else 16
+    orbit_occ_lambda = 0.05 if C <= 3 else 0.10
 
     # robust prior mass reference scale
     ATy_pos = ATy_flat[np.isfinite(ATy_flat) & (ATy_flat > 0.0)]
@@ -1292,7 +1269,15 @@ def streamActiveSetNNLS(
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
     orbit_beta = float(orbit_beta_eff)
-    orbit_occ_lambda = 0.15 if C <= 3 else 0.25
+
+    if w_target is not None and np.any(w_target > 0.0):
+        target_mass_ref = float(
+            alpha_ref * np.median(w_target[w_target > 0.0])
+        )
+    else:
+        target_mass_ref = 1.0
+
+    target_mass_ref = max(target_mass_ref, 1e-30)
 
     diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
     diag_stride = max(1, int(os.environ.get("CUBEFIT_DIAG_STRIDE", "1")))
@@ -1369,14 +1354,14 @@ def streamActiveSetNNLS(
     committed_active = active.copy()
 
     # Probation for newly admitted columns.
-    probation_iters = 3
-    probation_rel = 1e-6
-    probation_abs = 1e-12
+    probation_iters = 6
+    probation_rel = 5e-7
+    probation_abs = 1e-13
     provisional_hits: dict[int, int] = {}
 
     # Column-level tabu for genuinely unhelpful promotions.
     col_cooldown_until: dict[int, int] = {}
-    cooldown_iters = 10
+    cooldown_iters = 4
     promotion_noop_rel_tol = 1e-6
     promotion_noop_abs_tol = 1e-10
 
@@ -1634,8 +1619,7 @@ def streamActiveSetNNLS(
                 }
             )
 
-        # Prior should help under-represented orbits re-enter the active set,
-        # not suppress them.
+        # Prior acts symmetrically on orbit-mass residuals.
         if (w_target is not None) and (orbit_beta > 0.0):
             g_prior = np.zeros_like(grad_promo)
 
@@ -1643,27 +1627,26 @@ def streamActiveSetNNLS(
                 base = cc * P
                 idxs = np.arange(base, base + P, dtype=np.int64)
 
-                target_mass = float(orbit_t[cc])
-                current_mass = float(orbit_s[cc])
-                support_deficit = max(target_mass - current_mass, 0.0)
-
-                if support_deficit <= 0.0:
+                orbit_resid = float(orbit_t[cc] - orbit_s[cc])
+                if not np.isfinite(orbit_resid):
                     continue
 
                 S_local = S_flat[idxs]
                 beta_eff = _orbit_prior_beta_eff(
                     orbit_beta=orbit_beta,
-                    target_mass=target_mass,
+                    target_mass_ref=target_mass_ref,
                     data_scale_ref=data_scale_ref,
                 )
 
-                g_prior[idxs] = beta_eff * support_deficit * S_local
+                g_prior[idxs] = beta_eff * orbit_resid * S_local
 
-            clip_factor = 0.75
+            clip_factor = 1.0
             g_prior_norm = np.linalg.norm(g_prior)
             g_data_norm = np.linalg.norm(grad_data) + 1e-30
             if g_prior_norm > clip_factor * g_data_norm:
-                g_prior *= (clip_factor * g_data_norm) / (g_prior_norm + 1e-30)
+                g_prior *= (
+                    clip_factor * g_data_norm
+                ) / (g_prior_norm + 1e-30)
 
             grad_promo = grad_promo + g_prior
 
@@ -1683,10 +1666,10 @@ def streamActiveSetNNLS(
         S_not = S_flat[not_active]
         S_med = np.median(S_not) + 1e-30
         S_norm = S_not / S_med
-        penalty_strength = 0.5
+        topk = 32
+        penalty_strength = 0.35
         adj_score = gvals_promo / (1.0 + penalty_strength * (S_norm - 1.0))
 
-        topk = 16
         if adj_score.size > topk:
             top_idxs = np.argsort(adj_score)[-topk:]
             pick_local = top_idxs[np.argmax(gvals_promo[top_idxs])]
@@ -1715,9 +1698,9 @@ def streamActiveSetNNLS(
 
             if allow_explore and not_active.size > 0:
                 if force_explore:
-                    preferred_group = min(max(8, CP // 80), 24)
+                    preferred_group = min(max(12, CP // 64), 32)
                 else:
-                    preferred_group = min(12, max(4, CP // 120))
+                    preferred_group = min(16, max(8, CP // 128))
 
                 cooldown_mask = _col_cooldown_mask(it)
                 cols_to_activate = _deficit_rescue_columns(
@@ -1730,10 +1713,10 @@ def streamActiveSetNNLS(
                     C=C,
                     P=P,
                     total_cols=preferred_group,
-                    min_per_orbit=1,
-                    max_per_orbit=max(3, preferred_group),
-                    deficit_boost=2.0,
-                    penalty_strength=0.5,
+                    min_per_orbit=2,
+                    max_per_orbit=max(6, preferred_group),
+                    deficit_boost=3.0,
+                    penalty_strength=0.35,
                     exclude_mask=cooldown_mask,
                     occ_lambda=orbit_occ_lambda,
                 )
@@ -1818,10 +1801,10 @@ def streamActiveSetNNLS(
                         C=C,
                         P=P,
                         total_cols=preferred_group,
-                        min_per_orbit=1,
-                        max_per_orbit=max(3, preferred_group),
-                        deficit_boost=2.0,
-                        penalty_strength=0.5,
+                        min_per_orbit=2,
+                        max_per_orbit=max(6, preferred_group),
+                        deficit_boost=3.0,
+                        penalty_strength=0.35,
                         exclude_mask=cooldown_mask,
                         occ_lambda=orbit_occ_lambda,
                     )
@@ -1857,7 +1840,7 @@ def streamActiveSetNNLS(
                     break
             else:
                 if force_explore:
-                    preferred_group = min(max(8, CP // 80), 24)
+                    preferred_group = min(max(12, CP // 64), 32)
                 else:
                     preferred_group = min(positive_batch_size, pos_mask.size)
 
@@ -1872,10 +1855,10 @@ def streamActiveSetNNLS(
                     C=C,
                     P=P,
                     total_cols=preferred_group,
-                    min_per_orbit=1,
-                    max_per_orbit=max(3, preferred_group),
-                    deficit_boost=2.0,
-                    penalty_strength=0.5,
+                    min_per_orbit=2,
+                    max_per_orbit=max(6, preferred_group),
+                    deficit_boost=3.0,
+                    penalty_strength=0.35,
                     exclude_mask=cooldown_mask,
                     occ_lambda=orbit_occ_lambda,
                 )
@@ -2192,7 +2175,7 @@ def streamActiveSetNNLS(
 
                 beta_eff = _orbit_prior_beta_eff(
                     orbit_beta=orbit_beta,
-                    target_mass=target_mass,
+                    target_mass_ref=target_mass_ref,
                     data_scale_ref=data_scale_ref,
                 )
 
@@ -2302,7 +2285,7 @@ def streamActiveSetNNLS(
                 reject = True
 
         if did_explore and near_noop:
-            _cooldown_cols(promoted_cols, it, extra_iters=5)
+            _cooldown_cols(promoted_cols, it, extra_iters=3)
             print(
                 "[MONO][explore] cooling promoted columns after near-noop "
                 f"update: {promoted_cols}",
@@ -2317,7 +2300,7 @@ def streamActiveSetNNLS(
                 flush=True,
             )
             if promoted_cols.size > 0:
-                _cooldown_cols(promoted_cols, it, extra_iters=10)
+                _cooldown_cols(promoted_cols, it, extra_iters=5)
             if newly_activated is not None and newly_activated.size > 0:
                 active[newly_activated] = False
             z[active_idx] = z_old_active
@@ -2359,7 +2342,7 @@ def streamActiveSetNNLS(
                 z[:] = z_before
 
                 if newly_activated is not None and newly_activated.size > 0:
-                    _cooldown_cols(newly_activated, it, extra_iters=10)
+                    _cooldown_cols(newly_activated, it, extra_iters=5)
 
                 if _watch_progress():
                     break
@@ -2408,7 +2391,7 @@ def streamActiveSetNNLS(
             drop_cols = np.asarray(drop_cols, dtype=np.int64)
             z[drop_cols] = 0.0
             active[drop_cols] = False
-            _cooldown_cols(drop_cols, it, extra_iters=5)
+            _cooldown_cols(drop_cols, it, extra_iters=2)
             print(
                 f"[MONO][probation] dropped {drop_cols.size} stale columns: "
                 f"{drop_cols}",

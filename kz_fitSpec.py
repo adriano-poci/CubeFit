@@ -50,6 +50,7 @@ v1.13:  Fixed spectral fit plot unlinking glob in `loadCubeFit`. 31 March 2026
 v1.14:  Do not return full slab in `_reconstruct_worker`, causing extreme memory
             requirements. 22 May 2026
 """
+
 # need to set up the logger before any other imports
 import pathlib as plp
 from CubeFit.logger import get_logger
