@@ -49,6 +49,7 @@ v1.12:  Re-implemented `orbit_beta` support in `genCubeFit` and passed it to the
 v1.13:  Fixed spectral fit plot unlinking glob in `loadCubeFit`. 31 March 2026
 v1.14:  Do not return full slab in `_reconstruct_worker`, causing extreme memory
             requirements. 22 May 2026
+v1.15:  Polished `orbitMaps` figure. 3 August 2026
 """
 
 # need to set up the logger before any other imports
@@ -2548,31 +2549,56 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 print(f"Metal map limits: {mmin:.2f} to {mmax:.2f}")
                 print(f"Alpha map limits: {lmin:.2f} to {lmax:.2f}")
 
-                fig = plt.figure(figsize=plt.figaspect(3./4.)*0.75)
-                gs = gridspec.GridSpec(3, 3, hspace=0., wspace=0.)
-                for pi, prop in enumerate(['age', 'metal', 'alpha']):
-                    for oi, otype in enumerate(['sa', 'la', 'bo']):
-                        ax = fig.add_subplot(gs[oi, pi])
+                prop_specs = [
+                    (rf"$t\ [{UTS.gyr}]$", amin, amax),
+                    (r"$[Fe/H]$", mmin, mmax),
+                    (r"$[\alpha/Fe]$", lmin, lmax),
+                ]
+                orb_specs = [r'$z$ Tubes', r'$x$ Tubes', 'Boxes']
+
+                fig = plt.figure(figsize=plt.figaspect((yLen*3.)/xLen)*0.75)
+                gs = gridspec.GridSpec(3, 3, hspace=0.0, wspace=0.0)
+
+                for ri, (prop, vmin, vmax) in enumerate(prop_specs):
+                    mappable = None
+                    for oi, otype in enumerate(orb_specs):
+                        ax = fig.add_subplot(gs[ri, oi])
                         arr = maps[prop][otype]
                         arr = np.ma.masked_invalid(arr)[binNum]
-                        dbi(xpix, ypix, arr, pixelsize=pixs, angle=PA,
-                            cmap=moncmapr,
-                            vmin={'age':amin, 'metal':mmin, 'alpha':lmin}[prop],
-                            vmax={'age':amax, 'metal':mmax, 'alpha':lmax}[prop]
-                        )
+                        mappable = dbi(xpix, ypix, arr,
+                            pixelsize=pixs, angle=PA,
+                            cmap=moncmapr, vmin=vmin, vmax=vmax,)
                         ax.set_xlim(xmin, xmax)
                         ax.set_ylim(ymin, ymax)
-                        # ax.text(1e-2, 1-1e-2, rf"{np.nanmin(arr):.2f}/{np.nanmax(arr):.2f}",
-                        #     va='top', ha='left', color=POT.pgreen, transform=ax.transAxes, path_effects=[PathEffects.withStroke(linewidth=1.5, foreground='k')])
+
                         if not ax.get_subplotspec().is_last_row():
                             ax.set_xticklabels([])
                         if not ax.get_subplotspec().is_first_col():
                             ax.set_yticklabels([])
-                        lT = ax.text(1e-2, 1e-2, f"{prop} {otype}", va='bottom',
-                            ha='left', color=POT.pgreen, transform=ax.transAxes,
-                            path_effects=[PathEffects.withStroke(linewidth=1.5,
-                            foreground='k')])
-                fig.savefig(figDir/\
+                        if ax.get_subplotspec().is_first_col():
+                            ax.text(1e-2, 1e-2, otype,
+                                va="bottom", ha="left", color=POT.pgreen,
+                                transform=ax.transAxes,
+                                path_effects=[PathEffects.withStroke(
+                                        linewidth=1.5, foreground="k")],)
+                        if ax.get_subplotspec().is_last_col():
+                            cax = POT.attachAxis(ax, "right", 0.05)
+                            cb = plt.colorbar(mappable, cax=cax, orientation="vertical")
+                            lT = cax.text(
+                                0.5, 0.5, r"Mass",
+                                va="center", ha="center", color=POT.pgreen,
+                                transform=cax.transAxes, rotation=270,
+                                path_effects=[PathEffects.withStroke(
+                                    linewidth=1.5, foreground="k")])
+                            cax.text(0.45, 1.0 - 5e-3, f"{vmax:.2e}",
+                                va="top", ha="center", color="w",
+                                transform=cax.transAxes, rotation=270,)
+                            cax.text(0.45, 5e-3, f"{vmin:.2e}",
+                                va="bottom", ha="center", color="k",
+                                transform=cax.transAxes, rotation=270,)
+                            cb.set_ticks([])
+
+                fig.savefig(figDir/
                     f"orbitMaps_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
             except Exception as e:
                 print(f"Could not make projection plots: {e}")

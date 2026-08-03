@@ -110,6 +110,11 @@ v1.19:  Replaced one-sided orbit-deficit rescue with a symmetric orbit-mass prio
             without sacrificing data fidelity;
         Removed orbit support heuristics in favour of unified global support. 2
             August 2026
+v1.20: Replaced the soft orbit-penalty machinery with an augmented-Lagrangian
+            orbit-mass constraint, removing legacy orbit-beta promotion
+            heuristics and unifying orbit-target enforcement through dual-
+            variable updates while preserving the streaming active-set NNLS
+            formulation. 3 August 2026
 """
 
 from __future__ import annotations, print_function
@@ -441,7 +446,6 @@ class MPConfig:
     dset_slots: int = 1_000_003
     dset_bytes: int = 256 * 1024**2
     dset_w0: float = 0.90
-    orbit_beta: float = 0.0 # strength of rank-1 orbit penalisation (if > 0)
     s_tile_override: Optional[int] = None
     pixels_per_aperture: int = 256
     max_tiles: Optional[int] = None
@@ -769,115 +773,6 @@ def _robust_scale_ref(values: np.ndarray, fallback: float = 1.0) -> float:
 
 # ------------------------------------------------------------------------------
 
-def _combined_promotion_score(
-    grad_vec: np.ndarray,
-    aty_scaled_vec: np.ndarray,
-    active_mask: np.ndarray,
-    S_flat: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Unified promotion score.
-
-    Promotion is driven entirely by the combined gradient already containing
-    both the data term and the orbit prior.
-
-    Only a mild normalization by column scale and a small ATy tie-breaker are
-    retained. No orbit quotas, occupancy penalties, diversity bonuses or other
-    heuristics are applied.
-    """
-    grad_vec = np.asarray(
-        grad_vec,
-        dtype=np.float64,
-    ).ravel(order="C")
-
-    aty_scaled_vec = np.asarray(
-        aty_scaled_vec,
-        dtype=np.float64,
-    ).ravel(order="C")
-
-    active_mask = np.asarray(
-        active_mask,
-        dtype=bool,
-    ).ravel(order="C")
-
-    S_flat = np.asarray(
-        S_flat,
-        dtype=np.float64,
-    ).ravel(order="C")
-
-    not_active = np.where(~active_mask)[0]
-
-    if not_active.size == 0:
-        return (
-            not_active,
-            np.zeros((0,), dtype=np.float64),
-        )
-
-    score = grad_vec[not_active].copy()
-
-    svals = S_flat[not_active]
-    s_med = np.median(svals) + 1e-30
-
-    score /= (
-        1.0
-        + 0.25 * (svals / s_med - 1.0)
-    )
-
-    aty = aty_scaled_vec[not_active]
-    aty_scale = np.max(np.abs(aty)) + 1e-30
-
-    score += 0.10 * (aty / aty_scale)
-
-    return not_active, score
-
-# ------------------------------------------------------------------------------
-
-def _quota_rescue_columns(
-    grad_vec: np.ndarray,
-    aty_scaled_vec: np.ndarray,
-    active_mask: np.ndarray,
-    S_flat: np.ndarray,
-    w_target: np.ndarray | None,
-    C: int,
-    P: int,
-    total_cols: int,
-    *,
-    min_per_orbit: int = 2,
-    max_per_orbit: int = 12,
-    penalty_strength: float = 0.5,
-    orbit_occ_counts: np.ndarray | None = None,
-    occ_lambda: float = 0.0,
-    diversity_strength: float = 0.05,
-    exploration_pool: int = 32,
-) -> np.ndarray:
-    """
-    Select rescue columns using one combined promotion score only.
-
-    Orbit weights, quotas, occupancy penalties, and random sampling are
-    intentionally ignored in this simplified version. The function keeps the
-    old signature for backward compatibility.
-    """
-    if total_cols <= 0:
-        return np.zeros((0,), dtype=np.int64)
-
-    not_active, score = _combined_promotion_score(
-        grad_vec=grad_vec,
-        aty_scaled_vec=aty_scaled_vec,
-        active_mask=active_mask,
-        S_flat=S_flat,
-        P=P,
-        diversity_strength=diversity_strength,
-    )
-
-    if not_active.size == 0:
-        return np.zeros((0,), dtype=np.int64)
-
-    order = np.argsort(score)[::-1]
-    pick = not_active[order[:min(total_cols, order.size)]]
-    return np.asarray(pick, dtype=np.int64)
-
-# ------------------------------------------------------------------------------
-
 def streamActiveSetNNLS(
     h5_path: str,
     s_ranges: list,
@@ -890,7 +785,6 @@ def streamActiveSetNNLS(
     executor,
     cfg: MPConfig,
     orbit_weights: Optional[np.ndarray] = None,
-    orbit_beta_eff: float = 0.0,
     x0_flat: Optional[np.ndarray] = None,
     resume_state: Optional[dict] = None,
     max_active: int = 1000,
@@ -913,26 +807,6 @@ def streamActiveSetNNLS(
         if (not np.isfinite(ref)) or (ref <= 0.0):
             return float(max(1.0, fallback))
         return ref
-
-    def _orbit_prior_beta_eff(
-        orbit_beta: float,
-        target_mass_ref: float,
-        data_scale_ref: float,
-    ) -> float:
-        """
-        Convert the user-facing orbit_beta into a problem-scale prior weight.
-
-        The weight is made orbit-invariant by using a single reference mass
-        instead of the per-orbit target mass.
-        """
-        orbit_beta = float(orbit_beta)
-        if (not np.isfinite(orbit_beta)) or orbit_beta <= 0.0:
-            return 0.0
-
-        target_mass_ref = max(float(target_mass_ref), 1e-30)
-        data_scale_ref = max(float(data_scale_ref), 1.0)
-
-        return orbit_beta * data_scale_ref / (target_mass_ref * target_mass_ref)
 
     def _watch_progress() -> bool:
         """
@@ -1008,7 +882,6 @@ def streamActiveSetNNLS(
     w_target = None
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
-    orbit_beta = float(orbit_beta_eff)
 
     if w_target is not None and np.any(w_target > 0.0):
         target_mass_ref = float(
@@ -1018,6 +891,13 @@ def streamActiveSetNNLS(
         target_mass_ref = 1.0
 
     target_mass_ref = max(target_mass_ref, 1e-30)
+    orbit_target_mass = (
+        alpha_ref * np.asarray(w_target, dtype=np.float64)
+        if (w_target is not None and np.any(w_target > 0.0))
+        else None
+    )
+    orbit_lambda = np.zeros((C,), dtype=np.float64)
+    orbit_rho = 0.0
 
     diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
     diag_stride = max(1, int(os.environ.get("CUBEFIT_DIAG_STRIDE", "1")))
@@ -1040,13 +920,11 @@ def streamActiveSetNNLS(
             "CP": int(CP),
             "processes": int(cfg.processes),
             "blas_threads": int(cfg.blas_threads),
-            "orbit_beta": float(orbit_beta),
             "alpha_ref": float(alpha_ref),
             "data_scale_ref": float(data_scale_ref),
             "grad_ref": float(grad_ref),
             "tol_grad": float(tol_grad),
             "tol_grad_rel": float(tol_grad_rel),
-            "orbit_occ_lambda": float(orbit_occ_lambda),
             "diag_level": int(diag_level),
             "diag_stride": int(diag_stride),
             "diag_topk": int(diag_topk),
@@ -1235,16 +1113,17 @@ def streamActiveSetNNLS(
 
     def _orbit_mass_and_deficit(z_vec: np.ndarray):
         """
-        Compute current per-orbit masses and deficits relative to alpha_ref*w_target.
+        Compute current per-orbit masses and deficits relative to the fixed
+        orbit_target_mass vector.
         """
         x_vec = _current_x_from_z(z_vec).reshape(C, P)
         s_orbit = np.sum(x_vec, axis=1)
 
-        if w_target is None:
+        if orbit_target_mass is None:
             t_orbit = np.zeros((C,), dtype=np.float64)
             deficit = np.zeros((C,), dtype=np.float64)
         else:
-            t_orbit = alpha_ref * np.asarray(w_target, dtype=np.float64)
+            t_orbit = orbit_target_mass
             deficit = t_orbit - s_orbit
 
         return s_orbit, t_orbit, deficit
@@ -1294,8 +1173,7 @@ def streamActiveSetNNLS(
         grad_data = ATy_scaled - ATAz_scaled
         grad_promo = grad_data.copy()
 
-        orbit_s, orbit_t, orbit_deficit = _orbit_mass_and_deficit(z)
-        orbit_pressure = np.maximum(orbit_deficit, 0.0)
+        orbit_s, orbit_target, orbit_deficit = _orbit_mass_and_deficit(z)
 
         not_active = np.where(~active)[0]
         gvals_data = grad_data[not_active]
@@ -1321,10 +1199,9 @@ def streamActiveSetNNLS(
 
         if diag_level >= 1 and ((it % diag_stride) == 0):
             x_phys_now = _current_x_from_z(z).reshape(C, P)
-            orbit_mass = np.sum(x_phys_now, axis=1)
-            orbit_target = orbit_t.copy()
-            orbit_resid = orbit_mass - orbit_target
-            orbit_ratio = orbit_mass / np.maximum(orbit_target, 1e-30)
+            orbit_mass_vec = np.sum(x_phys_now, axis=1)
+            orbit_resid = orbit_mass_vec - orbit_target
+            orbit_ratio = orbit_mass_vec / np.maximum(orbit_target, 1e-30)
             orbit_nz = np.count_nonzero(x_phys_now > 0.0, axis=1).astype(
                 np.int64
             )
@@ -1348,7 +1225,7 @@ def streamActiveSetNNLS(
                     "avg_grad_promo": float(avg_grad_promotable),
                     "orbit_deficit_l1": float(np.sum(np.abs(orbit_deficit))),
                     "orbit_deficit_l2": float(np.linalg.norm(orbit_deficit)),
-                    "orbit_mass": orbit_mass.tolist(),
+                    "orbit_mass": orbit_mass_vec.tolist(),
                     "orbit_target": orbit_target.tolist(),
                     "orbit_resid": orbit_resid.tolist(),
                     "orbit_ratio": orbit_ratio.tolist(),
@@ -1358,37 +1235,6 @@ def streamActiveSetNNLS(
                     "orbit_top_share": top_share.tolist(),
                 }
             )
-
-        # Prior acts symmetrically on orbit-mass residuals.
-        if (w_target is not None) and (orbit_beta > 0.0):
-            g_prior = np.zeros_like(grad_promo)
-
-            for cc in range(C):
-                base = cc * P
-                idxs = np.arange(base, base + P, dtype=np.int64)
-
-                orbit_resid = float(orbit_t[cc] - orbit_s[cc])
-                if not np.isfinite(orbit_resid):
-                    continue
-
-                S_local = S_flat[idxs]
-                beta_eff = _orbit_prior_beta_eff(
-                    orbit_beta=orbit_beta,
-                    target_mass_ref=target_mass_ref,
-                    data_scale_ref=data_scale_ref,
-                )
-
-                g_prior[idxs] = beta_eff * orbit_resid * S_local
-
-            clip_factor = 1.0
-            g_prior_norm = np.linalg.norm(g_prior)
-            g_data_norm = np.linalg.norm(grad_data) + 1e-30
-            if g_prior_norm > clip_factor * g_data_norm:
-                g_prior *= (
-                    clip_factor * g_data_norm
-                ) / (g_prior_norm + 1e-30)
-
-            grad_promo = grad_promo + g_prior
 
         n_active = int(np.count_nonzero(active))
         print(
@@ -1402,13 +1248,18 @@ def streamActiveSetNNLS(
 
         tol_here = max(tol_grad, tol_grad_rel * grad_ref)
 
-        # Unified promotion score: data gradient + symmetric orbit prior.
-        not_active, score = _combined_promotion_score(
-            grad_vec=grad_promo,
-            aty_scaled_vec=ATy_scaled,
-            active_mask=active,
-            S_flat=S_flat,
-        )
+        # Unified promotion score: use the current combined gradient only.
+        not_active = np.where(~active)[0]
+        score = grad_promo[not_active].copy()
+
+        if not_active.size > 0:
+            svals = S_flat[not_active]
+            s_med = np.median(svals) + 1e-30
+            score /= (1.0 + 0.25 * (svals / s_med - 1.0))
+
+            aty = ATy_scaled[not_active]
+            aty_scale = np.max(np.abs(aty)) + 1e-30
+            score += 0.10 * (aty / aty_scale)
 
         if not_active.size == 0:
             if _watch_progress():
@@ -1476,11 +1327,6 @@ def streamActiveSetNNLS(
                 break
             _emit_checkpoint(it, final=True, phase="k_zero_exit")
             continue
-
-        orbit_occ_counts = np.bincount(
-            (active_idx // P).astype(np.int64),
-            minlength=C,
-        ).astype(np.int64)
 
         S_active = S_flat[active_idx]
 
@@ -1613,13 +1459,23 @@ def streamActiveSetNNLS(
         ridge = max(1e-10, ridge_rel * max(1.0, diag_med))
         ATA_sub_reg = ATA_sub + ridge * np.eye(k, dtype=np.float64)
 
+        ATA_norm = float(np.linalg.norm(ATA_sub))
+
         beta_eff_orbit = np.zeros((C,), dtype=np.float64)
         prior_block_norm = np.zeros((C,), dtype=np.float64)
         prior_block_trace = np.zeros((C,), dtype=np.float64)
+
         # ----------------------------------------------------
-        # Orbit prior in reduced solve
+        # Augmented-Lagrangian orbit-mass matching
         # ----------------------------------------------------
-        if (w_target is not None) and (orbit_beta > 0.0):
+        orbit_rho = 0.0
+        if orbit_target_mass is not None:
+            orbit_rho = float(np.clip(
+                1e-3 * ATA_norm / max(np.linalg.norm(orbit_target_mass) ** 2, 1e-30),
+                1e-12,
+                1e2,
+            ))
+
             orbit_groups = {}
             for local_i, gcol in enumerate(active_idx):
                 cc = int(gcol // P)
@@ -1631,34 +1487,27 @@ def streamActiveSetNNLS(
                     continue
 
                 S_local = S_active[idx]
-                w_cc = float(w_target[cc])
-                target_mass = max(1e-30, alpha_ref * w_cc)
+                t_cc = float(orbit_target_mass[cc])
+                lam_cc = float(orbit_lambda[cc])
 
-                beta_eff = _orbit_prior_beta_eff(
-                    orbit_beta=orbit_beta,
-                    target_mass_ref=target_mass_ref,
-                    data_scale_ref=data_scale_ref,
-                )
+                prior_block = orbit_rho * np.outer(S_local, S_local)
+                ATA_sub_reg[np.ix_(idx, idx)] += prior_block
+                ATy_sub[idx] += (orbit_rho * t_cc - lam_cc) * S_local
 
-                ATA_sub_reg[np.ix_(idx, idx)] += (
-                    beta_eff * np.outer(S_local, S_local)
-                )
-                ATy_sub[idx] += beta_eff * target_mass * S_local
+                beta_eff_orbit[cc] = orbit_rho
+                prior_block_norm[cc] = float(np.linalg.norm(prior_block))
+                prior_block_trace[cc] = float(np.trace(prior_block))
 
                 try:
                     print(
-                        f"[DIAG][orbit_prior_soft] orbit={cc} "
-                        f"cols={len(idx)} target_mass={target_mass:.3e} "
-                        f"data_scale={data_scale_ref:.3e} "
-                        f"beta_eff={beta_eff:.3e}",
+                        f"[DIAG][orbit_prior_al] orbit={cc} "
+                        f"cols={len(idx)} target_mass={t_cc:.3e} "
+                        f"rho={orbit_rho:.3e} "
+                        f"lambda={lam_cc:.3e}",
                         flush=True,
                     )
                 except Exception:
                     pass
-                beta_eff_orbit[cc] = beta_eff
-                prior_block = beta_eff * np.outer(S_local, S_local)
-                prior_block_norm[cc] = float(np.linalg.norm(prior_block))
-                prior_block_trace[cc] = float(np.trace(prior_block))
 
         z_old_active = z[active_idx].copy()
 
@@ -1836,8 +1685,11 @@ def streamActiveSetNNLS(
             if orbit_active.size == 0:
                 continue
 
-            orbit_mass = float(np.sum(x_phys[orbit_active]))
-            tiny_thresh = max(probation_abs, probation_rel * max(orbit_mass, 1.0))
+            orbit_mass_local = float(np.sum(x_phys[orbit_active]))
+            tiny_thresh = max(
+                probation_abs,
+                probation_rel * max(orbit_mass_local, 1.0),
+            )
 
             if x_phys[c] <= tiny_thresh:
                 provisional_hits[c] = provisional_hits.get(c, 0) + 1
@@ -1859,13 +1711,17 @@ def streamActiveSetNNLS(
                 flush=True,
             )
 
+        if orbit_target_mass is not None and orbit_rho > 0.0:
+            x_phys_now = _current_x_from_z(z).reshape(C, P)
+            orbit_mass_now = np.sum(x_phys_now, axis=1)
+            orbit_lambda += orbit_rho * (orbit_mass_now - orbit_target_mass)
+            np.clip(orbit_lambda, -1e12, 1e12, out=orbit_lambda)
 
         if diag_level >= 1 and ((it % diag_stride) == 0):
             x_phys_now = _current_x_from_z(z).reshape(C, P)
-            orbit_mass = np.sum(x_phys_now, axis=1)
-            orbit_target = orbit_t.copy()
-            orbit_resid = orbit_mass - orbit_target
-            orbit_ratio = orbit_mass / np.maximum(orbit_target, 1e-30)
+            orbit_target = orbit_target_mass.copy() if orbit_target_mass is not None else np.zeros((C,), dtype=np.float64)
+            orbit_resid = orbit_mass_vec - orbit_target
+            orbit_ratio = orbit_mass_vec / np.maximum(orbit_target, 1e-30)
             orbit_nz = np.count_nonzero(x_phys_now > 0.0, axis=1).astype(np.int64)
 
             eff_support = np.zeros((C,), dtype=np.float64)
@@ -1910,7 +1766,7 @@ def streamActiveSetNNLS(
                     "obj_gain": float(obj_gain),
                     "norm_old": float(norm_old),
                     "norm_new": float(norm_new),
-                    "orbit_mass": orbit_mass.tolist(),
+                    "orbit_mass": orbit_mass_vec.tolist(),
                     "orbit_target": orbit_target.tolist(),
                     "orbit_resid": orbit_resid.tolist(),
                     "orbit_ratio": orbit_ratio.tolist(),
@@ -2060,21 +1916,6 @@ def monolithic_nnls_scipy(
     # reshape to (C,P)
     x = x_flat.reshape((C, P)).copy()
 
-    # optional post-solve hard orbit projection (match existing pipeline)
-    if enforce_orbit_projection and (orbit_weights is not None):
-        w_t = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
-        if w_t is not None:
-            known_zero_orbit = np.all(np.zeros((C, P), dtype=bool), axis=1)  # no known_zero info here
-            # compute per-orbit sums on current x
-            s = np.sum(x, axis=1)
-            w = np.asarray(w_t, dtype=np.float64)
-            w_sum = float(np.sum(w))
-            alpha = float(np.sum(s)) / w_sum if (w_sum > 0.0) else 1.0
-            s_proj = alpha * w
-            ratio = s_proj / np.maximum(s, 1e-30)
-            x *= ratio[:, None]
-            np.maximum(x, 0.0, out=x)
-
     elapsed = time.perf_counter() - t0
     stats = dict(
         elapsed_sec=float(elapsed),
@@ -2133,8 +1974,6 @@ def solve_streaming_nnls(
     w_target = None
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
-    orbit_beta = float(cfg.orbit_beta)
-    orbit_occ_lambda = 0.15 if C <= 3 else 0.25
 
     # ---------------------------- diagnostics --------------------------
     diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
@@ -2163,8 +2002,6 @@ def solve_streaming_nnls(
             "n_ranges": int(len(s_ranges)),
             "processes": int(cfg.processes),
             "blas_threads": int(cfg.blas_threads),
-            "orbit_beta": float(orbit_beta),
-            "orbit_occ_lambda": float(orbit_occ_lambda),
             "diag_level": int(diag_level),
             "diag_stride": int(diag_stride),
             "diag_topk": int(diag_topk),
@@ -2348,15 +2185,6 @@ def solve_streaming_nnls(
         inv_sqrt_energy = S_temp
         inv_sqrt_energy_flat = inv_sqrt_energy.ravel(order="C")
 
-        beta_eff = 0.0
-        if orbit_weights is not None and cfg.orbit_beta > 0.0:
-            beta_eff = float(cfg.orbit_beta)
-
-        print(
-            f"[DIAG] orbit prior : cfg.orbit_beta = {beta_eff:.4e}",
-            flush=True,
-        )
-
         # DIAGNOSTIC: report S statistics (helps find extreme scalings)
         S_sample = inv_sqrt_energy_flat
         try:
@@ -2517,7 +2345,6 @@ def solve_streaming_nnls(
                 executor=executor,
                 cfg=cfg,
                 orbit_weights=orbit_weights,
-                orbit_beta_eff=beta_eff,
                 x0_flat=x.ravel(order="C"),
                 resume_state=resume_state,
                 max_active=monolithic_max_active,
