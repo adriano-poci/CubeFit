@@ -27,12 +27,14 @@ v1.2:   Added `galaxy` argument to `_configure_solver_environment` to specify
             paths. 30 July 2026
 v1.3:   Pass `args` and `propDict` to `_configure_solver_environment` to allow 
             for more flexible environment variable configuration. 1 August 2026
+v1.4:   Generate unique diagnostic JSONL for each run. 4 August 2026
 """
 
 import numpy as np
 import os, re, sys
 import pathlib as plp
 import argparse
+from datetime import datetime
 
 curdir = plp.Path(__file__).parent
 
@@ -61,9 +63,11 @@ def _configure_solver_environment(args, propDict):
     os.environ["CUBEFIT_DIAG_LEVEL"] = str(2)
     os.environ["CUBEFIT_DIAG_STRIDE"] = str(1)
     os.environ["CUBEFIT_DIAG_TOPK"] = str(12)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.environ["CUBEFIT_DIAG_JSONL"] = str(
         curdir/args.galaxy/
-        f"diagnostics_{args.ncomp}_{propDict['lOrder']:02d}.jsonl")
+        f"diagnostics_{args.ncomp}_{propDict['lOrder']:02d}_{stamp}.jsonl")
 
 
 def main():

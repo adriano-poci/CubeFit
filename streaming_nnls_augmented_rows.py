@@ -24,6 +24,9 @@ History
 v1.0:   Forked from `streaming_nnls` v1.20;
         Add orbit prior to design matrix for simultaneous constraints;
         Cleaned up `MPConfig`. 3 August 2026
+v1.1:   Removed legacy `epoch` loop. 4 August 2026
+v1.2:   Changed rollback logic to objective-based rather than gradient-based. 4
+            August 2026
 """
 
 from __future__ import annotations, print_function
@@ -458,12 +461,14 @@ def _canon_orbit_weights(h5_path: str,
                          C: int,
                          P: int) -> np.ndarray | None:
     """
-    Return a (C,) float64 prior vector for components, or None if unavailable.
+    Return an absolute (C,) orbit-mass target vector, or None if unavailable.
+
     Accepts:
       - orbit_weights == None: try reading '/CompWeights' from HDF5.
       - orbit_weights shape == (C,): use as-is.
       - orbit_weights shape == (C*P,): sum over populations -> (C,).
-    Raises if a provided vector has incompatible size.
+
+    This function does NOT normalise the result.
     """
     w = None
     if orbit_weights is not None:
@@ -471,22 +476,24 @@ def _canon_orbit_weights(h5_path: str,
     else:
         with open_h5(h5_path, role="reader") as f:
             if "/CompWeights" in f:
-                w = np.asarray(f["/CompWeights"][...], dtype=np.float64).ravel(order="C")
+                w = np.asarray(
+                    f["/CompWeights"][...],
+                    dtype=np.float64,
+                ).ravel(order="C")
             else:
-                return None  # no prior available
+                return None
 
     if w.size == C:
         pass
     elif w.size == C * P:
         w = w.reshape(C, P).sum(axis=1)
     else:
-        raise ValueError(f"orbit_weights length {w.size} incompatible with C={C}, P={P}. "
-                         f"Expected C or C*P.")
-    # normalize to a comparable scale
-    s = np.sum(w)
-    if np.isfinite(s) and s > 0.0:
-        w = w / s
-    return w
+        raise ValueError(
+            f"orbit_weights length {w.size} incompatible with C={C}, P={P}. "
+            f"Expected C or C*P."
+        )
+
+    return np.asarray(w, dtype=np.float64)
 
 # ------------------------------------------------------------------------------
 
@@ -877,6 +884,7 @@ def streamActiveSetNNLS(
         return False
 
     CP = int(C * P)
+    orbit_of_col = (np.arange(CP, dtype=np.int64) // P).astype(np.int64)
     negative_grad_count = 0
     explore_budget = max(1, min(20, CP // 50))
 
@@ -1148,6 +1156,15 @@ def streamActiveSetNNLS(
 
         deficit = t_orbit - s_orbit
         return s_orbit, t_orbit, deficit
+    def _orbit_prior_promotion_score(z_vec: np.ndarray) -> np.ndarray:
+        """
+        Return the orbit-prior contribution to the promotion score in z-space.
+        """
+        if w_target is None or orbit_prior_weight <= 0.0:
+            return np.zeros((CP,), dtype=np.float64)
+
+        _, _, deficit = _orbit_mass_and_deficit(z_vec)
+        return orbit_prior_weight * (S_flat * deficit[orbit_of_col])
 
     # ------------------------------------------------------------
     # Helper: compute ATAz in parallel using provided executor
@@ -1192,30 +1209,25 @@ def streamActiveSetNNLS(
 
         ATAz_scaled = _compute_ATAz_scaled(z)
         grad_data = ATy_scaled - ATAz_scaled
-        grad_promo = grad_data.copy()
+        orbit_promo = _orbit_prior_promotion_score(z)
+        grad_total = grad_data + orbit_promo
 
         orbit_s, orbit_target, orbit_deficit = _orbit_mass_and_deficit(z)
 
         not_active = np.where(~active)[0]
         gvals_data = grad_data[not_active]
-        gvals_promo = grad_promo[not_active]
-        if gvals_data.size == 0:
-            _emit_checkpoint(it, final=True, phase="no_gradient_exit")
-            break
+        gvals_orbit = orbit_promo[not_active]
+        gvals_total = grad_total[not_active]
 
-        max_grad_all = float(np.max(grad_data)) if grad_data.size else 0.0
-        active_before = active.copy()
-        z_before = z.copy()
-
+        max_grad_all = float(np.max(grad_total)) if grad_total.size else 0.0
         max_grad_promotable = (
-            float(np.max(gvals_promo)) if gvals_promo.size else 0.0
+            float(np.max(gvals_total)) if gvals_total.size else 0.0
         )
         avg_grad_promotable = (
-            float(np.mean(gvals_promo)) if gvals_promo.size else 0.0
+            float(np.mean(gvals_total)) if gvals_total.size else 0.0
         )
-        max_grad_data = (
-            float(np.max(gvals_data)) if gvals_data.size else 0.0
-        )
+        max_grad_data = float(np.max(gvals_data)) if gvals_data.size else 0.0
+        max_grad_orbit = float(np.max(gvals_orbit)) if gvals_orbit.size else 0.0
         grad_before_data = max_grad_data
 
         if diag_level >= 1 and ((it % diag_stride) == 0):
@@ -1246,6 +1258,8 @@ def streamActiveSetNNLS(
                     "max_grad_data": float(max_grad_data),
                     "max_grad_promo": float(max_grad_promotable),
                     "avg_grad_promo": float(avg_grad_promotable),
+                    "max_grad_total": float(max_grad_all),
+                    "max_grad_orbit": float(max_grad_orbit),
                     "orbit_deficit_l1": float(np.sum(np.abs(orbit_deficit))),
                     "orbit_deficit_l2": float(np.linalg.norm(orbit_deficit)),
                     "orbit_mass": orbit_mass_vec.tolist(),
@@ -1262,18 +1276,17 @@ def streamActiveSetNNLS(
         n_active = int(np.count_nonzero(active))
         print(
             f"[MONO][iter {it+1}] "
-            f"max_grad_all={max_grad_all:.3e} "
+            f"max_grad_total={max_grad_all:.3e} "
+            f"max_grad_data={max_grad_data:.3e} "
+            f"max_grad_orbit={max_grad_orbit:.3e} "
             f"max_grad_promotable={max_grad_promotable:.3e} "
-            f"avg_grad_promotable={avg_grad_promotable:.3e} "
             f"active={n_active}",
             flush=True,
         )
-
         tol_here = max(tol_grad, tol_grad_rel * grad_ref)
-
         # Unified promotion score: use the current combined gradient only.
         not_active = np.where(~active)[0]
-        score = grad_promo[not_active].copy()
+        score = gvals_total.copy()
 
         if not_active.size > 0:
             svals = S_flat[not_active]
@@ -1293,6 +1306,8 @@ def streamActiveSetNNLS(
         max_g = float(np.max(score)) if score.size else -np.inf
         did_explore = bool(max_g <= tol_here)
         newly_activated = None
+        active_before = active.copy()
+        z_before = z.copy()
 
         if max_g <= tol_here:
             negative_grad_count += 1
@@ -1489,6 +1504,18 @@ def streamActiveSetNNLS(
         def _quad_obj(A, b, x):
             return 0.5 * float(x @ (A @ x)) - float(b @ x)
 
+
+        if w_target is not None and np.any(w_target > 0.0) and orbit_prior_weight > 0.0:
+            orbit_ATA_sub, orbit_ATy_sub = _orbit_prior_quadratic_terms(
+                active_idx=active_idx,
+                S_active=S_active,
+                orbit_target_mass=np.asarray(w_target, dtype=np.float64),
+                C=C, P=P,
+                orbit_prior_weight=float(orbit_prior_weight),
+            )
+            ATA_sub_reg = ATA_sub_reg + orbit_ATA_sub
+            ATy_sub = ATy_sub + orbit_ATy_sub
+
         z_sub_raw = None
         try:
             z_sub_raw = np.linalg.solve(ATA_sub_reg, ATy_sub)
@@ -1509,18 +1536,6 @@ def streamActiveSetNNLS(
             "accepted": False,
             "reason": "orbit_prior_in_reduced_solve",
         }
-
-        if w_target is not None and np.any(w_target > 0.0) and orbit_prior_weight > 0.0:
-            orbit_ATA_sub, orbit_ATy_sub = _orbit_prior_quadratic_terms(
-                active_idx=active_idx,
-                S_active=S_active,
-                orbit_target_mass=np.asarray(w_target, dtype=np.float64),
-                C=C,
-                P=P,
-                orbit_prior_weight=float(orbit_prior_weight),
-            )
-            ATA_sub_reg = ATA_sub_reg + orbit_ATA_sub
-            ATy_sub = ATy_sub + orbit_ATy_sub
 
         # Track promoted columns that did not survive the reduced solve.
         failed_cols = []
@@ -1617,26 +1632,17 @@ def streamActiveSetNNLS(
             z[int(gcol)] = float(z_sub[ii])
 
         if did_explore:
-            grad_after_data = ATy_scaled - _compute_ATAz_scaled(z)
-
-            inactive_after = ~active
-            g_after_prom_data = grad_after_data[inactive_after]
-            max_grad_after_prom_data = (
-                float(np.max(g_after_prom_data))
-                if g_after_prom_data.size
-                else -np.inf
+            obj_tol = max(
+                1e-10 * max(1.0, abs(obj_old)),
+                1e-14,
             )
 
-            gain_needed = max(
-                1e-3 * abs(grad_before_data),
-                1e-6 * grad_ref,
-            )
-
-            if max_grad_after_prom_data >= grad_before_data - gain_needed:
+            if (not np.isfinite(obj_new)) or (obj_new > obj_old + obj_tol):
                 print(
                     "[MONO][explore] rolling back batch: "
-                    f"max_grad_before_data={grad_before_data:.3e} "
-                    f"max_grad_after_data={max_grad_after_prom_data:.3e}",
+                    f"obj_old={obj_old:.3e} "
+                    f"obj_new={obj_new:.3e} "
+                    f"tol={obj_tol:.3e}",
                     flush=True,
                 )
 
@@ -1699,9 +1705,7 @@ def streamActiveSetNNLS(
             _cooldown_cols(drop_cols, it, extra_iters=2)
             print(
                 f"[MONO][probation] dropped {drop_cols.size} stale columns: "
-                f"{drop_cols}",
-                flush=True,
-            )
+                f"{drop_cols}", flush=True,)
             _emit_checkpoint(it, final=False, phase="probation_prune")
             continue
 
@@ -1784,6 +1788,61 @@ def streamActiveSetNNLS(
         final_it = int(it)
     except Exception:
         final_it = 0
+
+    # Final objective summary in the solver's own scaled space.
+    x_final = _current_x_from_z(z)
+    ATAz_final = _compute_ATAz_scaled(z)
+
+    data_objective = (
+        0.5 * float(np.dot(z, ATAz_final))
+        - float(np.dot(ATy_scaled, z))
+    )
+
+    if w_target is not None and np.any(w_target > 0.0):
+        orbit_mass, orbit_target, orbit_deficit = _orbit_mass_and_deficit(z)
+        orbit_objective = 0.5 * float(orbit_prior_weight) * float(
+            np.dot(orbit_deficit, orbit_deficit)
+        )
+        orbit_resid_l1 = float(np.sum(np.abs(orbit_deficit)))
+        orbit_resid_l2 = float(np.linalg.norm(orbit_deficit))
+        orbit_resid_linf = float(np.max(np.abs(orbit_deficit)))
+    else:
+        orbit_mass = np.sum(x_final.reshape(C, P), axis=1)
+        orbit_target = np.zeros((C,), dtype=np.float64)
+        orbit_deficit = orbit_target - orbit_mass
+        orbit_objective = 0.0
+        orbit_resid_l1 = None
+        orbit_resid_l2 = None
+        orbit_resid_linf = None
+
+    total_objective = data_objective + orbit_objective
+
+    print(
+        f"[MONO][final] data_obj={data_objective:.3e} "
+        f"orbit_obj={orbit_objective:.3e} "
+        f"total_obj={total_objective:.3e} "
+        f"orbit_L1={(orbit_resid_l1 if orbit_resid_l1 is not None else float('nan')):.3e} "
+        f"orbit_Linf={(orbit_resid_linf if orbit_resid_linf is not None else float('nan')):.3e}",
+        flush=True,
+    )
+
+    _emit_diag(
+        {
+            "kind": "objective_summary",
+            "data_objective": float(data_objective),
+            "orbit_objective": float(orbit_objective),
+            "total_objective": float(total_objective),
+            "orbit_resid_l1": orbit_resid_l1,
+            "orbit_resid_l2": orbit_resid_l2,
+            "orbit_resid_linf": orbit_resid_linf,
+            "orbit_mass": orbit_mass.tolist(),
+            "orbit_target": orbit_target.tolist(),
+            "orbit_resid": orbit_deficit.tolist(),
+            "orbit_prior_present": bool(w_target is not None and np.any(w_target > 0.0)),
+            "orbit_prior_weight": float(orbit_prior_weight),
+        }
+    )
+
 
     _emit_checkpoint(final_it, final=True, phase="complete")
     return S_flat * z
@@ -2063,468 +2122,463 @@ def solve_streaming_nnls(
     best_x = x.copy()
     best_proxy = np.inf
 
-    # epoch loop
-    for ep in range(cfg.epochs):
-        print(f"[BC-FUSED] epoch {ep+1}/{cfg.epochs}", flush=True)
+    print(f"[BC-FUSED]", flush=True)
+    # D_tot per column (C,P)
+    D_tot = np.zeros((C, P), dtype=np.float64)
 
-        # D_tot per column (C,P)
-        D_tot = np.zeros((C, P), dtype=np.float64)
-
-        # ---------- single streaming pass: build ATy_flat & D_tot -------
-        ATy_flat = np.zeros((CP,), dtype=np.float64)
-        with open_h5(h5_path, role="reader") as f:
-            DC = f["/DataCube"]
-            M  = f["/HyperCube/models"]
-            try:
-                M.id.set_chunk_cache(cfg.dset_slots, cfg.dset_bytes,
-                    cfg.dset_w0)
-            except Exception:
-                pass
-
-            tile_iter = s_ranges
-            if verbose and (len(s_ranges) > 1):
-                tile_iter = tqdm(s_ranges,
-                    desc=f"[BC-FUSED] tiles ep{ep+1}",
-                    disable=not verbose)
-
-            for (s0, s1) in tile_iter:
-                Yt = np.asarray(DC[s0:s1, :], dtype=np.float64,
-                                order="C")
-                if keep_idx is not None:
-                    Yt = Yt[:, keep_idx]
-                Sblk = s1 - s0
-                Lk = Yt.shape[1]
-
-                # accumulate prediction for diagnostics (warm-start)
-                yhat_tile = np.zeros((Sblk, Lk), dtype=np.float64)
-                # read model tile (Sblk, C, P, Lk)
-                M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64,
-                    order="C")
-                if keep_idx is not None:
-                    M_tile = M_tile[:, :, :, keep_idx]
-
-                # compute D_tot contributions (per-column energy)
-                # sum over Sblk and wavelength dims
-                # M_tile: (Sblk, C, P, Lk)
-                D_tot += np.sum(M_tile * M_tile, axis=(0, 3))
-
-                # build A2_tile once for ATy accumulation
-                A2_tile = M_tile.transpose(0, 3, 1, 2).reshape(
-                    Sblk * Lk, CP)
-                y_flat = Yt.reshape(-1)
-
-                # accumulate ATy (uses data y, not residual)
-                ATy_flat += A2_tile.T @ y_flat
-
-                # diagnostics (same as before)
-                try:
-                    yf_norm = float(np.linalg.norm(y_flat)) if y_flat.size > 0 else 0.0
-                    yhatf_norm = float(np.linalg.norm(yhat_tile)) if yhat_tile.size > 0 else 0.0
-                    r_norm = float(np.linalg.norm(y_flat - yhat_tile.reshape(-1))) if y_flat.size > 0 else 0.0
-
-                    nnans = int(np.count_nonzero(~np.isfinite(y_flat)))
-                    nnans += int(np.count_nonzero(~np.isfinite(yhat_tile)))
-                    nnans += int(np.count_nonzero(~np.isfinite(y_flat - yhat_tile.reshape(-1))))
-
-                    print(
-                        f"[BC-FUSED][tile s={s0}:{s1}] Sblk={Sblk} Lk={Lk} "
-                        f"||y||={yf_norm:.3e} " + \
-                        [f"||yhat||={yhatf_norm:.3e} " if yhatf_norm > 0.0 else ""][0] + \
-                        f"||r||={r_norm:.3e} nonfinite_vals={nnans}",
-                        flush=True
-                    )
-                except Exception as _e:
-                    print("[BC-FUSED][tile diag] error while computing tile diagnostics:", _e, flush=True)
-
-        # end single streaming pass
-        # end single streaming pass
-        # ------------------------ end streaming --------------------------
-
-        # ------------------------------------------------------------------
-        # compute inv_sqrt_energy and scaled targets (per-tile average energy)
-        # Use average column energy per tile (not the summed D_tot) so the
-        # worker tile matrices and the global scaling agree.
-        # ------------------------------------------------------------------
-        col_energy_sum = D_tot.copy() # D_tot currently holds summed energy
-        n_tiles = max(1, len(s_ranges)) # number of tiles used in streaming pass
-
-        # Convert summed energy -> per-tile average energy
-        col_energy = col_energy_sum / float(n_tiles)
-
-        # ensure we only use positive entries for median calculation
-        pos_mask = (col_energy > 0.0)
-        if np.any(pos_mask):
-            energy_med = float(np.median(col_energy[pos_mask]))
-        else:
-            energy_med = 1.0
-
-        # Robust floor: clamp tiny energies to a fraction of the median
-        # (tunable; conservative default = 1% of median)
-        floor_frac = 1e-2
-        energy_floor = max(1e-30, energy_med * floor_frac)
-        col_energy = np.where(col_energy > energy_floor, col_energy, energy_floor)
-
-        # Compute raw S (1/sqrt(energy))
-        S_temp = 1.0 / np.sqrt(col_energy)
-
-        # Optional cap on extreme S to avoid a tiny set of columns dominating.
-        # Cap relative to median(S). Tunable; default allows up to 8x median.
+    # ---------- single streaming pass: build ATy_flat & D_tot -------
+    ATy_flat = np.zeros((CP,), dtype=np.float64)
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M  = f["/HyperCube/models"]
         try:
-            S_median = float(np.median(S_temp))
+            M.id.set_chunk_cache(cfg.dset_slots, cfg.dset_bytes,
+                cfg.dset_w0)
         except Exception:
-            S_median = 1.0
-        max_S_factor = 8.0
-        S_cap = max_S_factor * max(1.0, S_median)
-        S_temp = np.where(S_temp <= S_cap, S_temp, S_cap)
+            pass
 
-        # Final inv_sqrt_energy used by the solver
-        inv_sqrt_energy = S_temp
-        inv_sqrt_energy_flat = inv_sqrt_energy.ravel(order="C")
+        tile_iter = s_ranges
+        if verbose and (len(s_ranges) > 1):
+            tile_iter = tqdm(s_ranges,
+                desc=f"[BC-FUSED] tiles",
+                disable=not verbose)
 
-        # DIAGNOSTIC: report S statistics (helps find extreme scalings)
-        S_sample = inv_sqrt_energy_flat
-        try:
-            S_min = float(np.min(S_sample))
-            S_p50 = float(np.median(S_sample))
-            S_p90 = float(np.percentile(S_sample, 90.0))
-            S_p99 = float(np.percentile(S_sample, 99.0))
-            S_max = float(np.max(S_sample))
-            print(f"[DIAG] inv_sqrt_energy after per-tile avg + floor/cap: min/med/p90/p99/max = {S_min:.4e}/{S_p50:.4e}/{S_p90:.4e}/{S_p99:.4e}/{S_max:.4e}", flush=True)
-        except Exception as _e:
-            print(f"[DIAG] error printing S stats: {_e}", flush=True)
-
-        # run streaming active-set NNLS (monolithic) using persistent executor
-        print("[BC-FUSED][MONO] starting streaming active-set NNLS (mono)", flush=True)
-
-        # --------------------------
-        # Create persistent executor
-        # --------------------------
-        n_workers = max(1, int(cfg.processes))
-        # Use spawn to be safe with HDF5 + forking
-        ctx = mp.get_context("spawn")
-
-        executor = ProcessPoolExecutor(
-            max_workers=n_workers,
-            mp_context=ctx,
-            initializer=_init_worker,
-            initargs=(cfg.blas_threads,),
-        )
-
-        # DIAGNOSTICS: place immediately before the monolithic call
-        with open_h5(h5_path, role="reader") as f:
-            # small sample: first tile only (fast)
-            s0, s1 = s_ranges[0]
-            DC = f["/DataCube"]
-            M  = f["/HyperCube/models"]
-            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
+        for (s0, s1) in tile_iter:
+            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64,
+                            order="C")
             if keep_idx is not None:
                 Yt = Yt[:, keep_idx]
-            M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
+            Sblk = s1 - s0
+            Lk = Yt.shape[1]
+
+            # accumulate prediction for diagnostics (warm-start)
+            yhat_tile = np.zeros((Sblk, Lk), dtype=np.float64)
+            # read model tile (Sblk, C, P, Lk)
+            M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64,
+                order="C")
             if keep_idx is not None:
                 M_tile = M_tile[:, :, :, keep_idx]
 
-        # 1) D_tot sanity
-        D_sample = np.sum(M_tile * M_tile, axis=(0, 3))
-        print(f"[DIAG] sample D_tot (per-column) stats: min/max/median = {D_sample.min():.4e}/{D_sample.max():.4e}/{np.median(D_sample):.4e}", flush=True)
+            # compute D_tot contributions (per-column energy)
+            # sum over Sblk and wavelength dims
+            # M_tile: (Sblk, C, P, Lk)
+            D_tot += np.sum(M_tile * M_tile, axis=(0, 3))
 
-        # 2) ATy from streaming vs manual for the same tile
-        CP = int(C * P)
-        A2_tile = M_tile.transpose(0, 3, 1, 2).reshape((s1 - s0) * Yt.shape[1], CP)
-        ATy_tile_stream = A2_tile.T @ Yt.reshape(-1)
-        ATy_tile_manual = np.zeros_like(ATy_tile_stream)
-        # compute by summing per-column norm & dot to detect transpose/reshape errors
-        for col in range(min(10, ATy_tile_stream.size)):
-            ATy_tile_manual[col] = np.dot(A2_tile[:, col], Yt.reshape(-1))
-        print(f"[DIAG] ATy_tile difference (first 10 cols) maxabs = {float(np.max(np.abs(ATy_tile_stream[:10] - ATy_tile_manual[:10]))):.4e}", flush=True)
+            # build A2_tile once for ATy accumulation
+            A2_tile = M_tile.transpose(0, 3, 1, 2).reshape(
+                Sblk * Lk, CP)
+            y_flat = Yt.reshape(-1)
 
-        # 3) compare scaled vs unscaled reduced-worker ATA/ATy for a tiny active set
-        # pick first k columns as "active"
-        k = min(6, CP)
-        active_idx = np.arange(k, dtype=np.int64)
-        S_flat = np.asarray(inv_sqrt_energy_flat, dtype=np.float64).ravel()
-        S_active = S_flat[active_idx]
-        # Build scaled A2 like reduced worker
-        A2_small = np.empty((A2_tile.shape[0], k), dtype=np.float64)
-        for j, gcol in enumerate(active_idx):
-            cc = int(gcol // P)
-            p = int(gcol % P)
-            A2_small[:, j] = M_tile[:, cc, p, :].reshape(-1)
-        A2_small *= S_active[None, :]
-        ATA_sub_local = A2_small.T @ A2_small
-        ATy_sub_local = A2_small.T @ Yt.reshape(-1)
-        print(f"[DIAG] ATA_sub_local shape, ATy_sub_local[0:6]: {ATA_sub_local.shape} {ATy_sub_local[:6]}", flush=True)
+            # accumulate ATy (uses data y, not residual)
+            ATy_flat += A2_tile.T @ y_flat
 
-        checkpoint_every = int(
-            os.environ.get("CUBEFIT_SOLVER_CHECKPOINT_EVERY", "50")
-        )
-
-        latest_ckpt = {
-            "x": np.asarray(x, dtype=np.float64).ravel(order="C").copy(),
-            "stats": {
-                "iter": 0,
-                "max_iter": 0,
-                "phase": "init",
-                "final": False,
-                "active": int(np.count_nonzero(x > 0.0)),
-                "stall_count": 0,
-            },
-        }
-
-        checkpoint_error_logged = False
-
-        def _checkpoint_cb(x_vec: np.ndarray, stats: dict) -> None:
-            nonlocal checkpoint_error_logged
-
-            latest_ckpt["x"] = np.asarray(
-                x_vec, dtype=np.float64
-            ).ravel(order="C").copy()
-            latest_ckpt["stats"] = dict(stats)
-
-            if tracker is None:
-                return
-
+            # diagnostics (same as before)
             try:
-                tracker.maybe_snapshot_x(
-                    latest_ckpt["x"],
-                    epoch=int(stats.get("iter", -1)),
-                    rmse=None,
-                    force=True,
+                yf_norm = float(np.linalg.norm(y_flat)) if y_flat.size > 0 else 0.0
+                yhatf_norm = float(np.linalg.norm(yhat_tile)) if yhat_tile.size > 0 else 0.0
+                r_norm = float(np.linalg.norm(y_flat - yhat_tile.reshape(-1))) if y_flat.size > 0 else 0.0
+
+                nnans = int(np.count_nonzero(~np.isfinite(y_flat)))
+                nnans += int(np.count_nonzero(~np.isfinite(yhat_tile)))
+                nnans += int(np.count_nonzero(~np.isfinite(y_flat - yhat_tile.reshape(-1))))
+
+                print(
+                    f"[BC-FUSED][tile s={s0}:{s1}] Sblk={Sblk} Lk={Lk} "
+                    f"||y||={yf_norm:.3e} " + \
+                    [f"||yhat||={yhatf_norm:.3e} " if yhatf_norm > 0.0 else ""][0] + \
+                    f"||r||={r_norm:.3e} nonfinite_vals={nnans}",
+                    flush=True
                 )
+            except Exception as _e:
+                print("[BC-FUSED][tile diag] error while computing tile diagnostics:", _e, flush=True)
+
+    # end single streaming pass
+    # end single streaming pass
+    # ------------------------ end streaming --------------------------
+
+    # ------------------------------------------------------------------
+    # compute inv_sqrt_energy and scaled targets (per-tile average energy)
+    # Use average column energy per tile (not the summed D_tot) so the
+    # worker tile matrices and the global scaling agree.
+    # ------------------------------------------------------------------
+    col_energy_sum = D_tot.copy() # D_tot currently holds summed energy
+    n_tiles = max(1, len(s_ranges)) # number of tiles used in streaming pass
+
+    # Convert summed energy -> per-tile average energy
+    col_energy = col_energy_sum / float(n_tiles)
+
+    # ensure we only use positive entries for median calculation
+    pos_mask = (col_energy > 0.0)
+    if np.any(pos_mask):
+        energy_med = float(np.median(col_energy[pos_mask]))
+    else:
+        energy_med = 1.0
+
+    # Robust floor: clamp tiny energies to a fraction of the median
+    # (tunable; conservative default = 1% of median)
+    floor_frac = 1e-2
+    energy_floor = max(1e-30, energy_med * floor_frac)
+    col_energy = np.where(col_energy > energy_floor, col_energy, energy_floor)
+
+    # Compute raw S (1/sqrt(energy))
+    S_temp = 1.0 / np.sqrt(col_energy)
+
+    # Optional cap on extreme S to avoid a tiny set of columns dominating.
+    # Cap relative to median(S). Tunable; default allows up to 8x median.
+    try:
+        S_median = float(np.median(S_temp))
+    except Exception:
+        S_median = 1.0
+    max_S_factor = 8.0
+    S_cap = max_S_factor * max(1.0, S_median)
+    S_temp = np.where(S_temp <= S_cap, S_temp, S_cap)
+
+    # Final inv_sqrt_energy used by the solver
+    inv_sqrt_energy = S_temp
+    inv_sqrt_energy_flat = inv_sqrt_energy.ravel(order="C")
+
+    # DIAGNOSTIC: report S statistics (helps find extreme scalings)
+    S_sample = inv_sqrt_energy_flat
+    try:
+        S_min = float(np.min(S_sample))
+        S_p50 = float(np.median(S_sample))
+        S_p90 = float(np.percentile(S_sample, 90.0))
+        S_p99 = float(np.percentile(S_sample, 99.0))
+        S_max = float(np.max(S_sample))
+        print(f"[DIAG] inv_sqrt_energy after per-tile avg + floor/cap: min/med/p90/p99/max = {S_min:.4e}/{S_p50:.4e}/{S_p90:.4e}/{S_p99:.4e}/{S_max:.4e}", flush=True)
+    except Exception as _e:
+        print(f"[DIAG] error printing S stats: {_e}", flush=True)
+
+    # run streaming active-set NNLS (monolithic) using persistent executor
+    print("[BC-FUSED][MONO] starting streaming active-set NNLS (mono)", flush=True)
+
+    # --------------------------
+    # Create persistent executor
+    # --------------------------
+    n_workers = max(1, int(cfg.processes))
+    # Use spawn to be safe with HDF5 + forking
+    ctx = mp.get_context("spawn")
+
+    executor = ProcessPoolExecutor(
+        max_workers=n_workers,
+        mp_context=ctx,
+        initializer=_init_worker,
+        initargs=(cfg.blas_threads,),
+    )
+
+    # DIAGNOSTICS: place immediately before the monolithic call
+    with open_h5(h5_path, role="reader") as f:
+        # small sample: first tile only (fast)
+        s0, s1 = s_ranges[0]
+        DC = f["/DataCube"]
+        M  = f["/HyperCube/models"]
+        Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
+        if keep_idx is not None:
+            Yt = Yt[:, keep_idx]
+        M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
+        if keep_idx is not None:
+            M_tile = M_tile[:, :, :, keep_idx]
+
+    # 1) D_tot sanity
+    D_sample = np.sum(M_tile * M_tile, axis=(0, 3))
+    print(f"[DIAG] sample D_tot (per-column) stats: min/max/median = {D_sample.min():.4e}/{D_sample.max():.4e}/{np.median(D_sample):.4e}", flush=True)
+
+    # 2) ATy from streaming vs manual for the same tile
+    A2_tile = M_tile.transpose(0, 3, 1, 2).reshape((s1 - s0) * Yt.shape[1], CP)
+    ATy_tile_stream = A2_tile.T @ Yt.reshape(-1)
+    ATy_tile_manual = np.zeros_like(ATy_tile_stream)
+    # compute by summing per-column norm & dot to detect transpose/reshape errors
+    for col in range(min(10, ATy_tile_stream.size)):
+        ATy_tile_manual[col] = np.dot(A2_tile[:, col], Yt.reshape(-1))
+    print(f"[DIAG] ATy_tile difference (first 10 cols) maxabs = {float(np.max(np.abs(ATy_tile_stream[:10] - ATy_tile_manual[:10]))):.4e}", flush=True)
+
+    # 3) compare scaled vs unscaled reduced-worker ATA/ATy for a tiny active set
+    # pick first k columns as "active"
+    k = min(6, CP)
+    active_idx = np.arange(k, dtype=np.int64)
+    S_flat = np.asarray(inv_sqrt_energy_flat, dtype=np.float64).ravel()
+    S_active = S_flat[active_idx]
+    # Build scaled A2 like reduced worker
+    A2_small = np.empty((A2_tile.shape[0], k), dtype=np.float64)
+    for j, gcol in enumerate(active_idx):
+        cc = int(gcol // P)
+        p = int(gcol % P)
+        A2_small[:, j] = M_tile[:, cc, p, :].reshape(-1)
+    A2_small *= S_active[None, :]
+    ATA_sub_local = A2_small.T @ A2_small
+    ATy_sub_local = A2_small.T @ Yt.reshape(-1)
+    print(f"[DIAG] ATA_sub_local shape, ATy_sub_local[0:6]: {ATA_sub_local.shape} {ATy_sub_local[:6]}", flush=True)
+
+    checkpoint_every = int(
+        os.environ.get("CUBEFIT_SOLVER_CHECKPOINT_EVERY", "50")
+    )
+
+    latest_ckpt = {
+        "x": np.asarray(x, dtype=np.float64).ravel(order="C").copy(),
+        "stats": {
+            "iter": 0,
+            "max_iter": 0,
+            "phase": "init",
+            "final": False,
+            "active": int(np.count_nonzero(x > 0.0)),
+            "stall_count": 0,
+        },
+    }
+
+    checkpoint_error_logged = False
+
+    def _checkpoint_cb(x_vec: np.ndarray, stats: dict) -> None:
+        nonlocal checkpoint_error_logged
+
+        latest_ckpt["x"] = np.asarray(
+            x_vec, dtype=np.float64
+        ).ravel(order="C").copy()
+        latest_ckpt["stats"] = dict(stats)
+
+        if tracker is None:
+            return
+
+        try:
+            tracker.maybe_snapshot_x(
+                latest_ckpt["x"],
+                epoch=int(stats.get("iter", -1)),
+                rmse=None,
+                force=True,
+            )
+        except Exception as exc:
+            if not checkpoint_error_logged:
+                print(
+                    f"[MONO][checkpoint] maybe_snapshot_x failed: {exc}",
+                    flush=True,
+                )
+                checkpoint_error_logged = True
+            return
+
+        save_state = getattr(tracker, "save_state", None)
+        if callable(save_state):
+            try:
+                state = dict(stats.get("resume_state", {}))
+                if not state:
+                    state = {
+                        "iter": int(stats.get("iter", -1)),
+                        "max_iter": int(stats.get("max_iter", -1)),
+                        "phase": str(stats.get("phase", "solve")),
+                        "final": bool(stats.get("final", False)),
+                        "active": int(stats.get("active", -1)),
+                        "stall_count": int(stats.get("stall_count", -1)),
+                    }
+                save_state(state)
             except Exception as exc:
                 if not checkpoint_error_logged:
                     print(
-                        f"[MONO][checkpoint] maybe_snapshot_x failed: {exc}",
+                        f"[MONO][checkpoint] save_state failed: {exc}",
                         flush=True,
                     )
                     checkpoint_error_logged = True
-                return
-
-            save_state = getattr(tracker, "save_state", None)
-            if callable(save_state):
-                try:
-                    state = dict(stats.get("resume_state", {}))
-                    if not state:
-                        state = {
-                            "iter": int(stats.get("iter", -1)),
-                            "max_iter": int(stats.get("max_iter", -1)),
-                            "phase": str(stats.get("phase", "solve")),
-                            "final": bool(stats.get("final", False)),
-                            "active": int(stats.get("active", -1)),
-                            "stall_count": int(stats.get("stall_count", -1)),
-                        }
-                    save_state(state)
-                except Exception as exc:
-                    if not checkpoint_error_logged:
-                        print(
-                            f"[MONO][checkpoint] save_state failed: {exc}",
-                            flush=True,
-                        )
-                        checkpoint_error_logged = True
-            else:
-                if not checkpoint_error_logged:
-                    print(
-                        "[MONO][checkpoint] tracker has no save_state(); "
-                        "x snapshots will still be written",
-                        flush=True,
-                    )
-                    checkpoint_error_logged = True
-
-        try:
-            x_flat_unscaled = streamActiveSetNNLS(
-                h5_path=h5_path,
-                s_ranges=s_ranges,
-                keep_idx=keep_idx,
-                ATy_flat=ATy_flat,
-                inv_sqrt_energy_flat=inv_sqrt_energy_flat,
-                C=C,
-                P=P,
-                executor=executor,
-                cfg=cfg,
-                orbit_weights=orbit_weights,
-                x0_flat=x.ravel(order="C"),
-                resume_state=resume_state,
-                max_active=monolithic_max_active,
-                tol_grad=1e-8,
-                max_iter=5 * monolithic_max_active,
-                checkpoint_cb=_checkpoint_cb,
-                checkpoint_every=checkpoint_every,
-                orbit_prior_weight=orbit_prior_weight,
-            )
-
-            x = x_flat_unscaled.reshape(C, P).copy()
-            print("[BC-FUSED][MONO] finished streaming active-set NNLS",
-                flush=True)
-
-        finally:
-            try:
-                # shut down worker pool once per monolithic solve
-                executor.shutdown(wait=True)
-            except Exception:
-                pass
-
-        # --- DIAG: after all blocks solved (before projection) ---
-        try:
-            x_flat = x.ravel(order="C")
-            x_nonzero = int(np.count_nonzero(x_flat > 0))
-            x_sparsity = 1.0 - (x_nonzero / float(x_flat.size)) if x_flat.size else 1.0
-            x_l1 = float(np.sum(x_flat))
-            x_max = float(np.max(x_flat)) if x_flat.size else 0.0
-            x_min = float(np.min(x_flat)) if x_flat.size else 0.0
-            D_tot_finite = np.isfinite(D_tot)
-            dpos = float(np.sum(D_tot[D_tot_finite]))
-            print(
-                f"[BC-FUSED][after-blocks] x_l1={x_l1:.3e} max={x_max:.3e} min={x_min:.3e} "
-                f"nonzero={x_nonzero}/{x_flat.size} sparsity={x_sparsity:.3f} D_tot_sum={dpos:.3e}",
-                flush=True
-            )
-
-            # check for non-finite in x
-            nbad = int(np.count_nonzero(~np.isfinite(x_flat)))
-            if nbad:
-                print(f"[BC-FUSED][after-blocks] WARNING: non-finite entries in x: {nbad}", flush=True)
-
-        except Exception as _e:
-            print("[BC-FUSED][after-blocks] diag error:", _e, flush=True)
-        # --- end after-blocks diagnostics ---
-
-        # -------------------- epoch diagnostics & best-x --------------------
-        # Compute simple RMSE proxy (full scan cheap relative to earlier streaming)
-        rmse_curr = float("nan")
-        ssq = 0.0
-        nres = 0
-        with open_h5(h5_path, role="reader") as f:
-            DC = f["/DataCube"]
-            for (s0, s1) in s_ranges:
-                Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
-                if keep_idx is not None:
-                    Yt = Yt[:, keep_idx]
-                # build current yhat_tile for diagnostics
-                yhat_tile = np.zeros_like(Yt)
-                for cc in range(C):
-                    if known_zero_orbit[cc]:
-                        continue
-                    A_cc = np.asarray(f["/HyperCube/models"][s0:s1, cc, :, :], dtype=np.float64, order="C")
-                    if keep_idx is not None:
-                        A_cc = A_cc[:, :, keep_idx]
-                    yhat_tile += x[cc] @ A_cc
-                R = Yt - yhat_tile
-                if not np.all(np.isfinite(R)):
-                    R = np.nan_to_num(R, copy=False)
-                ssq += float(np.sum(R * R))
-                nres += R.size
-        if nres > 0:
-            rmse_curr = float(np.sqrt(ssq / max(1, nres)))
-            data_proxy = 0.5 * (rmse_curr ** 2)
         else:
-            data_proxy = np.inf
+            if not checkpoint_error_logged:
+                print(
+                    "[MONO][checkpoint] tracker has no save_state(); "
+                    "x snapshots will still be written",
+                    flush=True,
+                )
+                checkpoint_error_logged = True
 
-        if data_proxy < best_proxy:
-            best_proxy = float(data_proxy)
-            best_x = x.copy()
-            print(f"[BC-FUSED] new best proxy {best_proxy:.3e} at epoch {ep+1}", flush=True)
+    try:
+        x_flat_unscaled = streamActiveSetNNLS(
+            h5_path=h5_path,
+            s_ranges=s_ranges,
+            keep_idx=keep_idx,
+            ATy_flat=ATy_flat,
+            inv_sqrt_energy_flat=inv_sqrt_energy_flat,
+            C=C,
+            P=P,
+            executor=executor,
+            cfg=cfg,
+            orbit_weights=orbit_weights,
+            x0_flat=x.ravel(order="C"),
+            resume_state=resume_state,
+            max_active=monolithic_max_active,
+            tol_grad=1e-8,
+            max_iter=5 * monolithic_max_active,
+            checkpoint_cb=_checkpoint_cb,
+            checkpoint_every=checkpoint_every,
+            orbit_prior_weight=orbit_prior_weight,
+        )
 
-        # --- DIAG: epoch summary (timings & numerical health) ---
+        x = x_flat_unscaled.reshape(C, P).copy()
+        print("[BC-FUSED][MONO] finished streaming active-set NNLS",
+            flush=True)
+
+    finally:
         try:
-            epoch_elapsed = time.perf_counter() - t0
-            # D_tot stats per-orbit
-            D_tot_flat = D_tot.ravel(order="C")
-            D_finite = D_tot_flat[np.isfinite(D_tot_flat) & (D_tot_flat > 0)]
-            D_median = float(np.median(D_finite)) if D_finite.size else 0.0
-            D_min = float(np.min(D_finite)) if D_finite.size else 0.0
-            D_max = float(np.max(D_finite)) if D_finite.size else 0.0
+            # shut down worker pool once per monolithic solve
+            executor.shutdown(wait=True)
+        except Exception:
+            pass
 
-            x_flat = best_x.ravel(order="C")
-            x_nonfinite = int(np.count_nonzero(~np.isfinite(x_flat)))
-            x_nonzero = int(np.count_nonzero(x_flat > 0))
-            x_sum = float(np.sum(x_flat))
-            x_norm = float(np.linalg.norm(x_flat)) if x_flat.size else 0.0
+    # --- DIAG: after all blocks solved (before projection) ---
+    try:
+        x_flat = x.ravel(order="C")
+        x_nonzero = int(np.count_nonzero(x_flat > 0))
+        x_sparsity = 1.0 - (x_nonzero / float(x_flat.size)) if x_flat.size else 1.0
+        x_l1 = float(np.sum(x_flat))
+        x_max = float(np.max(x_flat)) if x_flat.size else 0.0
+        x_min = float(np.min(x_flat)) if x_flat.size else 0.0
+        D_tot_finite = np.isfinite(D_tot)
+        dpos = float(np.sum(D_tot[D_tot_finite]))
+        print(
+            f"[BC-FUSED][after-blocks] x_l1={x_l1:.3e} max={x_max:.3e} min={x_min:.3e} "
+            f"nonzero={x_nonzero}/{x_flat.size} sparsity={x_sparsity:.3f} D_tot_sum={dpos:.3e}",
+            flush=True
+        )
 
-            print("=== [BC-FUSED][epoch-summary] ===", flush=True)
-            print(f"[BC-FUSED][epoch-summary] epoch={ep+1}/{cfg.epochs} elapsed_total={epoch_elapsed:.1f}s", flush=True)
-            if np.isfinite(rmse_curr):
-                print(f"[BC-FUSED][epoch-summary] data_proxy={data_proxy:.3e} rmse={rmse_curr:.3e}", flush=True)
-            else:
-                print(f"[BC-FUSED][epoch-summary] data_proxy={data_proxy:.3e} rmse=nan", flush=True)
-            print(f"[BC-FUSED][epoch-summary] best_proxy={best_proxy:.3e}", flush=True)
-            print(
-                f"[BC-FUSED][epoch-summary] x_sum={x_sum:.3e} x_norm={x_norm:.3e} nonzero={x_nonzero}/{x_flat.size} nonfinite={x_nonfinite}",
-                flush=True
-            )
-            print(
-                f"[BC-FUSED][epoch-summary] D_tot diag med/min/max = {D_median:.3e} / {D_min:.3e} / {D_max:.3e}",
-                flush=True
-            )
+        # check for non-finite in x
+        nbad = int(np.count_nonzero(~np.isfinite(x_flat)))
+        if nbad:
+            print(f"[BC-FUSED][after-blocks] WARNING: non-finite entries in x: {nbad}", flush=True)
 
-            # sanity checks that likely indicate major numerical problems
-            if x_nonzero == 0:
-                print("[BC-FUSED][epoch-summary] ALERT: x is entirely zero after epoch!", flush=True)
-            if x_nonfinite > 0:
-                print("[BC-FUSED][epoch-summary] ALERT: non-finite elements in x!", flush=True)
-            if not np.isfinite(data_proxy) or data_proxy <= 0.0:
-                print("[BC-FUSED][epoch-summary] ALERT: data_proxy non-finite or <= 0.0", flush=True)
+    except Exception as _e:
+        print("[BC-FUSED][after-blocks] diag error:", _e, flush=True)
+    # --- end after-blocks diagnostics ---
 
-            # show top contributors (per-orbit totals)
-            try:
-                s_full = np.sum(x, axis=1)  # per-orbit
-                top_idx = np.argsort(s_full)[::-1][:10]
-                top_vals = s_full[top_idx]
-                print("[BC-FUSED][epoch-summary] top orbits (index:mass): " + ", ".join(
-                    [f"{int(i)}:{v:.3e}" for i, v in zip(top_idx.tolist(), top_vals.tolist())]
-                ), flush=True)
-            except Exception:
-                pass
-            # --- orbit_weights residual diagnostic (if prior provided) -----
-            try:
-                if (w_target is not None) and (np.sum(w_target) > 0.0):
-                    s_full = np.sum(x, axis=1)
-                    s_proj = np.asarray(w_target, dtype=np.float64).copy()
+    # -------------------- epoch diagnostics & best-x --------------------
+    # Compute simple RMSE proxy (full scan cheap relative to earlier streaming)
+    rmse_curr = float("nan")
+    ssq = 0.0
+    nres = 0
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        for (s0, s1) in s_ranges:
+            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
+            if keep_idx is not None:
+                Yt = Yt[:, keep_idx]
+            # build current yhat_tile for diagnostics
+            yhat_tile = np.zeros_like(Yt)
+            for cc in range(C):
+                if known_zero_orbit[cc]:
+                    continue
+                A_cc = np.asarray(f["/HyperCube/models"][s0:s1, cc, :, :], dtype=np.float64, order="C")
+                if keep_idx is not None:
+                    A_cc = A_cc[:, :, keep_idx]
+                yhat_tile += x[cc] @ A_cc
+            R = Yt - yhat_tile
+            if not np.all(np.isfinite(R)):
+                R = np.nan_to_num(R, copy=False)
+            ssq += float(np.sum(R * R))
+            nres += R.size
+    if nres > 0:
+        rmse_curr = float(np.sqrt(ssq / max(1, nres)))
+        data_proxy = 0.5 * (rmse_curr ** 2)
+    else:
+        data_proxy = np.inf
 
-                    print("[DIAG][orbit_weights]", flush=True)
-                    for cc in range(C):
-                        st = _support_stats_1d(x[cc, :])
-                        resid = float(s_full[cc] - s_proj[cc])
-                        ratio = float(s_full[cc] / max(s_proj[cc], 1e-30))
-                        print(
-                            f"orbit {cc:2d}: "
-                            f"mass={s_full[cc]:.3e} "
-                            f"target={s_proj[cc]:.3e} "
-                            f"resid={resid:+.3e} "
-                            f"ratio={ratio:7.3f} "
-                            f"nz={int(np.count_nonzero(x[cc, :] > 0.0)):3d} "
-                            f"eff={st['eff_support']:.2f} "
-                            f"top={st['top_share']:.2f}",
-                            flush=True,
-                        )
+    if data_proxy < best_proxy:
+        best_proxy = float(data_proxy)
+        best_x = x.copy()
+        print(f"[BC-FUSED] new best proxy {best_proxy:.3e}", flush=True)
 
-                    _emit_diag(
-                        {
-                            "kind": "epoch_orbit_table",
-                            "epoch": int(ep + 1),
-                            "orbit_mass": s_full.tolist(),
-                            "orbit_target": s_proj.tolist(),
-                            "orbit_resid": (s_full - s_proj).tolist(),
-                            "orbit_ratio": (s_full / np.maximum(s_proj, 1e-30)).tolist(),
-                            "orbit_nz": np.count_nonzero(x > 0.0, axis=1).astype(int).tolist(),
-                        }
-                    )
-                else:
+    # --- DIAG: epoch summary (timings & numerical health) ---
+    try:
+        epoch_elapsed = time.perf_counter() - t0
+        # D_tot stats per-orbit
+        D_tot_flat = D_tot.ravel(order="C")
+        D_finite = D_tot_flat[np.isfinite(D_tot_flat) & (D_tot_flat > 0)]
+        D_median = float(np.median(D_finite)) if D_finite.size else 0.0
+        D_min = float(np.min(D_finite)) if D_finite.size else 0.0
+        D_max = float(np.max(D_finite)) if D_finite.size else 0.0
+
+        x_flat = best_x.ravel(order="C")
+        x_nonfinite = int(np.count_nonzero(~np.isfinite(x_flat)))
+        x_nonzero = int(np.count_nonzero(x_flat > 0))
+        x_sum = float(np.sum(x_flat))
+        x_norm = float(np.linalg.norm(x_flat)) if x_flat.size else 0.0
+
+        print("=== [BC-FUSED][summary] ===", flush=True)
+        print(f"[BC-FUSED][summary] elapsed_total={epoch_elapsed:.1f}s", flush=True)
+        if np.isfinite(rmse_curr):
+            print(f"[BC-FUSED][summary] data_proxy={data_proxy:.3e} rmse={rmse_curr:.3e}", flush=True)
+        else:
+            print(f"[BC-FUSED][summary] data_proxy={data_proxy:.3e} rmse=nan", flush=True)
+        print(f"[BC-FUSED][summary] best_proxy={best_proxy:.3e}", flush=True)
+        print(
+            f"[BC-FUSED][summary] x_sum={x_sum:.3e} x_norm={x_norm:.3e} nonzero={x_nonzero}/{x_flat.size} nonfinite={x_nonfinite}",
+            flush=True
+        )
+        print(
+            f"[BC-FUSED][summary] D_tot diag med/min/max = {D_median:.3e} / {D_min:.3e} / {D_max:.3e}",
+            flush=True
+        )
+
+        # sanity checks that likely indicate major numerical problems
+        if x_nonzero == 0:
+            print("[BC-FUSED][summary] ALERT: x is entirely zero after epoch!", flush=True)
+        if x_nonfinite > 0:
+            print("[BC-FUSED][summary] ALERT: non-finite elements in x!", flush=True)
+        if not np.isfinite(data_proxy) or data_proxy <= 0.0:
+            print("[BC-FUSED][summary] ALERT: data_proxy non-finite or <= 0.0", flush=True)
+
+        # show top contributors (per-orbit totals)
+        try:
+            s_full = np.sum(x, axis=1)  # per-orbit
+            top_idx = np.argsort(s_full)[::-1][:10]
+            top_vals = s_full[top_idx]
+            print("[BC-FUSED][summary] top orbits (index:mass): " + ", ".join(
+                [f"{int(i)}:{v:.3e}" for i, v in zip(top_idx.tolist(), top_vals.tolist())]
+            ), flush=True)
+        except Exception:
+            pass
+        # --- orbit_weights residual diagnostic (if prior provided) -----
+        try:
+            if (w_target is not None) and (np.sum(w_target) > 0.0):
+                s_full = np.sum(x, axis=1)
+                s_proj = np.asarray(w_target, dtype=np.float64).copy()
+
+                print("[DIAG][orbit_weights]", flush=True)
+                for cc in range(C):
+                    st = _support_stats_1d(x[cc, :])
+                    resid = float(s_full[cc] - s_proj[cc])
+                    ratio = float(s_full[cc] / max(s_proj[cc], 1e-30))
                     print(
-                        "[DIAG][orbit_weights] no w_target present; skipping orbit table.",
+                        f"orbit {cc:2d}: "
+                        f"mass={s_full[cc]:.3e} "
+                        f"target={s_proj[cc]:.3e} "
+                        f"resid={resid:+.3e} "
+                        f"ratio={ratio:7.3f} "
+                        f"nz={int(np.count_nonzero(x[cc, :] > 0.0)):3d} "
+                        f"eff={st['eff_support']:.2f} "
+                        f"top={st['top_share']:.2f}",
                         flush=True,
                     )
-            except Exception as _e:
-                print("[DIAG][orbit_weights] diagnostic failed:", _e, flush=True)
 
-            print("=== [BC-FUSED][epoch-summary] end ===", flush=True)
+                _emit_diag(
+                    {
+                        "kind": "epoch_orbit_table",
+                        "orbit_mass": s_full.tolist(),
+                        "orbit_target": s_proj.tolist(),
+                        "orbit_resid": (s_full - s_proj).tolist(),
+                        "orbit_ratio": (s_full / np.maximum(s_proj, 1e-30)).tolist(),
+                        "orbit_nz": np.count_nonzero(x > 0.0, axis=1).astype(int).tolist(),
+                    }
+                )
+            else:
+                print(
+                    "[DIAG][orbit_weights] no w_target present; skipping orbit table.",
+                    flush=True,
+                )
         except Exception as _e:
-            print("[BC-FUSED][epoch-summary] error:", _e, flush=True)
-        # --- end epoch summary diagnostics ---
+            print("[DIAG][orbit_weights] diagnostic failed:", _e, flush=True)
+
+        print("=== [BC-FUSED][epoch-summary] end ===", flush=True)
+    except Exception as _e:
+        print("[BC-FUSED][epoch-summary] error:", _e, flush=True)
+    # --- end epoch summary diagnostics ---
 
     # done epochs
     th = cu.zero_floor_inplace(best_x, rel_tol=1e-25, abs_tol=0.0)
     elapsed = time.perf_counter() - t0
+
     stats = dict(
-        epochs=int(cfg.epochs),
         elapsed_sec=elapsed,
         rmse_proxy_best=float(best_proxy),
         known_zero_mask=known_zero.copy(),

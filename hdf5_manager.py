@@ -26,6 +26,7 @@ v1.1:   Normalise all LOSVD kernels to unity on write in `populate_from_arrays`.
             10 January 2026
 v1.2:   Fixed non-flux-conservation in `_build_R_T_dense`. 22 January 2026
 v1.3:   Universally removed all ad-hoc scalings. 25 January 2026
+v1.4:   Cleaned up legacy code. 4 August 2026
 
 
 HDF5 manager for CubeFit.
@@ -1120,45 +1121,6 @@ class H5Manager:
             _write("/DataCube",
                 datacube_SL.astype(np.float64, copy=False),
                 dtype=np.float64)  # (S,L)
-            # --- Normalize LOSVD kernels to unit integral and persist norms ---
-            # losvd_in has shape (S, V, C)
-            # losvd_norm = losvd_in.astype(np.float64, copy=False)
-
-            # # Sum over velocity axis (axis=1)
-            # # Result shape: (S, C)
-            # losvd_amp_sum = np.sum(losvd_norm, axis=1)
-
-            # # Persist normalization factors
-            # if "/HyperCube/losvd_norm" in f:
-            #     del f["/HyperCube/losvd_norm"]
-            # ds_norm = f.create_dataset(
-            #     "/HyperCube/losvd_norm",
-            #     data=losvd_amp_sum.astype(np.float64),
-            #     dtype=np.float64,
-            # )
-            # ds_norm.attrs["semantic"] = "LOSVD integral over velocity (pre-normalization)"
-            # ds_norm.attrs["normalized_to_unity"] = True
-            # ds_norm.attrs["source"] = "H5Manager.populate_from_arrays"
-
-            # # Normalize LOSVDs in-place (protect against zero mass)
-            # safe = losvd_amp_sum > 0.0
-            # # Expand denominator to (S, 1, C)
-            # denom = losvd_amp_sum[:, None, :]
-
-            # # Normalize where denom > 0, else zero
-            # losvd_norm = np.where(
-            #     denom > 0.0,
-            #     losvd_norm / denom,
-            #     0.0,
-            # )
-
-            # # Optional sanity check (cheap and decisive)
-            # if not np.allclose(
-            #     np.sum(losvd_in, axis=1)[safe],
-            #     1.0,
-            #     rtol=1e-6,
-            # ):
-            #     raise RuntimeError("LOSVD normalization failed in populate_from_arrays")
 
             # Write normalized LOSVDs
             _write(
@@ -1848,52 +1810,6 @@ def plot_prefit_panel(
 
 # ------------------------------------------------------------------------------
 
-def _component_scale(f, s: int, c: int, eps: float = 1e-30) -> tuple[float, str, float]:
-    """
-    Compute the scale applied to (s,c) columns in /HyperCube/models.
-
-    Parameters
-    ----------
-    f : h5py.File
-        Open HDF5 handle.
-    s : int
-        Spaxel index.
-    c : int
-        Component index.
-    eps : float, optional
-        Numerical floor to avoid divide-by-zero.
-
-    Returns
-    -------
-    scale_sc : float
-        The multiplicative factor actually applied to every (p,λ) for this
-        (s,c) in the models array.
-    mode : str
-        'data' or 'model' (the normalization mode).
-    frac : float
-        For data-mode only: A[s,c] / sum_c A[s,c]. For model-mode this is
-        0.0 (unused).
-
-    Examples
-    --------
-    >>> with open_h5(h5, 'reader') as f:
-    ...     scale, mode, frac = _component_scale(f, 1033, 124)
-    ...     print(scale, mode, frac)
-    """
-    mode = str(f["/HyperCube"].attrs.get("norm.mode", "model")).lower()
-    A_sc = float(f["/HyperCube/norm/losvd_amp"][s, c])  # A[s,c]
-    if mode == "data":
-        a_sum = float(f["/HyperCube/norm/losvd_amp_sum"][s])  # Σ_c A[s,c]
-        Ls = float(f["/HyperCube/data_flux"][s])              # masked mean data
-        if a_sum <= 0.0 or Ls <= 0.0:
-            return 0.0, mode, 0.0
-        frac = A_sc / max(a_sum, eps)
-        return Ls * frac, mode, frac
-    else:
-        return A_sc, mode, 0.0
-
-# ------------------------------------------------------------------------------
-
 def live_prefit_snapshot_from_models(
     h5_path: str,
     *,
@@ -2224,7 +2140,6 @@ def live_prefit_snapshot_from_models(
 
             v_for_k, Hk = _kernel_from_losvd(los, vel_pix)
             # actual per-(s,c) scale used in /HyperCube/models
-            # scale_sc, mode_used, frac = _component_scale(f, int(s_idx), int(c_idx))
 
             # # native LOSVD (solid)
             # if norm_mode == "data":

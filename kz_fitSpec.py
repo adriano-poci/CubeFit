@@ -50,6 +50,7 @@ v1.13:  Fixed spectral fit plot unlinking glob in `loadCubeFit`. 31 March 2026
 v1.14:  Do not return full slab in `_reconstruct_worker`, causing extreme memory
             requirements. 22 May 2026
 v1.15:  Polished `orbitMaps` figure. 3 August 2026
+v1.16:  Removed legacy keywords in solver calls in `genCubeFit`. 4 August 2026
 """
 
 # need to set up the logger before any other imports
@@ -80,7 +81,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed,\
 from typing import Tuple, Sequence
 from plotbin.display_pixels import display_pixels as dbi
 
-from CubeFit.hdf5_manager import H5Manager, H5Dims, open_h5,\
+from CubeFit.hdf5_manager import H5Manager, open_h5,\
     live_prefit_snapshot_from_models, invalidate_done
 from CubeFit.hypercube_builder import build_hypercube, assert_preflight_ok,\
     estimate_global_velocity_bias_prebuild
@@ -110,34 +111,6 @@ CPU_PROCESSES = 6
 BLAS_THREADS = 8
 
 # ------------------------------------------------------------------------------
-
-def _worker_reconstruct_readonly(h5_path: str, s0: int, s1: int, x_cp_2d, *, band_L: int = 128):
-    """
-    4-D only: compute Y for spaxels [s0:s1) without ever loading (ΔS,C,P,L).
-    Compute the contraction in float64 as requested.
-    """
-
-    x64 = np.asarray(x_cp_2d, dtype=np.float64, order="C")  # (C,P)
-
-    with open_h5(h5_path, role="reader") as f:
-        M = f["/HyperCube/models"] # (S,C,P,L) float32
-        S, C, P, L = map(int, M.shape)
-        dS = s1 - s0
-        Y  = np.empty((dS, L), dtype=np.float64)
-
-        # λ-banding: never hold (ΔS,C,P,L) in RAM
-        for i, s in enumerate(range(s0, s1)):
-            y = np.empty(L, dtype=np.float64)
-            for l0 in range(0, L, band_L):
-                l1   = min(L, l0 + band_L)
-                A32  = M[s, :, :, l0:l1][...] # (C,P,Lb), f32
-                A64  = A32.astype(np.float64, copy=False) # cast just the band
-                y[l0:l1] = np.tensordot(x64, A64, axes=([0,1],[0,1]))
-            Y[i, :] = y
-
-    if not Y.flags.c_contiguous:
-        Y = np.ascontiguousarray(Y)
-    return (s0, Y)
 
 def _worker_compute_tile(h5_path, s0, s1, x_cp64):
     x_cp64 = np.asarray(x_cp64, dtype=np.float64, order="C")
@@ -241,7 +214,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     method='fsf', varIMF=False, source='ppxf', redraw=False, runSwitch='gen',
     **kwargs):
     """
-    _summary_
+    Overarching generative function controlling the hypercube build and
+        streaming solver.
 
     Parameters
     ----------
@@ -250,45 +224,46 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     mPath : str
         Path to the model directory.
     decDir : str, optional
-        Decomposition directory name, by default None.
+        Decomposition directory name. Default None.
     nCuts : int, optional
-        Number of cuts for decomposition, by default None.
+        Number of cuts for decomposition. Default None.
     proj : str, optional
-        Projection type, by default 'i'.
+        Projection type. Default 'i'.
     SN : int, optional
-        Signal-to-noise ratio, by default 90.
+        Signal-to-noise ratio. Default 90.
     full : bool, optional
-        Whether to use full data or truncated, by default False.
+        Whether to use full data or truncated. Default False.
     slope : float, optional
-        Slope for the IMF, by default 1.30.
+        Slope for the IMF. Default 1.30.
     IMF : str, optional
-        Initial mass function type, by default 'KB'.
+        Initial mass function type. Default 'KB'.
     iso : str, optional
-        Isochrones type, by default 'pad'.
+        Isochrones type. Default 'pad'.
     weighting : str, optional
-        Weighting scheme, by default 'luminosity'.
-    nProcs : int, optional
-        Number of processes to use, by default 1.
+        Weighting scheme. Default 'luminosity'.
     lOrder : int, optional
-        Polynomial order for the fit, by default 4.
-    fit : str, optional
-        Type of fit to perform, by default 'cube'.
+        Polynomial order for the fit. Default 4.
     rescale : bool, optional
-        Whether to rescale the data, by default False.
+        Whether to rescale the data. Default False.
     specRange : tuple, optional
-        Spectral range to consider, by default None.
+        Spectral range to consider. Default None.
     lsf : bool, optional
-        Whether to apply LSF (Line Spread Function), by default False.
+        Whether to apply LSF (Line Spread Function). Default False.
     band : str, optional
-        Band to use for the fit, by default 'r'.
+        Band to use for the fit. Default 'r'.
     smask : str, optional
-        Mask for the spectra, by default None.
+        Mask for the spectra. Default None.
     method : str, optional
-        Method to use for the fit, by default 'fsf'.
+        Method to use for the fit. Default 'fsf'.
     varIMF : bool, optional
-        Whether to use variable IMF, by default False.
+        Whether to use variable IMF. Default False.
     source : str, optional
-        Source of the data, by default 'ppxf'.
+        Source of the data. Default 'ppxf'.
+    redraw : bool, optional
+        Whether to regenerate hypercube products. Default False.
+    runSwitch : str, optional
+        Switch to control the run mode; either 'gen' the hypercube or 'run' the
+            fitting. Default 'gen'.
     **kwargs : dict, optional
         Additional keyword arguments for the function.
     """
@@ -547,8 +522,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # --- Optional hard gate before any heavy work
     # Use small prefix slices if nothing is specified.
     with logger.capture_all_output():
-        _ = assert_preflight_ok(
-            hdf5Path,
+        _ = assert_preflight_ok(hdf5Path,
             s_list=list(range(int(np.minimum(3, nS)))),
             c_list=list(range(int(np.minimum(2, nC)))),
             p_list=list(range(int(np.minimum(6, nP)))),
@@ -582,12 +556,9 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     prefit_png = figDir / f"prefit_overlay_from_models_C{nComp:03d}.png"
     with logger.capture_all_output():
-        live_prefit_snapshot_from_models(
-            h5_path=str(hdf5Path),
-            max_components=4,
-            templates_per_pair=3,
-            out_png=str(prefit_png),
-        )
+        live_prefit_snapshot_from_models(h5_path=str(hdf5Path),
+            max_components=4, templates_per_pair=3,
+            out_png=str(prefit_png),)
     logger.log(f"[Prefit] wrote {prefit_png}")
     if 'gen' in runSwitch:
         return
@@ -631,16 +602,12 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Multi-processing Batched Kaczmarz #
     #####################################
     x_global, stats = runner.solve_all_mp_batched(
-        epochs=1,
-        lr=0.1,
-        project_nonneg=True,
         # orbit_weights=None, # or None for “free” fit
         orbit_weights=cWeights,
         processes=CPU_PROCESSES,
         blas_threads=BLAS_THREADS,
         reader_s_tile=128, # match /HyperCube/models chunking on S
         warm_start=warm_start,
-        seed_cfg=dict(Ns=128, L_sub=1200, K_cols=768, per_comp_cap=24),
     )
 
     xPath = hdf5Dir/hdf5Path.name.replace('hypercube', 'x')
@@ -1903,6 +1870,13 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         save=figDir/\
             f"compare_prior_{nComp:{pred}d}_i{proj}_{lOrder:02d}.png"
     )
+    compare_orbit_vs_solution_absolute(
+        h5_path=str(hdf5Path),
+        orbit_target_mass=cWeights,
+        x_global=x_global,
+        save=figDir/\
+            f"compare_prior_abs_{nComp:{pred}d}_i{proj}_{lOrder:02d}.png"
+    )
 
     # ---------------------------------------------
     # RAW-FLUX SPACE (solver space)
@@ -2772,19 +2746,22 @@ def compare_orbit_vs_solution(
     # --- exact orbit constraint check ---
     if orbit_weights is not None:
         w_in = np.asarray(orbit_weights, dtype=np.float64).ravel()
-        scale = sol_tot.sum() / w_in.sum()
-        w_scaled = w_in * scale
+        if w_in.size == C * P:
+            w_in = w_in.reshape(C, P).sum(axis=1)
+        elif w_in.size != C:
+            raise ValueError(
+                f"orbit_weights has length {w_in.size}, expected C={C} or C*P={C*P}."
+            )
 
-        err = np.linalg.norm(sol_tot - w_scaled)
-        rel = err / (np.linalg.norm(w_scaled) + 1e-30)
+        err = np.linalg.norm(sol_tot - w_in)
+        rel = err / (np.linalg.norm(w_in) + 1e-30)
 
         print("[orbit constraint check]")
         print(f"  ||s - w||        = {err:.6e}")
         print(f"  relative error   = {rel:.6e}")
 
-        # optional identity plot
-        plotw = np.log10(w_scaled + eps)
-        plotx = np.log10(sol_tot + eps)
+        plotw = np.log10(np.maximum(w_in, eps))
+        plotx = np.log10(np.maximum(sol_tot, eps))
         fig, ax = plt.subplots(figsize=(4,4))
         ax.plot(plotw, plotx, '.', alpha=0.6)
         lim = [min(plotw.min(), plotx.min()),
@@ -2796,3 +2773,166 @@ def compare_orbit_vs_solution(
             fig.savefig(save, dpi=140)
         plt.close(fig)
 
+# ------------------------------------------------------------------------------
+
+def compare_orbit_vs_solution_absolute(
+    h5_path: str,
+    *,
+    orbit_target_mass: np.ndarray | None = None,
+    orbit_weights: np.ndarray | None = None,
+    x_global: np.ndarray | None = None,
+    save: str | None = None,
+):
+    """
+    Compare the learned per-orbit mass against an absolute target mass vector.
+
+    Unlike the older comparison helper, this function does NOT rescale the
+    target to match the total solution mass. It therefore reflects the actual
+    absolute residual induced by the augmented-row prior.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the HDF5 file.
+    orbit_target_mass : ndarray, optional
+        Absolute orbit-mass target vector of shape (C,).
+        This is the preferred input for the augmented-row formulation.
+    orbit_weights : ndarray, optional
+        Backward-compatible alias. If provided and `orbit_target_mass` is None,
+        it is used directly as the absolute target vector.
+    x_global : ndarray, optional
+        Solution vector of shape (C*P,) or (C, P). If omitted, read /X_global.
+    save : str, optional
+        If provided, save the plot to this path.
+
+    Returns
+    -------
+    dict
+        Diagnostic summary with absolute and relative residuals.
+
+    Raises
+    ------
+    RuntimeError
+        If the target vector or solution is unavailable.
+    ValueError
+        If array shapes are incompatible.
+    """
+    with open_h5(h5_path, role="reader") as f:
+        M = f["/HyperCube/models"]
+        _, C, P, _ = map(int, M.shape)
+
+        if x_global is None:
+            if "/X_global" not in f:
+                raise RuntimeError(
+                    "No /X_global in HDF5 and x_global not provided."
+                )
+            x_global = np.asarray(f["/X_global"][...], dtype=np.float64)
+
+    x = np.asarray(x_global, dtype=np.float64)
+    if x.ndim == 1:
+        if x.size != C * P:
+            raise ValueError(
+                f"x_global has length {x.size}, expected C*P={C*P}."
+            )
+        x = x.reshape(C, P)
+    elif x.ndim == 2:
+        if x.shape != (C, P):
+            raise ValueError(
+                f"x_global shape {x.shape}, expected (C,P)=({C},{P})."
+            )
+    else:
+        raise ValueError("x_global must be 1-D or 2-D")
+
+    if orbit_target_mass is None:
+        if orbit_weights is None:
+            raise RuntimeError(
+                "Provide orbit_target_mass for absolute comparison."
+            )
+        orbit_target_mass = np.asarray(orbit_weights, dtype=np.float64).ravel()
+    else:
+        orbit_target_mass = np.asarray(orbit_target_mass, dtype=np.float64).ravel()
+
+    if orbit_target_mass.size == C * P:
+        orbit_target_mass = orbit_target_mass.reshape(C, P).sum(axis=1)
+    elif orbit_target_mass.size != C:
+        raise ValueError(
+            f"orbit_target_mass has size {orbit_target_mass.size}, "
+            f"expected C={C} or C*P={C*P}."
+        )
+
+    sol_mass = np.sum(x, axis=1)
+    resid = sol_mass - orbit_target_mass
+
+    abs_l1 = float(np.sum(np.abs(resid)))
+    abs_l2 = float(np.linalg.norm(resid))
+    abs_linf = float(np.max(np.abs(resid))) if resid.size else 0.0
+
+    rel_l2 = float(abs_l2 / (np.linalg.norm(orbit_target_mass) + 1e-30))
+    rel_linf = float(
+        abs_linf / (np.max(np.abs(orbit_target_mass)) + 1e-30)
+    )
+
+    eps = 1e-30
+    log_t = np.log10(np.maximum(orbit_target_mass, eps))
+    log_s = np.log10(np.maximum(sol_mass, eps))
+
+    fig = plt.figure(figsize=(9.5, 4.2))
+    gs = gridspec.GridSpec(1, 2, width_ratios=[1.05, 1.0], wspace=0.32)
+
+    # Left: absolute target vs solution
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax0.plot(log_t, log_s, "o", alpha=0.75, ms=5)
+    lo = float(np.min([log_t.min(), log_s.min()])) if log_t.size else -1.0
+    hi = float(np.max([log_t.max(), log_s.max()])) if log_t.size else 1.0
+    ax0.plot([lo, hi], [lo, hi], "k--", lw=1.0)
+    ax0.set_xlabel(r"$\log_{10}(M_{\rm target})$")
+    ax0.set_ylabel(r"$\log_{10}(M_{\rm solution})$")
+    ax0.set_title("Absolute orbit mass comparison")
+
+    txt = (
+        rf"$||s-t||_1={abs_l1:.3e}$" "\n"
+        rf"$||s-t||_2={abs_l2:.3e}$" "\n"
+        rf"$||s-t||_\infty={abs_linf:.3e}$" "\n"
+        rf"rel$_2$={rel_l2:.3e}, rel$_\infty$={rel_linf:.3e}"
+    )
+    ax0.text(
+        0.03,
+        0.97,
+        txt,
+        transform=ax0.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+    )
+
+    # Right: residual vector
+    ax1 = fig.add_subplot(gs[0, 1])
+    idx = np.arange(C, dtype=int)
+    ax1.axhline(0.0, color="k", lw=1.0)
+    ax1.bar(idx, resid, width=0.8)
+    ax1.set_xlabel("orbit index")
+    ax1.set_ylabel(r"$M_{\rm solution}-M_{\rm target}$")
+    ax1.set_title("Absolute residual per orbit")
+
+    if C <= 24:
+        ax1.set_xticks(idx)
+
+    fig.tight_layout()
+
+    if save:
+        fig.savefig(save, dpi=140)
+    plt.close(fig)
+
+    return {
+        "abs_l1": abs_l1,
+        "abs_l2": abs_l2,
+        "abs_linf": abs_linf,
+        "rel_l2": rel_l2,
+        "rel_linf": rel_linf,
+        "orbit_target_mass": orbit_target_mass,
+        "orbit_mass": sol_mass,
+        "orbit_resid": resid,
+    }
+
+# ------------------------------------------------------------------------------
