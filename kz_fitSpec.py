@@ -2550,16 +2550,16 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 print(f"Alpha map limits: {lmin:.2f} to {lmax:.2f}")
 
                 prop_specs = [
-                    (rf"$t\ [{UTS.gyr}]$", amin, amax),
-                    (r"$[Fe/H]$", mmin, mmax),
-                    (r"$[\alpha/Fe]$", lmin, lmax),
+                    ('metal', r"$[Fe/H]$", mmin, mmax),
+                    ('age', rf"$t\ [{UTS.gyr}]$", amin, amax),
+                    ('alpha', r"$[\alpha/Fe]$", lmin, lmax),
                 ]
                 orb_specs = [r'$z$ Tubes', r'$x$ Tubes', 'Boxes']
 
                 fig = plt.figure(figsize=plt.figaspect((yLen*3.)/xLen)*0.75)
                 gs = gridspec.GridSpec(3, 3, hspace=0.0, wspace=0.0)
 
-                for ri, (prop, vmin, vmax) in enumerate(prop_specs):
+                for ri, (prop, label, vmin, vmax) in enumerate(prop_specs):
                     mappable = None
                     for oi, otype in enumerate(orb_specs):
                         ax = fig.add_subplot(gs[ri, oi])
@@ -2585,10 +2585,10 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                             cax = POT.attachAxis(ax, "right", 0.05)
                             cb = plt.colorbar(mappable, cax=cax, orientation="vertical")
                             lT = cax.text(
-                                0.5, 0.5, r"Mass",
-                                va="center", ha="center", color=POT.pgreen,
-                                transform=cax.transAxes, rotation=270,
-                                path_effects=[PathEffects.withStroke(
+                                0.5, 0.5, label, va="center", ha="center",
+                                color=POT.pgreen, transform=cax.transAxes,
+                                rotation=270, path_effects=[
+                                    PathEffects.withStroke(
                                     linewidth=1.5, foreground="k")])
                             cax.text(0.45, 1.0 - 5e-3, f"{vmax:.2e}",
                                 va="top", ha="center", color="w",

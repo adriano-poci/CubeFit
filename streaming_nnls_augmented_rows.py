@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-    streaming_nnls.py
+    streaming_nnls_augmented_rows.py
     Adriano Poci
     University of Oxford
     2026
@@ -21,104 +21,8 @@ r"""
 
 History
 -------
-v1.0:   7 March 2026
-v1.1:   Implemented streaming active-set Lawson-Hanson NNLS;
-        Added rank-1 orbit penalisation with `orbit_beta` parameter instead of
-            hard projection. 13 March 2026
-v1.2:   Apply the orbit prior in the `z`-space of the solver in
-            `_streaming_active_set_nnls_via_streaming_matvec`;
-        Let orbit prior also influence active set promotion, not just data
-            gradient in `_streaming_active_set_nnls_via_streaming_matvec`;
-        Screen for temporarily-negative active-set entries and drop them if they
-            are substantially negative (numerical noise tolerance) in 
-            `_streaming_active_set_nnls_via_streaming_matvec`. 14 March 2026
-v1.3:   Compute global `alpha_fixed` in 
-            `_streaming_active_set_nnls_via_streaming_matvec` so that the orbit
-            prior scale is predictable;
-        Added soft exit where new column is randomly promoted to test local 
-            optima, up to `explore_budget` times in 
-            `_streaming_active_set_nnls_via_streaming_matvec`. 15 March 2026
-v1.4:   Fixed `alpha_ref` calculation in
-            `_streaming_active_set_nnls_via_streaming_matvec`;
-        Implemented group promotion when all gradients are negative to attempt
-            escaping local optima in
-            `_streaming_active_set_nnls_via_streaming_matvec`. 16 March 2026
-v1.5:   Added targeted orbit promotion for columns in under-represented orbits
-            to more strategically match the orbit prior without degrading fit
-            quality. 19 March 2026
-v1.6:   Consider full plateau window for early exit in
-            `_streaming_active_set_nnls_via_streaming_matvec`;
-        Use a relative per-orbit scale to determine which columns to drop, 
-            rather than a global scale in 
-            `_streaming_active_set_nnls_via_streaming_matvec`;
-        Temporarily ban columns from re-promotion after an initial unhelpful
-            promotion. 26 March 2026
-v1.7:   Added `cooldown_iters` parameter to control how long a column is banned
-            after a failed promotion in
-            `_streaming_active_set_nnls_via_streaming_matvec`;
-        Renamed `streaming_active_set_nnls_via_streaming_matvec` to
-            `streamActiveSetNNLS`. 27 March 2026
-v1.8:   Randomise column promotion from high-quality candidates to avoid
-            deterministic cycling when gradients are pathological, in
-            `_deficit_rescue_columns` and `_quota_rescue_columns`, and in
-            fallback selections in `streamActiveSetNNLS`;
-        Jail orbits groups rather than individual columns if they are not
-            beneficial to the fit. 28 March 2026
-v1.9:   Jail columns which are technically non-zero, but also not helpful to the
-            fit to encourage diverse exploration;
-        Removed over-zealous per-orbit pruning of columns in
-            `streamActiveSetNNLS`. 29 March 2026
-v1.10:  Re-implemented `orbit_beta` as a soft penalty in the objective rather
-            than a hard projection, and scale it to the data. 30 March 2026
-v1.11:  Changed plateau logic to use iteration-invariant metrics instead of the
-            gradient, which is no longer a stable cross-iteration metric once
-            the orbit prior and occupancy penalty are active in
-            `streamActiveSetNNLS`. 31 March 2026
-v1.12:  Updated `_worker_ATAz` and `_worker_reduced` to not stream full tiles for
-            memory efficiency. Instead, read orbit-by-orbit and use tensor
-            contractions to compute the same quantities with much lower peak
-            memory. 7 May 2026
-v1.13:  Added periodic restart checkpoints to `streamActiveSetNNLS`;
-            checkpoint the committed `x` vector and minimal solver state at a
-            configurable iteration interval, with a forced final flush on exit,
-            so truncated or cancelled runs can resume from the latest saved
-            state. 13 July 2026
-v1.14:  Enforced the orbit prior by projecting each orbit's mass onto the
-            target prior almost exactly within a small delta tolerance. 20 July
-            2026
-v1.15:  Replaced hard per-orbit mass projection with an exact active-set KKT
-            delta-x correction using the reduced Hessian (ATA_sub), preserving
-            the data-driven solution as much as possible while enforcing the
-            orbit prior, with best-effort fallback when the current active set
-            cannot satisfy the orbit constraints exactly. 23 July 2026
-v1.16:  Replaced the blind hard per-orbit mass projection with a data-aware
-            active-set KKT delta-x correction using the reduced Hessian
-            (ATA_sub), preserving the data-driven solution as much as possible
-            while enforcing the orbit prior through a best-effort constrained
-            correction instead of unconditional orbit rescaling. 24 July 2026
-v1.17:  Fixed history versioning;
-        Reverted to v1.13 soft projection;
-        Refined orbit-prior support recovery by applying promotion bias only to
-            under-represented orbits and widening the rescue candidate pool to
-            improve orbit diversity without degrading the spectral fit. 28 July
-            2026
-v1.18:  Added robust diagnostic machinery. 30 July 2026
-v1.19:  Replaced one-sided orbit-deficit rescue with a symmetric orbit-mass prior
-            acting on both under- and over-represented orbits, while relaxing
-            active-set promotion, probation, and cooldown to encourage richer
-            per-orbit population mixtures and improve orbit-prior adherence
-            without sacrificing data fidelity;
-        Removed orbit support heuristics in favour of unified global support. 2
-            August 2026
-v1.20: Replaced the soft orbit-penalty machinery with an augmented-Lagrangian
-            orbit-mass constraint, removing legacy orbit-beta promotion
-            heuristics and unifying orbit-target enforcement through dual-
-            variable updates while preserving the streaming active-set NNLS
-            formulation;
-        Replaced in-loop orbit-mass enforcement with a single end-of-solve
-            reduced-Hessian KKT correction on the final committed active set,
-            ensuring probation-triggered support changes restart the reduced
-            solve before applying the self-normalized orbit prior;
+v1.0:   Forked from `streaming_nnls` v1.20;
+        Add orbit prior to design matrix for simultaneous constraints;
         Cleaned up `MPConfig`. 3 August 2026
 """
 
@@ -853,6 +757,50 @@ def _orbit_mass_correction_step(
         "obj_new": float(obj_new),
     }
 
+
+def _orbit_prior_quadratic_terms(
+    active_idx: np.ndarray,
+    S_active: np.ndarray,
+    orbit_target_mass: np.ndarray,
+    C: int,
+    P: int,
+    orbit_prior_weight: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build the reduced active-set orbit prior contribution.
+
+    This is equivalent to augmenting the reduced system with one dense
+    orbit-sum row per component, weighted by ``orbit_prior_weight``.
+    """
+    active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
+    S_active = np.asarray(S_active, dtype=np.float64).ravel(order="C")
+    orbit_target_mass = np.asarray(
+        orbit_target_mass, dtype=np.float64
+    ).ravel(order="C")
+
+    k = int(active_idx.size)
+    orbit_ATA = np.zeros((k, k), dtype=np.float64)
+    orbit_ATy = np.zeros((k,), dtype=np.float64)
+
+    if k == 0 or orbit_prior_weight <= 0.0:
+        return orbit_ATA, orbit_ATy
+
+    orbit_of_col = (active_idx // P).astype(np.int64)
+
+    for cc in range(C):
+        loc = np.flatnonzero(orbit_of_col == cc)
+        if loc.size == 0:
+            continue
+        s_loc = S_active[loc]
+        orbit_ATA[np.ix_(loc, loc)] += orbit_prior_weight * np.outer(
+            s_loc, s_loc
+        )
+        orbit_ATy[loc] += orbit_prior_weight * float(orbit_target_mass[cc]) * s_loc
+
+    return orbit_ATA, orbit_ATy
+
+# ------------------------------------------------------------------------------
+
 # ------------------------------------------------------------------------------
 
 def streamActiveSetNNLS(
@@ -874,6 +822,7 @@ def streamActiveSetNNLS(
     max_iter: int = 5000,
     checkpoint_cb=None,
     checkpoint_every: int = 0,
+    orbit_prior_weight: float = 1.0,
 ):
     """
     TRUE MONOLITHIC streaming active-set NNLS.
@@ -1000,6 +949,7 @@ def streamActiveSetNNLS(
             "diag_level": int(diag_level),
             "diag_stride": int(diag_stride),
             "diag_topk": int(diag_topk),
+            "orbit_prior_weight": float(orbit_prior_weight),
         }
     )
 
@@ -1194,9 +1144,7 @@ def streamActiveSetNNLS(
         if w_target is None or not np.any(w_target > 0.0):
             t_orbit = np.zeros((C,), dtype=np.float64)
         else:
-            t_orbit = float(np.sum(s_orbit)) * np.asarray(
-                w_target, dtype=np.float64
-            )
+            t_orbit = np.asarray(w_target, dtype=np.float64).copy()
 
         deficit = t_orbit - s_orbit
         return s_orbit, t_orbit, deficit
@@ -1276,9 +1224,7 @@ def streamActiveSetNNLS(
             if w_target is None or not np.any(w_target > 0.0):
                 orbit_target = np.zeros((C,), dtype=np.float64)
             else:
-                orbit_target = float(np.sum(x_phys_now)) * np.asarray(
-                    w_target, dtype=np.float64
-                )
+                orbit_target = np.asarray(w_target, dtype=np.float64).copy()
             orbit_resid = orbit_mass_vec - orbit_target
             orbit_ratio = orbit_mass_vec / np.maximum(orbit_target, 1e-30)
             orbit_nz = np.count_nonzero(x_phys_now > 0.0, axis=1).astype(np.int64)
@@ -1561,25 +1507,20 @@ def streamActiveSetNNLS(
 
         orbit_corr_info = {
             "accepted": False,
-            "reason": "no_target",
+            "reason": "orbit_prior_in_reduced_solve",
         }
 
-        if w_target is not None and np.any(w_target > 0.0):
-            orbit_target_mass = (
-                float(np.sum(S_active * z_sub))
-                * np.asarray(w_target, dtype=np.float64)
-            )
-
-            z_sub, orbit_corr_info = _orbit_mass_correction_step(
-                z_sub=z_sub,
-                ATA_sub=ATA_sub_reg,
-                ATy_sub=ATy_sub,
+        if w_target is not None and np.any(w_target > 0.0) and orbit_prior_weight > 0.0:
+            orbit_ATA_sub, orbit_ATy_sub = _orbit_prior_quadratic_terms(
                 active_idx=active_idx,
                 S_active=S_active,
-                orbit_target_mass=orbit_target_mass,
+                orbit_target_mass=np.asarray(w_target, dtype=np.float64),
                 C=C,
                 P=P,
+                orbit_prior_weight=float(orbit_prior_weight),
             )
+            ATA_sub_reg = ATA_sub_reg + orbit_ATA_sub
+            ATy_sub = ATy_sub + orbit_ATy_sub
 
         # Track promoted columns that did not survive the reduced solve.
         failed_cols = []
@@ -1776,9 +1717,7 @@ def streamActiveSetNNLS(
             if w_target is None or not np.any(w_target > 0.0):
                 orbit_target = np.zeros((C,), dtype=np.float64)
             else:
-                orbit_target = float(np.sum(x_phys_now)) * np.asarray(
-                    w_target, dtype=np.float64
-                )
+                orbit_target = np.asarray(w_target, dtype=np.float64).copy()
             orbit_resid = orbit_mass_vec - orbit_target
             orbit_ratio = orbit_mass_vec / np.maximum(orbit_target, 1e-30)
             orbit_nz = np.count_nonzero(x_phys_now > 0.0, axis=1).astype(np.int64)
@@ -1839,33 +1778,7 @@ def streamActiveSetNNLS(
         _emit_checkpoint(it, final=False)
 
 
-    if (
-        w_target is not None
-        and np.any(w_target > 0.0)
-        and final_z_sub is not None
-        and final_ATA_sub is not None
-        and final_ATy_sub is not None
-        and final_active_idx.size > 0
-    ):
-        orbit_target_mass = float(np.sum(final_S_active * final_z_sub)) * np.asarray(
-            w_target, dtype=np.float64
-        )
-
-        z_corr, orbit_corr_info = _orbit_mass_correction_step(
-            z_sub=final_z_sub,
-            ATA_sub=final_ATA_sub,
-            ATy_sub=final_ATy_sub,
-            active_idx=final_active_idx,
-            S_active=final_S_active,
-            orbit_target_mass=orbit_target_mass,
-            C=C,
-            P=P,
-        )
-
-        if orbit_corr_info.get("accepted", False):
-            z[:] = 0.0
-            for ii, gcol in enumerate(final_active_idx):
-                z[int(gcol)] = float(z_corr[ii])
+    # Orbit prior is enforced in the reduced solves above; no final correction.
 
     try:
         final_it = int(it)
@@ -2055,6 +1968,8 @@ def solve_streaming_nnls(
     w_target = None
     if orbit_weights is not None:
         w_target = _canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
+    
+    orbit_prior_weight = float(getattr(cfg, "orbit_prior_weight", 1e-2))
 
     # ---------------------------- diagnostics --------------------------
     diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
@@ -2433,6 +2348,7 @@ def solve_streaming_nnls(
                 max_iter=5 * monolithic_max_active,
                 checkpoint_cb=_checkpoint_cb,
                 checkpoint_every=checkpoint_every,
+                orbit_prior_weight=orbit_prior_weight,
             )
 
             x = x_flat_unscaled.reshape(C, P).copy()
@@ -2561,10 +2477,7 @@ def solve_streaming_nnls(
             try:
                 if (w_target is not None) and (np.sum(w_target) > 0.0):
                     s_full = np.sum(x, axis=1)
-                    w = np.asarray(w_target, dtype=np.float64)
-                    w_sum = float(np.sum(w))
-                    alpha = float(np.sum(s_full)) / max(1e-30, w_sum)
-                    s_proj = alpha * w
+                    s_proj = np.asarray(w_target, dtype=np.float64).copy()
 
                     print("[DIAG][orbit_weights]", flush=True)
                     for cc in range(C):
@@ -2587,7 +2500,6 @@ def solve_streaming_nnls(
                         {
                             "kind": "epoch_orbit_table",
                             "epoch": int(ep + 1),
-                            "alpha": float(alpha),
                             "orbit_mass": s_full.tolist(),
                             "orbit_target": s_proj.tolist(),
                             "orbit_resid": (s_full - s_proj).tolist(),

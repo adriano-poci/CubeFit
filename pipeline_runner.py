@@ -72,12 +72,13 @@ from dataclasses import dataclass
 from CubeFit.hdf5_manager import H5Manager, H5Dims, open_h5
 from CubeFit.hypercube_builder import build_hypercube
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
-from CubeFit.streaming_nnls import (
-    MPConfig, solve_streaming_nnls, monolithic_nnls_scipy)
+# from CubeFit.streaming_nnls import (
+    # MPConfig, solve_streaming_nnls)
+from CubeFit.streaming_nnls_augmented_rows import (
+    MPConfig, solve_streaming_nnls)
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
 )
-# from CubeFit.nnls_patch import run_patch as _nnls_patch_run
 from CubeFit.fit_tracker import FitTracker, NullTracker, TrackerConfig
 import CubeFit.cube_utils as cu
 from CubeFit.cube_utils import RatioCfg
@@ -1208,15 +1209,15 @@ class PipelineRunner:
             tracker.set_meta(N=int(C)*int(P))
 
         cfg = MPConfig(
-            epochs=int(epochs),
-            lr=float(lr),
-            project_nonneg=bool(project_nonneg),
             processes=int(processes),
             blas_threads=int(blas_threads),
             apply_mask=bool(reader_apply_mask),
             # orbit_beta=float(
             #     os.environ.get("CUBEFIT_ORBIT_BETA", "1e-2")
             # ),
+            orbit_prior_weight=float(
+                os.environ.get("CUBEFIT_ORBIT_PRIOR_WEIGHT", "1e-2")
+            )
         )
 
         try:
