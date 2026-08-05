@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-    streaming_nnls_augmented_rows.py
+    streaming_nnls_constrained.py
     Adriano Poci
     University of Oxford
     2026
@@ -21,14 +21,10 @@ r"""
 
 History
 -------
-v1.0:   Forked from `streaming_nnls` v1.20;
-        Add orbit prior to design matrix for simultaneous constraints;
-        Cleaned up `MPConfig`. 3 August 2026
-v1.1:   Removed legacy `epoch` loop. 4 August 2026
-v1.2:   Changed rollback logic to objective-based rather than gradient-based;
-        Added orbit-level tabu in addition to the existing column-level tabu;
-        Cache expensive `FUSE` tile read;
-        Scale orbit prior by approximate coordinate scale. 4 August 2026
+v1.0:   Forked from `streaming_nnls_augmented_rows` v1.2;
+        A priori impose the orbit prior before the fit. 4 August 2026
+v1.1:   Fixed ordering bug on `promoted_cols`;
+        Ensure each non-zero orbit has at least one active column. 5 August 2026
 """
 
 from __future__ import annotations, print_function
@@ -355,7 +351,6 @@ class MPConfig:
     dset_w0: float = 0.90
     s_tile_override: Optional[int] = None
     verbose: bool = True
-    orbit_prior_weight: float = 1.0
 
 # ---------------------- Small pool utilities --------------------------
 
@@ -671,9 +666,8 @@ def _nnls_from_quadratic(
 
 # ------------------------------------------------------------------------------
 
-def _orbit_mass_correction_step(
-    z_sub: np.ndarray,
-    ATA_sub: np.ndarray,
+def _orbit_hard_constraint_solve(
+    ATA_sub_reg: np.ndarray,
     ATy_sub: np.ndarray,
     active_idx: np.ndarray,
     S_active: np.ndarray,
@@ -682,136 +676,74 @@ def _orbit_mass_correction_step(
     P: int,
     *,
     mu_rel: float = 1e-8,
-    max_rel_obj_increase: float = 1e-4,
 ) -> tuple[np.ndarray, dict]:
     """
-    Apply a best-effort orbit-mass correction on the final active set.
+    Solve the reduced NNLS problem with hard orbit-mass equality constraints.
 
-    The correction solves a small KKT system so that the active-set masses
-    move toward the target orbit masses with minimal quadratic distortion.
+    The constraint is:
+
+        sum_p x[c, p] = orbit_target_mass[c]
+
+    on the currently active support.
     """
-    z_sub = np.asarray(z_sub, dtype=np.float64).ravel(order="C")
-    ATA_sub = np.asarray(ATA_sub, dtype=np.float64, order="C")
+    ATA_sub_reg = np.asarray(ATA_sub_reg, dtype=np.float64, order="C")
     ATy_sub = np.asarray(ATy_sub, dtype=np.float64, order="C")
     active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
     S_active = np.asarray(S_active, dtype=np.float64).ravel(order="C")
-    orbit_target_mass = np.asarray(
-        orbit_target_mass, dtype=np.float64
-    ).ravel(order="C")
+    orbit_target_mass = np.asarray(orbit_target_mass, dtype=np.float64).ravel(order="C")
 
-    k = int(z_sub.size)
+    k = int(active_idx.size)
     if k == 0 or orbit_target_mass.size != C:
-        return z_sub, {"accepted": False, "reason": "bad_input"}
+        return np.zeros((0,), dtype=np.float64), {
+            "accepted": False,
+            "reason": "bad_input",
+            "resid_l1": np.inf,
+            "resid_l2": np.inf,
+            "resid_linf": np.inf,
+            "negative_count": 0,
+        }
 
     orbit_of_col = (active_idx // P).astype(np.int64)
-    current_mass = np.bincount(
-        orbit_of_col,
-        weights=S_active * z_sub,
-        minlength=C,
-    ).astype(np.float64)
-
-    resid = orbit_target_mass - current_mass
-    scale = np.maximum(np.abs(orbit_target_mass), 1.0)
-    rel_resid = float(np.max(np.abs(resid) / scale))
-
-    if rel_resid <= 1e-12:
-        return z_sub, {
-            "accepted": False,
-            "reason": "already_satisfied",
-            "rel_resid": rel_resid,
-        }
 
     B = np.zeros((C, k), dtype=np.float64)
     B[orbit_of_col, np.arange(k, dtype=np.int64)] = S_active
 
-    diag_med = float(np.median(np.diag(ATA_sub))) if ATA_sub.size else 1.0
+    diag_med = float(np.median(np.diag(ATA_sub_reg))) if ATA_sub_reg.size else 1.0
     mu = max(1e-12, mu_rel * max(1.0, diag_med))
 
     KKT = np.zeros((k + C, k + C), dtype=np.float64)
-    KKT[:k, :k] = ATA_sub + mu * np.eye(k, dtype=np.float64)
+    KKT[:k, :k] = ATA_sub_reg + mu * np.eye(k, dtype=np.float64)
     KKT[:k, k:] = B.T
     KKT[k:, :k] = B
 
     rhs = np.zeros((k + C,), dtype=np.float64)
-    rhs[k:] = resid
+    rhs[:k] = ATy_sub
+    rhs[k:] = orbit_target_mass
 
     try:
         sol = np.linalg.solve(KKT, rhs)
     except np.linalg.LinAlgError:
         sol = np.linalg.lstsq(KKT, rhs, rcond=None)[0]
 
-    delta = sol[:k]
-    z_trial = np.maximum(z_sub + delta, 0.0)
+    z_trial = np.asarray(sol[:k], dtype=np.float64)
+    mass_resid = B @ z_trial - orbit_target_mass
 
-    obj_old = 0.5 * float(z_sub @ (ATA_sub @ z_sub)) - float(ATy_sub @ z_sub)
-    obj_new = 0.5 * float(z_trial @ (ATA_sub @ z_trial)) - float(ATy_sub @ z_trial)
-    allowed = obj_old + max_rel_obj_increase * max(1.0, abs(obj_old))
-    accepted = np.isfinite(obj_new) and (obj_new <= allowed)
+    scale = np.maximum(np.abs(orbit_target_mass), 1.0)
+    neg_count = int(np.count_nonzero(z_trial < -1e-10))
+    accepted = (
+        np.all(np.isfinite(z_trial))
+        and neg_count == 0
+        and float(np.max(np.abs(mass_resid) / scale)) <= 1e-8
+    )
 
-    if accepted:
-        z_out = z_trial
-        current_mass = np.bincount(
-            orbit_of_col,
-            weights=S_active * z_out,
-            minlength=C,
-        ).astype(np.float64)
-        resid = orbit_target_mass - current_mass
-    else:
-        z_out = z_sub
-
-    return z_out, {
+    return z_trial, {
         "accepted": bool(accepted),
-        "reason": "accepted" if accepted else "rejected",
-        "rel_resid": float(np.max(np.abs(resid) / scale)),
-        "resid_l1": float(np.sum(np.abs(resid))),
-        "resid_l2": float(np.linalg.norm(resid)),
-        "obj_old": float(obj_old),
-        "obj_new": float(obj_new),
+        "reason": "accepted" if accepted else "infeasible_or_negative",
+        "resid_l1": float(np.sum(np.abs(mass_resid))),
+        "resid_l2": float(np.linalg.norm(mass_resid)),
+        "resid_linf": float(np.max(np.abs(mass_resid))),
+        "negative_count": int(neg_count),
     }
-
-
-def _orbit_prior_quadratic_terms(
-    active_idx: np.ndarray,
-    S_active: np.ndarray,
-    orbit_target_mass: np.ndarray,
-    C: int,
-    P: int,
-    orbit_prior_weight: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Build the reduced active-set orbit prior contribution.
-
-    This is equivalent to augmenting the reduced system with one dense
-    orbit-sum row per component, weighted by ``orbit_prior_weight``.
-    """
-    active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
-    S_active = np.asarray(S_active, dtype=np.float64).ravel(order="C")
-    orbit_target_mass = np.asarray(
-        orbit_target_mass, dtype=np.float64
-    ).ravel(order="C")
-
-    k = int(active_idx.size)
-    orbit_ATA = np.zeros((k, k), dtype=np.float64)
-    orbit_ATy = np.zeros((k,), dtype=np.float64)
-
-    if k == 0 or orbit_prior_weight <= 0.0:
-        return orbit_ATA, orbit_ATy
-
-    orbit_of_col = (active_idx // P).astype(np.int64)
-
-    for cc in range(C):
-        loc = np.flatnonzero(orbit_of_col == cc)
-        if loc.size == 0:
-            continue
-        s_loc = S_active[loc]
-        orbit_ATA[np.ix_(loc, loc)] += orbit_prior_weight * np.outer(
-            s_loc, s_loc
-        )
-        orbit_ATy[loc] += orbit_prior_weight * float(orbit_target_mass[cc]) * s_loc
-
-    return orbit_ATA, orbit_ATy
-
-# ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
 
@@ -834,7 +766,6 @@ def streamActiveSetNNLS(
     max_iter: int = 5000,
     checkpoint_cb=None,
     checkpoint_every: int = 0,
-    orbit_prior_weight: float = 1.0,
 ):
     """
     TRUE MONOLITHIC streaming active-set NNLS.
@@ -931,48 +862,6 @@ def streamActiveSetNNLS(
         w_target = alpha_ref * orbit_shape
     else:
         w_target = None
-    
-    # Convert the user-facing prior weight into a dimensionless relative
-    # weight. Since S_flat approximately normalises each data column to
-    # unit energy per tile, the typical full-data Hessian diagonal is of
-    # order len(s_ranges). Match the median orbit-row curvature to that
-    # scale before applying orbit_prior_weight.
-    prior_row_norm_sq = np.zeros((C,), dtype=np.float64)
-
-    for cc in range(C):
-        base = cc * P
-        prior_row_norm_sq[cc] = float(
-            np.dot(
-                S_flat[base:base + P],
-                S_flat[base:base + P],
-            )
-        )
-
-    valid_prior_rows = prior_row_norm_sq[
-        np.isfinite(prior_row_norm_sq) & (prior_row_norm_sq > 0.0)
-    ]
-
-    if valid_prior_rows.size > 0:
-        prior_curvature_ref = float(np.median(valid_prior_rows))
-    else:
-        prior_curvature_ref = 1.0
-
-    data_curvature_ref = float(max(1, len(s_ranges)))
-
-    orbit_prior_weight_effective = (
-        float(orbit_prior_weight)
-        * data_curvature_ref
-        / max(prior_curvature_ref, 1e-30)
-    )
-
-    print(
-        "[MONO][prior-scale] "
-        f"user_weight={orbit_prior_weight:.4e} "
-        f"data_curvature_ref={data_curvature_ref:.4e} "
-        f"prior_curvature_ref={prior_curvature_ref:.4e} "
-        f"effective_weight={orbit_prior_weight_effective:.4e}",
-        flush=True,
-    )
 
     diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
     diag_stride = max(1, int(os.environ.get("CUBEFIT_DIAG_STRIDE", "1")))
@@ -1003,12 +892,7 @@ def streamActiveSetNNLS(
             "diag_level": int(diag_level),
             "diag_stride": int(diag_stride),
             "diag_topk": int(diag_topk),
-            "orbit_prior_weight": float(orbit_prior_weight),
-            "orbit_prior_weight_effective": float(
-                orbit_prior_weight_effective
-            ),
-            "data_curvature_ref": float(data_curvature_ref),
-            "prior_curvature_ref": float(prior_curvature_ref),
+            "orbit_target_sum": float(np.sum(w_target)) if w_target is not None else None,
         }
     )
 
@@ -1226,21 +1110,6 @@ def streamActiveSetNNLS(
 
         deficit = t_orbit - s_orbit
         return s_orbit, t_orbit, deficit
-    def _orbit_prior_promotion_score(z_vec: np.ndarray) -> np.ndarray:
-        """
-        Return the orbit-prior contribution to the promotion score in z-space.
-        """
-        if (
-            w_target is None
-            or orbit_prior_weight_effective <= 0.0
-        ):
-            return np.zeros((CP,), dtype=np.float64)
-
-        _, _, deficit = _orbit_mass_and_deficit(z_vec)
-
-        return orbit_prior_weight_effective * (
-            S_flat * deficit[orbit_of_col]
-        )
 
     # ------------------------------------------------------------
     # Helper: compute ATAz in parallel using provided executor
@@ -1285,14 +1154,12 @@ def streamActiveSetNNLS(
 
         ATAz_scaled = _compute_ATAz_scaled(z)
         grad_data = ATy_scaled - ATAz_scaled
-        orbit_promo = _orbit_prior_promotion_score(z)
-        grad_total = grad_data + orbit_promo
+        grad_total = grad_data
 
         orbit_s, orbit_target, orbit_deficit = _orbit_mass_and_deficit(z)
 
         not_active = np.where(~active)[0]
         gvals_data = grad_data[not_active]
-        gvals_orbit = orbit_promo[not_active]
         gvals_total = grad_total[not_active]
 
         max_grad_all = float(np.max(grad_total)) if grad_total.size else 0.0
@@ -1303,7 +1170,7 @@ def streamActiveSetNNLS(
             float(np.mean(gvals_total)) if gvals_total.size else 0.0
         )
         max_grad_data = float(np.max(gvals_data)) if gvals_data.size else 0.0
-        max_grad_orbit = float(np.max(gvals_orbit)) if gvals_orbit.size else 0.0
+        max_grad_orbit = 0.0
         grad_before_data = max_grad_data
 
         if diag_level >= 1 and ((it % diag_stride) == 0):
@@ -1441,6 +1308,40 @@ def streamActiveSetNNLS(
         cols_to_activate = np.asarray(chosen, dtype=np.int64)
         active[cols_to_activate] = True
         newly_activated = cols_to_activate.copy()
+        promoted_cols = newly_activated.copy()
+        if w_target is not None:
+            required_orbits = np.flatnonzero(w_target > 0.0)
+
+            coverage_cols = []
+
+            for cc in required_orbits:
+                base = int(cc) * P
+                orbit_cols = np.arange(base, base + P, dtype=np.int64)
+
+                if np.any(active[orbit_cols]):
+                    continue
+
+                # Select the best data-gradient column from this orbit.
+                local_grad = grad_data[orbit_cols]
+                best_col = int(orbit_cols[int(np.argmax(local_grad))])
+
+                active[best_col] = True
+                coverage_cols.append(best_col)
+
+            if coverage_cols:
+                coverage_cols = np.asarray(
+                    coverage_cols,
+                    dtype=np.int64,
+                )
+                newly_activated = np.unique(
+                    np.concatenate(
+                        (
+                            newly_activated,
+                            coverage_cols,
+                        )
+                    )
+                )
+                promoted_cols = newly_activated.copy()
 
         if int(np.count_nonzero(active)) > int(max_active):
             if newly_activated is not None and newly_activated.size > 0:
@@ -1600,73 +1501,73 @@ def streamActiveSetNNLS(
             return 0.5 * float(x @ (A @ x)) - float(b @ x)
 
 
-        if (
-            w_target is not None
-            and np.any(w_target > 0.0)
-            and orbit_prior_weight_effective > 0.0
-        ):
-            orbit_ATA_sub, orbit_ATy_sub = (
-                _orbit_prior_quadratic_terms(
-                    active_idx=active_idx,
-                    S_active=S_active,
-                    orbit_target_mass=np.asarray(
-                        w_target,
-                        dtype=np.float64,
-                    ),
-                    C=C,
-                    P=P,
-                    orbit_prior_weight=float(
-                        orbit_prior_weight_effective
-                    ),
-                )
-            )
-            ATA_sub_reg = ATA_sub_reg + orbit_ATA_sub
-            ATy_sub = ATy_sub + orbit_ATy_sub
-
-        z_sub = _nnls_from_quadratic(
-            ATA=ATA_sub_reg,
-            ATy=ATy_sub,
-            x0=z_old_active,
-            max_iter=4000,
-            tol=1e-10,
-        )
-
-        if not np.all(np.isfinite(z_sub)):
-            print(
-                "[MONO] reduced NNLS returned non-finite values",
-                flush=True,
-            )
-            active[:] = active_before
-            z[:] = z_before
-
-            if newly_activated is not None:
-                _cooldown_cols(
-                    newly_activated,
-                    it,
-                    extra_iters=20,
-                )
-                _cooldown_orbits(
-                    np.unique(newly_activated // P),
-                    it,
-                    extra_iters=20,
-                )
-
-            if _watch_progress():
-                break
-
-            _emit_checkpoint(
-                it,
-                final=False,
-                phase="nonfinite_reduced_solve",
-            )
-            continue
-
-        np.maximum(z_sub, 0.0, out=z_sub)
-
-        orbit_corr_info = {
-            "accepted": False,
-            "reason": "orbit_prior_in_reduced_solve",
+        orbit_constraint_info = {
+            "accepted": True,
+            "reason": "no_prior",
+            "resid_l1": 0.0,
+            "resid_l2": 0.0,
+            "resid_linf": 0.0,
+            "negative_count": 0,
         }
+
+        if w_target is not None and np.any(w_target > 0.0):
+            z_sub_raw, orbit_constraint_info = _orbit_hard_constraint_solve(
+                ATA_sub_reg=ATA_sub_reg,
+                ATy_sub=ATy_sub,
+                active_idx=active_idx,
+                S_active=S_active,
+                orbit_target_mass=np.asarray(w_target, dtype=np.float64),
+                C=C,
+                P=P,
+            )
+
+            if not orbit_constraint_info["accepted"]:
+                print(
+                    "[MONO][constrained] rejecting infeasible reduced solve "
+                    f"(reason={orbit_constraint_info['reason']}, "
+                    f"neg={orbit_constraint_info['negative_count']}, "
+                    f"orbit_L1={orbit_constraint_info['resid_l1']:.3e}, "
+                    f"orbit_Linf={orbit_constraint_info['resid_linf']:.3e})",
+                    flush=True,
+                )
+                if promoted_cols.size > 0:
+                    _cooldown_cols(promoted_cols, it, extra_iters=20)
+                    _cooldown_orbits(np.unique(promoted_cols // P), it, extra_iters=20)
+                active[:] = active_before
+                z[:] = z_before
+                if _watch_progress():
+                    _emit_checkpoint(
+                        it,
+                        final=True,
+                        phase="constraint_reject_stall",
+                    )
+                    break
+
+                _emit_checkpoint(
+                    it,
+                    final=False,
+                    phase="constraint_reject",
+                )
+                continue
+
+            z_sub = np.asarray(z_sub_raw, dtype=np.float64).copy()
+
+        else:
+            z_sub_raw = None
+            try:
+                z_sub_raw = np.linalg.solve(ATA_sub_reg, ATy_sub)
+            except np.linalg.LinAlgError:
+                U, svals, Vt = np.linalg.svd(ATA_sub_reg, full_matrices=False)
+                smax = svals[0] if svals.size else 1.0
+                s_thresh = max(1e-12, 1e-6 * smax)
+                s_inv = np.array(
+                    [1.0 / s if s > s_thresh else 0.0 for s in svals],
+                    dtype=np.float64,
+                )
+                z_sub_raw = Vt.T @ (s_inv * (U.T @ ATy_sub))
+
+            z_sub_raw = np.maximum(z_sub_raw, 0.0)
+            z_sub = z_sub_raw.copy()
 
         # Track promoted columns that did not survive the reduced solve.
         failed_cols = []
@@ -1694,57 +1595,23 @@ def streamActiveSetNNLS(
         obj_gain = float(obj_old - obj_new)
         rel_gain = obj_gain / max(1.0, abs(obj_old))
 
-        promoted_cols = (
-            np.asarray(newly_activated, dtype=np.int64)
-            if newly_activated is not None and newly_activated.size > 0
-            else np.zeros((0,), dtype=np.int64)
-        )
-
-        orbit_improved = False
-        if did_explore and (w_target is not None):
-            _, _, deficit_old = _orbit_mass_and_deficit(z)
-            z_tmp = z.copy()
-            z_tmp[active_idx] = z_sub
-            _, _, deficit_new = _orbit_mass_and_deficit(z_tmp)
-
-            old_l1 = float(np.sum(np.abs(deficit_old)))
-            new_l1 = float(np.sum(np.abs(deficit_new)))
-            orbit_improved = new_l1 < (0.995 * old_l1)
-
         near_noop = (
             did_explore
             and promoted_cols.size > 0
             and (obj_gain <= promotion_noop_abs_tol
                  or rel_gain <= promotion_noop_rel_tol)
-            and not orbit_improved
         )
 
-        obj_tol = max(
-            1e-10 * max(1.0, abs(obj_old)),
-            1e-12,
-        )
+        reject = False
 
-        obj_nonfinite = (
-            not np.isfinite(obj_old)
-            or not np.isfinite(obj_new)
-        )
+        if did_explore:
+            obj_worsened = np.isfinite(obj_new) and (
+                obj_new > obj_old + 1e-12 * (1.0 + abs(obj_old))
+            )
+            norm_exploded = (norm_old > 1e-12 and norm_new > 50.0 * norm_old)
 
-        obj_worsened = (
-            np.isfinite(obj_new)
-            and obj_new > obj_old + obj_tol
-        )
-
-        if norm_old > 1e-12:
-            norm_exploded = norm_new > 50.0 * norm_old
-        else:
-            # Do not use a ratio against zero on the first iteration.
-            norm_exploded = not np.isfinite(norm_new)
-
-        reject = bool(
-            obj_nonfinite
-            or obj_worsened
-            or norm_exploded
-        )
+            if obj_worsened or norm_exploded:
+                reject = True
 
         if did_explore and near_noop:
             _cooldown_cols(promoted_cols, it, extra_iters=3)
@@ -1756,54 +1623,56 @@ def streamActiveSetNNLS(
 
         if reject:
             print(
-                "[MONO] rejecting reduced update "
-                f"(did_explore={did_explore}, "
-                f"obj_old={obj_old:.4e}, "
-                f"obj_new={obj_new:.4e}, "
-                f"obj_tol={obj_tol:.4e}, "
-                f"norm_old={norm_old:.4e}, "
-                f"norm_new={norm_new:.4e})",
+                "[MONO][explore] rejecting exploratory update "
+                f"(obj_old={obj_old:.4e}, obj_new={obj_new:.4e}, "
+                f"norm_old={norm_old:.4e}, norm_new={norm_new:.4e})",
                 flush=True,
             )
-
             if promoted_cols.size > 0:
-                _cooldown_cols(
-                    promoted_cols,
-                    it,
-                    extra_iters=20,
-                )
+                _cooldown_cols(promoted_cols, it, extra_iters=20)
                 _cooldown_orbits(
-                    np.unique(promoted_cols // P),
-                    it,
-                    extra_iters=20,
-                )
-
-            active[:] = active_before
-            z[:] = z_before
-
-            positive_batch_size = max(
-                2,
-                positive_batch_size // 2,
-            )
+                    np.unique(promoted_cols // P), it, extra_iters=20,)
+            if newly_activated is not None and newly_activated.size > 0:
+                active[newly_activated] = False
+            z[active_idx] = z_old_active
 
             if _watch_progress():
-                _emit_checkpoint(
-                    it,
-                    final=True,
-                    phase="reject_stall_exit",
-                )
                 break
-
-            _emit_checkpoint(
-                it,
-                final=False,
-                phase="reject_update",
-            )
+            _emit_checkpoint(it, final=True, phase="reject_exit")
             continue
 
         # Commit solution on the active subspace
         for ii, gcol in enumerate(active_idx):
             z[int(gcol)] = float(z_sub[ii])
+
+        if did_explore:
+            obj_tol = max(
+                1e-10 * max(1.0, abs(obj_old)),
+                1e-14,
+            )
+
+            if (not np.isfinite(obj_new)) or (obj_new > obj_old + obj_tol):
+                print(
+                    "[MONO][explore] rolling back batch: "
+                    f"obj_old={obj_old:.3e} "
+                    f"obj_new={obj_new:.3e} "
+                    f"tol={obj_tol:.3e}",
+                    flush=True,
+                )
+
+                active[:] = active_before
+                z[:] = z_before
+
+                if newly_activated is not None and newly_activated.size > 0:
+                    _cooldown_cols(newly_activated, it, extra_iters=20)
+                    _cooldown_orbits(
+                        np.unique(newly_activated // P), it, extra_iters=20,)
+
+                positive_batch_size = max(2, positive_batch_size // 2)
+                if _watch_progress():
+                    break
+                _emit_checkpoint(it, final=True, phase="rollback_exit")
+                continue
 
         # --------------------------------------------------------
         # Probation cleanup
@@ -1894,7 +1763,10 @@ def streamActiveSetNNLS(
                     "ridge": float(ridge),
                     "did_explore": bool(did_explore),
                     "reject": bool(reject),
-                    "orbit_improved": bool(orbit_improved),
+                    "orbit_constraint_ok": bool(orbit_constraint_info["accepted"]),
+                    "orbit_constraint_l1": float(orbit_constraint_info["resid_l1"]),
+                    "orbit_constraint_l2": float(orbit_constraint_info["resid_l2"]),
+                    "orbit_constraint_linf": float(orbit_constraint_info["resid_linf"]),
                     "n_promoted": int(promoted_cols.size),
                     "n_failed": int(len(failed_cols)),
                     "n_dropped": int(len(drop_cols)),
@@ -1924,8 +1796,7 @@ def streamActiveSetNNLS(
         _emit_checkpoint(it, final=False)
 
 
-    # Orbit prior is included simultaneously as augmented quadratic rows.
-    # It is a soft objective term, not an exact equality constraint.
+    # Orbit prior is enforced in the reduced solves above; no final correction.
 
     try:
         final_it = int(it)
@@ -1943,11 +1814,6 @@ def streamActiveSetNNLS(
 
     if w_target is not None and np.any(w_target > 0.0):
         orbit_mass, orbit_target, orbit_deficit = _orbit_mass_and_deficit(z)
-        orbit_objective = (
-            0.5
-            * float(orbit_prior_weight_effective)
-            * float(np.dot(orbit_deficit, orbit_deficit))
-        )
         orbit_resid_l1 = float(np.sum(np.abs(orbit_deficit)))
         orbit_resid_l2 = float(np.linalg.norm(orbit_deficit))
         orbit_resid_linf = float(np.max(np.abs(orbit_deficit)))
@@ -1955,16 +1821,14 @@ def streamActiveSetNNLS(
         orbit_mass = np.sum(x_final.reshape(C, P), axis=1)
         orbit_target = np.zeros((C,), dtype=np.float64)
         orbit_deficit = orbit_target - orbit_mass
-        orbit_objective = 0.0
         orbit_resid_l1 = None
         orbit_resid_l2 = None
         orbit_resid_linf = None
 
-    total_objective = data_objective + orbit_objective
+    total_objective = data_objective
 
     print(
         f"[MONO][final] data_obj={data_objective:.3e} "
-        f"orbit_obj={orbit_objective:.3e} "
         f"total_obj={total_objective:.3e} "
         f"orbit_L1={(orbit_resid_l1 if orbit_resid_l1 is not None else float('nan')):.3e} "
         f"orbit_Linf={(orbit_resid_linf if orbit_resid_linf is not None else float('nan')):.3e}",
@@ -1975,7 +1839,6 @@ def streamActiveSetNNLS(
         {
             "kind": "objective_summary",
             "data_objective": float(data_objective),
-            "orbit_objective": float(orbit_objective),
             "total_objective": float(total_objective),
             "orbit_resid_l1": orbit_resid_l1,
             "orbit_resid_l2": orbit_resid_l2,
@@ -1984,13 +1847,8 @@ def streamActiveSetNNLS(
             "orbit_target": orbit_target.tolist(),
             "orbit_resid": orbit_deficit.tolist(),
             "orbit_prior_present": bool(w_target is not None and np.any(w_target > 0.0)),
-            "orbit_prior_weight": float(orbit_prior_weight),
-            "orbit_prior_weight_effective": float(
-                orbit_prior_weight_effective
-            ),
         }
     )
-
 
     _emit_checkpoint(final_it, final=True, phase="complete")
     return S_flat * z
@@ -2230,6 +2088,27 @@ def solve_streaming_nnls(
     n_blocks = int(math.ceil(CP / block_size))
     blocks = [(i * block_size, min(CP, (i + 1) * block_size)) for i in range(n_blocks)]
 
+    # Precompute block metadata (maps, shapes)
+    block_meta = {}
+    for bi, (c0, c1) in enumerate(blocks):
+        cols = np.arange(c0, c1, dtype=np.int64)
+        ncols = cols.size
+        # map local_col_idx -> (orbit_cc, p)
+        cc_arr = (cols // P).astype(np.int64)
+        pp_arr = (cols % P).astype(np.int64)
+        # for soft prior we need w_vec per column (if w_target present)
+        if w_target is not None:
+            w_vec = np.asarray([float(w_target[int(cc)]) for cc in cc_arr], dtype=np.float64)
+        else:
+            w_vec = None
+        block_meta[bi] = dict(
+            cols=cols,
+            ncols=ncols,
+            cc_arr=cc_arr,
+            pp_arr=pp_arr,
+            w_vec=w_vec,
+        )
+
     verbose = getattr(cfg, "verbose", True)
     print(f"[BC-FUSED] blocks={n_blocks}, block_size={block_size}, processes={cfg.processes}", flush=True)
 
@@ -2305,15 +2184,6 @@ def solve_streaming_nnls(
             cache_npz["inv_sqrt_energy_flat"],
             dtype=np.float64,
         ).copy()
-        ATy_pos = ATy_flat[
-            np.isfinite(ATy_flat) & (ATy_flat > 0.0)
-        ]
-        if ATy_pos.size > 0:
-            alpha_ref = float(np.median(ATy_pos))
-        else:
-            alpha_ref = 1.0
-        if not np.isfinite(alpha_ref) or alpha_ref <= 0.0:
-            alpha_ref = 1.0
 
         try:
             cache_npz.close()
@@ -2412,15 +2282,6 @@ def solve_streaming_nnls(
                     )
 
         # ------------------------ end streaming --------------------------
-        ATy_pos = ATy_flat[
-            np.isfinite(ATy_flat) & (ATy_flat > 0.0)
-        ]
-        if ATy_pos.size > 0:
-            alpha_ref = float(np.median(ATy_pos))
-        else:
-            alpha_ref = 1.0
-        if not np.isfinite(alpha_ref) or alpha_ref <= 0.0:
-            alpha_ref = 1.0
 
         # ------------------------------------------------------------------
         # compute inv_sqrt_energy and scaled targets (per-tile average energy)
@@ -2482,33 +2343,6 @@ def solve_streaming_nnls(
                 print(f"[BC-FUSED] cache saved: {cache_path}", flush=True)
             except Exception as _e:
                 print(f"[BC-FUSED] cache save failed: {_e}", flush=True)
-
-
-    if w_target is not None:
-        w_target_abs = alpha_ref * w_target
-    else:
-        w_target_abs = None
-
-    # Precompute block metadata (maps, shapes)
-    block_meta = {}
-    for bi, (c0, c1) in enumerate(blocks):
-        cols = np.arange(c0, c1, dtype=np.int64)
-        ncols = cols.size
-        # map local_col_idx -> (orbit_cc, p)
-        cc_arr = (cols // P).astype(np.int64)
-        pp_arr = (cols % P).astype(np.int64)
-        # for soft prior we need w_vec per column (if w_target present)
-        if w_target_abs is not None:
-            w_vec = np.asarray([float(w_target_abs[int(cc)]) for cc in cc_arr], dtype=np.float64)
-        else:
-            w_vec = None
-        block_meta[bi] = dict(
-            cols=cols,
-            ncols=ncols,
-            cc_arr=cc_arr,
-            pp_arr=pp_arr,
-            w_vec=w_vec,
-        )
 
     # DIAGNOSTIC: report S statistics (helps find extreme scalings)
     S_sample = inv_sqrt_energy_flat
@@ -2676,7 +2510,6 @@ def solve_streaming_nnls(
             max_iter=5 * monolithic_max_active,
             checkpoint_cb=_checkpoint_cb,
             checkpoint_every=checkpoint_every,
-            orbit_prior_weight=orbit_prior_weight,
         )
 
         x = x_flat_unscaled.reshape(C, P).copy()
@@ -2803,15 +2636,9 @@ def solve_streaming_nnls(
             pass
         # --- orbit_weights residual diagnostic (if prior provided) -----
         try:
-            if (
-                w_target_abs is not None
-                and np.sum(w_target_abs) > 0.0
-            ):
+            if (w_target is not None) and (np.sum(w_target) > 0.0):
                 s_full = np.sum(x, axis=1)
-                s_proj = np.asarray(
-                    w_target_abs,
-                    dtype=np.float64,
-                ).copy()
+                s_proj = np.asarray(w_target, dtype=np.float64).copy()
 
                 print("[DIAG][orbit_weights]", flush=True)
                 for cc in range(C):

@@ -51,6 +51,8 @@ v1.14:  Do not return full slab in `_reconstruct_worker`, causing extreme memory
             requirements. 22 May 2026
 v1.15:  Polished `orbitMaps` figure. 3 August 2026
 v1.16:  Removed legacy keywords in solver calls in `genCubeFit`. 4 August 2026
+v1.17:  Fixed bug in `loadCubeFit` with the orbit map data dictionary labels in
+            the plotting loop. 5 August 2026
 """
 
 # need to set up the logger before any other imports
@@ -74,11 +76,9 @@ from matplotlib.colors import Normalize
 from matplotlib import colormaps, colors as mcolors
 from copy import copy
 import h5py
-import subprocess
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed,\
     ThreadPoolExecutor
-from typing import Tuple, Sequence
 from plotbin.display_pixels import display_pixels as dbi
 
 from CubeFit.hdf5_manager import H5Manager, open_h5,\
@@ -1838,6 +1838,44 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         mask = np.asarray(f["/Mask"][...], bool).ravel()
         nSpat, nLam = D.shape
     
+    # Read cache for orbit prior alpha
+    cache_path = plp.Path(f"{hdf5Path}.bcfused.npz")
+    if not cache_path.is_file():
+        raise RuntimeError(f"No solver cache found: {cache_path}")
+    cache_npz = np.load(cache_path, allow_pickle=False)
+    try:
+        cache_keep_idx = np.asarray(cache_npz["keep_idx"], dtype=np.int64)
+        cache_apply_mask = bool(int(cache_npz["apply_mask"]))
+
+        current_keep_idx = (
+            np.flatnonzero(mask_arr).astype(np.int64)
+            if (mask_arr is not None and cache_apply_mask)
+            else np.asarray([], dtype=np.int64)
+        )
+
+        ok = (
+            int(cache_npz["S"]) == int(nSpat)
+            and int(cache_npz["L"]) == int(nLSpec)
+            and int(cache_npz["C"]) == int(nComp)
+            and int(cache_npz["P"]) == int(nPop)
+            and int(cache_npz["s_tile"]) == int(s_chunk)
+            and cache_apply_mask == bool(int(cache_npz["apply_mask"]))
+            and np.array_equal(cache_keep_idx, current_keep_idx)
+        )
+        if not ok:
+            raise RuntimeError(
+                f"Solver cache is not valid for this fit: {cache_path}"
+            )
+        ATy_flat = np.asarray(cache_npz["ATy_flat"], dtype=np.float64)
+        ATy_pos = ATy_flat[np.isfinite(ATy_flat) & (ATy_flat > 0.0)]
+        if ATy_pos.size > 0:
+            alpha_ref = float(np.median(ATy_pos))
+        else:
+            alpha_ref = 1.0
+    finally:
+        cache_npz.close()
+    orbit_target_mass = alpha_ref * np.asarray(cWeights, dtype=np.float64)
+    
     arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
     M = np.zeros((NOrbs, nComp), dtype=np.float64)
     for c, comp in enumerate(nzComp):
@@ -1863,16 +1901,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         compDisp[nc, :] = svR
         compVel[nc, :] = vMean[:, 2] # v_phi
 
-    compare_orbit_vs_solution(
-        h5_path=str(hdf5Path),
-        orbit_weights=cWeights,
-        x_global=x_global,
-        save=figDir/\
-            f"compare_prior_{nComp:{pred}d}_i{proj}_{lOrder:02d}.png"
-    )
     compare_orbit_vs_solution_absolute(
         h5_path=str(hdf5Path),
-        orbit_target_mass=cWeights,
+        orbit_target_mass=orbit_target_mass,
         x_global=x_global,
         save=figDir/\
             f"compare_prior_abs_{nComp:{pred}d}_i{proj}_{lOrder:02d}.png"
@@ -2528,16 +2559,17 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     ('age', rf"$t\ [{UTS.gyr}]$", amin, amax),
                     ('alpha', r"$[\alpha/Fe]$", lmin, lmax),
                 ]
+                orb_keys = ['sa', 'la', 'bo']
                 orb_specs = [r'$z$ Tubes', r'$x$ Tubes', 'Boxes']
 
-                fig = plt.figure(figsize=plt.figaspect((yLen*3.)/xLen)*0.75)
+                fig = plt.figure(figsize=plt.figaspect((yLen)/xLen)*0.75)
                 gs = gridspec.GridSpec(3, 3, hspace=0.0, wspace=0.0)
 
                 for ri, (prop, label, vmin, vmax) in enumerate(prop_specs):
                     mappable = None
-                    for oi, otype in enumerate(orb_specs):
+                    for oi, (orb_key, otype) in enumerate(zip(orb_keys, orb_specs)):
                         ax = fig.add_subplot(gs[ri, oi])
-                        arr = maps[prop][otype]
+                        arr = maps[prop][orb_key]
                         arr = np.ma.masked_invalid(arr)[binNum]
                         mappable = dbi(xpix, ypix, arr,
                             pixelsize=pixs, angle=PA,
@@ -2706,72 +2738,6 @@ def plot_sparse_spectra_from_x(
             plt.close(fig)
 
         print(f"[DiagSparse] wrote {picks.size} plots to {plot_dir}")
-
-# ------------------------------------------------------------------------------
-
-def compare_orbit_vs_solution(
-    h5_path: str,
-    *,
-    orbit_weights: np.ndarray | None = None,   # shape (C,), raw or normalized
-    x_global: np.ndarray | None = None,        # shape (C*P,) or (C,P)
-    save: str | None = None,
-):
-    """
-    Visualize how the learned per-component mass (sum over P) compares to the
-    input orbit_weights used by the ratio penalty.
-    """
-    # --- read C,P and x_global if needed
-    with open_h5(h5_path, role="reader") as f:
-        M = f["/HyperCube/models"]
-        S, C, P, L = map(int, M.shape)
-        if x_global is None:
-            if "/X_global" not in f:
-                raise RuntimeError("No /X_global in HDF5 and x_global not provided.")
-            x_global = np.asarray(f["/X_global"][...], dtype=np.float64)
-
-    x = np.asarray(x_global, dtype=np.float64)
-    if x.ndim == 1:
-        if x.size != C*P:
-            raise ValueError(f"x_global has length {x.size}, expected C*P={C*P}.")
-        x = x.reshape(C, P)  # (C,P)
-    elif x.ndim == 2:
-        if x.shape != (C, P):
-            raise ValueError(f"x_global shape {x.shape}, expected (C,P)=({C},{P}).")
-    else:
-        raise ValueError("x_global must be 1-D or 2-D")
-
-    # --- per-component totals and normalization
-    eps = 1e-18
-    sol_tot = x.sum(axis=1)
-    # --- exact orbit constraint check ---
-    if orbit_weights is not None:
-        w_in = np.asarray(orbit_weights, dtype=np.float64).ravel()
-        if w_in.size == C * P:
-            w_in = w_in.reshape(C, P).sum(axis=1)
-        elif w_in.size != C:
-            raise ValueError(
-                f"orbit_weights has length {w_in.size}, expected C={C} or C*P={C*P}."
-            )
-
-        err = np.linalg.norm(sol_tot - w_in)
-        rel = err / (np.linalg.norm(w_in) + 1e-30)
-
-        print("[orbit constraint check]")
-        print(f"  ||s - w||        = {err:.6e}")
-        print(f"  relative error   = {rel:.6e}")
-
-        plotw = np.log10(np.maximum(w_in, eps))
-        plotx = np.log10(np.maximum(sol_tot, eps))
-        fig, ax = plt.subplots(figsize=(4,4))
-        ax.plot(plotw, plotx, '.', alpha=0.6)
-        lim = [min(plotw.min(), plotx.min()),
-            max(plotw.max(), plotx.max())]
-        ax.plot(lim, lim, 'k-')
-        ax.set_xlabel("$\\log_{10}(\\text{orbit prior (scaled)})$")
-        ax.set_ylabel("$\\log_{10}(\\text{solution } \\sum_p x[c,p])$")
-        if save:
-            fig.savefig(save, dpi=140)
-        plt.close(fig)
 
 # ------------------------------------------------------------------------------
 
