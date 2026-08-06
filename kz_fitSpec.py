@@ -53,6 +53,14 @@ v1.15:  Polished `orbitMaps` figure. 3 August 2026
 v1.16:  Removed legacy keywords in solver calls in `genCubeFit`. 4 August 2026
 v1.17:  Fixed bug in `loadCubeFit` with the orbit map data dictionary labels in
             the plotting loop. 5 August 2026
+v1.18:  Updated hard orbit-prior diagnostics for the constrained solver's
+            flexible global-amplitude formulation;
+        Removed the obsolete ATy-median estimate of the absolute orbit target;
+        Reconstructed the fitted target as the normalized a priori orbit shape
+            multiplied by the total fitted coefficient mass;
+        Corrected the absolute orbit-mass comparison plot and residual
+            diagnostics to use the same target enforced by the solver. 6 August
+            2026
 """
 
 # need to set up the logger before any other imports
@@ -1838,43 +1846,81 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         mask = np.asarray(f["/Mask"][...], bool).ravel()
         nSpat, nLam = D.shape
     
-    # Read cache for orbit prior alpha
-    cache_path = plp.Path(f"{hdf5Path}.bcfused.npz")
-    if not cache_path.is_file():
-        raise RuntimeError(f"No solver cache found: {cache_path}")
-    cache_npz = np.load(cache_path, allow_pickle=False)
-    try:
-        cache_keep_idx = np.asarray(cache_npz["keep_idx"], dtype=np.int64)
-        cache_apply_mask = bool(int(cache_npz["apply_mask"]))
+    # ------------------------------------------------------------
+    # Reconstruct the hard-prior target used by the constrained fit
+    # ------------------------------------------------------------
+    orbit_shape = np.asarray(
+        cWeights,
+        dtype=np.float64,
+    ).ravel(order="C")
 
-        current_keep_idx = (
-            np.flatnonzero(mask_arr).astype(np.int64)
-            if (mask_arr is not None and cache_apply_mask)
-            else np.asarray([], dtype=np.int64)
+    if orbit_shape.size != nComp:
+        raise ValueError(
+            "cWeights must contain one value per orbit component."
         )
 
-        ok = (
-            int(cache_npz["S"]) == int(nSpat)
-            and int(cache_npz["L"]) == int(nLSpec)
-            and int(cache_npz["C"]) == int(nComp)
-            and int(cache_npz["P"]) == int(nPop)
-            and int(cache_npz["s_tile"]) == int(s_chunk)
-            and cache_apply_mask == bool(int(cache_npz["apply_mask"]))
-            and np.array_equal(cache_keep_idx, current_keep_idx)
+    orbit_shape = np.maximum(
+        orbit_shape,
+        0.0,
+    )
+
+    orbit_shape_sum = float(
+        np.sum(orbit_shape)
+    )
+
+    if (
+        not np.isfinite(orbit_shape_sum)
+        or orbit_shape_sum <= 0.0
+    ):
+        raise ValueError(
+            "cWeights must have positive finite total weight."
         )
-        if not ok:
-            raise RuntimeError(
-                f"Solver cache is not valid for this fit: {cache_path}"
+
+    # This is the exact shape passed to the constrained solver.
+    orbit_shape /= orbit_shape_sum
+
+    x_global_cp = np.asarray(
+        x_global,
+        dtype=np.float64,
+    )
+
+    if x_global_cp.ndim == 1:
+        if x_global_cp.size != nComp * nPop:
+            raise ValueError(
+                "x_global has the wrong number of coefficients."
             )
-        ATy_flat = np.asarray(cache_npz["ATy_flat"], dtype=np.float64)
-        ATy_pos = ATy_flat[np.isfinite(ATy_flat) & (ATy_flat > 0.0)]
-        if ATy_pos.size > 0:
-            alpha_ref = float(np.median(ATy_pos))
-        else:
-            alpha_ref = 1.0
-    finally:
-        cache_npz.close()
-    orbit_target_mass = alpha_ref * np.asarray(cWeights, dtype=np.float64)
+        x_global_cp = x_global_cp.reshape(
+            nComp,
+            nPop,
+            order="C",
+        )
+    elif x_global_cp.shape != (nComp, nPop):
+        raise ValueError(
+            "x_global must have shape "
+            f"({nComp}, {nPop})."
+        )
+
+    # Because orbit_shape has unit sum, the fitted global amplitude is the
+    # total physical coefficient mass.
+    alpha_fit = float(
+        np.sum(
+            x_global_cp,
+            dtype=np.float64,
+        )
+    )
+
+    if (
+        not np.isfinite(alpha_fit)
+        or alpha_fit < 0.0
+    ):
+        raise RuntimeError(
+            "The fitted global orbit amplitude is invalid."
+        )
+
+    orbit_target_mass = (
+        alpha_fit
+        * orbit_shape
+    )
     
     arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
     M = np.zeros((NOrbs, nComp), dtype=np.float64)
@@ -1901,12 +1947,35 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         compDisp[nc, :] = svR
         compVel[nc, :] = vMean[:, 2] # v_phi
 
+    solution_orbit_mass = np.sum(
+        x_global_cp,
+        axis=1,
+    )
+
+    orbit_resid = (
+        solution_orbit_mass
+        - orbit_target_mass
+    )
+
+    print(
+        "[Orbit-prior plot] "
+        f"alpha_fit={alpha_fit:.6e} "
+        f"shape_sum={np.sum(orbit_shape):.6e} "
+        f"solution_sum={np.sum(solution_orbit_mass):.6e} "
+        f"target_sum={np.sum(orbit_target_mass):.6e} "
+        f"L1={np.sum(np.abs(orbit_resid)):.6e} "
+        f"Linf={np.max(np.abs(orbit_resid)):.6e}",
+        flush=True,
+    )
     compare_orbit_vs_solution_absolute(
         h5_path=str(hdf5Path),
         orbit_target_mass=orbit_target_mass,
         x_global=x_global,
-        save=figDir/\
-            f"compare_prior_abs_{nComp:{pred}d}_i{proj}_{lOrder:02d}.png"
+        save=figDir
+        / (
+            f"compare_prior_abs_"
+            f"{nComp:{pred}d}_i{proj}_{lOrder:02d}.png"
+        ),
     )
 
     # ---------------------------------------------
@@ -2750,11 +2819,14 @@ def compare_orbit_vs_solution_absolute(
     save: str | None = None,
 ):
     """
-    Compare the learned per-orbit mass against an absolute target mass vector.
+    Compare the fitted per-orbit masses against the exact hard-prior target.
 
-    Unlike the older comparison helper, this function does NOT rescale the
-    target to match the total solution mass. It therefore reflects the actual
-    absolute residual induced by the augmented-row prior.
+    For the flexible-amplitude constrained formulation, the target is
+
+        target[c] = alpha_fit * orbit_shape[c],
+
+    where orbit_shape is fixed a priori and normalized to unit sum, while
+    alpha_fit is the fitted global coefficient mass.
 
     Parameters
     ----------

@@ -24,6 +24,9 @@ v1.0:   Spectrum/white-light/residual plotting. 2025
 v1.1:   Integrated convergence and comparison plots. 2025
 v1.2:   Added `plot_diagnostic_jsonl_dashboard` for streaming solver diagnostics.
             4 August 2026
+v1.3:   Reworked `plot_diagnostic_jsonl_dashboard` for the constrained
+            solver's fixed orbit-shape and fitted global-amplitude formulation. 6
+            August 2026
 """
 
 from __future__ import annotations
@@ -420,392 +423,1288 @@ def plot_diagnostic_jsonl_dashboard(
     max_points: int | None = 5000,
     save_path: str | None = None,
     show: bool = False,
-    figsize: tuple[float, float] = (16.0, 11.0),
-):
+    figsize: tuple[float, float] = (18.0, 14.0),
+) -> tuple[
+    plt.Figure,
+    dict[str, plt.Axes],
+    list[dict],
+]:
     """
-    Plot streaming diagnostics from a solver JSONL file.
+    Plot diagnostics for the flexible-amplitude hard-prior solver.
 
-    The function understands the current solver records emitted by
-    `streamActiveSetNNLS(...)` / `solve_streaming_nnls(...)`, including:
+    The dashboard combines ``iter_pre``, ``iter_post``, setup, and final
+    records emitted by the constrained streaming active-set solver. Records
+    sharing an iteration number are merged so that pre-solve gradients and
+    post-solve objective, support, and constraint diagnostics appear on the
+    same iteration axis.
 
-    - iter / n_active / support / k_active
-    - rmse / residual_norm
-    - max_grad_total / max_grad_data / max_grad_orbit / max_grad_promotable
-    - n_promoted / n_failed / n_dropped
-    - orbit_mass / orbit_target / orbit_resid / orbit_ratio
-    - orbit_nz / orbit_eff_support
-    - norm_old / norm_new
-    - orbit objective summary fields when present
+    The panels show:
+
+    1. Global data-objective evolution and relative improvement.
+    2. Fitted global amplitude and coefficient norms.
+    3. Raw, constraint, and constrained reduced gradients.
+    4. Active-set size, effective support, and orbit occupation.
+    5. Promotions, failures, drops, and promotion survival.
+    6. Hard-constraint residuals and alpha stationarity.
+    7. Orbit-mass ratio history.
+    8. Final orbit masses, targets, and relative residuals.
+    9. Iteration runtime, ridge, and reduced-Hessian condition estimate.
 
     Parameters
     ----------
-    jsonl_path
-        Path to the diagnostics JSONL file.
-    live
-        If True, repeatedly rereads the file and refreshes the figure.
-    refresh_sec
-        Delay between refreshes in live mode.
-    max_points
-        Keep only the most recent N records. Set to None to use all records.
-    save_path
-        If provided, save the current figure to this path.
-    show
-        If True, call plt.show() in non-live mode and at the end of live mode.
-    figsize
+    jsonl_path : str
+        Path to the solver diagnostics JSONL file.
+    max_points : int or None, optional
+        Maximum number of merged iteration records to retain. ``None`` keeps
+        all records.
+    save_path : str or None, optional
+        Output image path. If ``None``, the figure is not written.
+    show : bool, optional
+        If True, display the figure with ``plt.show()``.
+    figsize : tuple of float, optional
         Figure size in inches.
 
     Returns
     -------
     fig : matplotlib.figure.Figure
-        The figure object.
-    axes : dict[str, matplotlib.axes.Axes]
-        Dictionary of subplot handles.
-    records : list[dict]
-        Parsed JSONL records used for the final draw.
-    """
+        Generated dashboard figure.
+    axes : dict of str to matplotlib.axes.Axes
+        Named subplot axes.
+    records : list of dict
+        Raw JSONL records successfully parsed from the file.
 
+    Raises
+    ------
+    FileNotFoundError
+        If ``jsonl_path`` does not exist.
+    ValueError
+        If ``max_points`` is not positive or ``None``.
+    OSError
+        If the input file cannot be read or the output cannot be written.
+
+    Examples
+    --------
+    >>> fig, axes, records = plot_diagnostic_jsonl_dashboard(
+    ...     "diagnostics.jsonl",
+    ...     save_path="diagnostics_dashboard.png",
+    ... )
+    """
     eps = 1e-300
 
+    if max_points is not None and int(max_points) <= 0:
+        raise ValueError(
+            "max_points must be positive or None."
+        )
+
     def _load_records() -> list[dict]:
-        records = []
-        with open(jsonl_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                s = line.strip()
-                if not s:
+        parsed = []
+
+        with open(
+            jsonl_path,
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            for line in handle:
+                text = line.strip()
+
+                if not text:
                     continue
+
                 try:
-                    rec = json.loads(s)
-                except Exception:
+                    record = json.loads(text)
+                except (TypeError, ValueError, json.JSONDecodeError):
                     continue
-                if isinstance(rec, dict):
-                    records.append(rec)
 
-        if max_points is not None and len(records) > max_points:
-            records = records[-max_points:]
-        return records
+                if isinstance(record, dict):
+                    parsed.append(record)
 
-    def _scalar(rec: dict, *keys: str, default=np.nan) -> float:
+        return parsed
+
+    def _finite_scalar(
+        record: dict,
+        *keys: str,
+        default: float = np.nan,
+    ) -> float:
         for key in keys:
-            if key in rec and rec[key] is not None:
-                try:
-                    return float(rec[key])
-                except Exception:
-                    continue
-        return default
+            value = record.get(key)
 
-    def _vec(rec: dict, *keys: str) -> np.ndarray | None:
-        for key in keys:
-            if key in rec and rec[key] is not None:
-                try:
-                    arr = np.asarray(rec[key], dtype=np.float64).ravel()
-                    if arr.size:
-                        return arr
-                except Exception:
-                    pass
-        return None
-
-    def _extract(records: list[dict]) -> dict:
-        iters = []
-        active = []
-        support = []
-        mean_orbit_nz = []
-        mean_eff_support = []
-        rmse = []
-        resid = []
-        orbit_l1 = []
-        orbit_linf = []
-        norm_old = []
-        norm_new = []
-        max_grad_total = []
-        max_grad_data = []
-        max_grad_orbit = []
-        max_grad_promo = []
-        n_promoted = []
-        n_failed = []
-        n_dropped = []
-
-        orbit_heat = []
-        orbit_last_mass = None
-        orbit_last_target = None
-        orbit_last_resid = None
-        orbit_heat_C = None
-
-        for rec in records:
-            it = _scalar(rec, "iter")
-            if not np.isfinite(it):
+            if value is None:
                 continue
 
-            iters.append(int(it))
-            active.append(_scalar(rec, "n_active", "active", "k_active"))
-            support.append(_scalar(rec, "support", "support_n", "x_nonzero"))
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
 
-            rmse.append(_scalar(rec, "rmse", "rmse_proxy"))
-            resid.append(_scalar(rec, "residual_norm", "resid"))
-            orbit_l1.append(
-                _scalar(rec, "orbit_l1", "orbit_L1", "orbit_resid_l1")
+            if np.isfinite(value):
+                return value
+
+        return float(default)
+
+    def _vector(
+        record: dict,
+        *keys: str,
+    ) -> np.ndarray | None:
+        for key in keys:
+            value = record.get(key)
+
+            if value is None:
+                continue
+
+            try:
+                array = np.asarray(
+                    value,
+                    dtype=np.float64,
+                ).ravel(order="C")
+            except (TypeError, ValueError):
+                continue
+
+            if array.size > 0:
+                return array
+
+        return None
+
+    def _merge_iteration_records(
+        raw_records: list[dict],
+    ) -> tuple[list[dict], dict]:
+        """
+        Merge pre- and post-solve records for each iteration.
+
+        Later records overwrite earlier scalar fields, while vector fields
+        remain available from whichever phase emitted them most recently.
+        """
+        merged_by_iter: dict[int, dict] = {}
+        non_iteration: dict[str, dict] = {}
+
+        for record in raw_records:
+            kind = str(record.get("kind", ""))
+
+            try:
+                iteration = int(record["iter"])
+            except (KeyError, TypeError, ValueError):
+                if kind:
+                    non_iteration[kind] = dict(record)
+                continue
+
+            current = merged_by_iter.setdefault(
+                iteration,
+                {
+                    "iter": iteration,
+                },
             )
-            orbit_linf.append(
-                _scalar(rec, "orbit_linf", "orbit_Linf", "orbit_resid_linf")
-            )
-            norm_old.append(_scalar(rec, "norm_old"))
-            norm_new.append(_scalar(rec, "norm_new"))
-            max_grad_total.append(_scalar(rec, "max_grad_total"))
-            max_grad_data.append(_scalar(rec, "max_grad_data"))
-            max_grad_orbit.append(_scalar(rec, "max_grad_orbit"))
-            max_grad_promo.append(
-                _scalar(rec, "max_grad_promotable", "max_grad_promo")
-            )
-            n_promoted.append(_scalar(rec, "n_promoted", default=0.0))
-            n_failed.append(_scalar(rec, "n_failed", default=0.0))
-            n_dropped.append(_scalar(rec, "n_dropped", default=0.0))
 
-            orbit_nz = _vec(rec, "orbit_nz")
-            if orbit_nz is not None:
-                mean_orbit_nz.append(float(np.nanmean(orbit_nz)))
-            else:
-                mean_orbit_nz.append(np.nan)
+            current.update(record)
 
-            orbit_eff = _vec(rec, "orbit_eff_support")
-            if orbit_eff is not None:
-                mean_eff_support.append(float(np.nanmean(orbit_eff)))
-            else:
-                mean_eff_support.append(np.nan)
+            if kind == "iter_pre":
+                current["_has_pre"] = True
+            elif kind == "iter_post":
+                current["_has_post"] = True
 
-            orbit_mass = _vec(rec, "orbit_mass")
-            orbit_target = _vec(rec, "orbit_target")
-            orbit_resid = _vec(rec, "orbit_resid")
-            orbit_ratio = _vec(rec, "orbit_ratio")
+        merged = [
+            merged_by_iter[key]
+            for key in sorted(merged_by_iter)
+        ]
 
-            if orbit_mass is not None:
-                if orbit_heat_C is None:
-                    orbit_heat_C = int(orbit_mass.size)
+        if max_points is not None:
+            merged = merged[-int(max_points):]
 
-                if orbit_mass.size == orbit_heat_C:
-                    if (
-                        orbit_ratio is None
-                        and orbit_target is not None
-                        and orbit_target.size == orbit_heat_C
-                    ):
-                        orbit_ratio = orbit_mass / np.maximum(orbit_target, eps)
+        return merged, non_iteration
 
-                    if orbit_ratio is not None and orbit_ratio.size == orbit_heat_C:
-                        orbit_heat.append(np.log10(np.maximum(orbit_ratio, eps)))
-                        orbit_last_mass = orbit_mass.copy()
-                        orbit_last_target = (
-                            orbit_target.copy()
-                            if orbit_target is not None
-                            and orbit_target.size == orbit_heat_C
-                            else None
-                        )
-                        if orbit_resid is not None and orbit_resid.size == orbit_heat_C:
-                            orbit_last_resid = orbit_resid.copy()
-                        elif orbit_last_target is not None:
-                            orbit_last_resid = orbit_last_mass - orbit_last_target
+    def _series(
+        merged: list[dict],
+        *keys: str,
+        default: float = np.nan,
+    ) -> np.ndarray:
+        return np.asarray(
+            [
+                _finite_scalar(
+                    record,
+                    *keys,
+                    default=default,
+                )
+                for record in merged
+            ],
+            dtype=np.float64,
+        )
 
-        return {
-            "iters": np.asarray(iters, dtype=np.int64),
-            "active": np.asarray(active, dtype=np.float64),
-            "support": np.asarray(support, dtype=np.float64),
-            "mean_orbit_nz": np.asarray(mean_orbit_nz, dtype=np.float64),
-            "mean_eff_support": np.asarray(mean_eff_support, dtype=np.float64),
-            "rmse": np.asarray(rmse, dtype=np.float64),
-            "resid": np.asarray(resid, dtype=np.float64),
-            "orbit_l1": np.asarray(orbit_l1, dtype=np.float64),
-            "orbit_linf": np.asarray(orbit_linf, dtype=np.float64),
-            "norm_old": np.asarray(norm_old, dtype=np.float64),
-            "norm_new": np.asarray(norm_new, dtype=np.float64),
-            "max_grad_total": np.asarray(max_grad_total, dtype=np.float64),
-            "max_grad_data": np.asarray(max_grad_data, dtype=np.float64),
-            "max_grad_orbit": np.asarray(max_grad_orbit, dtype=np.float64),
-            "max_grad_promo": np.asarray(max_grad_promo, dtype=np.float64),
-            "n_promoted": np.asarray(n_promoted, dtype=np.float64),
-            "n_failed": np.asarray(n_failed, dtype=np.float64),
-            "n_dropped": np.asarray(n_dropped, dtype=np.float64),
-            "orbit_heat": (
-                np.asarray(orbit_heat, dtype=np.float64) if orbit_heat else None
-            ),
-            "orbit_last_mass": orbit_last_mass,
-            "orbit_last_target": orbit_last_target,
-            "orbit_last_resid": orbit_last_resid,
-        }
+    def _plot_finite(
+        axis,
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+        label: str,
+        *,
+        absolute: bool = False,
+        positive_log: bool = False,
+        **kwargs,
+    ) -> None:
+        x_array = np.asarray(
+            x_values,
+            dtype=np.float64,
+        )
+        y_array = np.asarray(
+            y_values,
+            dtype=np.float64,
+        )
 
-    def _plot_series(ax, x, y, label, *, logy=False, **kwargs):
-        xx = np.asarray(x, dtype=np.float64).ravel()
-        yy = np.asarray(y, dtype=np.float64).ravel()
-        m = np.isfinite(xx) & np.isfinite(yy)
-        if not np.any(m):
+        mask = (
+            np.isfinite(x_array)
+            & np.isfinite(y_array)
+        )
+
+        if not np.any(mask):
             return
 
-        xx = xx[m]
-        yy = yy[m]
+        x_plot = x_array[mask]
+        y_plot = y_array[mask]
 
-        if logy:
-            yy = np.abs(yy)
-            m2 = yy > eps
-            if not np.any(m2):
+        if absolute:
+            y_plot = np.abs(y_plot)
+
+        if positive_log:
+            positive = y_plot > 0.0
+
+            if not np.any(positive):
                 return
-            ax.semilogy(xx[m2], np.maximum(yy[m2], eps), label=label, **kwargs)
-        else:
-            ax.plot(xx, yy, label=label, **kwargs)
 
-    def _draw(data: dict, fig=None):
-        if fig is None:
-            fig = plt.figure(figsize=figsize)
-        else:
-            fig.clf()
-
-        gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.35, wspace=0.25)
-
-        ax00 = fig.add_subplot(gs[0, 0])
-        ax01 = fig.add_subplot(gs[0, 1])
-        ax10 = fig.add_subplot(gs[1, 0])
-        ax11 = fig.add_subplot(gs[1, 1])
-        ax20 = fig.add_subplot(gs[2, 0])
-        ax21 = fig.add_subplot(gs[2, 1])
-
-        it = data["iters"]
-        if it.size == 0:
-            for ax in (ax00, ax01, ax10, ax11, ax20, ax21):
-                ax.set_axis_off()
-            ax00.text(0.5, 0.5, "No diagnostics yet", ha="center", va="center")
-            return fig, {
-                "active": ax00,
-                "norms": ax01,
-                "gradients": ax10,
-                "counts": ax11,
-                "orbit_heat": ax20,
-                "orbit_final": ax21,
-            }
-
-        _plot_series(ax00, it, data["active"], "Active", lw=1.5)
-        _plot_series(ax00, it, data["support"], "Support", lw=1.5)
-        _plot_series(
-            ax00, it, data["mean_orbit_nz"], "Mean orbit nz", lw=1.2, alpha=0.85
-        )
-        _plot_series(
-            ax00,
-            it,
-            data["mean_eff_support"],
-            "Mean eff support",
-            lw=1.2,
-            alpha=0.85,
-        )
-        ax00.set_title("Active set / orbit occupation")
-        ax00.set_xlabel("Iteration")
-        ax00.set_ylabel("Count / support")
-        ax00.legend(fontsize=8, ncol=2)
-
-        _plot_series(ax01, it, data["rmse"], "RMSE", logy=True, lw=1.5)
-        _plot_series(ax01, it, data["resid"], "Residual norm", logy=True, lw=1.5)
-        _plot_series(ax01, it, data["orbit_l1"], "Orbit L1", logy=True, lw=1.2)
-        _plot_series(
-            ax01, it, data["orbit_linf"], "Orbit Linf", logy=True, lw=1.2
-        )
-        _plot_series(ax01, it, data["norm_old"], "Norm old", logy=True, lw=1.0)
-        _plot_series(ax01, it, data["norm_new"], "Norm new", logy=True, lw=1.0)
-        ax01.set_title("Fit norms")
-        ax01.set_xlabel("Iteration")
-        ax01.set_ylabel("Value")
-        ax01.legend(fontsize=8, ncol=2)
-
-        _plot_series(
-            ax10, it, data["max_grad_total"], "Max grad total", logy=True, lw=1.5
-        )
-        _plot_series(
-            ax10, it, data["max_grad_data"], "Max grad data", logy=True, lw=1.2
-        )
-        _plot_series(
-            ax10, it, data["max_grad_orbit"], "Max grad orbit", logy=True, lw=1.2
-        )
-        _plot_series(
-            ax10,
-            it,
-            data["max_grad_promo"],
-            "Max grad promotable",
-            logy=True,
-            lw=1.0,
-            alpha=0.85,
-        )
-        ax10.set_title("Promotion gradients")
-        ax10.set_xlabel("Iteration")
-        ax10.set_ylabel("Gradient")
-        ax10.legend(fontsize=8, ncol=2)
-
-        _plot_series(ax11, it, data["n_promoted"], "Promoted", lw=1.3)
-        _plot_series(ax11, it, data["n_failed"], "Failed", lw=1.3)
-        _plot_series(ax11, it, data["n_dropped"], "Dropped", lw=1.3)
-        ax11.set_title("Batch bookkeeping")
-        ax11.set_xlabel("Iteration")
-        ax11.set_ylabel("Count")
-        ax11.legend(fontsize=8)
-
-        heat = data["orbit_heat"]
-        if heat is not None and heat.size > 0:
-            im = ax20.imshow(
-                heat.T,
-                origin="lower",
-                aspect="auto",
-                interpolation="nearest",
-                extent=[float(it.min()), float(it.max()), 0.0, float(heat.shape[1])],
-                cmap="viridis",
+            axis.semilogy(
+                x_plot[positive],
+                np.maximum(
+                    y_plot[positive],
+                    eps,
+                ),
+                label=label,
+                **kwargs,
             )
-            ax20.set_title(r"Orbit occupation heatmap: $\log_{10}(M/T)$")
-            ax20.set_xlabel("Iteration")
-            ax20.set_ylabel("Orbit")
-            cbar = fig.colorbar(im, ax=ax20, fraction=0.046, pad=0.04)
-            cbar.set_label(r"$\log_{10}(M/T)$")
         else:
-            ax20.set_axis_off()
-            ax20.text(0.5, 0.5, "No orbit ratio history", ha="center", va="center")
+            axis.plot(
+                x_plot,
+                y_plot,
+                label=label,
+                **kwargs,
+            )
 
-        mass = data["orbit_last_mass"]
-        target = data["orbit_last_target"]
-        resid_last = data["orbit_last_resid"]
-        if mass is not None:
-            idx = np.arange(mass.size, dtype=np.int64)
-            w = 0.38
-            ax21.bar(idx - w / 2, mass, width=w, label="Mass")
-            if target is not None and target.size == mass.size:
-                ax21.bar(idx + w / 2, target, width=w, label="Target")
-            ax21.set_title("Final orbit masses")
-            ax21.set_xlabel("Orbit")
-            ax21.set_ylabel("Mass")
-            ax21.legend(fontsize=8, loc="best")
+    def _latest_vector(
+        merged: list[dict],
+        *keys: str,
+    ) -> np.ndarray | None:
+        for record in reversed(merged):
+            value = _vector(
+                record,
+                *keys,
+            )
 
-            ax21r = ax21.twinx()
-            if resid_last is not None and resid_last.size == mass.size:
-                ax21r.plot(idx, resid_last, "k.-", lw=1.0, label="Residual")
-                ax21r.axhline(0.0, color="k", lw=0.8, alpha=0.6)
-                ax21r.set_ylabel("Residual")
-                l1 = float(np.sum(np.abs(resid_last)))
-                linf = float(np.max(np.abs(resid_last)))
-                ax21.set_title(
-                    f"Final orbit masses  |  L1={l1:.3e}, Linf={linf:.3e}"
+            if value is not None:
+                return value
+
+        return None
+
+    raw_records = _load_records()
+    merged, non_iteration = _merge_iteration_records(
+        raw_records
+    )
+
+    fig = plt.figure(
+        figsize=figsize,
+    )
+    grid = gridspec.GridSpec(
+        3,
+        3,
+        figure=fig,
+        hspace=0.36,
+        wspace=0.30,
+    )
+
+    axes = {
+        "objective": fig.add_subplot(grid[0, 0]),
+        "amplitude": fig.add_subplot(grid[0, 1]),
+        "gradients": fig.add_subplot(grid[0, 2]),
+        "support": fig.add_subplot(grid[1, 0]),
+        "promotions": fig.add_subplot(grid[1, 1]),
+        "constraints": fig.add_subplot(grid[1, 2]),
+        "orbit_history": fig.add_subplot(grid[2, 0]),
+        "orbit_final": fig.add_subplot(grid[2, 1]),
+        "numerics": fig.add_subplot(grid[2, 2]),
+    }
+
+    if not merged:
+        for axis in axes.values():
+            axis.set_axis_off()
+
+        axes["objective"].set_axis_on()
+        axes["objective"].text(
+            0.5,
+            0.5,
+            "No iteration diagnostics found",
+            ha="center",
+            va="center",
+            transform=axes["objective"].transAxes,
+        )
+
+        if save_path:
+            fig.savefig(
+                save_path,
+                dpi=150,
+                bbox_inches="tight",
+            )
+
+        if show:
+            plt.show()
+
+        return fig, axes, raw_records
+
+    iterations = np.asarray(
+        [
+            int(record["iter"])
+            for record in merged
+        ],
+        dtype=np.int64,
+    )
+
+    # ------------------------------------------------------------------
+    # Extract primary scalar histories
+    # ------------------------------------------------------------------
+    data_objective = _series(
+        merged,
+        "data_objective",
+    )
+    obj_old = _series(
+        merged,
+        "obj_old",
+    )
+    obj_new = _series(
+        merged,
+        "obj_new",
+    )
+    obj_gain = _series(
+        merged,
+        "obj_gain",
+    )
+
+    alpha = _series(
+        merged,
+        "alpha",
+    )
+    norm_old = _series(
+        merged,
+        "norm_old",
+    )
+    norm_new = _series(
+        merged,
+        "norm_new",
+    )
+
+    grad_total = _series(
+        merged,
+        "max_grad_total",
+    )
+    grad_data = _series(
+        merged,
+        "max_grad_data",
+    )
+    grad_orbit = _series(
+        merged,
+        "max_grad_orbit",
+    )
+    grad_promo = _series(
+        merged,
+        "max_grad_promotable",
+        "max_grad_promo",
+    )
+
+    n_active = _series(
+        merged,
+        "n_active",
+        "k_active",
+        "active",
+    )
+    n_promoted = _series(
+        merged,
+        "n_promoted",
+        default=0.0,
+    )
+    n_failed = _series(
+        merged,
+        "n_failed",
+        default=0.0,
+    )
+    n_dropped = _series(
+        merged,
+        "n_dropped",
+        default=0.0,
+    )
+
+    constraint_l1 = _series(
+        merged,
+        "orbit_constraint_l1",
+        "orbit_resid_l1",
+    )
+    constraint_linf = _series(
+        merged,
+        "orbit_constraint_linf",
+        "orbit_resid_linf",
+    )
+    alpha_stationarity = _series(
+        merged,
+        "alpha_stationarity",
+    )
+
+    iteration_time = _series(
+        merged,
+        "t_iter_sec",
+    )
+    ridge = _series(
+        merged,
+        "ridge",
+    )
+    eig_min = _series(
+        merged,
+        "emin",
+    )
+    eig_max = _series(
+        merged,
+        "emax",
+    )
+
+    mean_orbit_nz = np.full(
+        iterations.shape,
+        np.nan,
+        dtype=np.float64,
+    )
+    mean_eff_support = np.full(
+        iterations.shape,
+        np.nan,
+        dtype=np.float64,
+    )
+    max_top_share = np.full(
+        iterations.shape,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    orbit_ratio_rows = []
+    orbit_ratio_iters = []
+    orbit_count = None
+
+    for index, record in enumerate(merged):
+        orbit_nz = _vector(
+            record,
+            "orbit_nz",
+        )
+        orbit_eff = _vector(
+            record,
+            "orbit_eff_support",
+        )
+        orbit_top = _vector(
+            record,
+            "orbit_top_share",
+        )
+
+        if orbit_nz is not None:
+            mean_orbit_nz[index] = float(
+                np.nanmean(orbit_nz)
+            )
+
+        if orbit_eff is not None:
+            mean_eff_support[index] = float(
+                np.nanmean(orbit_eff)
+            )
+
+        if orbit_top is not None:
+            max_top_share[index] = float(
+                np.nanmax(orbit_top)
+            )
+
+        ratio = _vector(
+            record,
+            "orbit_ratio",
+        )
+        mass = _vector(
+            record,
+            "orbit_mass",
+        )
+        target = _vector(
+            record,
+            "orbit_target",
+        )
+
+        if (
+            ratio is None
+            and mass is not None
+            and target is not None
+            and mass.size == target.size
+        ):
+            ratio = np.divide(
+                mass,
+                target,
+                out=np.full_like(
+                    mass,
+                    np.nan,
+                ),
+                where=np.abs(target) > 0.0,
+            )
+
+        if ratio is None:
+            continue
+
+        if orbit_count is None:
+            orbit_count = int(ratio.size)
+
+        if ratio.size != orbit_count:
+            continue
+
+        orbit_ratio_rows.append(
+            ratio.copy()
+        )
+        orbit_ratio_iters.append(
+            int(record["iter"])
+        )
+
+    # ------------------------------------------------------------------
+    # Panel 1: data objective
+    # ------------------------------------------------------------------
+    axis = axes["objective"]
+
+    _plot_finite(
+        axis,
+        iterations,
+        data_objective,
+        "Global data objective",
+        lw=1.6,
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        obj_new,
+        "Reduced objective",
+        lw=1.0,
+        alpha=0.75,
+    )
+
+    axis.set_title(
+        "Data-fit objective"
+    )
+    axis.set_xlabel(
+        "Iteration"
+    )
+    axis.set_ylabel(
+        "Objective"
+    )
+    axis.legend(
+        fontsize=8,
+        loc="best",
+    )
+
+    objective_for_gain = data_objective.copy()
+
+    if not np.any(np.isfinite(objective_for_gain)):
+        objective_for_gain = obj_new.copy()
+
+    relative_gain = np.full_like(
+        objective_for_gain,
+        np.nan,
+    )
+
+    for index in range(
+        1,
+        objective_for_gain.size,
+    ):
+        previous = objective_for_gain[index - 1]
+        current = objective_for_gain[index]
+
+        if (
+            np.isfinite(previous)
+            and np.isfinite(current)
+        ):
+            relative_gain[index] = (
+                previous - current
+            ) / max(
+                1.0,
+                abs(previous),
+            )
+
+    objective_axis_right = axis.twinx()
+
+    _plot_finite(
+        objective_axis_right,
+        iterations,
+        relative_gain,
+        "Relative gain",
+        absolute=True,
+        positive_log=True,
+        lw=1.0,
+        alpha=0.65,
+    )
+
+    objective_axis_right.set_ylabel(
+        "|Relative improvement|"
+    )
+
+    # ------------------------------------------------------------------
+    # Panel 2: alpha and coefficient norms
+    # ------------------------------------------------------------------
+    axis = axes["amplitude"]
+
+    _plot_finite(
+        axis,
+        iterations,
+        alpha,
+        "Fitted alpha",
+        lw=1.7,
+    )
+
+    axis.set_title(
+        "Global amplitude and coefficient norm"
+    )
+    axis.set_xlabel(
+        "Iteration"
+    )
+    axis.set_ylabel(
+        "Global amplitude"
+    )
+
+    norm_axis = axis.twinx()
+
+    _plot_finite(
+        norm_axis,
+        iterations,
+        norm_old,
+        "Norm old",
+        positive_log=True,
+        lw=1.0,
+        alpha=0.70,
+    )
+    _plot_finite(
+        norm_axis,
+        iterations,
+        norm_new,
+        "Norm new",
+        positive_log=True,
+        lw=1.2,
+    )
+
+    norm_axis.set_ylabel(
+        "Coefficient norm"
+    )
+
+    handles_left, labels_left = axis.get_legend_handles_labels()
+    handles_right, labels_right = norm_axis.get_legend_handles_labels()
+
+    if handles_left or handles_right:
+        axis.legend(
+            handles_left + handles_right,
+            labels_left + labels_right,
+            fontsize=8,
+            loc="best",
+        )
+
+    # ------------------------------------------------------------------
+    # Panel 3: reduced-gradient optimality
+    # ------------------------------------------------------------------
+    axis = axes["gradients"]
+
+    _plot_finite(
+        axis,
+        iterations,
+        grad_data,
+        "Raw data gradient",
+        absolute=True,
+        positive_log=True,
+        lw=1.2,
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        grad_orbit,
+        "Constraint correction",
+        absolute=True,
+        positive_log=True,
+        lw=1.2,
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        grad_total,
+        "Constrained reduced gradient",
+        absolute=True,
+        positive_log=True,
+        lw=1.6,
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        grad_promo,
+        "Promotable reduced gradient",
+        absolute=True,
+        positive_log=True,
+        lw=1.1,
+        alpha=0.85,
+    )
+
+    axis.set_title(
+        "Constrained optimality"
+    )
+    axis.set_xlabel(
+        "Iteration"
+    )
+    axis.set_ylabel(
+        "Absolute gradient"
+    )
+    axis.legend(
+        fontsize=8,
+        loc="best",
+    )
+
+    # ------------------------------------------------------------------
+    # Panel 4: active and effective support
+    # ------------------------------------------------------------------
+    axis = axes["support"]
+
+    _plot_finite(
+        axis,
+        iterations,
+        n_active,
+        "Active columns",
+        lw=1.6,
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        mean_orbit_nz,
+        "Mean nonzero/orbit",
+        lw=1.2,
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        mean_eff_support,
+        "Mean effective support",
+        lw=1.2,
+    )
+
+    axis.set_title(
+        "Support size and diversity"
+    )
+    axis.set_xlabel(
+        "Iteration"
+    )
+    axis.set_ylabel(
+        "Count"
+    )
+    axis.legend(
+        fontsize=8,
+        loc="best",
+    )
+
+    share_axis = axis.twinx()
+
+    _plot_finite(
+        share_axis,
+        iterations,
+        max_top_share,
+        "Largest orbit top-share",
+        lw=1.0,
+        alpha=0.70,
+    )
+
+    share_axis.set_ylim(
+        0.0,
+        1.05,
+    )
+    share_axis.set_ylabel(
+        "Maximum top-share"
+    )
+
+    # ------------------------------------------------------------------
+    # Panel 5: active-set churn
+    # ------------------------------------------------------------------
+    axis = axes["promotions"]
+
+    _plot_finite(
+        axis,
+        iterations,
+        n_promoted,
+        "Promoted",
+        lw=1.3,
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        n_failed,
+        "Failed",
+        lw=1.3,
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        n_dropped,
+        "Dropped",
+        lw=1.3,
+    )
+
+    promotion_survival = np.divide(
+        n_promoted - n_failed,
+        n_promoted,
+        out=np.full_like(
+            n_promoted,
+            np.nan,
+        ),
+        where=n_promoted > 0.0,
+    )
+
+    survival_axis = axis.twinx()
+
+    _plot_finite(
+        survival_axis,
+        iterations,
+        promotion_survival,
+        "Promotion survival",
+        lw=1.2,
+    )
+
+    survival_axis.set_ylim(
+        -0.05,
+        1.05,
+    )
+    survival_axis.set_ylabel(
+        "Surviving fraction"
+    )
+
+    axis.set_title(
+        "Active-set churn"
+    )
+    axis.set_xlabel(
+        "Iteration"
+    )
+    axis.set_ylabel(
+        "Columns"
+    )
+
+    handles_left, labels_left = axis.get_legend_handles_labels()
+    handles_right, labels_right = (
+        survival_axis.get_legend_handles_labels()
+    )
+
+    axis.legend(
+        handles_left + handles_right,
+        labels_left + labels_right,
+        fontsize=8,
+        loc="best",
+    )
+
+    # ------------------------------------------------------------------
+    # Panel 6: exact hard-constraint diagnostics
+    # ------------------------------------------------------------------
+    axis = axes["constraints"]
+
+    _plot_finite(
+        axis,
+        iterations,
+        constraint_l1,
+        "Orbit residual L1",
+        absolute=True,
+        positive_log=True,
+        lw=1.3,
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        constraint_linf,
+        "Orbit residual Linf",
+        absolute=True,
+        positive_log=True,
+        lw=1.3,
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        alpha_stationarity,
+        "|shape dot lambda|",
+        absolute=True,
+        positive_log=True,
+        lw=1.3,
+    )
+
+    axis.set_title(
+        "Hard-prior feasibility"
+    )
+    axis.set_xlabel(
+        "Iteration"
+    )
+    axis.set_ylabel(
+        "Absolute residual"
+    )
+    axis.legend(
+        fontsize=8,
+        loc="best",
+    )
+
+    # ------------------------------------------------------------------
+    # Panel 7: orbit-ratio history
+    # ------------------------------------------------------------------
+    axis = axes["orbit_history"]
+
+    if orbit_ratio_rows:
+        ratio_history = np.asarray(
+            orbit_ratio_rows,
+            dtype=np.float64,
+        )
+        ratio_iterations = np.asarray(
+            orbit_ratio_iters,
+            dtype=np.float64,
+        )
+
+        log_ratio = np.log10(
+            np.maximum(
+                ratio_history,
+                eps,
+            )
+        )
+
+        finite_log = log_ratio[
+            np.isfinite(log_ratio)
+        ]
+
+        if finite_log.size > 0:
+            limit = float(
+                np.nanpercentile(
+                    np.abs(finite_log),
+                    99.0,
                 )
+            )
+            limit = max(
+                limit,
+                1e-12,
+            )
         else:
-            ax21.set_axis_off()
-            ax21.text(0.5, 0.5, "No orbit masses found", ha="center", va="center")
+            limit = 1.0
 
-        fig.tight_layout()
-        return fig, {
-            "active": ax00,
-            "norms": ax01,
-            "gradients": ax10,
-            "counts": ax11,
-            "orbit_heat": ax20,
-            "orbit_final": ax21,
-        }
+        image = axis.imshow(
+            log_ratio.T,
+            origin="lower",
+            aspect="auto",
+            interpolation="nearest",
+            extent=[
+                float(ratio_iterations[0]),
+                float(ratio_iterations[-1]),
+                -0.5,
+                float(log_ratio.shape[1]) - 0.5,
+            ],
+            cmap="coolwarm",
+            vmin=-limit,
+            vmax=limit,
+        )
 
-    records = _load_records()
-    data = _extract(records)
-    fig, axes = _draw(data, None)
+        axis.set_title(
+            r"Orbit prior history: "
+            r"$\log_{10}(M_c/(\alpha w_c))$"
+        )
+        axis.set_xlabel(
+            "Iteration"
+        )
+        axis.set_ylabel(
+            "Orbit index"
+        )
+
+        colorbar = fig.colorbar(
+            image,
+            ax=axis,
+            fraction=0.046,
+            pad=0.04,
+        )
+        colorbar.set_label(
+            r"$\log_{10}(M_c/(\alpha w_c))$"
+        )
+    else:
+        axis.set_axis_off()
+        axis.text(
+            0.5,
+            0.5,
+            "No orbit-ratio history",
+            ha="center",
+            va="center",
+            transform=axis.transAxes,
+        )
+
+    # ------------------------------------------------------------------
+    # Panel 8: final orbit comparison
+    # ------------------------------------------------------------------
+    axis = axes["orbit_final"]
+
+    final_mass = _latest_vector(
+        merged,
+        "orbit_mass",
+    )
+    final_target = _latest_vector(
+        merged,
+        "orbit_target",
+    )
+    final_resid = _latest_vector(
+        merged,
+        "orbit_resid",
+    )
+    final_shape = _latest_vector(
+        merged,
+        "orbit_shape",
+    )
+
+    if final_mass is not None:
+        orbit_indices = np.arange(
+            final_mass.size,
+            dtype=np.int64,
+        )
+        width = 0.38
+
+        axis.bar(
+            orbit_indices - width / 2.0,
+            final_mass,
+            width=width,
+            label="Fitted mass",
+        )
+
+        if (
+            final_target is not None
+            and final_target.size == final_mass.size
+        ):
+            axis.bar(
+                orbit_indices + width / 2.0,
+                final_target,
+                width=width,
+                label=r"Target $\alpha w$",
+            )
+
+        axis.set_xlabel(
+            "Orbit index"
+        )
+        axis.set_ylabel(
+            "Physical mass"
+        )
+
+        if (
+            final_resid is None
+            and final_target is not None
+            and final_target.size == final_mass.size
+        ):
+            final_resid = (
+                final_mass - final_target
+            )
+
+        relative_residual = None
+
+        if (
+            final_resid is not None
+            and final_resid.size == final_mass.size
+            and final_target is not None
+            and final_target.size == final_mass.size
+        ):
+            relative_residual = np.divide(
+                final_resid,
+                final_target,
+                out=np.full_like(
+                    final_resid,
+                    np.nan,
+                ),
+                where=np.abs(final_target) > 0.0,
+            )
+
+            residual_axis = axis.twinx()
+            residual_axis.plot(
+                orbit_indices,
+                relative_residual,
+                marker="o",
+                lw=1.0,
+                label="Relative residual",
+            )
+            residual_axis.axhline(
+                0.0,
+                lw=0.8,
+                alpha=0.65,
+            )
+            residual_axis.set_ylabel(
+                "Relative residual"
+            )
+
+        absolute_l1 = (
+            float(np.sum(np.abs(final_resid)))
+            if final_resid is not None
+            else np.nan
+        )
+        absolute_linf = (
+            float(np.max(np.abs(final_resid)))
+            if final_resid is not None
+            else np.nan
+        )
+
+        final_alpha = alpha[
+            np.flatnonzero(np.isfinite(alpha))[-1]
+        ] if np.any(np.isfinite(alpha)) else np.nan
+
+        axis.set_title(
+            "Final hard-prior match\n"
+            f"alpha={final_alpha:.4e}, "
+            f"L1={absolute_l1:.3e}, "
+            f"Linf={absolute_linf:.3e}"
+        )
+        axis.legend(
+            fontsize=8,
+            loc="best",
+        )
+    else:
+        axis.set_axis_off()
+        axis.text(
+            0.5,
+            0.5,
+            "No final orbit masses",
+            ha="center",
+            va="center",
+            transform=axis.transAxes,
+        )
+
+    # ------------------------------------------------------------------
+    # Panel 9: runtime and numerical conditioning
+    # ------------------------------------------------------------------
+    axis = axes["numerics"]
+
+    _plot_finite(
+        axis,
+        iterations,
+        iteration_time,
+        "Iteration time",
+        positive_log=True,
+        lw=1.4,
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        ridge,
+        "Ridge",
+        positive_log=True,
+        lw=1.1,
+    )
+
+    condition_estimate = np.divide(
+        np.abs(eig_max),
+        np.maximum(
+            np.abs(eig_min),
+            eps,
+        ),
+        out=np.full_like(
+            eig_max,
+            np.nan,
+        ),
+        where=(
+            np.isfinite(eig_max)
+            & np.isfinite(eig_min)
+        ),
+    )
+
+    condition_axis = axis.twinx()
+
+    _plot_finite(
+        condition_axis,
+        iterations,
+        condition_estimate,
+        "Condition estimate",
+        positive_log=True,
+        lw=1.2,
+    )
+
+    axis.set_title(
+        "Cost and reduced-system conditioning"
+    )
+    axis.set_xlabel(
+        "Iteration"
+    )
+    axis.set_ylabel(
+        "Seconds / ridge"
+    )
+    condition_axis.set_ylabel(
+        "Condition estimate"
+    )
+
+    handles_left, labels_left = axis.get_legend_handles_labels()
+    handles_right, labels_right = (
+        condition_axis.get_legend_handles_labels()
+    )
+
+    if handles_left or handles_right:
+        axis.legend(
+            handles_left + handles_right,
+            labels_left + labels_right,
+            fontsize=8,
+            loc="best",
+        )
+
+    # ------------------------------------------------------------------
+    # Figure-level summary
+    # ------------------------------------------------------------------
+    final_record = non_iteration.get(
+        "objective_summary",
+        {},
+    )
+
+    final_data_objective = _finite_scalar(
+        final_record,
+        "data_objective",
+    )
+    final_total_objective = _finite_scalar(
+        final_record,
+        "total_objective",
+    )
+
+    final_alpha_summary = _finite_scalar(
+        final_record,
+        "alpha",
+    )
+
+    if not np.isfinite(final_alpha_summary):
+        finite_alpha = alpha[
+            np.isfinite(alpha)
+        ]
+        final_alpha_summary = (
+            float(finite_alpha[-1])
+            if finite_alpha.size
+            else np.nan
+        )
+
+    title_parts = [
+        "CubeFit constrained streaming diagnostics",
+        f"iterations={iterations[0]}-{iterations[-1]}",
+    ]
+
+    if np.isfinite(final_alpha_summary):
+        title_parts.append(
+            f"alpha={final_alpha_summary:.6e}"
+        )
+
+    if np.isfinite(final_data_objective):
+        title_parts.append(
+            f"data objective={final_data_objective:.6e}"
+        )
+    elif np.isfinite(final_total_objective):
+        title_parts.append(
+            f"objective={final_total_objective:.6e}"
+        )
+
+    fig.suptitle(
+        " | ".join(title_parts),
+        fontsize=14,
+        y=0.995,
+    )
+
+    fig.tight_layout(
+        rect=(0.0, 0.0, 1.0, 0.975),
+    )
 
     if save_path:
-        fig.savefig(save_path, dpi=150)
+        fig.savefig(
+            save_path,
+            dpi=150,
+            bbox_inches="tight",
+        )
 
     if show:
         plt.show()
 
-    return fig, axes, records
+    return fig, axes, raw_records
 
 # ------------------------------------------------------------------------------
