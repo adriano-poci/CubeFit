@@ -2248,12 +2248,11 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         otypes = copy(nzComp)-1 # zero-indexed
         diskComps = bulgeComps = None
 
+    satube = (otypes == 0) # group short-axis tubes
+    latube = (otypes == 1)
+    boxess = (otypes == 2)
     if 'sfh' in pplots:
         try:
-            satube = (otypes == 0) # group short-axis tubes
-            latube = (otypes == 1)
-            boxess = (otypes == 2)
-
             coSFH = np.zeros((nMetals, nAges, nAlphas), dtype=float)
             laSFH = np.zeros((nMetals, nAges, nAlphas), dtype=float)
             boSFH = np.zeros((nMetals, nAges, nAlphas), dtype=float)
@@ -2362,10 +2361,13 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 transform=cax.transAxes, rotation=270)
             lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                 foreground='k')])
-            cax.text(0.45, 1.0-5e-3, f"{wmax:.2e}", va='top', ha='center',
-                color='w', transform=cax.transAxes, rotation=270)
-            cax.text(0.45, 5e-3, f"{wmin:.2e}", va='bottom', ha='center',
+            pren = 2
+            miText = POT.prec(pren, wmin)
+            maText = POT.prec(pren, wmax)
+            cax.text(0.45, 5e-3, miText, va='bottom', ha='center',
                 color='k', transform=cax.transAxes, rotation=270)
+            cax.text(0.45, 1.0-5e-3, maText, va='top', ha='center',
+                color='w', transform=cax.transAxes, rotation=270)
             cb.set_ticks([])
 
             plt.savefig(figDir/\
@@ -2440,9 +2442,12 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     transform=cax.transAxes, rotation=270)
                 lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                     foreground='k')])
-                cax.text(0.45, 1.0-5e-3, f"{dbmax:.2e}", va='top', ha='center',
+                pren = 2
+                miText = POT.prec(pren, dbmin)
+                maText = POT.prec(pren, dbmax)
+                cax.text(0.45, 1.0-5e-3, miText, va='top', ha='center',
                     color='w', transform=cax.transAxes, rotation=270)
-                cax.text(0.45, 5e-3, f"{dbmin:.2e}", va='bottom', ha='center',
+                cax.text(0.45, 5e-3, maText, va='bottom', ha='center',
                     color='k', transform=cax.transAxes, rotation=270)
                 cb.set_ticks([])
 
@@ -2501,10 +2506,13 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 transform=cax2.transAxes, rotation=270)
             lT2.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                 foreground='k')])
-            cax2.text(0.45, 1.0-1e-3, f"{vmax2:.2e}", va='top', ha='center',
-                color='w', transform=cax2.transAxes, rotation=270)
-            cax2.text(0.45, 1e-3, f"{vmin2:.2e}", va='bottom', ha='center',
+            pren = 2
+            miText = POT.prec(pren, vmin2)
+            maText = POT.prec(pren, vmax2)
+            cax2.text(0.45, 1e-3, miText, va='bottom', ha='center',
                 color='k', transform=cax2.transAxes, rotation=270)
+            cax2.text(0.45, 1.0-1e-3, maText, va='top', ha='center',
+                color='w', transform=cax2.transAxes, rotation=270)
             cb2.set_ticks([])
 
             fig2.savefig(figDir/\
@@ -2554,10 +2562,13 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 transform=cax3.transAxes, rotation=270)
             lT3.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                 foreground='k')])
-            cax3.text(0.45, 1.0-1e-3, f"{vmax3:.2e}", va='top', ha='center',
-                color='w', transform=cax3.transAxes, rotation=270)
-            cax3.text(0.45, 1e-3, f"{vmin3:.2e}", va='bottom', ha='center',
+            pren = 2
+            miText = POT.prec(pren, vmin3)
+            maText = POT.prec(pren, vmax3)
+            cax3.text(0.45, 1e-3, miText, va='bottom', ha='center',
                 color='k', transform=cax3.transAxes, rotation=270)
+            cax3.text(0.45, 1.0-1e-3, maText, va='top', ha='center',
+                color='w', transform=cax3.transAxes, rotation=270)
             cb3.set_ticks([])
 
             fig3.savefig(figDir/\
@@ -2613,51 +2624,63 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     la=_MWProp(laAlpha, np.compress(latube, aperMass, axis=1)),
                     bo=_MWProp(boAlpha, np.compress(boxess, aperMass, axis=1))),)
                 
-                amin = np.min([np.nanmin(maps['age'][otype]) for otype in maps['age'].keys()])
-                amax = np.max([np.nanmax(maps['age'][otype]) for otype in maps['age'].keys()])
-                mmin = np.min([np.nanmin(maps['metal'][otype]) for otype in maps['metal'].keys()])
-                mmax = np.max([np.nanmax(maps['metal'][otype]) for otype in maps['metal'].keys()])
-                lmin = np.min([np.nanmin(maps['alpha'][otype]) for otype in maps['alpha'].keys()])
-                lmax = np.max([np.nanmax(maps['alpha'][otype]) for otype in maps['alpha'].keys()])
+                orbKeys = ['sa', 'la']
+                orbSpecs = [r'$z$ Tubes', r'$x$ Tubes']
+                amin = np.min([np.nanmin(maps['age'][otype]) for otype in orbKeys])
+                amax = np.max([np.nanmax(maps['age'][otype]) for otype in orbKeys])
+                mmin = np.min([np.nanmin(maps['metal'][otype]) for otype in orbKeys])
+                mmax = np.max([np.nanmax(maps['metal'][otype]) for otype in orbKeys])
+                lmin = np.min([np.nanmin(maps['alpha'][otype]) for otype in orbKeys])
+                lmax = np.max([np.nanmax(maps['alpha'][otype]) for otype in orbKeys])
                 print(f"Age map limits: {amin:.2f} to {amax:.2f}")
                 print(f"Metal map limits: {mmin:.2f} to {mmax:.2f}")
                 print(f"Alpha map limits: {lmin:.2f} to {lmax:.2f}")
-
-                prop_specs = [
+                propSpecs = [
                     ('metal', r"$[Fe/H]$", mmin, mmax),
                     ('age', rf"$t\ [{UTS.gyr}]$", amin, amax),
                     ('alpha', r"$[\alpha/Fe]$", lmin, lmax),
                 ]
-                orb_keys = ['sa', 'la', 'bo']
-                orb_specs = [r'$z$ Tubes', r'$x$ Tubes', 'Boxes']
 
-                fig = plt.figure(figsize=plt.figaspect((yLen)/xLen)*0.75)
-                gs = gridspec.GridSpec(3, 3, hspace=0.0, wspace=0.0)
 
-                for ri, (prop, label, vmin, vmax) in enumerate(prop_specs):
+                fig = plt.figure(figsize=plt.figaspect((yLen/xLen)*\
+                    (len(propSpecs)/len(orbKeys))*1.1))
+                gs = gridspec.GridSpec(len(propSpecs), len(orbKeys), hspace=0.0,
+                    wspace=0.0)
+
+                for ri, (prop, label, vmin, vmax) in enumerate(propSpecs):
                     mappable = None
-                    for oi, (orb_key, otype) in enumerate(zip(orb_keys, orb_specs)):
+                    for oi, (orb_key, otype) in enumerate(zip(orbKeys, orbSpecs)):
                         ax = fig.add_subplot(gs[ri, oi])
                         arr = maps[prop][orb_key]
                         arr = np.ma.masked_invalid(arr)[binNum]
+                        # vmin = np.ma.min(arr) if np.ma.any(arr) else vmin
+                        # vmax = np.ma.max(arr) if np.ma.any(arr) else vmax
                         mappable = dbi(xpix, ypix, arr,
                             pixelsize=pixs, angle=PA,
                             cmap=moncmapr, vmin=vmin, vmax=vmax,)
                         ax.set_xlim(xmin, xmax)
                         ax.set_ylim(ymin, ymax)
+                        pren = 2
+                        miText = POT.prec(pren, vmin)
+                        maText = POT.prec(pren, vmax)
+                        # ax.text(0.99, 0.99, f"{miText}/{maText}", va="top",
+                        #     ha="right", color=POT.pgreen, transform=ax.transAxes,
+                        #     rotation=0, path_effects=[
+                        #         PathEffects.withStroke(linewidth=1.5,
+                        #         foreground="k")])
 
                         if not ax.get_subplotspec().is_last_row():
                             ax.set_xticklabels([])
                         if not ax.get_subplotspec().is_first_col():
                             ax.set_yticklabels([])
-                        if ax.get_subplotspec().is_first_col():
+                        if ax.get_subplotspec().is_first_row():
                             ax.text(1e-2, 1e-2, otype,
                                 va="bottom", ha="left", color=POT.pgreen,
                                 transform=ax.transAxes,
                                 path_effects=[PathEffects.withStroke(
                                         linewidth=1.5, foreground="k")],)
                         if ax.get_subplotspec().is_last_col():
-                            cax = POT.attachAxis(ax, "right", 0.05)
+                            cax = POT.attachAxis(ax, "right", 0.1)
                             cb = plt.colorbar(mappable, cax=cax, orientation="vertical")
                             lT = cax.text(
                                 0.5, 0.5, label, va="center", ha="center",
@@ -2665,13 +2688,20 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                                 rotation=270, path_effects=[
                                     PathEffects.withStroke(
                                     linewidth=1.5, foreground="k")])
-                            cax.text(0.45, 1.0 - 5e-3, f"{vmax:.2e}",
-                                va="top", ha="center", color="w",
-                                transform=cax.transAxes, rotation=270,)
-                            cax.text(0.45, 5e-3, f"{vmin:.2e}",
+                            cax.text(0.45, 5e-3, miText,
                                 va="bottom", ha="center", color="k",
                                 transform=cax.transAxes, rotation=270,)
+                            cax.text(0.45, 1.0 - 5e-3, maText,
+                                va="top", ha="center", color="w",
+                                transform=cax.transAxes, rotation=270,)
                             cb.set_ticks([])
+
+                BIG = fig.add_subplot(gs[:])
+                BIG.set_frame_on(False)
+                BIG.set_xticks([])
+                BIG.set_yticks([])
+                BIG.set_xlabel(r"$x\ [{\rm arcsec}]$", labelpad=20)
+                BIG.set_ylabel(r"$y\ [{\rm arcsec}]$", labelpad=30)
 
                 fig.savefig(figDir/
                     f"orbitMaps_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
