@@ -40,6 +40,9 @@ v1.2:   Replaced fixed absolute orbit-mass targets with a hard a priori
             coefficient vector remain consistent;
         Updated orbit-target, constraint, checkpoint, and final diagnostics
             for the flexible-amplitude hard prior. 6 August 2026
+v1.3:   Switched checkpoint emission to atomic `save_checkpoint` and removed the
+            split snapshot/state write path so resumable checkpoints preserve the
+            full constrained solver state. 7 August 2026
 """
 
 from __future__ import annotations, print_function
@@ -1607,6 +1610,12 @@ def streamActiveSetNNLS(
         col_cooldown_until = _pairs_to_dict(
             resume_state.get("col_cooldown_until", [])
         )
+        orbit_cooldown_until = _pairs_to_dict(
+            resume_state.get(
+                "orbit_cooldown_until",
+                [],
+            )
+        )
 
     def _on_cooldown(col: int, it: int) -> bool:
         return it < col_cooldown_until.get(int(col), -1)
@@ -1681,6 +1690,10 @@ def streamActiveSetNNLS(
                 lambda_orbit_current.astype(np.float64).tolist()
             ),
             "alpha_current": float(alpha_current),
+            "orbit_cooldown_until": [
+                [int(k), int(v)]
+                for k, v in orbit_cooldown_until.items()
+            ],
         }
     
     def _emit_checkpoint(
@@ -3323,48 +3336,27 @@ def solve_streaming_nnls(
         if tracker is None:
             return
 
+        state = dict(stats.get("resume_state", {}))
+        if not state:
+            state = {
+                "iter": int(stats.get("iter", -1)),
+                "max_iter": int(stats.get("max_iter", -1)),
+                "phase": str(stats.get("phase", "solve")),
+                "final": bool(stats.get("final", False)),
+                "active": int(stats.get("active", -1)),
+                "stall_count": int(stats.get("stall_count", -1)),
+            }
+
         try:
-            tracker.maybe_snapshot_x(
+            tracker.save_checkpoint(
                 latest_ckpt["x"],
-                epoch=int(stats.get("iter", -1)),
-                rmse=None,
-                force=True,
+                state,
+                block=True,
             )
         except Exception as exc:
             if not checkpoint_error_logged:
                 print(
-                    f"[MONO][checkpoint] maybe_snapshot_x failed: {exc}",
-                    flush=True,
-                )
-                checkpoint_error_logged = True
-            return
-
-        save_state = getattr(tracker, "save_state", None)
-        if callable(save_state):
-            try:
-                state = dict(stats.get("resume_state", {}))
-                if not state:
-                    state = {
-                        "iter": int(stats.get("iter", -1)),
-                        "max_iter": int(stats.get("max_iter", -1)),
-                        "phase": str(stats.get("phase", "solve")),
-                        "final": bool(stats.get("final", False)),
-                        "active": int(stats.get("active", -1)),
-                        "stall_count": int(stats.get("stall_count", -1)),
-                    }
-                save_state(state)
-            except Exception as exc:
-                if not checkpoint_error_logged:
-                    print(
-                        f"[MONO][checkpoint] save_state failed: {exc}",
-                        flush=True,
-                    )
-                    checkpoint_error_logged = True
-        else:
-            if not checkpoint_error_logged:
-                print(
-                    "[MONO][checkpoint] tracker has no save_state(); "
-                    "x snapshots will still be written",
+                    f"[MONO][checkpoint] save_checkpoint failed: {exc}",
                     flush=True,
                 )
                 checkpoint_error_logged = True
@@ -3619,13 +3611,29 @@ def solve_streaming_nnls(
 
     if tracker is not None:
         try:
-            tracker.save_state({
-                "iter": int(stats.get("epochs", -1)),
-                "phase": "final",
-                "final": True,
-                "best_proxy": float(stats.get("rmse_proxy_best", np.nan)),
-            }, block=True)
-            tracker.maybe_save(best_x, stats, block=True)
+            state = dict(stats.get("resume_state", {}))
+            if not state:
+                state = {
+                    "iter": int(stats.get("iter", -1)),
+                    "max_iter": int(stats.get("max_iter", -1)),
+                    "phase": "final",
+                    "final": True,
+                    "active": int(stats.get("active", -1)),
+                    "stall_count": int(stats.get("stall_count", -1)),
+                }
+            else:
+                state["phase"] = "final"
+                state["final"] = True
+                state.setdefault("iter", int(stats.get("iter", -1)))
+                state.setdefault("max_iter", int(stats.get("max_iter", -1)))
+                state.setdefault("active", int(stats.get("active", -1)))
+                state.setdefault("stall_count", int(stats.get("stall_count", -1)))
+
+            tracker.save_checkpoint(
+                best_x,
+                state,
+                block=True,
+            )
         except Exception:
             pass
 

@@ -61,6 +61,8 @@ v1.18:  Updated hard orbit-prior diagnostics for the constrained solver's
         Corrected the absolute orbit-mass comparison plot and residual
             diagnostics to use the same target enforced by the solver. 6 August
             2026
+v1.19:  Dynamically adjust parallelism in case of cpuset restrictions. 7 August
+            2026
 """
 
 # need to set up the logger before any other imports
@@ -115,8 +117,8 @@ moncmapr = 'inferno_r'
 
 os.environ["FITTRACKER_START"] = "fork"
 
-CPU_PROCESSES = 6
-BLAS_THREADS = 8
+CPU_PROCESSES = 12
+BLAS_THREADS = 4
 
 # ------------------------------------------------------------------------------
 
@@ -579,32 +581,66 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     runner = PipelineRunner(hdf5Path)
 
     ncpuset, mask = cu.cpuset_count()
+    cores_available = len(os.sched_getaffinity(0))
+    cores_available = max(1, int(cores_available))
+
     print(f"[guard] cpuset mask: {mask}  cores: {ncpuset}")
-    logger.log(f"cpuset cores: {len(os.sched_getaffinity(0))}")
+    logger.log(f"cpuset cores: {cores_available}")
+
     from threadpoolctl import threadpool_info
     logger.log(f"BLAS pools: {threadpool_info()}")
-    # look for openblas 
-    try:
-        with open("/proc/self/cgroup") as f:
-            print("[guard] cgroups:")
-            for line in f:
-                if "cpuset" in line or "cpu" in line:
-                    print(" ", line.strip())
-    except Exception:
-        pass
 
-    print("[env] SLURM_JOB_ID=", os.environ.get("SLURM_JOB_ID"),
-        " SLURM_STEP_ID=", os.environ.get("SLURM_STEP_ID"))
+    requested_processes = max(1, int(CPU_PROCESSES))
+    requested_blas = max(1, int(BLAS_THREADS))
+    requested_total = requested_processes * requested_blas
 
-    # sidecar = cu._find_latest_sidecar(hdf5Path)
-    # ridx = 95
-    # x0 = load_xring_best(
-    #     sidecar,
-    #     ring_idx=ridx,
-    #     as_physical=True,
-    #     cp_flux_ref=None,
-    # )
-    # logger.log(f"[CubeFit] Loaded `x0` from sidecar {sidecar} at ring {ridx}.")
+    # Choose the best (processes, BLAS_threads) pair for the current core budget.
+    # Preference order:
+    #   1) exact coverage if possible;
+    #   2) otherwise the smallest oversubscription;
+    #   3) then stay as close as possible to the requested CPU_PROCESSES;
+    #   4) then prefer fewer BLAS threads.
+    best_score = None
+    best_processes = requested_processes
+    best_blas = requested_blas
+    best_total = requested_total
+
+    max_procs = min(requested_processes, cores_available)
+
+    for procs in range(max_procs, 0, -1):
+        blas = max(1, int(math.ceil(cores_available / float(procs))))
+        total = procs * blas
+        oversub = total - cores_available
+
+        score = (
+            oversub,                      # smaller is better; exact = 0
+            abs(procs - requested_processes),
+            blas,
+            -procs,                       # tie-break toward more processes
+        )
+
+        if best_score is None or score < best_score:
+            best_score = score
+            best_processes = procs
+            best_blas = blas
+            best_total = total
+
+    if (
+        best_processes != requested_processes
+        or best_blas != requested_blas
+        or best_total != requested_total
+    ):
+        logger.log(
+            f"[guard] adjusting parallelism: "
+            f"CPU_PROCESSES {requested_processes} -> {best_processes}, "
+            f"BLAS_THREADS {requested_blas} -> {best_blas} "
+            f"(requested total={requested_total}, "
+            f"chosen total={best_total}, "
+            f"available cores={cores_available})"
+        )
+
+    CPU_PROCESSES = best_processes
+    BLAS_THREADS = best_blas
 
     #####################################
     # Multi-processing Batched Kaczmarz #

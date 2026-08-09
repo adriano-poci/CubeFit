@@ -27,6 +27,9 @@ v1.2:   Added `plot_diagnostic_jsonl_dashboard` for streaming solver diagnostics
 v1.3:   Reworked `plot_diagnostic_jsonl_dashboard` for the constrained
             solver's fixed orbit-shape and fitted global-amplitude formulation. 6
             August 2026
+v1.4:   Added explicit `color` and `linestyle` keyword arguments to
+            `_plot_finite` calls in `plot_diagnostic_jsonl_dashboard` to manually
+            differentiate through `twinx` calls. 9 August 2026
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib import gridspec
+import matplotlib.ticker as mticker
 
 from CubeFit.logger import get_logger
 from dynamics.IFU.Constants import UnitStr
@@ -635,22 +639,14 @@ def plot_diagnostic_jsonl_dashboard(
         *,
         absolute: bool = False,
         positive_log: bool = False,
+        color: str | None = None,
+        linestyle: str | None = None,
         **kwargs,
     ) -> None:
-        x_array = np.asarray(
-            x_values,
-            dtype=np.float64,
-        )
-        y_array = np.asarray(
-            y_values,
-            dtype=np.float64,
-        )
+        x_array = np.asarray(x_values, dtype=np.float64)
+        y_array = np.asarray(y_values, dtype=np.float64)
 
-        mask = (
-            np.isfinite(x_array)
-            & np.isfinite(y_array)
-        )
-
+        mask = np.isfinite(x_array) & np.isfinite(y_array)
         if not np.any(mask):
             return
 
@@ -662,17 +658,15 @@ def plot_diagnostic_jsonl_dashboard(
 
         if positive_log:
             positive = y_plot > 0.0
-
             if not np.any(positive):
                 return
 
             axis.semilogy(
                 x_plot[positive],
-                np.maximum(
-                    y_plot[positive],
-                    eps,
-                ),
+                np.maximum(y_plot[positive], eps),
                 label=label,
+                color=color,
+                linestyle=linestyle,
                 **kwargs,
             )
         else:
@@ -680,6 +674,8 @@ def plot_diagnostic_jsonl_dashboard(
                 x_plot,
                 y_plot,
                 label=label,
+                color=color,
+                linestyle=linestyle,
                 **kwargs,
             )
 
@@ -969,14 +965,14 @@ def plot_diagnostic_jsonl_dashboard(
         iterations,
         data_objective,
         "Global data objective",
-        lw=1.6,
+        lw=1.6, color="tab:blue"
     )
     _plot_finite(
         axis,
         iterations,
         obj_new,
         "Reduced objective",
-        lw=1.0,
+        lw=1.0, color="tab:orange",
         alpha=0.75,
     )
 
@@ -988,10 +984,6 @@ def plot_diagnostic_jsonl_dashboard(
     )
     axis.set_ylabel(
         "Objective"
-    )
-    axis.legend(
-        fontsize=8,
-        loc="best",
     )
 
     objective_for_gain = data_objective.copy()
@@ -1031,13 +1023,37 @@ def plot_diagnostic_jsonl_dashboard(
         "Relative gain",
         absolute=True,
         positive_log=True,
-        lw=1.0,
+        lw=1.0, color="tab:green",
         alpha=0.65,
     )
 
-    objective_axis_right.set_ylabel(
-        "|Relative improvement|"
+    objective_axis_right.yaxis.set_major_locator(
+        mticker.LogLocator(base=10, numticks=4)
     )
+    objective_axis_right.yaxis.set_major_formatter(
+        mticker.LogFormatterExponent(base=10)
+    )
+    objective_axis_right.tick_params(
+        axis="y",
+        colors="tab:green",
+        labelsize=8,
+        pad=2,
+    )
+    objective_axis_right.spines["right"].set_color("tab:green")
+    objective_axis_right.set_ylabel(
+        r"$\log_{10}|\text{Relative improvement}|$", color="tab:green"
+    )
+
+    handles_left, labels_left = axis.get_legend_handles_labels()
+    handles_right, labels_right = objective_axis_right.get_legend_handles_labels()
+
+    if handles_left or handles_right:
+        axis.legend(
+            handles_left + handles_right,
+            labels_left + labels_right,
+            fontsize=8,
+            loc="best",
+        )
 
     # ------------------------------------------------------------------
     # Panel 2: alpha and coefficient norms
@@ -1047,9 +1063,19 @@ def plot_diagnostic_jsonl_dashboard(
     _plot_finite(
         axis,
         iterations,
-        alpha,
-        "Fitted alpha",
-        lw=1.7,
+        norm_old,
+        "Norm old",
+        positive_log=True,
+        lw=1.0, color="tab:blue",
+        alpha=0.70,
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        norm_new,
+        "Norm new",
+        positive_log=True,
+        lw=1.2, color="tab:orange",
     )
 
     axis.set_title(
@@ -1059,35 +1085,24 @@ def plot_diagnostic_jsonl_dashboard(
         "Iteration"
     )
     axis.set_ylabel(
-        "Global amplitude"
-    )
-
-    norm_axis = axis.twinx()
-
-    _plot_finite(
-        norm_axis,
-        iterations,
-        norm_old,
-        "Norm old",
-        positive_log=True,
-        lw=1.0,
-        alpha=0.70,
-    )
-    _plot_finite(
-        norm_axis,
-        iterations,
-        norm_new,
-        "Norm new",
-        positive_log=True,
-        lw=1.2,
-    )
-
-    norm_axis.set_ylabel(
         "Coefficient norm"
     )
 
+    amp_axis = axis.twinx()
+    _plot_finite(
+        amp_axis,
+        iterations,
+        alpha,
+        "Fitted alpha",
+        lw=1.7, color="tab:green"
+    )
+
+    amp_axis.tick_params(axis="y", colors="tab:green")
+    amp_axis.spines["right"].set_color("tab:green")
+    amp_axis.set_ylabel("Fitted alpha", color="tab:green")
+
     handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = norm_axis.get_legend_handles_labels()
+    handles_right, labels_right = amp_axis.get_legend_handles_labels()
 
     if handles_left or handles_right:
         axis.legend(
@@ -1109,7 +1124,7 @@ def plot_diagnostic_jsonl_dashboard(
         "Raw data gradient",
         absolute=True,
         positive_log=True,
-        lw=1.2,
+        lw=1.2, color="tab:blue"
     )
     _plot_finite(
         axis,
@@ -1118,7 +1133,7 @@ def plot_diagnostic_jsonl_dashboard(
         "Constraint correction",
         absolute=True,
         positive_log=True,
-        lw=1.2,
+        lw=1.2, color="tab:orange"
     )
     _plot_finite(
         axis,
@@ -1127,7 +1142,7 @@ def plot_diagnostic_jsonl_dashboard(
         "Constrained reduced gradient",
         absolute=True,
         positive_log=True,
-        lw=1.6,
+        lw=1.6, color="tab:green"
     )
     _plot_finite(
         axis,
@@ -1136,7 +1151,7 @@ def plot_diagnostic_jsonl_dashboard(
         "Promotable reduced gradient",
         absolute=True,
         positive_log=True,
-        lw=1.1,
+        lw=1.1, color="tab:red",
         alpha=0.85,
     )
 
@@ -1164,21 +1179,21 @@ def plot_diagnostic_jsonl_dashboard(
         iterations,
         n_active,
         "Active columns",
-        lw=1.6,
+        lw=1.6, color="tab:blue"
     )
     _plot_finite(
         axis,
         iterations,
         mean_orbit_nz,
         "Mean nonzero/orbit",
-        lw=1.2,
+        lw=1.2, color="tab:orange"
     )
     _plot_finite(
         axis,
         iterations,
         mean_eff_support,
         "Mean effective support",
-        lw=1.2,
+        lw=1.2, color="tab:green"
     )
 
     axis.set_title(
@@ -1190,10 +1205,6 @@ def plot_diagnostic_jsonl_dashboard(
     axis.set_ylabel(
         "Count"
     )
-    axis.legend(
-        fontsize=8,
-        loc="best",
-    )
 
     share_axis = axis.twinx()
 
@@ -1202,7 +1213,7 @@ def plot_diagnostic_jsonl_dashboard(
         iterations,
         max_top_share,
         "Largest orbit top-share",
-        lw=1.0,
+        lw=1.0, color="tab:red",
         alpha=0.70,
     )
 
@@ -1210,9 +1221,22 @@ def plot_diagnostic_jsonl_dashboard(
         0.0,
         1.05,
     )
+    share_axis.tick_params(axis="y", colors="tab:red")
+    share_axis.spines["right"].set_color("tab:red")
     share_axis.set_ylabel(
-        "Maximum top-share"
+        "Maximum top-share", color="tab:red"
     )
+
+    handles_left, labels_left = axis.get_legend_handles_labels()
+    handles_right, labels_right = share_axis.get_legend_handles_labels()
+
+    if handles_left or handles_right:
+        axis.legend(
+            handles_left + handles_right,
+            labels_left + labels_right,
+            fontsize=8,
+            loc="best",
+        )
 
     # ------------------------------------------------------------------
     # Panel 5: active-set churn
@@ -1224,21 +1248,21 @@ def plot_diagnostic_jsonl_dashboard(
         iterations,
         n_promoted,
         "Promoted",
-        lw=1.3,
+        lw=1.3, color="tab:blue"
     )
     _plot_finite(
         axis,
         iterations,
         n_failed,
         "Failed",
-        lw=1.3,
+        lw=1.3, color="tab:orange"
     )
     _plot_finite(
         axis,
         iterations,
         n_dropped,
         "Dropped",
-        lw=1.3,
+        lw=1.3, color="tab:green"
     )
 
     promotion_survival = np.divide(
@@ -1258,15 +1282,17 @@ def plot_diagnostic_jsonl_dashboard(
         iterations,
         promotion_survival,
         "Promotion survival",
-        lw=1.2,
+        lw=1.2, color="tab:red"
     )
 
     survival_axis.set_ylim(
         -0.05,
         1.05,
     )
+    survival_axis.tick_params(axis="y", colors="tab:red")
+    survival_axis.spines["right"].set_color("tab:red")
     survival_axis.set_ylabel(
-        "Surviving fraction"
+        "Surviving fraction", color="tab:red"
     )
 
     axis.set_title(
@@ -1303,7 +1329,7 @@ def plot_diagnostic_jsonl_dashboard(
         "Orbit residual L1",
         absolute=True,
         positive_log=True,
-        lw=1.3,
+        lw=1.3, color="tab:blue"
     )
     _plot_finite(
         axis,
@@ -1312,7 +1338,7 @@ def plot_diagnostic_jsonl_dashboard(
         "Orbit residual Linf",
         absolute=True,
         positive_log=True,
-        lw=1.3,
+        lw=1.3, color="tab:orange"
     )
     _plot_finite(
         axis,
@@ -1321,9 +1347,14 @@ def plot_diagnostic_jsonl_dashboard(
         "|shape dot lambda|",
         absolute=True,
         positive_log=True,
-        lw=1.3,
+        lw=1.3, color="tab:green"
     )
-
+    axis.yaxis.set_major_locator(
+        mticker.LogLocator(base=10, numticks=3)
+    )
+    axis.yaxis.set_major_formatter(
+        mticker.LogFormatterExponent(base=10)
+    )
     axis.set_title(
         "Hard-prior feasibility"
     )
@@ -1510,8 +1541,8 @@ def plot_diagnostic_jsonl_dashboard(
             residual_axis.plot(
                 orbit_indices,
                 relative_residual,
-                marker="o",
-                lw=1.0,
+                marker=".",
+                lw=1.0, color="tab:red",
                 label="Relative residual",
             )
             residual_axis.axhline(
@@ -1519,8 +1550,10 @@ def plot_diagnostic_jsonl_dashboard(
                 lw=0.8,
                 alpha=0.65,
             )
+            residual_axis.tick_params(axis="y", colors="tab:red")
+            residual_axis.spines["right"].set_color("tab:red")
             residual_axis.set_ylabel(
-                "Relative residual"
+                "Relative residual", color="tab:red"
             )
 
         absolute_l1 = (
@@ -1570,7 +1603,7 @@ def plot_diagnostic_jsonl_dashboard(
         iteration_time,
         "Iteration time",
         positive_log=True,
-        lw=1.4,
+        lw=1.4, color="tab:blue"
     )
     _plot_finite(
         axis,
@@ -1578,7 +1611,7 @@ def plot_diagnostic_jsonl_dashboard(
         ridge,
         "Ridge",
         positive_log=True,
-        lw=1.1,
+        lw=1.1, color="tab:orange"
     )
 
     condition_estimate = np.divide(
@@ -1605,7 +1638,7 @@ def plot_diagnostic_jsonl_dashboard(
         condition_estimate,
         "Condition estimate",
         positive_log=True,
-        lw=1.2,
+        lw=1.2, color="tab:green"
     )
 
     axis.set_title(
@@ -1617,8 +1650,10 @@ def plot_diagnostic_jsonl_dashboard(
     axis.set_ylabel(
         "Seconds / ridge"
     )
+    condition_axis.tick_params(axis="y", colors="tab:green")
+    condition_axis.spines["right"].set_color("tab:green")
     condition_axis.set_ylabel(
-        "Condition estimate"
+        "Condition estimate", color="tab:green"
     )
 
     handles_left, labels_left = axis.get_legend_handles_labels()

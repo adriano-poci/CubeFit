@@ -24,6 +24,9 @@ History
 -------
 v1.0:   Added `maybe_snapshot_x` to `NullTracker` for consistency. 1 January 2026
 v1.1:   Added `save_state` to `*Tracker` classes. 1 January 2026
+v1.2:   Added atomic sidecar checkpoint support and read-side loading for matched
+            `x` + solver state, enabling full resumable restarts from one
+            checkpoint path. 7 August 2026
 """
 
 from __future__ import annotations
@@ -264,6 +267,22 @@ def _writer_main(h5_path: str, cfg: TrackerConfig, rx: MPQueue) -> None:
                     _save_state(dict(msg.get("state", {})))
                     pending += 1
 
+                elif op == "save_checkpoint":
+                    _append_x(
+                        np.asarray(msg["x"], np.float32),
+                        msg.get("epoch"),
+                        msg.get("rmse"),
+                    )
+                    _save_state(dict(msg.get("state", {})))
+
+                    # Stamp both sides with the same checkpoint epoch so the loader can
+                    # validate that x and state correspond.
+                    ckpt_epoch = int(msg.get("epoch") if msg.get("epoch") is not None else -1)
+                    gfit.attrs["solver_state_epoch"] = ckpt_epoch
+                    gfit["x_last"].attrs["solver_state_epoch"] = ckpt_epoch
+
+                    pending += 1
+
                 # batch/interval flush
                 now = time.monotonic()
                 if pending >= FLUSH_EVERY or (now - t_last) >= FLUSH_INTERVAL:
@@ -284,6 +303,91 @@ def _writer_main(h5_path: str, cfg: TrackerConfig, rx: MPQueue) -> None:
             f.flush()
         except Exception:
             pass
+
+# ------------------------------------------------------------------------------
+
+def load_checkpoint(
+    sidecar_path: str | None,
+    expected_size: int | None = None,
+) -> tuple[np.ndarray | None, dict | None]:
+    """
+    Load the latest matching coefficient vector and solver state.
+
+    Parameters
+    ----------
+    sidecar_path : str or None
+        FitTracker sidecar path.
+    expected_size : int or None, optional
+        Expected number of coefficients.
+
+    Returns
+    -------
+    x : ndarray or None
+        Latest coefficient vector.
+    state : dict or None
+        Matching solver restart state.
+    """
+    if not sidecar_path:
+        return None, None
+
+    if not os.path.exists(sidecar_path):
+        return None, None
+
+    try:
+        with h5py.File(
+            sidecar_path,
+            "r",
+            libver="latest",
+            swmr=True,
+        ) as f:
+            fit = f.get("/Fit")
+
+            if fit is None:
+                return None, None
+
+            if "x_last" not in fit:
+                return None, None
+
+            x = np.asarray(
+                fit["x_last"][...],
+                dtype=np.float64,
+            ).ravel(order="C")
+
+            if (
+                expected_size is not None
+                and x.size != int(expected_size)
+            ):
+                return None, None
+
+            raw = fit.attrs.get(
+                "solver_state_json",
+                None,
+            )
+
+            if raw is None:
+                return x, None
+
+            if isinstance(raw, bytes):
+                raw = raw.decode(
+                    "utf-8",
+                    errors="replace",
+                )
+
+            state = json.loads(
+                str(raw)
+            )
+
+            if not isinstance(state, dict):
+                state = None
+
+            return x, state
+
+    except Exception as exc:
+        logger.log(
+            "[FitTracker] Could not load checkpoint "
+            f"from {sidecar_path}: {exc}"
+        )
+        return None, None
 
 # --------------------------------- public API --------------------------------
 
@@ -424,6 +528,48 @@ class FitTracker:
         except Exception:
             payload = {}
         return self._try_put({"op": "save_state", "state": payload}, block=block)
+
+    def save_checkpoint(
+        self,
+        x: np.ndarray,
+        state: dict,
+        *,
+        rmse: float | None = None,
+        block: bool = False,
+    ) -> bool:
+        """
+        Persist a coefficient vector and its matching solver state together.
+        """
+        try:
+            x32 = np.asarray(
+                x,
+                dtype=np.float32,
+            ).ravel(order="C")
+            payload = dict(state)
+        except Exception:
+            return False
+
+        return self._try_put(
+            {
+                "op": "save_checkpoint",
+                "x": x32,
+                "state": payload,
+                "epoch": (
+                    int(epoch)
+                    if epoch is not None
+                    else None
+                ),
+                "rmse": (
+                    float(rmse)
+                    if (
+                        rmse is not None
+                        and np.isfinite(rmse)
+                    )
+                    else None
+                ),
+            },
+            block=block,
+        )
 
     def close(self, timeout: float = 2.0) -> None:
         # send a real sentinel the writer understands

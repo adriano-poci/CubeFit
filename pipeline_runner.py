@@ -63,6 +63,9 @@ v1.20:  Use `cube_utils.vprint` for diagnostic prints. 31 July 2026
 v1.21:  Removed legacy `jacobi` warm-start option;
         Removed redundant single-core solve pathway from `PipelineRunner`;
         Removed legacy keywords in `solve_all_mp_batched`. 4 August 2026
+v1.22:  Reworked resume warm-starting to load a matched sidecar checkpoint with
+            `load_checkpoint` and pass only the consistent `resume_state` into
+            the constrained solver. 7 August 2026
 """
 
 from __future__ import annotations
@@ -84,7 +87,7 @@ from CubeFit.streaming_nnls_constrained import (
 from CubeFit.live_fit_dashboard import (
     render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
 )
-from CubeFit.fit_tracker import FitTracker, NullTracker, TrackerConfig
+from CubeFit.fit_tracker import FitTracker, NullTracker, load_checkpoint
 import CubeFit.cube_utils as cu
 from CubeFit.cube_utils import RatioCfg
 from CubeFit.logger import get_logger
@@ -343,32 +346,6 @@ class PipelineRunner:
 
         return None, None
 
-    @staticmethod
-    def _read_solver_state(sidecar_path: str | None) -> dict:
-        """
-        Read the JSON-serialized streaming NNLS resume state from a sidecar.
-        """
-        if (sidecar_path is None) or (not os.path.exists(sidecar_path)):
-            return {}
-
-        try:
-            with open_h5(sidecar_path, role="reader", swmr=True) as f:
-                fit = f.get("/Fit", None)
-                if fit is None:
-                    return {}
-
-                raw = fit.attrs.get("solver_state_json", None)
-                if raw is None:
-                    return {}
-
-                if isinstance(raw, (bytes, bytearray)):
-                    raw = raw.decode("utf-8", errors="replace")
-
-                state = json.loads(raw)
-                return state if isinstance(state, dict) else {}
-        except Exception:
-            return {}
-
     def _read_seed_from_h5(self,
                         h5_path: str,
                         N_expected: int,
@@ -430,12 +407,19 @@ class PipelineRunner:
         blas_threads=12,
         orbit_weights=None,
         x0=None,
+        resume_state=None,
         warm_start="zeros",  # default to the new seed
         tracker_mode="on",
     ):
 
         # --------------- Warm-start (same policy as SP path) -----------
         N_expected = int(self.nComp * self.nPop)
+
+        resume_state_effective = (
+            dict(resume_state)
+            if resume_state is not None
+            else None
+        )
 
         if x0 is not None:
             x0_effective = np.asarray(x0, dtype=np.float64, order="C")
@@ -456,98 +440,138 @@ class PipelineRunner:
         elif warm_start == "resume":
             sidecar = cu._find_latest_sidecar(self.h5_path)
 
-            vprint(f"[Pipeline] Warm-start mode: resume; "
-                f"sidecar found: {sidecar if sidecar else 'none'}")
-            # Always define these (avoids UnboundLocalError patterns).
+            vprint(
+                f"[Pipeline] Warm-start mode: resume; "
+                f"sidecar found: {sidecar if sidecar else 'none'}"
+            )
+
             x_side, src_side = (None, None)
             x_main, src_main = (None, None)
-            x_seed, src_seed = (None, None)
 
-            # Candidate 1: newest sidecar (by filename/mtime), but may not exist.
-            if sidecar is not None and os.path.exists(sidecar):
-                x_side, src_side = self._read_latest_from_sidecar(
-                    sidecar, N_expected
-                )
-
-            # Candidate 2: main file (committed solution).
-            x_main, src_main = self._read_latest_from_main(
-                self.h5_path, N_expected
-            )
-
-            def _safe_mtime(path: str | None) -> float:
-                if not path:
-                    return -np.inf
-                try:
-                    return float(os.path.getmtime(path))
-                except Exception:
-                    return -np.inf
-
-            def _try_epoch(path: str | None, dset: str | None) -> float | None:
-                if (path is None) or (dset is None):
-                    return None
-                try:
-                    with open_h5(path, role="reader", swmr=True) as f:
-                        if dset in f:
-                            e = f[dset].attrs.get("epoch", None)
-                            if e is None:
-                                return None
-                            e = float(e)
-                            return e if np.isfinite(e) else None
-                except Exception:
-                    return None
-                return None
-
-            # Decide: newest progress (prefer higher epoch if both have it;
-            # otherwise prefer newer file mtime).
+            resume_state_effective = None
             choose_side = False
-            if x_side is not None and x_main is None:
+
+            if sidecar is not None:
+                x_side, resume_state_effective = load_checkpoint(
+                    sidecar,
+                    expected_size=N_expected,
+                )
+
+            # If the sidecar contains a valid full checkpoint, always use it.
+            # That is the only source that can restore the full constrained state.
+            if x_side is not None and resume_state_effective is not None:
+                x0_effective = x_side
+                src_label = src_side = "/Fit/x_last"
+                src_file = sidecar
                 choose_side = True
-            elif x_side is None and x_main is not None:
-                choose_side = False
-            elif x_side is not None and x_main is not None:
-                e_side = _try_epoch(sidecar, src_side)
-                e_main = _try_epoch(self.h5_path, src_main)
 
-                if (e_side is not None) and (e_main is not None) and (e_side != e_main):
-                    choose_side = (e_side > e_main)
-                else:
-                    choose_side = (_safe_mtime(sidecar) > _safe_mtime(self.h5_path))
-
-            vprint(f"[Pipeline] Warm-start resume candidates: "
-                f"sidecar: {src_side if src_side else 'none'}, "
-                f"main: {src_main if src_main else 'none'}; "
-                f"choosing {'sidecar' if choose_side else 'main' if (x_main is not None) else 'none'}.")
-            x0_effective, src_label, src_file = (
-                (x_side, src_side, sidecar) if choose_side
-                else (x_main, src_main, self.h5_path)
-            )
-
-            # Fallback: seed (optional but robust).
-            seed_used = False
-            if x0_effective is None:
-                seed_path = os.environ.get("CUBEFIT_SEED_PATH",
-                    "/Seeds/x0_nnls_patch")
-                x_seed, src_seed = self._read_seed_from_h5(
-                    self.h5_path, N_expected, dset=seed_path
-                )
-                if x_seed is not None:
-                    x0_effective = x_seed
-                    src_label = src_seed
-                    src_file = self.h5_path
-                    choose_side = False
-                    seed_used = True
-                    vprint("[Pipeline] Warm-start fallback from seed "
-                        f"{src_seed} (n={x0_effective.size}).")
-
-            if x0_effective is not None and (not seed_used):
-                t_side = _safe_mtime(sidecar) if sidecar else -np.inf
-                t_main = _safe_mtime(self.h5_path)
                 vprint(
-                    f"[Pipeline] Warm-start from {src_label} "
-                    f"({'sidecar' if choose_side else 'main'}: {src_file}) "
-                    f"(n={x0_effective.size}); "
-                    f"mtime(sidecar)={t_side:.0f}, mtime(main)={t_main:.0f}."
+                    "[Pipeline] Full solver-state resume from "
+                    f"{sidecar}: "
+                    f"iter={resume_state_effective.get('iter', None)}, "
+                    f"phase={resume_state_effective.get('phase', None)}, "
+                    f"final={resume_state_effective.get('final', None)}."
                 )
+
+            else:
+                # No full checkpoint in the sidecar: fall back to the best available x
+                # only, but do not carry any sidecar state forward.
+                x_main, src_main = self._read_latest_from_main(
+                    self.h5_path,
+                    N_expected,
+                )
+
+                def _safe_mtime(path: str | None) -> float:
+                    if not path:
+                        return -np.inf
+                    try:
+                        return float(os.path.getmtime(path))
+                    except Exception:
+                        return -np.inf
+
+                def _try_epoch(path: str | None, dset: str | None) -> float | None:
+                    if (path is None) or (dset is None):
+                        return None
+                    try:
+                        with open_h5(path, role="reader", swmr=True) as f:
+                            if dset in f:
+                                e = f[dset].attrs.get("epoch", None)
+                                if e is None:
+                                    return None
+                                e = float(e)
+                                return e if np.isfinite(e) else None
+                    except Exception:
+                        return None
+                    return None
+
+                choose_side = False
+                if x_side is not None and x_main is None:
+                    choose_side = True
+                elif x_side is None and x_main is not None:
+                    choose_side = False
+                elif x_side is not None and x_main is not None:
+                    e_side = _try_epoch(sidecar, src_side)
+                    e_main = _try_epoch(self.h5_path, src_main)
+
+                    if (
+                        (e_side is not None)
+                        and (e_main is not None)
+                        and (e_side != e_main)
+                    ):
+                        choose_side = (e_side > e_main)
+                    else:
+                        choose_side = (
+                            _safe_mtime(sidecar) > _safe_mtime(self.h5_path)
+                        )
+
+                vprint(
+                    f"[Pipeline] Warm-start resume candidates: "
+                    f"sidecar: {src_side if src_side else 'none'}, "
+                    f"main: {src_main if src_main else 'none'}; "
+                    f"choosing "
+                    f"{'sidecar' if choose_side else 'main' if (x_main is not None) else 'none'}."
+                )
+
+                x0_effective, src_label, src_file = (
+                    (x_side, src_side, sidecar)
+                    if choose_side
+                    else (x_main, src_main, self.h5_path)
+                )
+
+                # No full sidecar state is safe to reuse in this branch.
+                resume_state_effective = None
+
+                seed_used = False
+                if x0_effective is None:
+                    seed_path = os.environ.get(
+                        "CUBEFIT_SEED_PATH",
+                        "/Seeds/x0_nnls_patch",
+                    )
+                    x_seed, src_seed = self._read_seed_from_h5(
+                        self.h5_path,
+                        N_expected,
+                        dset=seed_path,
+                    )
+                    if x_seed is not None:
+                        x0_effective = x_seed
+                        src_label = src_seed
+                        src_file = self.h5_path
+                        choose_side = False
+                        seed_used = True
+                        vprint(
+                            "[Pipeline] Warm-start fallback from seed "
+                            f"{src_seed} (n={x0_effective.size})."
+                        )
+
+                if x0_effective is not None and (not seed_used):
+                    t_side = _safe_mtime(sidecar) if sidecar else -np.inf
+                    t_main = _safe_mtime(self.h5_path)
+                    vprint(
+                        f"[Pipeline] Warm-start from {src_label} "
+                        f"({'sidecar' if choose_side else 'main'}: {src_file}) "
+                        f"(n={x0_effective.size}); "
+                        f"mtime(sidecar)={t_side:.0f}, mtime(main)={t_main:.0f}."
+                    )
 
         elif warm_start == "zeros":
             x0_effective = np.zeros(N_expected, np.float64)
@@ -595,27 +619,17 @@ class PipelineRunner:
             processes=int(processes),
             blas_threads=int(blas_threads),
             apply_mask=bool(reader_apply_mask),
-            # orbit_beta=float(
-            #     os.environ.get("CUBEFIT_ORBIT_BETA", "1e-2")
-            # ),
-            # orbit_prior_weight=float(
-            #     os.environ.get("CUBEFIT_ORBIT_PRIOR_WEIGHT", "1e-2")
-            # )
         )
 
         try:
             with logger.capture_all_output():
-                resume_state = {}
-                if warm_start == "resume" and choose_side and \
-                    (src_file is not None):
-                    resume_state = self._read_solver_state(src_file)
 
                 x_solver, stats = solve_streaming_nnls(
                     self.h5_path,
                     cfg,
                     orbit_weights=orbit_weights,
                     x0=x0_effective,
-                    resume_state=resume_state,
+                    resume_state=resume_state_effective,
                     tracker=tracker,
                     monolithic_max_active=1000,
                 )
