@@ -27,6 +27,10 @@ v1.1:   Normalise all LOSVD kernels to unity on write in `populate_from_arrays`.
 v1.2:   Fixed non-flux-conservation in `_build_R_T_dense`. 22 January 2026
 v1.3:   Universally removed all ad-hoc scalings. 25 January 2026
 v1.4:   Cleaned up legacy code. 4 August 2026
+v1.5:   Added archive/restore wrappers for `/HyperCube/models` that rewrite the
+            dataset with or without compression, then repack the file to
+            maximize archival compaction or return to a solver-ready layout. 10
+            August 2026
 
 
 HDF5 manager for CubeFit.
@@ -47,6 +51,7 @@ needs optional overrides in memory.
 from __future__ import annotations
 import numpy as np
 import json
+from tqdm import tqdm
 from dataclasses import dataclass
 from pathlib import Path
 from types import NoneType
@@ -1513,98 +1518,6 @@ def set_spectral_grids(base_h5: str | Path,
 
 # ------------------------------------------------------------------------------
 
-def recompress_hypercube_models(
-    base_h5: str | Path,
-    *,
-    dataset: str = "/HyperCube/models",
-    compression: str = "gzip", # or "lzf"
-    compression_opts: Optional[int] = 4, # gzip level (1–9), None = lib default
-    shuffle: bool = True,
-    chunk_overrides: Optional[Tuple[int,int,int,int]] = None,  # (S,C,P,L)
-    temp_name: str = "models_tmp",
-    keep_backup: bool = False,
-) -> dict:
-    """
-    Re-encode `/HyperCube/models` with new filters by copying chunk-by-chunk to a
-    sibling dataset, then swapping names. Keeps a **single writer** open, in line
-    with open_h5(...) usage elsewhere. File size on disk may not shrink until you
-    run `h5repack` (see compact_file_via_h5repack below).
-
-    Returns a dict with before/after chunking and (if available) on-disk sizes.
-    """
-    start = time.time()
-    base_h5 = Path(base_h5)
-
-    with open_h5(base_h5, "writer") as f:
-        if dataset not in f:
-            raise RuntimeError(f"{dataset} not found in {base_h5}")
-        old = f[dataset]
-        parent = old.parent  # /HyperCube
-
-        shape = tuple(int(x) for x in old.shape)           # (S,C,P,L)
-        dtype = old.dtype
-        old_chunks = old.chunks or (shape[0], 1, min(64, shape[2]), shape[3])
-        chunks = tuple(chunk_overrides) if chunk_overrides else old_chunks
-
-        # fresh temp
-        if temp_name in parent:
-            del parent[temp_name]
-
-        kwargs = dict(shape=shape, dtype=dtype, chunks=chunks)
-        if compression not in (None, "none", 0, False):
-            kwargs.update(compression=compression,
-                          compression_opts=compression_opts,
-                          shuffle=bool(shuffle))
-        new = parent.create_dataset(temp_name, **kwargs)
-
-        # copy attributes
-        for k, v in old.attrs.items():
-            new.attrs[k] = v
-
-        # chunked copy using old chunk grid (minimize read amplification)
-        S_ch, C_ch, P_ch, L_ch = old_chunks
-        for s0 in range(0, shape[0], S_ch):
-            s1 = min(s0 + S_ch, shape[0])
-            for c0 in range(0, shape[1], C_ch):
-                c1 = min(c0 + C_ch, shape[1])
-                for p0 in range(0, shape[2], P_ch):
-                    p1 = min(p0 + P_ch, shape[2])
-                    new[s0:s1, c0:c1, p0:p1, :] = old[s0:s1, c0:c1, p0:p1, :]
-
-        # atomically swap; optionally keep backup
-        backup_name = None
-        if keep_backup:
-            backup_name = f"{Path(dataset).name}_backup_{int(time.time())}"
-            parent.move(Path(dataset).name, backup_name)
-        else:
-            del parent[Path(dataset).name]
-        parent.move(temp_name, Path(dataset).name)
-
-        # try to report storage sizes
-        old_size = None
-        new_size = None
-        try:
-            if backup_name:
-                old_size = parent[backup_name].id.get_storage_size()
-            new_size = parent[Path(dataset).name].id.get_storage_size()
-        except Exception:
-            pass
-
-        return {
-            "dataset": dataset,
-            "shape": shape,
-            "dtype": str(dtype),
-            "chunks_old": tuple(old_chunks),
-            "chunks_new": tuple(chunks),
-            "compression": compression,
-            "compression_opts": compression_opts,
-            "shuffle": bool(shuffle),
-            "old_size_bytes": old_size,
-            "new_size_bytes": new_size,
-            "elapsed_sec": time.time() - start,
-            "backup_dataset": backup_name,
-        }
-
 def compact_file_via_h5repack(path: str | Path) -> Path:
     """
     Physically compact an HDF5 file by rewriting it with `h5repack`.
@@ -1620,6 +1533,244 @@ def compact_file_via_h5repack(path: str | Path) -> Path:
         raise RuntimeError(f"h5repack failed: {e}")
     tmp.replace(path)
     return path
+
+# ------------------------------------------------------------------------------
+
+def _stamp_hypercube_storage_state(
+    base_h5: str | Path,
+    *,
+    state: str,
+    detail: str | None = None,
+) -> None:
+    """
+    Stamp /HyperCube with a lightweight storage-state tag.
+
+    Parameters
+    ----------
+    base_h5 : str or Path
+        HDF5 file to update.
+    state : str
+        Short classification label, e.g. "archived" or "solver_ready".
+    detail : str, optional
+        Optional free-form detail string.
+    """
+    with open_h5(base_h5, "writer") as f:
+        hg = f.require_group("/HyperCube")
+        hg.attrs["storage_state"] = str(state)
+        hg.attrs["storage_state_time"] = time.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        if detail is not None:
+            hg.attrs["storage_state_detail"] = str(detail)
+        elif "storage_state_detail" in hg.attrs:
+            del hg.attrs["storage_state_detail"]
+
+def _rewrite_models_then_repack(
+    base_h5: str | Path,
+    *,
+    dataset: str,
+    compression: str | None,
+    compression_opts: Optional[int],
+    shuffle: bool,
+    chunk_overrides: Optional[Tuple[int, int, int, int]],
+    temp_name: str,
+    keep_backup: bool,
+    repack: bool = True,
+    storage_state: str | None = None,
+    storage_detail: str | None = None,
+) -> dict:
+    """
+    Rewrite /HyperCube/models with new filters, then compact the file.
+    """
+    start = time.time()
+    base_h5 = Path(base_h5)
+
+    with open_h5(base_h5, "writer") as f:
+        if dataset not in f:
+            raise RuntimeError(f"{dataset} not found in {base_h5}")
+
+        old = f[dataset]
+        parent = old.parent
+
+        shape = tuple(int(x) for x in old.shape)
+        dtype = old.dtype
+        old_chunks = old.chunks or (shape[0], 1, min(64, shape[2]), shape[3])
+        chunks = tuple(chunk_overrides) if chunk_overrides else old_chunks
+
+        if temp_name in parent:
+            del parent[temp_name]
+
+        kwargs = dict(shape=shape, dtype=dtype, chunks=chunks)
+        if compression not in (None, "none", 0, False):
+            kwargs.update(
+                compression=compression,
+                compression_opts=compression_opts,
+                shuffle=bool(shuffle),
+            )
+
+        new = parent.create_dataset(temp_name, **kwargs)
+
+        for k, v in old.attrs.items():
+            new.attrs[k] = v
+
+        S_ch, C_ch, P_ch, L_ch = old_chunks
+        tiles = []
+        for s0 in range(0, shape[0], S_ch):
+            s1 = min(s0 + S_ch, shape[0])
+            for c0 in range(0, shape[1], C_ch):
+                c1 = min(c0 + C_ch, shape[1])
+                for p0 in range(0, shape[2], P_ch):
+                    p1 = min(p0 + P_ch, shape[2])
+                    tiles.append((s0, s1, c0, c1, p0, p1))
+
+        for s0, s1, c0, c1, p0, p1 in tqdm(
+            tiles,
+            desc=f"[HDF5] {Path(dataset).name}",
+            unit="tile",
+            dynamic_ncols=True,
+        ):
+            new[s0:s1, c0:c1, p0:p1, :] = old[s0:s1, c0:c1, p0:p1, :]
+
+        backup_name = None
+        if keep_backup:
+            backup_name = f"{Path(dataset).name}_backup_{int(time.time())}"
+            parent.move(Path(dataset).name, backup_name)
+        else:
+            del parent[Path(dataset).name]
+
+        parent.move(temp_name, Path(dataset).name)
+
+        old_size = None
+        new_size = None
+        try:
+            if backup_name:
+                old_size = parent[backup_name].id.get_storage_size()
+            new_size = parent[Path(dataset).name].id.get_storage_size()
+        except Exception:
+            pass
+
+    repacked = False
+    repack_error = None
+    if repack and shutil.which("h5repack") is not None:
+        try:
+            logger.log("[HDF5] starting h5repack...")
+            compact_file_via_h5repack(base_h5)
+            repacked = True
+            logger.log("[HDF5] h5repack finished.")
+        except Exception as exc:
+            repack_error = str(exc)
+            logger.log(f"[HDF5] h5repack failed: {exc}")
+    elif repack:
+        repack_error = "h5repack not found in PATH"
+        logger.log("[HDF5] h5repack not found in PATH; skipping physical repack.")
+
+    if storage_state is not None:
+        try:
+            _stamp_hypercube_storage_state(
+                base_h5,
+                state=storage_state,
+                detail=storage_detail,
+            )
+        except Exception as exc:
+            logger.log(f"[HDF5] storage-state stamp failed: {exc}")
+
+    return {
+        "dataset": dataset,
+        "shape": shape,
+        "dtype": str(dtype),
+        "chunks_old": tuple(old_chunks),
+        "chunks_new": tuple(chunks),
+        "compression": compression,
+        "compression_opts": compression_opts,
+        "shuffle": bool(shuffle),
+        "old_size_bytes": old_size,
+        "new_size_bytes": new_size,
+        "elapsed_sec": time.time() - start,
+        "backup_dataset": backup_name,
+        "repacked": repacked,
+        "repack_error": repack_error,
+        "storage_state": storage_state if repacked else None,
+    }
+
+def archive_hypercube_models(
+    base_h5: str | Path,
+    *,
+    dataset: str = "/HyperCube/models",
+    chunk_overrides: Optional[Tuple[int, int, int, int]] = None,
+    temp_name: str = "models_tmp",
+    keep_backup: bool = False,
+) -> dict:
+    """
+    Archive /HyperCube/models with maximum compression, then repack.
+    """
+    return _rewrite_models_then_repack(
+        base_h5=base_h5,
+        dataset=dataset,
+        compression="gzip",
+        compression_opts=9,
+        shuffle=True,
+        chunk_overrides=chunk_overrides,
+        temp_name=temp_name,
+        keep_backup=keep_backup,
+        repack=True,
+        storage_state="archived",
+        storage_detail="gzip-9 + shuffle + h5repack",
+    )
+
+def restore_hypercube_models(
+    base_h5: str | Path,
+    *,
+    dataset: str = "/HyperCube/models",
+    chunk_overrides: Optional[Tuple[int, int, int, int]] = None,
+    temp_name: str = "models_tmp",
+    keep_backup: bool = False,
+) -> dict:
+    """
+    Restore /HyperCube/models to a solver-ready uncompressed layout, then repack.
+    """
+    return _rewrite_models_then_repack(
+        base_h5=base_h5,
+        dataset=dataset,
+        compression=None,
+        compression_opts=None,
+        shuffle=False,
+        chunk_overrides=chunk_overrides,
+        temp_name=temp_name,
+        keep_backup=keep_backup,
+        repack=True,
+        storage_state="solver_ready",
+        storage_detail="uncompressed + no shuffle + h5repack",
+    )
+
+def classify_hypercube_models(base_h5: str) -> dict:
+    """
+    Inspect /HyperCube/models and classify the file as archived or
+    solver-ready based on dataset filters.
+    """
+    with open_h5(base_h5, role="reader") as f:
+        if "/HyperCube/models" not in f:
+            raise RuntimeError("Missing /HyperCube/models")
+
+        ds = f["/HyperCube/models"]
+
+        info = {
+            "shape": tuple(ds.shape),
+            "chunks": ds.chunks,
+            "dtype": str(ds.dtype),
+            "compression": ds.compression,
+            "compression_opts": ds.compression_opts,
+            "shuffle": bool(ds.shuffle),
+            "fletcher32": bool(ds.fletcher32),
+        }
+
+        if ds.compression in ("gzip", "lzf"):
+            info["state"] = "archived_or_compressed"
+        elif ds.compression is None:
+            info["state"] = "solver_ready_or_uncompressed"
+        else:
+            info["state"] = "unknown_filter_state"
+
+        return info
 
 # ------------------------------------------------------------------------------
 

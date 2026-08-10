@@ -1547,7 +1547,7 @@ def plot_diagnostic_jsonl_dashboard(
             )
             residual_axis.axhline(
                 0.0,
-                lw=0.8,
+                lw=0.8, c='k',
                 alpha=0.65,
             )
             residual_axis.tick_params(axis="y", colors="tab:red")
