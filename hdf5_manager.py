@@ -1525,12 +1525,31 @@ def compact_file_via_h5repack(path: str | Path) -> Path:
     """
     path = Path(path)
     tmp = path.with_suffix(path.suffix + ".repacked")
+
+    if tmp.exists():
+        tmp.unlink()
+
     try:
-        subprocess.run(["h5repack", "-i", str(path), "-o", str(tmp), "-v"], check=True)
+        r = subprocess.run(
+            ["h5repack", "-i", str(path), "-o", str(tmp), "-v"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if r.stdout:
+            logger.log(f"[HDF5] h5repack stdout:\n{r.stdout}")
+        if r.stderr:
+            logger.log(f"[HDF5] h5repack stderr:\n{r.stderr}")
     except FileNotFoundError:
         raise RuntimeError("h5repack not found in PATH; cannot compact file.")
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"h5repack failed: {e}")
+        msg = (
+            f"h5repack failed rc={e.returncode}\n"
+            f"stdout:\n{e.stdout or ''}\n"
+            f"stderr:\n{e.stderr or ''}"
+        )
+        raise RuntimeError(msg)
+
     tmp.replace(path)
     return path
 
