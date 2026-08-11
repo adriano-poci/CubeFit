@@ -445,9 +445,11 @@ def plot_diagnostic_jsonl_dashboard(
     The panels show:
 
     1. Global data-objective evolution and relative improvement.
-    2. Fitted global amplitude and coefficient norms.
+    2. Physical solution-vector norm, relative iteration-to-iteration change,
+       and effective support.
     3. Raw, constraint, and constrained reduced gradients.
-    4. Active-set size, effective support, and orbit occupation.
+    4. Active-set size, physical nnz(x), effective support, and coefficient
+       concentration.
     5. Promotions, failures, drops, and promotion survival.
     6. Hard-constraint residuals and alpha stationarity.
     7. Orbit-mass ratio history.
@@ -877,6 +879,92 @@ def plot_diagnostic_jsonl_dashboard(
         dtype=np.float64,
     )
 
+    # ------------------------------------------------------------------
+    # Physical solution-vector histories
+    # ------------------------------------------------------------------
+    n_iter = iterations.size
+
+    x_norm = np.full(
+        n_iter,
+        np.nan,
+        dtype=np.float64,
+    )
+    x_rel_step = np.full(
+        n_iter,
+        np.nan,
+        dtype=np.float64,
+    )
+    x_nnz = np.full(
+        n_iter,
+        np.nan,
+        dtype=np.float64,
+    )
+    x_eff_support = np.full(
+        n_iter,
+        np.nan,
+        dtype=np.float64,
+    )
+    x_top_share = np.full(
+        n_iter,
+        np.nan,
+        dtype=np.float64,
+    )
+    x_min = np.full(
+        n_iter,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    previous_x = None
+
+    for index, record in enumerate(merged):
+        x_vec = _vector(
+            record,
+            "x",
+            "x_current",
+        )
+
+        if x_vec is None:
+            continue
+
+        finite = np.isfinite(x_vec)
+
+        if not np.all(finite):
+            continue
+
+        norm = float(np.linalg.norm(x_vec))
+        mass = float(np.sum(x_vec))
+        sq_mass = float(np.dot(x_vec, x_vec))
+
+        x_norm[index] = norm
+        x_nnz[index] = float(
+            np.count_nonzero(x_vec > 0.0)
+        )
+        x_min[index] = float(np.min(x_vec))
+
+        if sq_mass > 0.0:
+            x_eff_support[index] = (
+                mass * mass / sq_mass
+            )
+
+        if mass > 0.0:
+            x_top_share[index] = (
+                float(np.max(x_vec)) / mass
+            )
+
+        if (
+            previous_x is not None
+            and previous_x.size == x_vec.size
+        ):
+            dx = x_vec - previous_x
+
+            x_rel_step[index] = (
+                float(np.linalg.norm(dx))
+                / max(norm, eps)
+            )
+
+        previous_x = x_vec.copy()
+
     orbit_ratio_rows = []
     orbit_ratio_iters = []
     orbit_count = None
@@ -1056,53 +1144,69 @@ def plot_diagnostic_jsonl_dashboard(
         )
 
     # ------------------------------------------------------------------
-    # Panel 2: alpha and coefficient norms
+    # Panel 2: physical solution-vector evolution
     # ------------------------------------------------------------------
     axis = axes["amplitude"]
 
     _plot_finite(
         axis,
         iterations,
-        norm_old,
-        "Norm old",
+        x_norm,
+        r"$||x||_2$",
         positive_log=True,
-        lw=1.0, color="tab:blue",
-        alpha=0.70,
+        lw=1.5,
+        color="tab:blue",
     )
+
     _plot_finite(
         axis,
         iterations,
-        norm_new,
-        "Norm new",
+        x_rel_step,
+        r"$||\Delta x||_2 / ||x||_2$",
         positive_log=True,
-        lw=1.2, color="tab:orange",
+        lw=1.3,
+        color="tab:orange",
     )
 
     axis.set_title(
-        "Global amplitude and coefficient norm"
+        "Physical solution-vector evolution"
     )
     axis.set_xlabel(
         "Iteration"
     )
     axis.set_ylabel(
-        "Coefficient norm"
+        "Norm / relative change"
     )
 
-    amp_axis = axis.twinx()
+    x_support_axis = axis.twinx()
+
     _plot_finite(
-        amp_axis,
+        x_support_axis,
         iterations,
-        alpha,
-        "Fitted alpha",
-        lw=1.7, color="tab:green"
+        x_eff_support,
+        "Effective support",
+        lw=1.2,
+        color="tab:green",
     )
 
-    amp_axis.tick_params(axis="y", colors="tab:green")
-    amp_axis.spines["right"].set_color("tab:green")
-    amp_axis.set_ylabel("Fitted alpha", color="tab:green")
+    x_support_axis.tick_params(
+        axis="y",
+        colors="tab:green",
+    )
+    x_support_axis.spines[
+        "right"
+    ].set_color("tab:green")
+    x_support_axis.set_ylabel(
+        "Effective support",
+        color="tab:green",
+    )
 
-    handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = amp_axis.get_legend_handles_labels()
+    handles_left, labels_left = (
+        axis.get_legend_handles_labels()
+    )
+    handles_right, labels_right = (
+        x_support_axis.get_legend_handles_labels()
+    )
 
     if handles_left or handles_right:
         axis.legend(
@@ -1195,6 +1299,15 @@ def plot_diagnostic_jsonl_dashboard(
         "Mean effective support",
         lw=1.2, color="tab:green"
     )
+    _plot_finite(
+        axis,
+        iterations,
+        x_nnz,
+        "nnz(x)",
+        lw=1.2,
+        color="tab:purple",
+        alpha=0.85,
+    )
 
     axis.set_title(
         "Support size and diversity"
@@ -1215,6 +1328,15 @@ def plot_diagnostic_jsonl_dashboard(
         "Largest orbit top-share",
         lw=1.0, color="tab:red",
         alpha=0.70,
+    )
+    _plot_finite(
+        share_axis,
+        iterations,
+        x_top_share,
+        "max(x) / sum(x)",
+        lw=1.2,
+        color="tab:brown",
+        alpha=0.85,
     )
 
     share_axis.set_ylim(
@@ -1612,6 +1734,22 @@ def plot_diagnostic_jsonl_dashboard(
         "Ridge",
         positive_log=True,
         lw=1.1, color="tab:orange"
+    )
+    _plot_finite(
+        axis,
+        iterations,
+        x_min,
+        "min(x)",
+        lw=1.2,
+        color="tab:red",
+        alpha=0.85,
+    )
+
+    axis.axhline(
+        0.0,
+        lw=0.8,
+        color="black",
+        alpha=0.5,
     )
 
     condition_estimate = np.divide(

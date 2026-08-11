@@ -43,6 +43,11 @@ v1.2:   Replaced fixed absolute orbit-mass targets with a hard a priori
 v1.3:   Switched checkpoint emission to atomic `save_checkpoint` and removed the
             split snapshot/state write path so resumable checkpoints preserve the
             full constrained solver state. 7 August 2026
+v1.4:   Emit current `x` vector in the diagnostics to assist in debugging;
+        Don't zero the solution in-place before returning, as this mutates the
+            vector after the solver has finished;
+        Make the final summary statistics use `best_x` as a total solver
+            summary. 11 August 2026
 """
 
 from __future__ import annotations, print_function
@@ -1358,7 +1363,7 @@ def streamActiveSetNNLS(
     diag_t0 = time.perf_counter()
 
     def _emit_diag(record: dict) -> None:
-        if diag_level <= 0:
+        if diag_level <= 0 and ('error' not in str(record.get("kind"))):
             return
         rec = dict(record)
         rec.setdefault("t_sec", float(time.perf_counter() - diag_t0))
@@ -2671,6 +2676,7 @@ def streamActiveSetNNLS(
                         if orbit_shape is not None
                         else None
                     ),
+                    "x": x_phys_now.ravel(order="C").tolist(),
                 }
             )
 
@@ -2756,6 +2762,7 @@ def streamActiveSetNNLS(
             "orbit_prior_present": bool(
                 has_hard_orbit_shape
             ),
+            "x": x_final.ravel(order="C").tolist(),
         }
     )
 
@@ -3496,7 +3503,7 @@ def solve_streaming_nnls(
 
         # show top contributors (per-orbit totals)
         try:
-            s_full = np.sum(x, axis=1)  # per-orbit
+            s_full = np.sum(best_x, axis=1)  # per-orbit
             top_idx = np.argsort(s_full)[::-1][:10]
             top_vals = s_full[top_idx]
             print("[BC-FUSED][summary] top orbits (index:mass): " + ", ".join(
@@ -3510,10 +3517,6 @@ def solve_streaming_nnls(
                 orbit_shape_outer is not None
                 and np.sum(orbit_shape_outer) > 0.0
             ):
-                s_full = np.sum(
-                    x,
-                    axis=1,
-                )
 
                 alpha_outer = float(
                     np.sum(s_full)
@@ -3534,7 +3537,7 @@ def solve_streaming_nnls(
 
                 for cc in range(C):
                     st = _support_stats_1d(
-                        x[cc, :]
+                        best_x[cc, :]
                     )
                     resid = float(
                         s_full[cc] - s_proj[cc]
@@ -3551,7 +3554,7 @@ def solve_streaming_nnls(
                         f"resid={resid:+.3e} "
                         f"ratio={ratio:7.3f} "
                         f"nz="
-                        f"{int(np.count_nonzero(x[cc, :] > 0.0)):3d} "
+                        f"{int(np.count_nonzero(best_x[cc, :] > 0.0)):3d} "
                         f"eff={st['eff_support']:.2f} "
                         f"top={st['top_share']:.2f}",
                         flush=True,
@@ -3578,7 +3581,7 @@ def solve_streaming_nnls(
                         ).tolist(),
                         "orbit_nz": (
                             np.count_nonzero(
-                                x > 0.0,
+                                best_x > 0.0,
                                 axis=1,
                             )
                             .astype(int)
@@ -3600,7 +3603,69 @@ def solve_streaming_nnls(
     # --- end epoch summary diagnostics ---
 
     # done epochs
-    th = cu.zero_floor_inplace(best_x, rel_tol=1e-25, abs_tol=0.0)
+    # ------------------------------------------------------------
+
+
+    # Final NNLS feasibility check.
+    # ------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Final NNLS feasibility validation.
+    #
+    # If the constrained solver has produced an infeasible solution, preserve and
+    # diagnose the exact offending vector before failing.
+    # ------------------------------------------------------------
+    x_final_flat = np.asarray(best_x, dtype=np.float64).ravel(order="C")
+    bad = np.flatnonzero(~np.isfinite(x_final_flat))
+    if bad.size:
+        _emit_diag(
+            {
+                "kind": "error",
+                "error": "nonfinite_final_x",
+                "message": (
+                    "Final NNLS solution contains non-finite coefficients."),
+                "n_bad": int(bad.size),
+                "bad_indices": bad.tolist(),
+                "x": x_final_flat.tolist(),
+            }
+        )
+        raise RuntimeError(
+            "Final NNLS solution contains non-finite coefficients: "
+            f"n_bad={bad.size}, "
+            f"first_indices={bad[:10].tolist()}"
+        )
+    neg = np.flatnonzero(x_final_flat < 0.0)
+    if neg.size:
+        _emit_diag(
+            {
+                "kind": "error",
+                "error": "negative_final_x",
+                "message": (
+                    "Final NNLS solution violates non-negativity."),
+                "n_negative": int(neg.size),
+                "min_x": float(np.min(x_final_flat)),
+                "negative_indices": neg.tolist(),
+                "negative_values": x_final_flat[neg].tolist(),
+                "x": x_final_flat.tolist(),
+            }
+        )
+        raise RuntimeError(
+            "Final NNLS solution violates non-negativity: "
+            f"n_negative={neg.size}, "
+            f"min={float(np.min(x_final_flat)):.17e}, "
+            f"first_indices={neg[:10].tolist()}, "
+            f"first_values={x_final_flat[neg[:10]].tolist()}"
+        )
+    _emit_diag(
+        {
+            "kind": "final_solution",
+            "x": best_x.ravel(order="C").tolist(),
+            "x_sum": float(np.sum(best_x)),
+            "x_norm": float(np.linalg.norm(best_x)),
+            "x_max": float(np.max(best_x)),
+            "x_nnz": int(np.count_nonzero(best_x > 0.0)),
+            "rmse_proxy_best": float(best_proxy),
+        }
+    )
     elapsed = time.perf_counter() - t0
 
     stats = dict(

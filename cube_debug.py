@@ -26,6 +26,8 @@ import time, os
 import numpy as np
 from pathlib import Path
 from typing import Optional, Sequence
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 
 from CubeFit.hdf5_manager import open_h5
 from CubeFit.hypercube_builder import read_global_column_energy
@@ -319,6 +321,212 @@ def nnls_seed_diagnostics(
         "apertures": ap_idx,
         "fits_png": str(fits_png),
         "sfh_png": str(sfh_png),
+    }
+
+# ------------------------------------------------------------------------------
+
+def compare_sidecar_solution_to_hypercube(
+    x_h5: str,
+    hypercube_h5: str,
+    *,
+    x_key_candidates: tuple[str, ...] = (
+        "/X_global",
+    ),
+    save: str | None = None,
+    title: str | None = None,
+) -> dict:
+    """
+    Compare the coefficient solution stored in a dedicated sidecar HDF5 file
+    against the solution stored inside a hypercube HDF5 file.
+
+    The function reads the full coefficient matrix from each file, compares the
+    coefficient vectors directly, and also compares the per-orbit masses
+    obtained by summing over the population axis.
+
+    Parameters
+    ----------
+    x_h5 : str
+        Path to the dedicated solution HDF5 file, e.g. ``x_154_00.h5``.
+    hypercube_h5 : str
+        Path to the hypercube HDF5 file containing ``/HyperCube/models`` and
+        the embedded solution.
+    x_key_candidates : tuple of str, optional
+        Candidate dataset paths to probe, in order, for the solution vector.
+    save : str, optional
+        If provided, save the comparison figure to this path.
+    title : str, optional
+        Optional figure title.
+
+    Returns
+    -------
+    dict
+        Summary dictionary containing coefficient norms, per-orbit residuals,
+        and the loaded coefficient arrays.
+
+    Raises
+    ------
+    RuntimeError
+        If a required dataset is missing.
+    ValueError
+        If the coefficient shapes are incompatible.
+
+    Notes
+    -----
+    The hypercube solution is taken from the embedded coefficient store, not
+    from ``/ModelCube``. This is the cleanest way to detect whether the saved
+    solver state itself is stale.
+    """
+    import os
+
+    def _load_first_solution(
+        f,
+        *,
+        C: int,
+        P: int,
+        label: str,
+    ) -> np.ndarray:
+        for key in x_key_candidates:
+            if key in f:
+                arr = np.asarray(f[key][...], dtype=np.float64)
+                break
+        else:
+            raise RuntimeError(
+                f"No solution dataset found in {label}; tried: "
+                + ", ".join(x_key_candidates)
+            )
+
+        if arr.ndim == 1:
+            if arr.size != C * P:
+                raise ValueError(
+                    f"{label} solution length {arr.size} != C*P={C*P}."
+                )
+            arr = arr.reshape(C, P)
+        elif arr.ndim == 2:
+            if arr.shape != (C, P):
+                raise ValueError(
+                    f"{label} solution shape {arr.shape} != (C,P)=({C},{P})."
+                )
+        else:
+            raise ValueError(
+                f"{label} solution must be 1-D or 2-D, got ndim={arr.ndim}."
+            )
+
+        return np.asarray(arr, dtype=np.float64, order="C")
+
+    with open_h5(hypercube_h5, role="reader") as fh:
+        if "/HyperCube/models" not in fh:
+            raise RuntimeError(
+                f"{hypercube_h5} does not contain /HyperCube/models."
+            )
+        _, C, P, _ = map(int, fh["/HyperCube/models"].shape)
+        x_hyper = _load_first_solution(
+            fh,
+            C=C,
+            P=P,
+            label="hypercube",
+        )
+
+    with open_h5(x_h5, role="reader") as fx:
+        x_side = _load_first_solution(
+            fx,
+            C=C,
+            P=P,
+            label="sidecar",
+        )
+
+    if x_side.shape != x_hyper.shape:
+        raise ValueError(
+            f"Shape mismatch: sidecar {x_side.shape} vs hypercube {x_hyper.shape}."
+        )
+
+    dx = x_hyper - x_side
+    side_mass = np.sum(x_side, axis=1)
+    hyper_mass = np.sum(x_hyper, axis=1)
+    dmass = hyper_mass - side_mass
+
+    x_l1 = float(np.sum(np.abs(dx)))
+    x_l2 = float(np.linalg.norm(dx))
+    x_linf = float(np.max(np.abs(dx))) if dx.size else 0.0
+
+    mass_l1 = float(np.sum(np.abs(dmass)))
+    mass_l2 = float(np.linalg.norm(dmass))
+    mass_linf = float(np.max(np.abs(dmass))) if dmass.size else 0.0
+
+    rel_mass_l2 = float(mass_l2 / (np.linalg.norm(side_mass) + 1e-30))
+    rel_mass_linf = float(
+        mass_linf / (np.max(np.abs(side_mass)) + 1e-30)
+    )
+
+    eps = 1e-30
+    log_side = np.log10(np.maximum(side_mass, eps))
+    log_hyper = np.log10(np.maximum(hyper_mass, eps))
+
+    fig = plt.figure(figsize=(10.0, 4.4))
+    gs = gridspec.GridSpec(1, 2, width_ratios=[1.05, 1.0], wspace=0.32)
+
+    # Left: per-orbit mass comparison.
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax0.plot(log_side, log_hyper, "o", alpha=0.8, ms=5)
+    lo = float(np.min([log_side.min(), log_hyper.min()])) if C else -1.0
+    hi = float(np.max([log_side.max(), log_hyper.max()])) if C else 1.0
+    ax0.plot([lo, hi], [lo, hi], "k--", lw=1.0)
+    ax0.set_xlabel(r"$\log_{10}(M_{\rm sidecar})$")
+    ax0.set_ylabel(r"$\log_{10}(M_{\rm hypercube})$")
+    ax0.set_title("Solution comparison")
+
+    txt = (
+        rf"$||x_h-x_s||_1={x_l1:.3e}$" "\n"
+        rf"$||x_h-x_s||_2={x_l2:.3e}$" "\n"
+        rf"$||x_h-x_s||_\infty={x_linf:.3e}$" "\n"
+        rf"$||M_h-M_s||_2={mass_l2:.3e}$" "\n"
+        rf"rel$_2$={rel_mass_l2:.3e}, rel$_\infty$={rel_mass_linf:.3e}"
+    )
+    ax0.text(
+        0.03,
+        0.97,
+        txt,
+        transform=ax0.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+    )
+
+    # Right: per-orbit residuals.
+    ax1 = fig.add_subplot(gs[0, 1])
+    idx = np.arange(C, dtype=int)
+    ax1.axhline(0.0, color="k", lw=1.0)
+    ax1.bar(idx, dmass, width=0.8)
+    ax1.set_xlabel("orbit index")
+    ax1.set_ylabel(r"$M_{\rm hypercube}-M_{\rm sidecar}$")
+    ax1.set_title("Per-orbit residual")
+
+    if C <= 24:
+        ax1.set_xticks(idx)
+
+    if title is not None:
+        fig.suptitle(title, y=0.98)
+
+    fig.tight_layout()
+
+    if save:
+        fig.savefig(save, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    return {
+        "x_l1": x_l1,
+        "x_l2": x_l2,
+        "x_linf": x_linf,
+        "mass_l1": mass_l1,
+        "mass_l2": mass_l2,
+        "mass_linf": mass_linf,
+        "rel_mass_l2": rel_mass_l2,
+        "rel_mass_linf": rel_mass_linf,
+        "sidecar_mass": side_mass,
+        "hypercube_mass": hyper_mass,
+        "mass_resid": dmass,
+        "x_sidecar": x_side,
+        "x_hypercube": x_hyper,
     }
 
 # ------------------------------------------------------------------------------

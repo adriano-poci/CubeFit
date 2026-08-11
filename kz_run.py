@@ -67,8 +67,7 @@ def _configure_solver_environment(args, propDict):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.environ["CUBEFIT_DIAG_JSONL"] = str(
         curdir/args.galaxy/
-        f"diagnostics_{args.ncomp}_{propDict['lOrder']:02d}.jsonl")
-        # f"diagnostics_{args.ncomp}_{propDict['lOrder']:02d}_{stamp}.jsonl")
+        f"diagnostics_{args.ncomp}_{propDict['lOrder']:02d}_{stamp}.jsonl")
 
 
 def main():

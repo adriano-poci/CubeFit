@@ -67,7 +67,9 @@ v1.20:  Made all orbital phase-space plots show the logarithmic mass fractions
             in `loadCubeFit`;
         Use `moncmap` for spatial maps in `loadCubeFit`. 10 August 2026
 v1.21:  Added `plot_best_worst_spectrum_fits_stacked` to plot single
-            representative spectral figure. 11 August 2026
+            representative spectral figure;
+        Use new `cube_utils.resolve_parallelism` to access optimal CPU/BLAS
+            configuration from all functions. 11 August 2026
 """
 
 # need to set up the logger before any other imports
@@ -585,67 +587,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # --- 4) Run the global Kaczmarz fit (tiled; RAM-bounded) ---
     runner = PipelineRunner(hdf5Path)
 
-    ncpuset, mask = cu.cpuset_count()
-    cores_available = len(os.sched_getaffinity(0))
-    cores_available = max(1, int(cores_available))
-
-    print(f"[guard] cpuset mask: {mask}  cores: {ncpuset}")
-    logger.log(f"cpuset cores: {cores_available}")
-
-    from threadpoolctl import threadpool_info
-    logger.log(f"BLAS pools: {threadpool_info()}")
-
-    requested_processes = max(1, int(CPU_PROCESSES))
-    requested_blas = max(1, int(BLAS_THREADS))
-    requested_total = requested_processes * requested_blas
-
-    # Choose the best (processes, BLAS_threads) pair for the current core budget.
-    # Preference order:
-    #   1) exact coverage if possible;
-    #   2) otherwise the smallest oversubscription;
-    #   3) then stay as close as possible to the requested CPU_PROCESSES;
-    #   4) then prefer fewer BLAS threads.
-    best_score = None
-    best_processes = requested_processes
-    best_blas = requested_blas
-    best_total = requested_total
-
-    max_procs = min(requested_processes, cores_available)
-
-    for procs in range(max_procs, 0, -1):
-        blas = max(1, int(math.ceil(cores_available / float(procs))))
-        total = procs * blas
-        oversub = total - cores_available
-
-        score = (
-            oversub,                      # smaller is better; exact = 0
-            abs(procs - requested_processes),
-            blas,
-            -procs,                       # tie-break toward more processes
-        )
-
-        if best_score is None or score < best_score:
-            best_score = score
-            best_processes = procs
-            best_blas = blas
-            best_total = total
-
-    if (
-        best_processes != requested_processes
-        or best_blas != requested_blas
-        or best_total != requested_total
-    ):
-        logger.log(
-            f"[guard] adjusting parallelism: "
-            f"CPU_PROCESSES {requested_processes} -> {best_processes}, "
-            f"BLAS_THREADS {requested_blas} -> {best_blas} "
-            f"(requested total={requested_total}, "
-            f"chosen total={best_total}, "
-            f"available cores={cores_available})"
-        )
-
-    CPU_PROCESSES = best_processes
-    BLAS_THREADS = best_blas
+    best_processes, best_blas = cu.resolve_parallelism(CPU_PROCESSES,
+        BLAS_THREADS)
 
     #####################################
     # Multi-processing Batched Kaczmarz #
@@ -653,8 +596,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     x_global, stats = runner.solve_all_mp_batched(
         # orbit_weights=None, # or None for “free” fit
         orbit_weights=cWeights,
-        processes=CPU_PROCESSES,
-        blas_threads=BLAS_THREADS,
+        processes=best_processes,
+        blas_threads=best_blas,
         reader_s_tile=128, # match /HyperCube/models chunking on S
         warm_start=warm_start,
     )
@@ -1015,7 +958,7 @@ def reconstruct_modelcube_fast_parallel(
     rdcc_bytes: int = 8 * 1024**2,
     rdcc_w0: float = 0.90,
     n_workers: int | None = None,
-    blas_threads_per_worker: int = 1,
+    blas_threads_per_worker: int | None = None,
 ) -> None:
     """
     Parallel reconstruction of /ModelCube with low peak memory.
@@ -1023,6 +966,21 @@ def reconstruct_modelcube_fast_parallel(
     Workers read a spatial slab, contract it locally with x_cp, and return
     only the output tile. The parent performs only HDF5 writes.
     """
+
+    if (
+        n_workers is None
+        or blas_threads_per_worker is None
+    ):
+        cpu_processes, blas_threads = (
+            cu.resolve_parallelism(CPU_PROCESSES, BLAS_THREADS)
+        )
+
+        if n_workers is None:
+            n_workers = cpu_processes
+
+        if blas_threads_per_worker is None:
+            blas_threads_per_worker = blas_threads
+
     want_dtype = np.float64 if str(out_dtype) == "float64" else np.float32
     x_in = np.ascontiguousarray(
         np.asarray(x_cp, dtype=np.float64).ravel(),
@@ -2067,8 +2025,11 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         mask_arr = np.asarray(f["/Mask"][...], bool) if has_mask else None
         obs = f["/ObsPix"][...] if "/ObsPix" in f else np.arange(nLSpec)
 
-    spat_tile, nTiles = choose_spat_tile_fast(nSpat, CPU_PROCESSES, s_chunk, k=2)
-    nProcs = builtins.min(CPU_PROCESSES, nTiles, 12) 
+    best_processes, best_blas = cu.resolve_parallelism(CPU_PROCESSES,
+        BLAS_THREADS)
+    spat_tile, nTiles = choose_spat_tile_fast(nSpat, best_processes, s_chunk,
+        k=2)
+    nProcs = builtins.min(best_processes, nTiles, 12) 
     # don’t spawn more processes than tiles
 
     ok, why = modelcube_status(str(hdf5Path), x_global=x_global, require_float64=True, redraw=redraw)
@@ -2079,7 +2040,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         logger.log("[ModelCube] Reconstructing…")
         # reconstruct_model_cube_single(  # or your parallel version
         try:
-            if CPU_PROCESSES <= 1:
+            if best_processes <= 1:
                 reconstruct_modelcube_fast(
                     h5_path=str(hdf5Path),
                     x_cp=x_global,
@@ -2095,8 +2056,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     rdcc_slots=1_000_003,
                     rdcc_bytes=8 * 1024**2,
                     rdcc_w0=0.90,
-                    n_workers=builtins.min(CPU_PROCESSES, nTiles, 4),
-                    blas_threads_per_worker=BLAS_THREADS // max(1, CPU_PROCESSES)
+                    n_workers=builtins.min(best_processes, nTiles, 4),
+                    blas_threads_per_worker=best_blas // max(1, best_processes)
                 )
         except Exception as e:
             logger.log(
@@ -2253,7 +2214,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     compare_orbit_vs_solution_absolute(
         h5_path=str(hdf5Path),
         orbit_target_mass=orbit_target_mass,
-        x_global=x_global,
+        x_global=x_global_cp,
         save=figDir
         / (
             f"compare_prior_abs_"
@@ -2637,7 +2598,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 chi2=rms_resid_raw,
                 n=50,
                 plot_dir=str(figDir),
-                n_workers=CPU_PROCESSES,
+                n_workers=best_processes,
                 tag=f"C{nComp:04d}",
                 mask=mask_arr,
             )
@@ -3389,13 +3350,13 @@ def compare_orbit_vs_solution_absolute(
         rf"rel$_2$={rel_l2:.3e}, rel$_\infty$={rel_linf:.3e}"
     )
     ax0.text(
-        0.03,
-        0.97,
+        1.0-0.03,
+        1.0-0.97,
         txt,
         transform=ax0.transAxes,
-        va="top",
-        ha="left",
-        fontsize=9,
+        va='bottom',
+        ha='right',
+        fontsize=7,
         bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
     )
 

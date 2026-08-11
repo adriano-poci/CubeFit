@@ -12,14 +12,14 @@
 #SBATCH -D "/data/phys-gal-dynamics/phys2603/muse"
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
-#SBATCH -p long
+#SBATCH -p medium
 
 #SBATCH --job-name="CubeFit_2Fit"
-#SBATCH --time=6-00:00
+#SBATCH --time=2-00:00
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=48
-#SBATCH --mem=500G
+#SBATCH --mem=300G
 #SBATCH --hint=nomultithread
 #SBATCH --exclusive
 #SBATCH --mail-type=ALL

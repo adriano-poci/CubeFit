@@ -20,9 +20,12 @@ v1.6:   Fixed bug in `_glob*MILES` where age sorting was neglected, so added
             `parseAgeFromPath` and updated sorting logic. 30 March 2026
 v1.7:   Moved template-reading functions to `dynamics.IFU.FileIO`. 21 July 2026
 v1.8:   Added `vprint` to globally manage diagnostic level. 31 July 2026
+v1.9:   Added `resolve_parallelism` to determine optimal CPU/BLAS configuration.
+            11 August 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
+from threadpoolctl import threadpool_info
 from typing import Any, Dict, Optional, Tuple, Sequence
 import numpy as np
 from tqdm import tqdm
@@ -3150,5 +3153,118 @@ def recommend_streaming_architecture(
         },
         "ram_limit_gb": float(ram_limit_gb),
     }
+
+# ------------------------------------------------------------------------------
+
+def resolve_parallelism(
+    requested_processes=None,
+    requested_blas=None,
+):
+    """
+    Resolve process and BLAS thread counts against the available CPU set.
+
+    Parameters
+    ----------
+    requested_processes : int, optional
+        Requested number of worker processes. Defaults to
+        ``CPU_PROCESSES``.
+    requested_blas : int, optional
+        Requested number of BLAS threads per process. Defaults to
+        ``BLAS_THREADS``.
+
+    Returns
+    -------
+    cpu_processes : int
+        Resolved number of worker processes.
+    blas_threads : int
+        Resolved number of BLAS threads per worker.
+
+    Raises
+    ------
+    ValueError
+        If either requested value cannot be converted to a positive integer.
+
+    Examples
+    --------
+    >>> cpu_processes, blas_threads = resolve_parallelism()
+    """
+    if requested_processes is None:
+        requested_processes = 1
+
+    if requested_blas is None:
+        requested_blas = 1
+
+    requested_processes = max(
+        1,
+        int(requested_processes),
+    )
+    requested_blas = max(
+        1,
+        int(requested_blas),
+    )
+
+    ncpuset, mask = cpuset_count()
+    cores_available = len(os.sched_getaffinity(0))
+    cores_available = max(1, int(cores_available))
+    print(f"[guard] cpuset mask: {mask}  cores: {ncpuset}")
+    print(f"cpuset cores: {cores_available}")
+    print(f"BLAS pools: {threadpool_info()}")
+
+    requested_total = (
+        requested_processes * requested_blas
+    )
+
+    best_score = None
+    best_processes = requested_processes
+    best_blas = requested_blas
+    best_total = requested_total
+
+    max_procs = min(
+        requested_processes,
+        cores_available,
+    )
+
+    for procs in range(max_procs, 0, -1):
+        blas = max(
+            1,
+            int(
+                math.ceil(
+                    cores_available / float(procs)
+                )
+            ),
+        )
+
+        total = procs * blas
+        oversub = total - cores_available
+
+        score = (
+            oversub,
+            abs(procs - requested_processes),
+            blas,
+        )
+
+        if best_score is None or score < best_score:
+            best_score = score
+            best_processes = procs
+            best_blas = blas
+            best_total = total
+
+    if (
+        best_processes != requested_processes
+        or best_blas != requested_blas
+        or best_total != requested_total
+    ):
+        print(
+            "[guard] adjusting parallelism: "
+            f"CPU_PROCESSES {requested_processes} -> "
+            f"{best_processes}, "
+            f"BLAS_THREADS {requested_blas} -> "
+            f"{best_blas} "
+            f"(requested total={requested_total}, "
+            f"chosen total={best_total}, "
+            f"available cores={cores_available})"
+        )
+
+    return best_processes, best_blas
 
 # ------------------------------------------------------------------------------
