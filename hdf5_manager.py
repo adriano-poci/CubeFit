@@ -31,6 +31,8 @@ v1.5:   Added archive/restore wrappers for `/HyperCube/models` that rewrite the
             dataset with or without compression, then repack the file to
             maximize archival compaction or return to a solver-ready layout. 10
             August 2026
+v1.6:   Added extensive safe-guards to archive/restore to avoid accidental data
+            loss. 11 August 2026
 
 
 HDF5 manager for CubeFit.
@@ -1530,28 +1532,57 @@ def compact_file_via_h5repack(path: str | Path) -> Path:
         tmp.unlink()
 
     try:
-        r = subprocess.run(
+        subprocess.run(
             ["h5repack", "-i", str(path), "-o", str(tmp), "-v"],
             check=True,
             capture_output=True,
             text=True,
         )
-        if r.stdout:
-            logger.log(f"[HDF5] h5repack stdout:\n{r.stdout}")
-        if r.stderr:
-            logger.log(f"[HDF5] h5repack stderr:\n{r.stderr}")
     except FileNotFoundError:
         raise RuntimeError("h5repack not found in PATH; cannot compact file.")
     except subprocess.CalledProcessError as e:
-        msg = (
+        raise RuntimeError(
             f"h5repack failed rc={e.returncode}\n"
             f"stdout:\n{e.stdout or ''}\n"
             f"stderr:\n{e.stderr or ''}"
         )
-        raise RuntimeError(msg)
+
+    # Validate before swapping it into place.
+    _validate_hdf5_file(tmp, dataset="/HyperCube/models")
 
     tmp.replace(path)
     return path
+
+# ------------------------------------------------------------------------------
+
+def _validate_hdf5_file(
+    path: str | Path,
+    *,
+    dataset: str = "/HyperCube/models",
+) -> None:
+    """
+    Validate that the HDF5 file can be opened and that core datasets exist.
+
+    Raises
+    ------
+    RuntimeError
+        If the file cannot be opened or required datasets are unreadable.
+    """
+    path = Path(path)
+
+    with open_h5(path, "reader") as f:
+        if dataset not in f:
+            raise RuntimeError(f"{dataset} missing in validated file: {path}")
+        for req in ("/DataCube", "/LOSVD", "/Templates", "/ObsPix", "/TemPix"):
+            if req not in f:
+                raise RuntimeError(f"{req} missing in validated file: {path}")
+
+        # Touch the critical objects so HDF5 must actually traverse them.
+        _ = f[dataset].shape
+        _ = f[dataset].dtype
+        _ = f["/DataCube"].shape
+        _ = f["/LOSVD"].shape
+        _ = f["/Templates"].shape
 
 # ------------------------------------------------------------------------------
 
@@ -1720,21 +1751,53 @@ def archive_hypercube_models(
     keep_backup: bool = False,
 ) -> dict:
     """
-    Archive /HyperCube/models with maximum compression, then repack.
+    Archive /HyperCube/models safely.
+
+    The operation is performed on a work copy. The original file is only
+    replaced after the work copy has been rewritten, optionally repacked, and
+    successfully validated.
     """
-    return _rewrite_models_then_repack(
-        base_h5=base_h5,
-        dataset=dataset,
-        compression="gzip",
-        compression_opts=9,
-        shuffle=True,
-        chunk_overrides=chunk_overrides,
-        temp_name=temp_name,
-        keep_backup=keep_backup,
-        repack=True,
-        storage_state="archived",
-        storage_detail="gzip-9 + shuffle + h5repack",
-    )
+    base_h5 = Path(base_h5)
+    work_h5 = base_h5.with_suffix(base_h5.suffix + ".archive_work")
+
+    if work_h5.exists():
+        work_h5.unlink()
+
+    shutil.copy2(base_h5, work_h5)
+
+    try:
+        info = _rewrite_models_then_repack(
+            base_h5=work_h5,
+            dataset=dataset,
+            compression="gzip",
+            compression_opts=9,
+            shuffle=True,
+            chunk_overrides=chunk_overrides,
+            temp_name=temp_name,
+            keep_backup=keep_backup,
+            repack=True,
+            storage_state=None,   # stamp only after final validation
+            storage_detail=None,
+        )
+
+        _validate_hdf5_file(work_h5, dataset=dataset)
+
+        _stamp_hypercube_storage_state(
+            work_h5,
+            state="archived",
+            detail="gzip-9 + shuffle + validated",
+        )
+
+        os.replace(work_h5, base_h5)
+        return info
+
+    except Exception:
+        try:
+            if work_h5.exists():
+                work_h5.unlink()
+        except Exception:
+            pass
+        raise
 
 def restore_hypercube_models(
     base_h5: str | Path,
@@ -1745,21 +1808,52 @@ def restore_hypercube_models(
     keep_backup: bool = False,
 ) -> dict:
     """
-    Restore /HyperCube/models to a solver-ready uncompressed layout, then repack.
+    Restore /HyperCube/models safely to a solver-ready layout.
+
+    The operation is performed on a work copy and only swapped in after
+    successful validation.
     """
-    return _rewrite_models_then_repack(
-        base_h5=base_h5,
-        dataset=dataset,
-        compression=None,
-        compression_opts=None,
-        shuffle=False,
-        chunk_overrides=chunk_overrides,
-        temp_name=temp_name,
-        keep_backup=keep_backup,
-        repack=True,
-        storage_state="solver_ready",
-        storage_detail="uncompressed + no shuffle + h5repack",
-    )
+    base_h5 = Path(base_h5)
+    work_h5 = base_h5.with_suffix(base_h5.suffix + ".restore_work")
+
+    if work_h5.exists():
+        work_h5.unlink()
+
+    shutil.copy2(base_h5, work_h5)
+
+    try:
+        info = _rewrite_models_then_repack(
+            base_h5=work_h5,
+            dataset=dataset,
+            compression=None,
+            compression_opts=None,
+            shuffle=False,
+            chunk_overrides=chunk_overrides,
+            temp_name=temp_name,
+            keep_backup=keep_backup,
+            repack=True,
+            storage_state=None,
+            storage_detail=None,
+        )
+
+        _validate_hdf5_file(work_h5, dataset=dataset)
+
+        _stamp_hypercube_storage_state(
+            work_h5,
+            state="solver_ready",
+            detail="uncompressed + validated",
+        )
+
+        os.replace(work_h5, base_h5)
+        return info
+
+    except Exception:
+        try:
+            if work_h5.exists():
+                work_h5.unlink()
+        except Exception:
+            pass
+        raise
 
 def classify_hypercube_models(base_h5: str) -> dict:
     """

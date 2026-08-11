@@ -65,7 +65,9 @@ v1.19:  Dynamically adjust parallelism in case of cpuset restrictions. 7 August
             2026
 v1.20:  Made all orbital phase-space plots show the logarithmic mass fractions
             in `loadCubeFit`;
-        Use `moncmap` for spatial maps in `loadCubeFit`. 10 August 2026 
+        Use `moncmap` for spatial maps in `loadCubeFit`. 10 August 2026
+v1.21:  Added `plot_best_worst_spectrum_fits_stacked` to plot single
+            representative spectral figure. 11 August 2026
 """
 
 # need to set up the logger before any other imports
@@ -1479,6 +1481,248 @@ def parallel_spectrum_plots(
 
 # ------------------------------------------------------------------------------
 
+def plot_best_worst_spectrum_fits_stacked(
+    h5_or_path: str,
+    chi2: np.ndarray,
+    n_each: int = 3,
+    plot_path: plp.Path | str | None = None,
+    mask: np.ndarray | None = None,
+    title: str | None = None,
+    tag: str = "best_worst",
+) -> plp.Path:
+    """
+    Make a publication-quality stacked comparison of best and worst spectral
+    fits on one figure.
+
+    Each spectrum is normalized by its own robust amplitude estimate and then
+    vertically offset by a constant amount, so every panel-like trace has the
+    same effective height in plot units.
+
+    Parameters
+    ----------
+    h5_or_path : str
+        HDF5 file path.
+    chi2 : ndarray
+        Per-spaxel fit-quality metric. Smaller is better.
+    n_each : int, optional
+        Number of best and worst spectra to show.
+    plot_path : Path or str, optional
+        Output PNG path. If omitted, a default path is created next to the HDF5
+        file.
+    mask : ndarray, optional
+        Boolean spectral mask. True means keep the wavelength pixel.
+    title : str, optional
+        Optional figure title.
+    tag : str, optional
+        Name fragment used when plot_path is not supplied.
+
+    Returns
+    -------
+    Path
+        Path to the saved PNG file.
+    """
+    h5_path = str(h5_or_path)
+    chi2 = np.asarray(chi2, dtype=np.float64).ravel()
+    if chi2.size == 0:
+        raise ValueError("chi2 is empty.")
+
+    n_each = int(max(1, n_each))
+    n_each = min(n_each, int(chi2.size))
+
+    idx_best = np.argsort(chi2)[:n_each]
+    idx_worst = np.argsort(chi2)[::-1][:n_each]
+
+    picks = []
+    seen = set()
+    for label, idxs in (("worst", idx_worst), ("best", idx_best)):
+        for s in idxs:
+            s = int(s)
+            if s not in seen:
+                picks.append((label, s))
+                seen.add(s)
+
+    with open_h5(h5_path, role="reader") as f:
+        if "/DataCube" not in f or "/ModelCube" not in f:
+            raise RuntimeError("Expected /DataCube and /ModelCube in HDF5.")
+
+        data_ds = f["/DataCube"]
+        model_ds = f["/ModelCube"]
+
+        if data_ds.ndim != 2 or model_ds.ndim != 2:
+            raise RuntimeError("Expected /DataCube and /ModelCube to be 2-D.")
+
+        if data_ds.shape != model_ds.shape:
+            raise RuntimeError(
+                f"Shape mismatch: {data_ds.shape} vs {model_ds.shape}"
+            )
+
+        L = int(model_ds.shape[1])
+        obs = (
+            np.asarray(f["/ObsPix"][...], dtype=np.float64)
+            if "/ObsPix" in f
+            else np.arange(L, dtype=np.float64)
+        )
+
+        if mask is None and "/Mask" in f:
+            m = np.asarray(f["/Mask"][...], dtype=bool).ravel()
+            mask = m if int(m.size) == L else None
+
+        if mask is None:
+            mask = np.ones(L, dtype=bool)
+        else:
+            mask = np.asarray(mask, dtype=bool).ravel()
+            if int(mask.size) != L:
+                raise ValueError(f"Mask length {mask.size} != L={L}")
+
+        data_sel = np.empty((len(picks), L), dtype=np.float64)
+        model_sel = np.empty((len(picks), L), dtype=np.float64)
+        chi2_sel = np.empty((len(picks),), dtype=np.float64)
+
+        for j, (_, s) in enumerate(picks):
+            data_sel[j, :] = np.asarray(data_ds[int(s), :], dtype=np.float64)
+            model_sel[j, :] = np.asarray(model_ds[int(s), :], dtype=np.float64)
+            chi2_sel[j] = float(chi2[int(s)])
+
+    # Normalise each spectrum independently so every trace has the same
+    # effective vertical height in plot units.
+    plot_amp = 0.42
+    band_step = 1.0
+    offsets = np.arange(len(picks), dtype=np.float64) * band_step
+
+    data_plot = np.empty_like(data_sel)
+    model_plot = np.empty_like(model_sel)
+    scales = np.empty((len(picks),), dtype=np.float64)
+    centers = np.empty((len(picks),), dtype=np.float64)
+
+    for j in range(len(picks)):
+        vals = np.concatenate((data_sel[j, mask], model_sel[j, mask]))
+        vals = vals[np.isfinite(vals)]
+
+        if vals.size == 0:
+            center = 0.0
+            scale = 1.0
+        else:
+            center = float(np.nanmedian(vals))
+            spread = np.abs(vals - center)
+            scale = float(np.nanpercentile(spread, 99.0))
+            scale = max(scale, 1e-30)
+
+        centers[j] = center
+        scales[j] = scale
+
+        data_plot[j, :] = plot_amp * (data_sel[j, :] - center) / scale
+        model_plot[j, :] = plot_amp * (model_sel[j, :] - center) / scale
+
+    # Masked wavelength intervals.
+    masked = ~mask
+    mask_spans = []
+    if np.any(masked):
+        pad = np.concatenate((
+            np.array([0], dtype=np.int8),
+            masked.view(np.int8),
+            np.array([0], dtype=np.int8),
+        ))
+        edges = np.diff(pad)
+        starts = np.nonzero(edges == 1)[0]
+        ends = np.nonzero(edges == -1)[0]
+        mask_spans = list(zip(starts, ends))
+
+    if plot_path is None:
+        base = plp.Path(h5_path)
+        plot_path = base.with_name(base.stem + f"_{tag}_stacked.png")
+    else:
+        plot_path = plp.Path(plot_path)
+
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=plt.figaspect(3.0 / len(picks)))
+
+    data_c = "k"
+    model_c = "tab:red"
+
+    for j, ((label, s), off) in enumerate(zip(picks, offsets)):
+        dat = data_plot[j, :] + off
+        mod = model_plot[j, :] + off
+
+        ax.plot(obs[mask], dat[mask], lw=1.0, color=data_c, solid_capstyle="round")
+        ax.plot(obs[mask], mod[mask], lw=1.0, color=model_c, alpha=0.95,
+                solid_capstyle="round")
+
+        ax.axhline(off, lw=0.45, color="0.6", alpha=0.35, zorder=0)
+
+        if mask_spans:
+            for a, b in mask_spans:
+                x0 = float(obs[int(a)])
+                x1 = float(obs[int(max(a, b - 1))])
+                if int(b) < L:
+                    x1 = float(obs[int(b)])
+                ax.axvspan(x0, x1, color="0.2", alpha=0.08, zorder=0)
+
+        txt = f"{label}  spax={s:d}  $\\chi^2$={chi2_sel[j]:.3g}"
+        ax.text(
+            0.01,
+            off + 0.34,
+            txt,
+            transform=ax.get_yaxis_transform(),
+            ha="left",
+            va="center",
+            fontsize=9,
+            color="k",
+            path_effects=[PathEffects.withStroke(linewidth=2.0, foreground="white")],
+        )
+
+    ax.plot([], [], color=data_c, lw=1.2, label="data")
+    ax.plot([], [], color=model_c, lw=1.2, label="model")
+
+    ax.set_xlim(float(np.nanmin(obs[mask])), float(np.nanmax(obs[mask])))
+    # Auto-scale the vertical extent so no stack is clipped.
+    ymin = np.inf
+    ymax = -np.inf
+    for j, off in enumerate(offsets):
+        yy = np.concatenate((
+            data_plot[j, mask],
+            model_plot[j, mask],
+        ))
+        yy = yy[np.isfinite(yy)]
+        if yy.size == 0:
+            continue
+        ymin = min(ymin, float(np.nanmin(yy)) + float(off))
+        ymax = max(ymax, float(np.nanmax(yy)) + float(off))
+    if not np.isfinite(ymin) or not np.isfinite(ymax):
+        ymin = -0.5
+        ymax = offsets[-1] + 1.0 if len(offsets) else 1.0
+    else:
+        pad = 0.10 * max(ymax - ymin, band_step)
+        ymin -= pad
+        ymax += pad
+    ax.set_ylim(ymin, ymax)
+
+    ax.set_xlabel("log(\u03bb [\u212B])")
+    ax.set_ylabel("Flux (arbitrary units, normalized & offset)")
+    ax.set_yticks([])
+    ax.tick_params(axis="y", left=False, labelleft=False)
+
+    ax.legend(loc="upper right", frameon=False, fontsize=10, handlelength=2.8)
+
+    if title is not None:
+        ax.set_title(title, fontsize=13, pad=10)
+
+    # fig.text(
+    #     0.015, 0.02,
+    #     "Each spectrum is normalized by its own robust amplitude and vertically "
+    #     "offset by one unit.",
+    #     fontsize=8,
+    #     color="0.35",
+    # )
+
+    # fig.tight_layout(rect=(0, 0.03, 1, 1))
+    fig.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    return plot_path
+
+# ------------------------------------------------------------------------------
+
 def ceil_div(a,b): return (a + b - 1)//b
 def round_down_to_multiple(x,m): return (x//m)*m
 
@@ -2022,30 +2266,49 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # ---------------------------------------------
     data_raw = np.sum(data_cube[:, mask_arr], axis=1)
     model_raw = np.sum(model_cube[:, mask_arr], axis=1)
-    # residuals in raw units (what the solver fits)
-    resid_raw = data_cube[:, mask_arr] - model_cube[:, mask_arr]   # (nSpat, nMask)
-    # RMS residual per bin in RAW flux units
-    rms_resid_raw = np.sqrt(np.mean(resid_raw**2, axis=1))         # (nSpat,)
 
-    # Mean signed residual per bin in RAW units
-    mean_resid_raw = np.mean(resid_raw, axis=1)                    # (nSpat,)
+    # Absolute residuals in raw units
+    resid_raw = data_cube[:, mask_arr] - model_cube[:, mask_arr]
+    rms_resid_raw = np.sqrt(np.mean(resid_raw**2, axis=1))
+    mean_resid_raw = np.mean(resid_raw, axis=1)
 
     # ---------------------------------------------
     # SURFACE-BRIGHTNESS SPACE (interpretation)
     # ---------------------------------------------
-    # SB maps (broadband)
     data_sb = data_raw / binCounts
     model_sb = model_raw / binCounts
 
     data_sb = np.ma.masked_invalid(np.ma.masked_less_equal(data_sb, 0.0))
     model_sb = np.ma.masked_invalid(np.ma.masked_less_equal(model_sb, 0.0))
 
-    # Convert residuals to SB units
+    # Absolute residuals in SB units
     rms_resid_sb = rms_resid_raw / binCounts
     mean_resid_sb = mean_resid_raw / binCounts
 
     rms_resid_sb = np.ma.masked_invalid(rms_resid_sb)
     mean_resid_sb = np.ma.masked_invalid(mean_resid_sb)
+
+    # ---------------------------------------------
+    # FRACTIONAL RMS RESIDUAL (dimensionless)
+    # ---------------------------------------------
+    denom = 0.5 * (np.abs(data_cube[:, mask_arr]) + np.abs(model_cube[:, mask_arr]))
+    positive = denom[np.isfinite(denom) & (denom > 0.0)]
+    if positive.size > 0:
+        rel_floor = float(np.percentile(positive, 1.0) * 1e-6)
+        rel_floor = max(rel_floor, 1e-30)
+    else:
+        rel_floor = 1e-30
+
+    frac_resid = (
+        data_cube[:, mask_arr] - model_cube[:, mask_arr]
+    ) / np.maximum(denom, rel_floor)
+    rms_resid_frac = 100.0 * np.sqrt(np.mean(frac_resid**2, axis=1))
+    rms_resid_frac = np.ma.masked_invalid(rms_resid_frac)
+
+    rmax_abs = np.nanpercentile(rms_resid_sb, 99)
+    rmax_abs = max(float(rmax_abs), 1.0)
+    rmax_frac = np.nanpercentile(rms_resid_frac, 99)
+    rmax_frac = max(float(rmax_frac), 1.0)
 
     plt.figure(figsize=(6, 4))
     plt.hist(rms_resid_raw, bins=40, alpha=0.7)
@@ -2146,25 +2409,22 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         ax.set_ylim(ymin, ymax)
         # ax.add_patch(copy(pPatch))
 
-        rmax = np.percentile(rms_resid_sb, 99)
-        rmax = 200
-        maText = POT.prec(pren, rmax)
+        maText = POT.prec(0, rmax_frac)
         ax = fig.add_subplot(gs[2])
         cnt = dbi(
-            xpix, ypix, rms_resid_sb[binNum],
+            xpix, ypix, rms_resid_frac[binNum],
             pixelsize=pixs, angle=PA,
-            cmap=divcmap, vmin=0.0, vmax=rmax
+            cmap=moncmap, vmin=0.0, vmax=rmax_frac
         )
         cax = POT.attachAxis(ax, 'top', 0.1, mid=True)
         cb = plt.colorbar(cnt, cax=cax, orientation='horizontal')
-        lT = cax.text(0.5, 0.5,
-            r"${\rm RMS}(D-M)\ /\ N_{\rm pix}$", va='center', ha='center',
+        lT = cax.text(0.5, 0.5, 'Residual $[\%]$', va='center', ha='center',
             color=POT.pgreen, transform=cax.transAxes)
         lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
             foreground='k')])
-        cax.text(1e-3, 0.5, '0.0', va='center', ha='left', color='white',
+        cax.text(1e-3, 0.5, '0', va='center', ha='left', color='white',
             transform=cax.transAxes)
-        cax.text(1.0-1e-3, 0.5, maText, va='center', ha='right', color='white',
+        cax.text(1.0-1e-3, 0.5, maText, va='center', ha='right', color='k',
             transform=cax.transAxes)
         cb.set_ticks([])
         ax.set_xlim(xmin, xmax)
@@ -2175,11 +2435,125 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         BIG.set_frame_on(False)
         BIG.set_xticks([])
         BIG.set_yticks([])
-        BIG.set_xlabel(r'$x\ [{\rm arcsec}]$', labelpad=25)
+        BIG.set_xlabel(r'$x\ [{\rm arcsec}]$', labelpad=20)
         BIG.set_ylabel(r'$y\ [{\rm arcsec}]$', labelpad=25)
 
         plt.savefig(figDir/\
             f"modelCube_sb_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+
+        # ---------------------------------------------
+        # FIGURE: data / model / absolute residual / fractional residual
+        # ---------------------------------------------
+        fig = plt.figure(figsize=plt.figaspect(yLen / xLen) * 0.75)
+        gs = gridspec.GridSpec(2, 2, hspace=0.0, wspace=0.0)
+
+        # Panel 1: data
+        pren = 2
+        miText = POT.prec(pren, fmin)
+        maText = POT.prec(pren, fmax)
+
+        ax = fig.add_subplot(gs[0])
+        cnt = dbi(
+            xpix, ypix, np.log10(data_sb[binNum]),
+            pixelsize=pixs, angle=PA,
+            cmap=heat, vmin=fmin, vmax=fmax
+        )
+        ax.set_xticklabels([])
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+
+        # Panel 2: model
+        ax = fig.add_subplot(gs[1])
+        dbi(
+            xpix, ypix, np.log10(model_sb[binNum]),
+            pixelsize=pixs, angle=PA,
+            cmap=heat, vmin=fmin, vmax=fmax
+        )
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        cax = POT.attachAxis(ax, 'right', 0.1)
+        cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
+        lT = cax.text(
+            0.5, 0.5, fr"$L\ [{UTS.lsun}]$",
+            va='center', ha='center', rotation=270.,
+            color=POT.pgreen, transform=cax.transAxes
+        )
+        lT.set_path_effects([
+            PathEffects.withStroke(linewidth=1.5, foreground='k')
+        ])
+        cax.text(0.5, 5e-3, miText, va='bottom', ha='center', color='white',
+                transform=cax.transAxes, rotation=270.)
+        cax.text(0.5, 1.0 - 5e-3, maText, va='top', ha='center', color='black',
+                transform=cax.transAxes, rotation=270.)
+        cb.set_ticks([])
+
+        # Panel 3: absolute RMS residual
+        ax = fig.add_subplot(gs[2])
+        cnt = dbi(
+            xpix, ypix, rms_resid_sb[binNum],
+            pixelsize=pixs, angle=PA,
+            cmap=moncmap, vmin=0.0, vmax=rmax_abs
+        )
+        cax = POT.attachAxis(ax, 'right', 0.1, mid=True)
+        cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
+        lT = cax.text(
+            0.5, 0.5,
+            r"${\rm RMS}(D-M)\ /\ N_{\rm pix}$",
+            va='center', ha='center', rotation=270.,
+            color=POT.pgreen, transform=cax.transAxes
+        )
+        lT.set_path_effects([
+            PathEffects.withStroke(linewidth=1.5, foreground='k')
+        ])
+        cax.text(0.5, 5e-3, '0.0', va='bottom', ha='center', color='white',
+                transform=cax.transAxes, rotation=270.)
+        cax.text(0.5, 1.0 - 5e-3, f"{rmax_abs:.1f}",
+                va='top', ha='center', color='k',
+                transform=cax.transAxes, rotation=270.)
+        cb.set_ticks([])
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+
+        # Panel 4: fractional RMS residual
+        ax = fig.add_subplot(gs[3])
+        cnt = dbi(
+            xpix, ypix, rms_resid_frac[binNum],
+            pixelsize=pixs, angle=PA,
+            cmap=moncmap, vmin=0.0, vmax=rmax_frac
+        )
+        ax.set_yticklabels([])
+        cax = POT.attachAxis(ax, 'right', 0.1)
+        cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
+        lT = cax.text(
+            0.5, 0.5,
+            r"${\rm RMS}\!\left[\frac{D-M}{(D+M)/2}\right]\ [\%]$",
+            va='center', ha='center', rotation=270.,
+            color=POT.pgreen, transform=cax.transAxes
+        )
+        lT.set_path_effects([
+            PathEffects.withStroke(linewidth=1.5, foreground='k')
+        ])
+        cax.text(0.5, 5e-3, '0.0', va='bottom', ha='center', color='white',
+                transform=cax.transAxes, rotation=270.)
+        cax.text(0.5, 1.0 - 5e-3, f"{rmax_frac:.1f}",
+                va='top', ha='center', color='k',
+                transform=cax.transAxes, rotation=270.)
+        cb.set_ticks([])
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+
+        BIG = fig.add_subplot(gs[:])
+        BIG.set_frame_on(False)
+        BIG.set_xticks([])
+        BIG.set_yticks([])
+        BIG.set_xlabel(r"$x\ [{\rm arcsec}]$", labelpad=20)
+        BIG.set_ylabel(r"$y\ [{\rm arcsec}]$", labelpad=20)
+
+        plt.savefig(
+            figDir / f"modelCube_sb_grid_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png"
+        )
 
         fmin, fmax = np.log10(np.min(data_raw)), np.log10(np.max(data_raw))
         gs = gridspec.GridSpec(3, 1, hspace=0., wspace=0.)
@@ -2261,11 +2635,19 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             parallel_spectrum_plots(
                 h5_or_path=str(hdf5Path),
                 chi2=rms_resid_raw,
-                n=100,
+                n=50,
                 plot_dir=str(figDir),
                 n_workers=CPU_PROCESSES,
                 tag=f"C{nComp:04d}",
                 mask=mask_arr,
+            )
+            plot_best_worst_spectrum_fits_stacked(
+                h5_or_path=str(hdf5Path),
+                chi2=rms_resid_raw,
+                n_each=2,
+                plot_path=figDir / f"spectrum_fits_stacked_C{nComp:04d}.png",
+                mask=mask_arr,
+                # title=f"{galaxy}  C={nComp:d}",
             )
 
     if 'otype' not in oDict['cutOn']:
