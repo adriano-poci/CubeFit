@@ -1292,7 +1292,7 @@ def modelcube_status(h5_path: str, x_global=None, require_float64: bool = True,
 
 def parallel_spectrum_plots(
     h5_or_path: str,
-    chi2: np.ndarray,
+    fit_metric: np.ndarray,
     n: int,
     plot_dir: plp.Path | str,
     n_workers: int,
@@ -1319,12 +1319,12 @@ def parallel_spectrum_plots(
     pDir.mkdir(parents=True, exist_ok=True)
 
     n = int(np.maximum(1, n))
-    chi2 = np.asarray(chi2, dtype=np.float64)
-    S = int(chi2.shape[0])
+    fit_metric = np.asarray(fit_metric, dtype=np.float64)
+    S = int(fit_metric.shape[0])
 
-    # Pick indices (worst/best by chi^2)
-    order_desc = np.argsort(-chi2)
-    order_asc  = np.argsort( chi2)
+    # Pick indices (worst/best by fit_metric)
+    order_desc = np.argsort(-fit_metric)
+    order_asc  = np.argsort( fit_metric)
     idx_worst  = order_desc[:n]
     idx_best   = order_asc[:n]
     picks      = np.unique(np.concatenate([idx_worst, idx_best])).astype(int)
@@ -1443,7 +1443,7 @@ def parallel_spectrum_plots(
 
 def plot_best_worst_spectrum_fits_stacked(
     h5_or_path: str,
-    chi2: np.ndarray,
+    fit_metric: np.ndarray,
     n_each: int = 3,
     plot_path: plp.Path | str | None = None,
     mask: np.ndarray | None = None,
@@ -1462,8 +1462,8 @@ def plot_best_worst_spectrum_fits_stacked(
     ----------
     h5_or_path : str
         HDF5 file path.
-    chi2 : ndarray
-        Per-spaxel fit-quality metric. Smaller is better.
+    fit_metric : ndarray
+        Per-spaxel fractional residual NMAD in percent. Smaller is better.
     n_each : int, optional
         Number of best and worst spectra to show.
     plot_path : Path or str, optional
@@ -1482,15 +1482,15 @@ def plot_best_worst_spectrum_fits_stacked(
         Path to the saved PNG file.
     """
     h5_path = str(h5_or_path)
-    chi2 = np.asarray(chi2, dtype=np.float64).ravel()
-    if chi2.size == 0:
-        raise ValueError("chi2 is empty.")
+    fit_metric = np.asarray(fit_metric, dtype=np.float64).ravel()
+    if fit_metric.size == 0:
+        raise ValueError("fit_metric is empty.")
 
     n_each = int(max(1, n_each))
-    n_each = min(n_each, int(chi2.size))
+    n_each = min(n_each, int(fit_metric.size))
 
-    idx_best = np.argsort(chi2)[:n_each]
-    idx_worst = np.argsort(chi2)[::-1][:n_each]
+    idx_best = np.argsort(fit_metric)[:n_each]
+    idx_worst = np.argsort(fit_metric)[::-1][:n_each]
 
     picks = []
     seen = set()
@@ -1536,12 +1536,12 @@ def plot_best_worst_spectrum_fits_stacked(
 
         data_sel = np.empty((len(picks), L), dtype=np.float64)
         model_sel = np.empty((len(picks), L), dtype=np.float64)
-        chi2_sel = np.empty((len(picks),), dtype=np.float64)
+        fit_metric_sel = np.empty((len(picks),), dtype=np.float64)
 
         for j, (_, s) in enumerate(picks):
             data_sel[j, :] = np.asarray(data_ds[int(s), :], dtype=np.float64)
             model_sel[j, :] = np.asarray(model_ds[int(s), :], dtype=np.float64)
-            chi2_sel[j] = float(chi2[int(s)])
+            fit_metric_sel[j] = float(fit_metric[int(s)])
 
     # Normalise each spectrum independently so every trace has the same
     # effective vertical height in plot units.
@@ -1618,7 +1618,10 @@ def plot_best_worst_spectrum_fits_stacked(
                     x1 = float(obs[int(b)])
                 ax.axvspan(x0, x1, color="0.2", alpha=0.08, zorder=0)
 
-        txt = f"{label}  spax={s:d}  $\\chi^2$={chi2_sel[j]:.3g}"
+        txt = (
+            f"{label}  spax={s:d}  "
+            f"NMAD={fit_metric_sel[j]:.3g}%"
+        )
         ax.text(
             0.01,
             off + 0.34,
@@ -2212,27 +2215,45 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         f"Linf={np.max(np.abs(orbit_resid)):.6e}",
         flush=True,
     )
-    compare_orbit_vs_solution_absolute(
-        h5_path=str(hdf5Path),
-        orbit_target_mass=orbit_target_mass,
-        x_global=x_global_cp,
-        save=figDir
-        / (
-            f"compare_prior_abs_"
-            f"{nComp:{pred}d}_i{proj}_{lOrder:02d}.png"
-        ),
+
+    # ---------------------------------------------
+    # FIT RESIDUALS
+    # ---------------------------------------------
+    data_fit = np.asarray(
+        data_cube[:, mask_arr],
+        dtype=np.float64,
     )
+    model_fit = np.asarray(
+        model_cube[:, mask_arr],
+        dtype=np.float64,
+    )
+
+    # Residual spectrum in the native flux units.
+    resid_fit = data_fit - model_fit
 
     # ---------------------------------------------
     # RAW-FLUX SPACE (solver space)
     # ---------------------------------------------
-    data_raw = np.sum(data_cube[:, mask_arr], axis=1)
-    model_raw = np.sum(model_cube[:, mask_arr], axis=1)
+    data_raw = np.sum(
+        data_fit,
+        axis=1,
+    )
+    model_raw = np.sum(
+        model_fit,
+        axis=1,
+    )
 
-    # Absolute residuals in raw units
-    resid_raw = data_cube[:, mask_arr] - model_cube[:, mask_arr]
-    rms_resid_raw = np.sqrt(np.mean(resid_raw**2, axis=1))
-    mean_resid_raw = np.mean(resid_raw, axis=1)
+    rms_resid_raw = np.sqrt(
+        np.mean(
+            resid_fit**2,
+            axis=1,
+        )
+    )
+
+    mean_resid_raw = np.mean(
+        resid_fit,
+        axis=1,
+    )
 
     # ---------------------------------------------
     # SURFACE-BRIGHTNESS SPACE (interpretation)
@@ -2240,53 +2261,186 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     data_sb = data_raw / binCounts
     model_sb = model_raw / binCounts
 
-    data_sb = np.ma.masked_invalid(np.ma.masked_less_equal(data_sb, 0.0))
-    model_sb = np.ma.masked_invalid(np.ma.masked_less_equal(model_sb, 0.0))
+    data_sb = np.ma.masked_invalid(
+        np.ma.masked_less_equal(
+            data_sb,
+            0.0,
+        )
+    )
+    model_sb = np.ma.masked_invalid(
+        np.ma.masked_less_equal(
+            model_sb,
+            0.0,
+        )
+    )
 
-    # Absolute residuals in SB units
-    rms_resid_sb = rms_resid_raw / binCounts
-    mean_resid_sb = mean_resid_raw / binCounts
+    rms_resid_sb = (
+        rms_resid_raw / binCounts
+    )
+    mean_resid_sb = (
+        mean_resid_raw / binCounts
+    )
 
-    rms_resid_sb = np.ma.masked_invalid(rms_resid_sb)
-    mean_resid_sb = np.ma.masked_invalid(mean_resid_sb)
+    rms_resid_sb = np.ma.masked_invalid(
+        rms_resid_sb
+    )
+    mean_resid_sb = np.ma.masked_invalid(
+        mean_resid_sb
+    )
 
     # ---------------------------------------------
-    # FRACTIONAL RMS RESIDUAL (dimensionless)
+    # SYMMETRIC FRACTIONAL RESIDUAL
     # ---------------------------------------------
-    denom = 0.5 * (np.abs(data_cube[:, mask_arr]) + np.abs(model_cube[:, mask_arr]))
+    denom = 0.5 * (data_fit + model_fit)
+
     positive = denom[np.isfinite(denom) & (denom > 0.0)]
+
     if positive.size > 0:
-        rel_floor = float(np.percentile(positive, 1.0) * 1e-6)
-        rel_floor = max(rel_floor, 1e-30)
+        rel_floor = max(float(np.percentile(positive, 1.0) * 1e-6), 1e-30)
     else:
         rel_floor = 1e-30
 
-    frac_resid = (
-        data_cube[:, mask_arr] - model_cube[:, mask_arr]
-    ) / np.maximum(denom, rel_floor)
-    rms_resid_frac = 100.0 * np.sqrt(np.mean(frac_resid**2, axis=1))
-    rms_resid_frac = np.ma.masked_invalid(rms_resid_frac)
+    frac_resid = resid_fit / np.maximum(denom, rel_floor)
 
+    # ---------------------------------------------
+    # ROBUST FRACTIONAL ABSOLUTE RESIDUAL
+    # ---------------------------------------------
+    # Primary goodness-of-fit metric.
+    #
+    # Unlike NMAD, this retains sensitivity to a systematic
+    # offset between the data and model while remaining robust
+    # against a small number of pathological pixels.
+    abs_frac_resid = np.abs(frac_resid)
+    median_abs_frac_resid = 100.0 * np.nanmedian(abs_frac_resid, axis=1,)
+    median_abs_frac_resid = np.ma.masked_invalid(median_abs_frac_resid)
+    p999_abs_frac_resid = 100.0 * np.nanpercentile(abs_frac_resid, 99.9,
+        axis=1,)
+
+    # ---------------------------------------------
+    # FRACTIONAL RMS RESIDUAL
+    # ---------------------------------------------
+    rms_resid_frac = 100.0 * np.sqrt(
+        np.nanmean(
+            frac_resid**2,
+            axis=1,
+        )
+    )
+    rms_resid_frac = np.ma.masked_invalid(
+        rms_resid_frac
+    )
+
+    # ---------------------------------------------
+    # ROBUST FRACTIONAL RESIDUAL: NMAD
+    # ---------------------------------------------
+    frac_median = np.nanmedian(
+        frac_resid,
+        axis=1,
+    )
+    frac_abs_dev = np.abs(
+        frac_resid
+        - frac_median[:, None]
+    )
+    mad_frac = np.nanmedian(
+        frac_abs_dev,
+        axis=1,
+    )
+    # 1.4826 converts MAD to the Gaussian-equivalent sigma.
+    nmad_resid_frac = (
+        100.0
+        * 1.4826
+        * mad_frac
+    )
+    nmad_resid_frac = np.ma.masked_invalid(
+        nmad_resid_frac
+    )
+    median_frac_resid = (
+        100.0 * frac_median
+    )
+    median_frac_resid = np.ma.masked_invalid(
+        median_frac_resid
+    )
+
+    # ---------------------------------------------
+    # FIT-QUALITY METRIC
+    # ---------------------------------------------
+    fit_metric = np.asarray(
+        median_abs_frac_resid,
+        dtype=np.float64,
+    )
+    finite_metric = np.isfinite(
+        fit_metric
+    )
+    fitLabel = r'$Q_s\ [\%]$'
+    metric_median = np.nan
+    metric_std = np.nan
+    if np.any(finite_metric):
+        worst = int(np.nanargmax(np.where(finite_metric, fit_metric, -np.inf)))
+        best = int(np.nanargmin(np.where(finite_metric, fit_metric, np.inf)))
+        metric_mean = float(np.nanmean(fit_metric))
+        metric_median = float(np.nanmedian(fit_metric))
+        metric_std = float(np.nanstd(fit_metric))
+
+        print("Median absolute fractional residual: "
+            f"mean={metric_mean:.3f}% "
+            f"median={metric_median:.3f}% "
+            f"std={metric_std:.3f}%",
+            flush=True)
+
+        nmad_finite = np.asarray(
+            nmad_resid_frac,
+            dtype=np.float64,
+        )
+        nmad_finite = nmad_finite[
+            np.isfinite(nmad_finite)
+        ]
+
+        if nmad_finite.size > 0:
+            print(
+                "Fractional NMAD: "
+                f"mean={np.mean(nmad_finite):.3f}% "
+                f"median={np.median(nmad_finite):.3f}%",
+                flush=True,
+            )
+        print(
+            f"Worst fit: aperture {worst} "
+            f"(median |fractional residual|="
+            f"{fit_metric[worst]:.3f}%)",
+            flush=True,
+        )
+
+        print(
+            f"Best fit: aperture {best} "
+            f"(median |fractional residual|="
+            f"{fit_metric[best]:.3f}%)",
+            flush=True,
+        )
+
+    # ---------------------------------------------
+    # PLOTTING LIMITS
+    # ---------------------------------------------
     rmax_abs = np.nanpercentile(rms_resid_sb, 99)
     rmax_abs = max(float(rmax_abs), 1.0)
-    rmax_frac = np.nanpercentile(rms_resid_frac, 99)
+    rmax_frac = round(np.nanpercentile(rms_resid_frac, 99)/10.0)*10.0
     rmax_frac = max(float(rmax_frac), 1.0)
 
+    print('[CubeFit] '+'-'*(80-10))
+    print('[CubeFit] PLOTTING')
+    print('[CubeFit] '+'-'*(80-10))
+    print(f"[CubeFit] All plots and maps saved in {str(figDir)}")
+
+    compare_orbit_vs_solution_absolute(h5_path=str(hdf5Path),
+        orbit_target_mass=orbit_target_mass, x_global=x_global_cp,
+        save=figDir/f"compare_prior_abs_{nComp:{pred}d}_i{proj}_{lOrder:02d}.png"
+    )
+
     plt.figure(figsize=(6, 4))
-    plt.hist(rms_resid_raw, bins=40, alpha=0.7)
-    plt.xlabel(r"${\rm Norm}/\sqrt{N_{\rm pix}}$")
-    plt.ylabel("Number of apertures")
-    plt.title("Distribution of fit quality")
-    plt.savefig(figDir/"chi2_hist.png")
+    plt.hist(fit_metric[finite_metric], bins=40)
+    plt.xlabel(r'Fractional NMAD $[\%]$')
+    plt.ylabel(r'$N$')
+    plt.savefig(figDir/'fractional_nmad_hist.png')
     plt.close()
 
     print(f"Mean reduced χ²: {np.mean(rms_resid_raw):.2f} ± {np.std(rms_resid_raw):.2f}")
-    worst = np.argmax(rms_resid_raw)
-    best = np.argmin(rms_resid_raw)
-    print(f"Worst fit: aperture {worst} (χ² = {rms_resid_raw[worst]:.2f})")
-    print(f"Best fit:  aperture {best} (χ² = {rms_resid_raw[best]:.2f})")
-    print(f"[CubeFit] All plots and maps saved in {str(figDir)}")
-
 
     divcmap = colormaps.get_cmap('GECKOSdr')
     if isinstance(divcmap, mcolors.ListedColormap):
@@ -2316,13 +2470,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     ax.set_ylim(ymin, ymax)
     cax = POT.attachAxis(ax, "top", 0.1, mid=True)
     cb = plt.colorbar(cnt, cax=cax, orientation="horizontal")
-    cax.text(
-        0.5, 0.5,
-        r"$\langle D-M\rangle_\lambda / N_{\rm pix}$",
-        ha="center", va="center",
-        color=POT.pgreen,
-        transform=cax.transAxes,
-    )
+    cax.text(0.5, 0.5, r"$\langle D-M\rangle_\lambda / N_{\rm pix}$",
+        ha="center", va="center", color=POT.pgreen, transform=cax.transAxes,
+        path_effects=[PathEffects.withStroke(linewidth=1.5, foreground='k')])
     cb.set_ticks([])
     ax.set_xlabel(r"$x\ [{\rm arcsec}]$")
     ax.set_ylabel(r"$y\ [{\rm arcsec}]$")
@@ -2335,6 +2485,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
         fmin, fmax = np.log10(np.min(data_sb)), np.log10(np.max(data_sb))
         pren = 2
+        fLabel = r"$\log_{10}\ L\ [{\rm L_\odot\ pc^{-2}}]$"
         miText = POT.prec(pren, fmin)
         maText = POT.prec(pren, fmax)
         gs = gridspec.GridSpec(3, 1, hspace=0., wspace=0.)
@@ -2355,9 +2506,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             color=POT.pgreen, transform=cax.transAxes)
         lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
             foreground='k')])
-        cax.text(1e-3, 0.5, miText, va='center', ha='left', color='white',
+        cax.text(5e-3, 0.5, miText, va='center', ha='left', color='white',
             transform=cax.transAxes)
-        cax.text(1.0-1e-3, 0.5, maText, va='center', ha='right', color='black',
+        cax.text(1.0-5e-3, 0.5, maText, va='center', ha='right', color='black',
             transform=cax.transAxes)
         cb.set_ticks([])
         ax = fig.add_subplot(gs[1])
@@ -2373,20 +2524,17 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
         maText = POT.prec(0, rmax_frac)
         ax = fig.add_subplot(gs[2])
-        cnt = dbi(
-            xpix, ypix, rms_resid_frac[binNum],
-            pixelsize=pixs, angle=PA,
-            cmap=moncmap, vmin=0.0, vmax=rmax_frac
-        )
+        cnt = dbi(xpix, ypix, fit_metric[binNum], pixelsize=pixs, angle=PA,
+            cmap=moncmap, vmin=0.0, vmax=rmax_frac)
         cax = POT.attachAxis(ax, 'top', 0.1, mid=True)
         cb = plt.colorbar(cnt, cax=cax, orientation='horizontal')
-        lT = cax.text(0.5, 0.5, 'Residual $[\%]$', va='center', ha='center',
+        lT = cax.text(0.5, 0.5, fitLabel, va='center', ha='center',
             color=POT.pgreen, transform=cax.transAxes)
         lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
             foreground='k')])
-        cax.text(1e-3, 0.5, '0', va='center', ha='left', color='white',
+        cax.text(5e-3, 0.5, '0', va='center', ha='left', color='white',
             transform=cax.transAxes)
-        cax.text(1.0-1e-3, 0.5, maText, va='center', ha='right', color='k',
+        cax.text(1.0-5e-3, 0.5, maText, va='center', ha='right', color='k',
             transform=cax.transAxes)
         cb.set_ticks([])
         ax.set_xlim(xmin, xmax)
@@ -2453,50 +2601,34 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
         # Panel 3: absolute RMS residual
         ax = fig.add_subplot(gs[2])
-        cnt = dbi(
-            xpix, ypix, rms_resid_sb[binNum],
-            pixelsize=pixs, angle=PA,
-            cmap=moncmap, vmin=0.0, vmax=rmax_abs
-        )
+        cnt = dbi(xpix, ypix, rms_resid_sb[binNum], pixelsize=pixs, angle=PA,
+            cmap=moncmap, vmin=0.0, vmax=rmax_abs)
         cax = POT.attachAxis(ax, 'right', 0.1, mid=True)
         cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
-        lT = cax.text(
-            0.5, 0.5,
-            r"${\rm RMS}(D-M)\ /\ N_{\rm pix}$",
-            va='center', ha='center', rotation=270.,
-            color=POT.pgreen, transform=cax.transAxes
-        )
-        lT.set_path_effects([
-            PathEffects.withStroke(linewidth=1.5, foreground='k')
-        ])
+        cax.text(0.5, 0.5, r"${\rm RMS}(D-M)\ /\ N_{\rm pix}$", va='center',
+            ha='center', rotation=270., color=POT.pgreen,
+            transform=cax.transAxes, path_effects=
+            [PathEffects.withStroke(linewidth=1.5, foreground='k')])
         cax.text(0.5, 5e-3, '0.0', va='bottom', ha='center', color='white',
-                transform=cax.transAxes, rotation=270.)
-        cax.text(0.5, 1.0 - 5e-3, f"{rmax_abs:.1f}",
-                va='top', ha='center', color='k',
-                transform=cax.transAxes, rotation=270.)
+            transform=cax.transAxes, rotation=270.)
+        cax.text(0.5, 1.0 - 5e-3, f"{rmax_abs:.1f}", va='top', ha='center',
+            color='k', transform=cax.transAxes, rotation=270.)
         cb.set_ticks([])
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
 
         # Panel 4: fractional RMS residual
         ax = fig.add_subplot(gs[3])
-        cnt = dbi(
-            xpix, ypix, rms_resid_frac[binNum],
-            pixelsize=pixs, angle=PA,
-            cmap=moncmap, vmin=0.0, vmax=rmax_frac
-        )
+        cnt = dbi(xpix, ypix, rms_resid_frac[binNum], pixelsize=pixs, angle=PA,
+            cmap=moncmap, vmin=0.0, vmax=rmax_frac)
         ax.set_yticklabels([])
         cax = POT.attachAxis(ax, 'right', 0.1)
         cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
-        lT = cax.text(
-            0.5, 0.5,
+        cax.text(0.5, 0.5,
             r"${\rm RMS}\!\left[\frac{D-M}{(D+M)/2}\right]\ [\%]$",
-            va='center', ha='center', rotation=270.,
-            color=POT.pgreen, transform=cax.transAxes
-        )
-        lT.set_path_effects([
-            PathEffects.withStroke(linewidth=1.5, foreground='k')
-        ])
+            va='center', ha='center', rotation=270.,color=POT.pgreen,
+            transform=cax.transAxes, path_effects=
+            [PathEffects.withStroke(linewidth=1.5, foreground='k')])
         cax.text(0.5, 5e-3, '0.0', va='bottom', ha='center', color='white',
                 transform=cax.transAxes, rotation=270.)
         cax.text(0.5, 1.0 - 5e-3, f"{rmax_frac:.1f}",
@@ -2596,7 +2728,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                         f.unlink()
             parallel_spectrum_plots(
                 h5_or_path=str(hdf5Path),
-                chi2=rms_resid_raw,
+                fit_metric=fit_metric,
                 n=50,
                 plot_dir=str(figDir),
                 n_workers=best_processes,
@@ -2605,11 +2737,18 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             )
             plot_best_worst_spectrum_fits_stacked(
                 h5_or_path=str(hdf5Path),
-                chi2=rms_resid_raw,
+                fit_metric=fit_metric,
                 n_each=2,
-                plot_path=figDir / f"spectrum_fits_stacked_C{nComp:04d}.png",
+                plot_path=(figDir/f"spectrum_fits_stacked_C{nComp:04d}.png"),
                 mask=mask_arr,
-                # title=f"{galaxy}  C={nComp:d}",
+            )
+            plot_best_worst_spectrum_fits_stacked(
+                h5_or_path=str(hdf5Path),
+                fit_metric=p999_abs_frac_resid,
+                n_each=2,
+                plot_path=(figDir/\
+                    f"outlier_spectrum_fits_stacked_C{nComp:04d}.png"),
+                mask=mask_arr,
             )
 
     if 'otype' not in oDict['cutOn']:

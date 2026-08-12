@@ -554,19 +554,8 @@ class FitTracker:
                 "op": "save_checkpoint",
                 "x": x32,
                 "state": payload,
-                "epoch": (
-                    int(epoch)
-                    if epoch is not None
-                    else None
-                ),
-                "rmse": (
-                    float(rmse)
-                    if (
-                        rmse is not None
-                        and np.isfinite(rmse)
-                    )
-                    else None
-                ),
+                "rmse": (float(rmse) if (rmse is not None and np.isfinite(rmse)
+                    ) else None),
             },
             block=block,
         )

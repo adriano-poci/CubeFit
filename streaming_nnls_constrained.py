@@ -3089,17 +3089,9 @@ def streamActiveSetNNLS(
         f"total_obj={total_objective:.3e} "
         f"alpha={alpha_current:.6e} "
         f"orbit_L1="
-        f"{(
-            orbit_resid_l1
-            if orbit_resid_l1 is not None
-            else float('nan')
-        ):.3e} "
+        f"{(orbit_resid_l1 if orbit_resid_l1 is not None else float('nan')):.3e} "
         f"orbit_Linf="
-        f"{(
-            orbit_resid_linf
-            if orbit_resid_linf is not None
-            else float('nan')
-        ):.3e}",
+        f"{(orbit_resid_linf if orbit_resid_linf is not None else float('nan')):.3e}",
         flush=True,
     )
 
