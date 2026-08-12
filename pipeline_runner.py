@@ -631,7 +631,7 @@ class PipelineRunner:
                     x0=x0_effective,
                     resume_state=resume_state_effective,
                     tracker=tracker,
-                    monolithic_max_active=1000,
+                    monolithic_max_active=2000,
                 )
                 # x_solver, stats = solve_monolithic_nnls(self.h5_path,
                     # orbit_weights=orbit_weights, 

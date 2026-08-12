@@ -70,6 +70,8 @@ v1.21:  Added `plot_best_worst_spectrum_fits_stacked` to plot single
             representative spectral figure;
         Use new `cube_utils.resolve_parallelism` to access optimal CPU/BLAS
             configuration from all functions. 11 August 2026
+v1.22:  Fixed bug in `loadCubeFit` where `cWeights` was being computed
+            incorrectly from the orbit weights. 12 August 2026
 """
 
 # need to set up the logger before any other imports
@@ -1891,9 +1893,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     NOrbs, inds, energs, I2s, I3s, regs, types, weights, lcuts =\
         cu.Read.orbits(nnOrb)
-    cWeights = np.zeros(nComp)
-    for jk, comp in enumerate(nzComp):
-        cWeights[jk] = np.ma.sum(weights[oDict['wheres'][f"{comp:{pred}d}"]])
+    cWeights = np.array([
+        np.ma.sum(oDict['weights'][f"{comp:{pred}d}"]) for comp in nzComp])
 
     kiBin = INF['kin']['nbins'][0]
     assert nbins == kiBin, 'Output does not agree with input bins\nInput:'+\
