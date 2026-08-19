@@ -72,6 +72,8 @@ v1.21:  Added `plot_best_worst_spectrum_fits_stacked` to plot single
             configuration from all functions. 11 August 2026
 v1.22:  Fixed bug in `loadCubeFit` where `cWeights` was being computed
             incorrectly from the orbit weights. 12 August 2026
+v1.23:  Normalised all outputs to adhere to the same `nComp` schema. 19 August
+            2026
 """
 
 # need to set up the logger before any other imports
@@ -513,7 +515,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
-    hdf5Path = (hdf5Dir/f"hypercube_{nComp}_{lOrder:02d}").with_suffix('.h5')
+    hdf5Path = (hdf5Dir/
+        f"hypercube_{nComp:{pred}d}_{lOrder:02d}").with_suffix('.h5')
 
     # --- Initialize and load data ---
     mgr = H5Manager(hdf5Path)
@@ -573,7 +576,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # is built, so we don't return early here.
     # Should be zero-cost if already built
 
-    prefit_png = figDir / f"prefit_overlay_from_models_C{nComp:03d}.png"
+    prefit_png = figDir / f"prefit_overlay_from_models_{nComp:{pred}d}.png"
     with logger.capture_all_output():
         live_prefit_snapshot_from_models(h5_path=str(hdf5Path),
             max_components=4, templates_per_pair=3,
@@ -2002,7 +2005,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
-    hdf5Path = (hdf5Dir/f"hypercube_{nComp}_{lOrder:02d}").with_suffix('.h5')
+    hdf5Path = (hdf5Dir/
+        f"hypercube_{nComp:{pred}d}_{lOrder:02d}").with_suffix('.h5')
     
     # Read dims & X_global using robust reader
     with open_h5(hdf5Path, role="reader") as f:
@@ -2724,7 +2728,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         with logger.capture_all_output():
             if figDir.exists():
                 for prefix in ("best", "worst"):
-                    for f in figDir.glob(f"{prefix}_C{nComp:04d}_spax*.png"):
+                    for f in figDir.glob(f"{prefix}_{nComp:{pred}d}_spax*.png"):
                         f.unlink()
             parallel_spectrum_plots(
                 h5_or_path=str(hdf5Path),
@@ -2732,14 +2736,14 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 n=50,
                 plot_dir=str(figDir),
                 n_workers=best_processes,
-                tag=f"C{nComp:04d}",
+                tag=f"{nComp:{pred}d}",
                 mask=mask_arr,
             )
             plot_best_worst_spectrum_fits_stacked(
                 h5_or_path=str(hdf5Path),
                 fit_metric=fit_metric,
                 n_each=2,
-                plot_path=(figDir/f"spectrum_fits_stacked_C{nComp:04d}.png"),
+                plot_path=(figDir/f"spectrum_fits_stacked_{nComp:{pred}d}.png"),
                 mask=mask_arr,
             )
             plot_best_worst_spectrum_fits_stacked(
@@ -2747,7 +2751,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 fit_metric=p999_abs_frac_resid,
                 n_each=2,
                 plot_path=(figDir/\
-                    f"outlier_spectrum_fits_stacked_C{nComp:04d}.png"),
+                    f"outlier_spectrum_fits_stacked_{nComp:{pred}d}.png"),
                 mask=mask_arr,
             )
 
