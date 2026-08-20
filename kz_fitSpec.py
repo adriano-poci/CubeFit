@@ -74,6 +74,12 @@ v1.22:  Fixed bug in `loadCubeFit` where `cWeights` was being computed
             incorrectly from the orbit weights. 12 August 2026
 v1.23:  Normalised all outputs to adhere to the same `nComp` schema. 19 August
             2026
+v1.24:  Return `picks` in `plot_best_worst_spectrum_fits_stacked` for downstream
+            use;
+        Added `r_{s,\lambda}` residuals to each pair in
+            `plot_best_worst_spectrum_fits_stacked`;
+        Changed residuals in `parallel_spectrum_plots` to match new
+            `r_{s,\lambda}`. 20 August 2026
 """
 
 # need to set up the logger before any other imports
@@ -1382,54 +1388,102 @@ def parallel_spectrum_plots(
     # Small plotting worker: operates on compact row views
     def _plot_one(s_idx: int, rank_tag: str):
         j = int(np.where(picks == s_idx)[0][0])
+
         dat = data_sel[j, :]
         mod = model_sel[j, :]
-        res = dat - mod
 
-        # Keep the SAME residual offset policy as before
-        y_lo = float(np.nanmin(np.concatenate((dat[mask], mod[mask]))))
-        y_hi = float(np.nanmax(np.concatenate((dat[mask], mod[mask]))))
-        y_rng = float(np.maximum(y_hi - y_lo, 1.0))
-        y_off = y_lo - 0.25 * y_rng
+        # --------------------------------------------------------
+        # Fractional residual:
+        #
+        #              D - M
+        # r = -----------------------
+        #          0.5 * (D + M)
+        #
+        # Plot 100*r in percent.
+        # --------------------------------------------------------
+        denom = 0.5 * (dat + mod)
 
-        # σ from masked residuals
-        sigma = float(np.nanstd(res[mask])) if np.any(mask) else 0.0
-
-        fig = plt.figure(figsize=(8, 3.5))
-        ax  = fig.add_subplot(111)
-
-        # Data/model lines (thin)
-        ax.plot(obs[mask], dat[mask], lw=0.8, color="k", label="data")
-        ax.plot(obs[mask], mod[mask], lw=0.8, color="r", label="model")
-
-        # Residuals as green diamonds at every pixel (offset)
-        ax.scatter(
-            obs[mask], (res[mask] + y_off),
-            s=8, marker="D", edgecolors="none", color="g", alpha=0.9,
-            label="residual (offset)"
+        valid = (
+            mask
+            & np.isfinite(dat)
+            & np.isfinite(mod)
+            & np.isfinite(denom)
+            & (denom > 0.0)
         )
 
-        # Residual baseline (solid) and ±1σ (dashed)
-        ax.axhline(y_off, ls="-",  lw=0.7, color="g") # zero residual
-        if sigma > 0.0 and np.isfinite(sigma):
-            ax.axhline(y_off + sigma, ls="--", lw=0.6, color="g")
-            ax.axhline(y_off - sigma, ls="--", lw=0.6, color="g")
+        frac_resid_pct = np.full(L, np.nan, dtype=np.float64,)
 
-        # Shade masked regions as semi-transparent grey bands
+        if np.any(valid):
+            positive = denom[valid]
+            rel_floor = max(float(np.nanpercentile(positive,1.0) * 1e-6), 1e-30)
+            frac_resid_pct[valid] = 100.0 * (dat[valid] - mod[valid])\
+                / np.maximum(denom[valid], rel_floor)
+
+        # --------------------------------------------------------
+        # Figure
+        # --------------------------------------------------------
+        fig = plt.figure(figsize=(8, 4.5))
+        gs = fig.add_gridspec(2, 1, height_ratios=(3.0, 1.0), hspace=0.0)
+        ax_spec = fig.add_subplot(gs[0])
+        ax_resid = fig.add_subplot(gs[1], sharex=ax_spec)
+
+        # --------------------------------------------------------
+        # Spectrum
+        # --------------------------------------------------------
+        ax_spec.plot(obs[mask], dat[mask], lw=0.8, color='k', label='Data')
+
+        ax_spec.plot(obs[mask], mod[mask], lw=0.8, color='tab:red',
+            label='Model')
+
+        # --------------------------------------------------------
+        # Fractional residual
+        # --------------------------------------------------------
+        ax_resid.plot(obs[valid], frac_resid_pct[valid], lw=0.75,
+            color="tab:green",)
+        ax_resid.axhline(0.0, lw=0.55, color="tab:green", alpha=0.7)
+
+        # --------------------------------------------------------
+        # Masked regions
+        # --------------------------------------------------------
         if mask_spans:
-            y0, y1 = ax.get_ylim()
             for a, b in mask_spans:
                 x0 = float(obs[int(a)])
-                x1 = float(obs[int(np.maximum(a, b - 1))])
+                x1 = float(obs[int(max(a, b - 1))])
+
                 if int(b) < L:
                     x1 = float(obs[int(b)])
-                ax.axvspan(x0, x1, color="0.2", alpha=0.12, zorder=0)
-            ax.set_ylim(y0, y1)
 
-        ax.set_xlabel("log(\u03bb [\u212B])")
-        ax.set_ylabel(r"$F_\lambda$ (arb. units)")
+                ax_spec.axvspan(x0, x1, color="0.2", alpha=0.12, zorder=0)
+                ax_resid.axvspan(x0, x1, color="0.2", alpha=0.12, zorder=0)
+
+        # --------------------------------------------------------
+        # Q_s annotation
+        # --------------------------------------------------------
+        q_s = float(fit_metric[int(s_idx)])
+        ax_spec.text(0.015, 0.94, rf"$s={int(s_idx):d}\qquad Q_s={q_s:.2f}\%$",
+            transform=ax_spec.transAxes, ha="left", va="top", color="k")
+
+        # --------------------------------------------------------
+        # Axes
+        # --------------------------------------------------------
+        ax_spec.set_ylabel(r"$F_\lambda$ (arb. units)")
+        ax_spec.legend(loc="upper right", frameon=False)
+        ax_spec.tick_params(axis="x", labelbottom=False,)
+
+        ax_resid.set_ylabel(r"$100\,r_{s,\lambda}\,[\%]$")
+        ax_resid.set_xlabel("log(\u03bb [\u212B])")
+
+        # Use a symmetric residual range so positive and negative
+        # discrepancies have identical visual significance.
+        finite_abs = np.abs(frac_resid_pct[np.isfinite(frac_resid_pct)])
+
+        if finite_abs.size > 0:
+            resid_lim = float(np.nanpercentile(finite_abs, 99.5,))
+            resid_lim = max(resid_lim, 1e-3,)
+            ax_resid.set_ylim(-1.10 * resid_lim, +1.10 * resid_lim)
+
         fig.savefig(pDir/f"{rank_tag}_{tag}_spax{int(s_idx):05d}.png",
-            dpi=120)
+            dpi=120, bbox_inches="tight")
         plt.close(fig)
 
     # Tiny pool; ≤4 for I/O friendliness
@@ -1592,100 +1646,187 @@ def plot_best_worst_spectrum_fits_stacked(
 
     if plot_path is None:
         base = plp.Path(h5_path)
-        plot_path = base.with_name(base.stem + f"_{tag}_stacked.png")
+        plot_path = base.with_name(
+            base.stem + f"_{tag}_stacked.png"
+        )
     else:
         plot_path = plp.Path(plot_path)
 
-    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    plot_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    fig, ax = plt.subplots(figsize=plt.figaspect(3.0 / len(picks)))
+    # ------------------------------------------------------------
+    # Prepare spectra and fractional residuals
+    # ------------------------------------------------------------
+    n_picks = len(picks)
 
-    data_c = "k"
-    model_c = "tab:red"
+    plot_amp = 0.34
+    residual_amp = 0.14
+    residual_offset = 0.38
+    band_step = 1.0
+
+    offsets = np.arange(n_picks, dtype=np.float64,) * band_step
+
+    data_plot = np.empty_like(data_sel)
+    model_plot = np.empty_like(model_sel)
+
+    frac_resid_pct = np.full_like(data_sel, np.nan, dtype=np.float64)
+
+    for j in range(n_picks):
+        dat = data_sel[j, :]
+        mod = model_sel[j, :]
+
+        # --------------------------------------------------------
+        # Robust display normalization for the spectrum.
+        # This affects only its visual vertical amplitude.
+        # --------------------------------------------------------
+        vals = np.concatenate((dat[mask], mod[mask],))
+        vals = vals[np.isfinite(vals)]
+
+        if vals.size == 0:
+            center = 0.0
+            scale = 1.0
+        else:
+            center = float(np.nanmedian(vals))
+
+            spread = np.abs(vals - center)
+
+            scale = float(np.nanpercentile(spread, 99.0,))
+
+            scale = max(scale, 1e-30,)
+
+        data_plot[j, :] = plot_amp * (dat - center) / scale
+        model_plot[j, :] = plot_amp * (mod - center) / scale
+
+        # --------------------------------------------------------
+        # Fractional residual:
+        #
+        #              D - M
+        # r = -----------------------
+        #          0.5 * (D + M)
+        #
+        # Store 100*r so the plotted residual is in percent.
+        # --------------------------------------------------------
+        denom = 0.5 * (dat + mod)
+
+        valid = (
+            mask
+            & np.isfinite(dat)
+            & np.isfinite(mod)
+            & np.isfinite(denom)
+            & (denom > 0.0)
+        )
+
+        if np.any(valid):
+            positive = denom[valid]
+
+            rel_floor = max(float(np.nanpercentile(positive, 1.0) * 1e-6
+                ), 1e-30)
+
+            frac_resid_pct[j, valid] = 100.0 * (dat[valid] - mod[valid])\
+                / np.maximum(denom[valid], rel_floor)
+
+    # ------------------------------------------------------------
+    # Use ONE residual scale for every stacked spectrum.
+    #
+    # Therefore an n-percent residual has the same visual
+    # displacement for every spatial bin.
+    # ------------------------------------------------------------
+    finite_resid = np.abs(frac_resid_pct[np.isfinite(frac_resid_pct)])
+
+    if finite_resid.size > 0:
+        residual_scale = max(float(np.nanpercentile(finite_resid, 99.0)), 1e-6)
+    else:
+        residual_scale = 1.0
+
+    # ------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=plt.figaspect(3.0 / n_picks))
+
+    data_c = 'k'
+    model_c = 'tab:red'
+    resid_c = 'tab:green'
 
     for j, ((label, s), off) in enumerate(zip(picks, offsets)):
         dat = data_plot[j, :] + off
         mod = model_plot[j, :] + off
 
-        ax.plot(obs[mask], dat[mask], lw=1.0, color=data_c, solid_capstyle="round")
-        ax.plot(obs[mask], mod[mask], lw=1.0, color=model_c, alpha=0.95,
-                solid_capstyle="round")
+        # --------------------------------------------------------
+        # Data: D_{s,lambda}
+        # --------------------------------------------------------
+        ax.plot(obs[mask], dat[mask], lw=1.0, color=data_c,
+            solid_capstyle='round')
+        # --------------------------------------------------------
+        # Model: M_{s,lambda}
+        # --------------------------------------------------------
+        ax.plot(obs[mask],mod[mask], lw=1.0, color=model_c,
+            alpha=0.95, solid_capstyle='round')
+        # --------------------------------------------------------
+        # Fractional residual: 100 r_{s,lambda}
+        # --------------------------------------------------------
+        resid_off = off - residual_offset
+        resid = frac_resid_pct[j, :]
+        valid_resid = mask & np.isfinite(resid)
 
-        ax.axhline(off, lw=0.45, color="0.6", alpha=0.35, zorder=0)
+        if np.any(valid_resid):
+            resid_y = resid_off + residual_amp * resid / residual_scale
+            ax.plot(obs[valid_resid], resid_y[valid_resid], lw=0.75,
+                color=resid_c, alpha=0.95)
+        # r = 0 baseline.
+        ax.axhline(resid_off, lw=0.45, color=resid_c, alpha=0.65)
 
+        # --------------------------------------------------------
+        # Masked wavelength regions
+        # --------------------------------------------------------
         if mask_spans:
             for a, b in mask_spans:
                 x0 = float(obs[int(a)])
                 x1 = float(obs[int(max(a, b - 1))])
+
                 if int(b) < L:
                     x1 = float(obs[int(b)])
+
                 ax.axvspan(x0, x1, color="0.2", alpha=0.08, zorder=0)
 
-        txt = (
-            f"{label}  spax={s:d}  "
-            f"NMAD={fit_metric_sel[j]:.3g}%"
-        )
-        ax.text(
-            0.01,
-            off + 0.34,
-            txt,
-            transform=ax.get_yaxis_transform(),
-            ha="left",
-            va="center",
-            fontsize=9,
-            color="k",
-            path_effects=[PathEffects.withStroke(linewidth=2.0, foreground="white")],
-        )
+        # --------------------------------------------------------
+        # Q_s annotation
+        # --------------------------------------------------------
+        txt = rf"$s={int(s):d}\qquad Q_s={fit_metric_sel[j]:.2f}\%$"
+        ax.text(0.01, off + 0.29, txt, ha='left', va='center',
+            transform=ax.get_yaxis_transform(), color='k', path_effects=[
+                PathEffects.withStroke(linewidth=2.0, foreground='white',)],)
 
-    ax.plot([], [], color=data_c, lw=1.2, label="data")
-    ax.plot([], [], color=model_c, lw=1.2, label="model")
+    # ------------------------------------------------------------
+    # Legend
+    # ------------------------------------------------------------
+    ax.plot([], [], color=data_c, lw=1.2, label='Data')
+    ax.plot([], [], color=model_c, lw=1.2, label='Model')
+    ax.plot([], [], color=resid_c, lw=0.8, label=r"$100\,r_{s,\lambda}$")
 
+    # ------------------------------------------------------------
+    # Axes
+    # ------------------------------------------------------------
     ax.set_xlim(float(np.nanmin(obs[mask])), float(np.nanmax(obs[mask])))
-    # Auto-scale the vertical extent so no stack is clipped.
-    ymin = np.inf
-    ymax = -np.inf
-    for j, off in enumerate(offsets):
-        yy = np.concatenate((
-            data_plot[j, mask],
-            model_plot[j, mask],
-        ))
-        yy = yy[np.isfinite(yy)]
-        if yy.size == 0:
-            continue
-        ymin = min(ymin, float(np.nanmin(yy)) + float(off))
-        ymax = max(ymax, float(np.nanmax(yy)) + float(off))
-    if not np.isfinite(ymin) or not np.isfinite(ymax):
-        ymin = -0.5
-        ymax = offsets[-1] + 1.0 if len(offsets) else 1.0
-    else:
-        pad = 0.10 * max(ymax - ymin, band_step)
-        ymin -= pad
-        ymax += pad
-    ax.set_ylim(ymin, ymax)
-
+    ax.set_ylim(
+        offsets[0] - 0.60,
+        offsets[-1] + 0.55*1.5, # add extra for the legend
+    )
     ax.set_xlabel("log(\u03bb [\u212B])")
-    ax.set_ylabel("Flux (arbitrary units, normalized & offset)")
+    ax.set_ylabel("Normalized flux and fractional residual")
     ax.set_yticks([])
-    ax.tick_params(axis="y", left=False, labelleft=False)
-
-    ax.legend(loc="upper right", frameon=False, fontsize=10, handlelength=2.8)
+    ax.tick_params(axis="y", left=False, labelleft=False,)
+    ax.legend(loc="upper right", frameon=False, fontsize=9,)
 
     if title is not None:
-        ax.set_title(title, fontsize=13, pad=10)
+        ax.set_title(title, fontsize=13, pad=10,)
 
-    # fig.text(
-    #     0.015, 0.02,
-    #     "Each spectrum is normalized by its own robust amplitude and vertically "
-    #     "offset by one unit.",
-    #     fontsize=8,
-    #     color="0.35",
-    # )
-
-    # fig.tight_layout(rect=(0, 0.03, 1, 1))
-    fig.savefig(plot_path, dpi=300, bbox_inches="tight")
+    fig.savefig(plot_path, dpi=300, bbox_inches="tight",)
     plt.close(fig)
 
-    return plot_path
+    return picks
 
 # ------------------------------------------------------------------------------
 
@@ -2454,6 +2595,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     heat = colormaps.get_cmap('cet_fire')
     if not hasattr(heat, "n_variates"):
         heat.n_variates = 1
+    
+    picks = []
 
     # ---------------------------------------------
     # Plot
@@ -2739,19 +2882,19 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 tag=f"{nComp:{pred}d}",
                 mask=mask_arr,
             )
-            plot_best_worst_spectrum_fits_stacked(
-                h5_or_path=str(hdf5Path),
-                fit_metric=fit_metric,
-                n_each=2,
-                plot_path=(figDir/f"spectrum_fits_stacked_{nComp:{pred}d}.png"),
-                mask=mask_arr,
-            )
-            plot_best_worst_spectrum_fits_stacked(
+            _ = plot_best_worst_spectrum_fits_stacked(
                 h5_or_path=str(hdf5Path),
                 fit_metric=p999_abs_frac_resid,
                 n_each=2,
                 plot_path=(figDir/\
                     f"outlier_spectrum_fits_stacked_{nComp:{pred}d}.png"),
+                mask=mask_arr,
+            )
+            picks = plot_best_worst_spectrum_fits_stacked(
+                h5_or_path=str(hdf5Path),
+                fit_metric=fit_metric,
+                n_each=2,
+                plot_path=(figDir/f"spectrum_fits_stacked_{nComp:{pred}d}.png"),
                 mask=mask_arr,
             )
 
@@ -3239,6 +3382,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 print(f"Could not make projection plots: {e}")
                 traceback.print_exc()
                 pass
+    
+    return picks
 
 # ------------------------------------------------------------------------------
 
