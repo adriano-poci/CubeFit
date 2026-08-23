@@ -22,6 +22,8 @@ v1.7:   Moved template-reading functions to `dynamics.IFU.FileIO`. 21 July 2026
 v1.8:   Added `vprint` to globally manage diagnostic level. 31 July 2026
 v1.9:   Added `resolve_parallelism` to determine optimal CPU/BLAS configuration.
             11 August 2026
+v1.10:  Added `sspIdx` keyword to `_oneTimeSpec` to allow for thinning of the SSP
+            grid. 21 August 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -2469,7 +2471,7 @@ def legendre_detrend(
 
 def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     full=False, lOrder=10, rescale=False, specRange=None, lsf=False, band='r',
-    source='ppxf', **kwargs):
+    source='ppxf', sspIdx = [[], [], []],**kwargs):
     """
     This function is designed to reduce redundancy in acquiring the necessary
         input data for the spectral decomposition
@@ -2500,9 +2502,11 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             instrumental LSF
         band (str): the band in which the MGE was fit, in order to use the
             correct spectral range. Only if `rescale==True`
-        method (str): choice of `['fsf', 'fif']` to indicte Full-Spectral-
-            Fitting and Full-Index-Fitting, respectively
-        varIMF (bool): toggles whether an IMF was fit for
+        source (str): the source of the spectral decomposition, either `'ppxf'`
+            or `'alf'`
+        sspIdx (list:list:float): list of lists of the values of the SSP
+            templates if trimming of the library is desired, of length 3, for
+            metallicity, age, and [alpha/Fe], respectively
     Returns
     -------
         decDir (str): the directory containing the decomposition results
@@ -2717,33 +2721,27 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     ualphas = np.unique(talphas) if not isinstance(talphas, type(None)) else \
         np.array([0.0]) # no alphas in EMILES
 
-    # # thinning
-    aIdx = np.asarray([np.argmin(np.abs(uages-xc)) for xc in
-        [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0]])
-        # [4.0, 6.0, 8.0, 10.0, 11.5, 13.0, 14.0]])
-    zIdx = np.asarray([np.argmin(np.abs(umetals-xc)) for xc in
-        [-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26, 0.4]])
-        # [-1.0, -0.6, 0.0, 0.15, 0.26, 0.4]])
-    # zIdx = np.arange(umetals.size) # use all metallicities
-    if not isinstance(talphas, type(None)):
-        if ualphas.size > 5:
-            lIdx = np.asarray([np.argmin(np.abs(ualphas-xc)) for xc in
-                [-0.2, 0.0, 0.2, 0.4, 0.6]])
-                # [-0.2, 0.0, 0.4]])
+    zVals, aVals, iVals = sspIdx
+    if np.any([len(zVals) > 0, len(aVals) > 0, len(iVals) > 0]):
+        zVals = np.asarray(zVals) if len(zVals) > 0 else np.array(umetals)
+        aVals = np.asarray(aVals) if len(aVals) > 0 else np.array(uages)
+        iVals = np.asarray(iVals) if len(iVals) > 0 else np.array(ualphas)
+        zIdx = np.asarray([np.argmin(np.abs(umetals-xc)) for xc in zVals])
+        aIdx = np.asarray([np.argmin(np.abs(uages-xc)) for xc in aVals])
+        if not isinstance(talphas, type(None)):
+            lIdx = np.asarray([np.argmin(np.abs(ualphas-xc)) for xc in iVals])
         else:
-            lIdx = np.arange(ualphas.size)
-    else:
-        talphas = np.zeros_like(tages)
-        ualphas = np.array([0.0])
-        lIdx = np.atleast_1d(0)
+            talphas = np.zeros_like(tages)
+            ualphas = np.array([0.0])
+            lIdx = np.atleast_1d(0)
 
-    # Select the templates
-    teDir = teDir.reshape(umetals.size, uages.size, ualphas.size)[
-        zIdx[:, np.newaxis, np.newaxis], aIdx[np.newaxis, :, np.newaxis],
-        lIdx[np.newaxis, np.newaxis, :]]
-    uages = uages[aIdx]
-    umetals = umetals[zIdx]
-    ualphas = ualphas[lIdx]
+        # Select the templates
+        teDir = teDir.reshape(umetals.size, uages.size, ualphas.size)[
+            zIdx[:, np.newaxis, np.newaxis], aIdx[np.newaxis, :, np.newaxis],
+            lIdx[np.newaxis, np.newaxis, :]]
+        uages = uages[aIdx]
+        umetals = umetals[zIdx]
+        ualphas = ualphas[lIdx]
 
     nMetals = umetals.size
     nAges = uages.size

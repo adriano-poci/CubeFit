@@ -28,6 +28,8 @@ v1.2:   Added `galaxy` argument to `_configure_solver_environment` to specify
 v1.3:   Pass `args` and `propDict` to `_configure_solver_environment` to allow 
             for more flexible environment variable configuration. 1 August 2026
 v1.4:   Generate unique diagnostic JSONL for each run. 4 August 2026
+v1.5:   Provide `sspIdx` for large `nCuts` runs to thin the SSP grid. 21 August
+            2026
 """
 
 import numpy as np
@@ -74,20 +76,16 @@ def main():
     ap = argparse.ArgumentParser(description="Thin wrapper around genCubeFit")
     ap.add_argument('--galaxy', type=str, default=None,
         help='Galaxy name to process')
-    ap.add_argument(
-        "--run-switch",
-        type=str,
-        default=None,
-        help="Single string passed directly as runSwitch to genCubeFit"
-    )
+    ap.add_argument("--run-switch", type=str, default=None,
+        help="Single string passed directly as runSwitch to genCubeFit")
     # boolean redraw with explicit on/off flags
     ap.add_argument("--ncomp", type=int, default=None,
         help="Number of components to fit")
     group = ap.add_mutually_exclusive_group()
     group.add_argument("--redraw", dest="redraw", action="store_true",
-                       help="Enable redraw mode")
+        help="Enable redraw mode")
     group.add_argument("--no-redraw", dest="redraw", action="store_false",
-                       help="Disable redraw mode")
+        help="Disable redraw mode")
     ap.set_defaults(redraw=False)
 
     args = ap.parse_args()
@@ -117,9 +115,12 @@ def main():
     propDict['redraw'] = bool(args.redraw)
     print(f"redraw = {propDict['redraw']}")
 
-
     if args.ncomp is not None:
         propDict['nCuts'] = args.ncomp
+    if propDict['nCuts'] > 50:
+        propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26, 0.4],
+            [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
+            [-0.2, 0.0, 0.2, 0.4, 0.6])
     print(propDict)
 
     _configure_solver_environment(args, propDict)
