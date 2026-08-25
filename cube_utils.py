@@ -24,6 +24,9 @@ v1.9:   Added `resolve_parallelism` to determine optimal CPU/BLAS configuration.
             11 August 2026
 v1.10:  Added `sspIdx` keyword to `_oneTimeSpec` to allow for thinning of the SSP
             grid. 21 August 2026
+v1.11:  Reworked `resolve_parallelism` to roughly retain the hybrid parallelism
+            of the provided configuration using the input ratio of cores and
+            threads. 25 August 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -3159,16 +3162,19 @@ def resolve_parallelism(
     requested_blas=None,
 ):
     """
-    Resolve process and BLAS thread counts against the available CPU set.
+    Resolve hybrid process/BLAS parallelism against available CPUs.
+
+    When the requested configuration exceeds the available CPU allocation,
+    preserve both process-level and BLAS-level parallelism where possible.
+    Candidate configurations are ranked by CPU utilization and similarity
+    to the requested process-to-thread balance.
 
     Parameters
     ----------
     requested_processes : int, optional
-        Requested number of worker processes. Defaults to
-        ``CPU_PROCESSES``.
+        Requested number of worker processes. Defaults to 1.
     requested_blas : int, optional
-        Requested number of BLAS threads per process. Defaults to
-        ``BLAS_THREADS``.
+        Requested number of BLAS threads per worker. Defaults to 1.
 
     Returns
     -------
@@ -3184,7 +3190,10 @@ def resolve_parallelism(
 
     Examples
     --------
-    >>> cpu_processes, blas_threads = resolve_parallelism()
+    For a request of 12 processes and 4 BLAS threads, a 12-core allocation
+    preferentially resolves to 6 processes and 2 BLAS threads:
+
+    >>> cpu_processes, blas_threads = resolve_parallelism(12, 4)
     """
     if requested_processes is None:
         requested_processes = 1
@@ -3192,77 +3201,203 @@ def resolve_parallelism(
     if requested_blas is None:
         requested_blas = 1
 
-    requested_processes = max(
-        1,
-        int(requested_processes),
-    )
-    requested_blas = max(
-        1,
-        int(requested_blas),
-    )
+    try:
+        requested_processes = max(
+            1,
+            int(requested_processes),
+        )
+        requested_blas = max(
+            1,
+            int(requested_blas),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "requested_processes and requested_blas must be "
+            "positive integers."
+        ) from exc
 
     ncpuset, mask = cpuset_count()
-    cores_available = len(os.sched_getaffinity(0))
-    cores_available = max(1, int(cores_available))
-    print(f"[guard] cpuset mask: {mask}  cores: {ncpuset}")
-    print(f"cpuset cores: {cores_available}")
-    print(f"BLAS pools: {threadpool_info()}")
+
+    try:
+        cores_available = len(
+            os.sched_getaffinity(0)
+        )
+    except (AttributeError, OSError):
+        cores_available = int(ncpuset)
+
+    cores_available = max(
+        1,
+        int(cores_available),
+    )
+
+    print(
+        f"[guard] cpuset mask: {mask}  "
+        f"cores: {ncpuset}"
+    )
+    print(
+        f"[guard] cpuset cores: "
+        f"{cores_available}"
+    )
+    print(
+        f"[guard] BLAS pools: "
+        f"{threadpool_info()}"
+    )
 
     requested_total = (
-        requested_processes * requested_blas
+        requested_processes
+        * requested_blas
     )
 
-    best_score = None
-    best_processes = requested_processes
-    best_blas = requested_blas
-    best_total = requested_total
+    # ------------------------------------------------------------
+    # Preserve the exact request whenever it fits.
+    # ------------------------------------------------------------
+    if requested_total <= cores_available:
+        best_processes = requested_processes
+        best_blas = requested_blas
 
-    max_procs = min(
-        requested_processes,
-        cores_available,
-    )
+    else:
+        # --------------------------------------------------------
+        # Search feasible hybrid configurations.
+        #
+        # We want to:
+        #
+        # 1. avoid oversubscription;
+        # 2. use as many allocated cores as possible;
+        # 3. preserve process AND BLAS parallelism;
+        # 4. preserve the requested hybrid balance;
+        # 5. avoid increasing either dimension beyond its request.
+        # --------------------------------------------------------
+        candidates = []
 
-    for procs in range(max_procs, 0, -1):
-        blas = max(
+        requested_ratio = (
+            requested_processes
+            / float(requested_blas)
+        )
+
+        for procs in range(
             1,
-            int(
-                math.ceil(
-                    cores_available / float(procs)
+            min(
+                requested_processes,
+                cores_available,
+            ) + 1,
+        ):
+            for blas in range(
+                1,
+                min(
+                    requested_blas,
+                    cores_available,
+                ) + 1,
+            ):
+                total = procs * blas
+
+                if total > cores_available:
+                    continue
+
+                # Prefer genuinely hybrid configurations whenever
+                # the allocation permits one.
+                hybrid = (
+                    procs > 1
+                    and blas > 1
                 )
-            ),
-        )
 
-        total = procs * blas
-        oversub = total - cores_available
+                unused = (
+                    cores_available - total
+                )
 
-        score = (
-            oversub,
-            abs(procs - requested_processes),
-            blas,
-        )
+                ratio = (
+                    procs / float(blas)
+                )
 
-        if best_score is None or score < best_score:
-            best_score = score
-            best_processes = procs
-            best_blas = blas
-            best_total = total
+                # Compare multiplicatively rather than by raw
+                # difference.  This treats, e.g., ratios of 2 and
+                # 8 symmetrically around a requested ratio of 4.
+                ratio_error = abs(
+                    math.log(
+                        ratio / requested_ratio
+                    )
+                )
+
+                # Fractional contraction of each requested axis.
+                process_scale = (
+                    procs
+                    / float(requested_processes)
+                )
+                blas_scale = (
+                    blas
+                    / float(requested_blas)
+                )
+
+                balance_error = abs(
+                    process_scale - blas_scale
+                )
+
+                # Lower score is better.
+                score = (
+                    0 if hybrid else 1,
+                    unused,
+                    balance_error,
+                    ratio_error,
+                    -procs,
+                    -blas,
+                )
+
+                candidates.append(
+                    (
+                        score,
+                        procs,
+                        blas,
+                    )
+                )
+
+        if not candidates:
+            best_processes = 1
+            best_blas = 1
+        else:
+            candidates.sort(
+                key=lambda item: item[0]
+            )
+
+            _, best_processes, best_blas = (
+                candidates[0]
+            )
+
+    best_total = (
+        best_processes
+        * best_blas
+    )
 
     if (
         best_processes != requested_processes
         or best_blas != requested_blas
-        or best_total != requested_total
     ):
         print(
-            "[guard] adjusting parallelism: "
-            f"CPU_PROCESSES {requested_processes} -> "
+            "[guard] adjusting hybrid parallelism: "
+            f"CPU_PROCESSES "
+            f"{requested_processes} -> "
             f"{best_processes}, "
-            f"BLAS_THREADS {requested_blas} -> "
+            f"BLAS_THREADS "
+            f"{requested_blas} -> "
             f"{best_blas} "
-            f"(requested total={requested_total}, "
+            f"(requested total="
+            f"{requested_total}, "
             f"chosen total={best_total}, "
-            f"available cores={cores_available})"
+            f"available cores="
+            f"{cores_available})"
+        )
+    else:
+        print(
+            "[guard] parallelism accepted: "
+            f"CPU_PROCESSES="
+            f"{best_processes}, "
+            f"BLAS_THREADS="
+            f"{best_blas}, "
+            f"total={best_total}/"
+            f"{cores_available}"
         )
 
-    return best_processes, best_blas
+    return (
+        best_processes,
+        best_blas,
+    )
 
 # ------------------------------------------------------------------------------
