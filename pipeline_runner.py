@@ -66,6 +66,7 @@ v1.21:  Removed legacy `jacobi` warm-start option;
 v1.22:  Reworked resume warm-starting to load a matched sidecar checkpoint with
             `load_checkpoint` and pass only the consistent `resume_state` into
             the constrained solver. 7 August 2026
+v1.23:  Removed all legacy checkpointing and tracking. 26 August 2026
 """
 
 from __future__ import annotations
@@ -191,160 +192,96 @@ class PipelineRunner:
     @staticmethod
     def _read_latest_from_sidecar(sidecar_path: str, N_expected: int):
         """
-        Read the most recent solution vector from a FitTracker sidecar file.
-
-        For *resume semantics* we prefer the latest checkpoint, not the
-        best-so-far checkpoint. So we try, in order:
-
-        1) /Fit/x_last
-        2) /Fit/x_epoch_last
-        3) /Fit/x_snapshots[-1]
-        4) /Fit/x_best
-        5) /Fit/x_hist[-1] (legacy)
+        Read the latest physical solution from a tracker sidecar.
 
         Parameters
         ----------
         sidecar_path : str
-            Path to the sidecar HDF5 file: <main>.fit.<pid>.<ts>.h5
+            Tracker sidecar path.
         N_expected : int
-            Expected flattened size (C*P).
+            Expected flattened solution size.
 
         Returns
         -------
-        x : ndarray[float64] or None
-            Flattened solution vector of length N_expected, if found.
+        x : ndarray or None
+            Flattened physical solution vector.
         src : str or None
-            Dataset label used to load x (for logging).
+            Source dataset label.
+
+        Raises
+        ------
+        None
+
+        Examples
+        --------
+        Used internally for x-only resume fallback.
         """
-        if (sidecar_path is None) or (not os.path.exists(sidecar_path)):
+        if not sidecar_path or not os.path.exists(sidecar_path):
             return None, None
 
-        def _read_flat(g, name: str):
-            if name not in g:
-                return None
-            ds = g[name]
-            try:
-                if ds.ndim == 2 and ds.shape[0] > 0:
-                    v = np.asarray(ds[-1, :], np.float64, order="C")
-                else:
-                    v = np.asarray(ds[...], np.float64, order="C")
-            except Exception:
-                return None
+        try:
+            with open_h5(sidecar_path, role="reader", swmr=True) as f:
+                if "/Fit/x_last" not in f:
+                    return None, None
 
-            v = np.asarray(v, np.float64).ravel(order="C")
-            if v.size != int(N_expected):
-                return None
-            return v
+                x = np.asarray(
+                    f["/Fit/x_last"][...], dtype=np.float64).ravel(order="C")
 
-        with open_h5(sidecar_path, role="reader", swmr=True) as g:
-            # Prefer latest progress for resume.
-            v = _read_flat(g, "/Fit/x_last")
-            if v is not None:
-                return v, "/Fit/x_last"
+                if x.size != int(N_expected):
+                    return None, None
+                if not np.all(np.isfinite(x)):
+                    return None, None
 
-            v = _read_flat(g, "/Fit/x_epoch_last")
-            if v is not None:
-                return v, "/Fit/x_epoch_last"
-
-            if "/Fit/x_snapshots" in g and g["/Fit/x_snapshots"].shape[0] > 0:
-                ds = g["/Fit/x_snapshots"]
-                try:
-                    v = np.asarray(ds[-1, :], np.float64, order="C")
-                    v = v.ravel(order="C")
-                    if v.size == int(N_expected):
-                        return v, "/Fit/x_snapshots[-1]"
-                except Exception:
-                    pass
-
-            # Fallback to best-so-far.
-            v = _read_flat(g, "/Fit/x_best")
-            if v is not None:
-                return v, "/Fit/x_best"
-
-            # Legacy fallback.
-            if "/Fit/x_hist" in g and g["/Fit/x_hist"].shape[0] > 0:
-                ds = g["/Fit/x_hist"]
-                try:
-                    v = np.asarray(ds[-1, :], np.float64, order="C")
-                    v = v.ravel(order="C")
-                    if v.size == int(N_expected):
-                        return v, "/Fit/x_hist[-1]"
-                except Exception:
-                    pass
-
-        return None, None
+                return x, "/Fit/x_last"
+        except Exception:
+            return None, None
 
     @staticmethod
     def _read_latest_from_main(h5_path: str, N_expected: int):
         """
-        Read the best available solution vector from the *main* HDF5.
+        Read the canonical solution vector from the main HDF5 file.
 
-        Priority is "most resume-correct" first:
-        1) /Fit/x_last
-        2) /Fit/x_epoch_last
-        3) /X_global
-        4) /Fit/x_best
-        5) legacy fallbacks
+        Parameters
+        ----------
+        h5_path : str
+            Main HDF5 path.
+        N_expected : int
+            Expected flattened solution size.
 
         Returns
         -------
-        x : ndarray[float64] or None
-            Flattened solution vector (length N_expected), if found.
+        x : ndarray or None
+            Flattened physical solution vector.
         src : str or None
-            Dataset label used to load x (for logging).
+            Source dataset label.
+
+        Raises
+        ------
+        None
+
+        Examples
+        --------
+        Used internally for x-only resume fallback.
         """
-        if (h5_path is None) or (not os.path.exists(h5_path)):
+        if not h5_path or not os.path.exists(h5_path):
             return None, None
 
-        def _read_flat(f, name: str):
-            if name not in f:
-                return None
-            ds = f[name]
-            try:
-                if name.startswith("/Fit/") and ds.ndim == 2 and \
-                    ds.shape[0] > 0:
-                    # history-like, per epoch
-                    v = np.asarray(ds[-1, :], np.float64, order="C")
-                else:
-                    # canonical solution vector
-                    v = np.asarray(ds[...], np.float64, order="C")
-            except Exception:
-                return None
+        try:
+            with open_h5(h5_path, role="reader", swmr=True) as f:
+                if "/X_global" not in f:
+                    return None, None
 
-            v = np.asarray(v, np.float64).ravel(order="C")
-            if v.size != int(N_expected):
-                return None
-            if not np.all(np.isfinite(v)):
-                v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
-            return v
+                x = np.asarray(
+                    f["/X_global"][...], dtype=np.float64).ravel(order="C")
 
-        with open_h5(h5_path, role="reader", swmr=True) as f:
-            # Resume-correct (if present)
-            v = _read_flat(f, "/Fit/x_last")
-            if v is not None:
-                return v, "/Fit/x_last"
+                if x.size != int(N_expected):
+                    return None, None
+                if not np.all(np.isfinite(x)):
+                    return None, None
 
-            v = _read_flat(f, "/Fit/x_epoch_last")
-            if v is not None:
-                return v, "/Fit/x_epoch_last"
-
-            # Canonical committed solution
-            v = _read_flat(f, "/X_global")
-            if v is not None:
-                return v, "/X_global"
-
-            # Best-so-far fallback (if you keep it in main)
-            v = _read_flat(f, "/Fit/x_best")
-            if v is not None:
-                return v, "/Fit/x_best"
-
-            # Legacy candidates (only if they exist in your file)
-            for name in ("/X_best", "/X_last", "/Fit/x_hist"):
-                v = _read_flat(f, name)
-                if v is not None:
-                    return v, name
-
-        return None, None
+                return x, "/X_global"
+        except Exception:
+            return None, None
 
     def _read_seed_from_h5(self,
                         h5_path: str,
@@ -456,6 +393,18 @@ class PipelineRunner:
                     sidecar,
                     expected_size=N_expected,
                 )
+                if x_side is None:
+                    vprint(
+                        "[Pipeline] Sidecar contains no usable checkpoint x.")
+                elif resume_state_effective is None:
+                    vprint(
+                        "[Pipeline] Sidecar contains x but no resumable solver "
+                        "state.")
+                else:
+                    vprint("[Pipeline] Sidecar contains a full resumable "
+                        "checkpoint: "
+                        f"iter={resume_state_effective.get('iter', None)}, "
+                        f"phase={resume_state_effective.get('phase', None)}.")
 
             # If the sidecar contains a valid full checkpoint, always use it.
             # That is the only source that can restore the full constrained state.
@@ -474,12 +423,16 @@ class PipelineRunner:
                 )
 
             else:
-                # No full checkpoint in the sidecar: fall back to the best available x
-                # only, but do not carry any sidecar state forward.
+                # Full constrained state is unavailable. The sidecar may still
+                # contain a valid x-only warm start.
+                resume_state_effective = None
+
+                if sidecar is not None:
+                    x_side, src_side = self._read_latest_from_sidecar(
+                        sidecar, N_expected)
+
                 x_main, src_main = self._read_latest_from_main(
-                    self.h5_path,
-                    N_expected,
-                )
+                    self.h5_path, N_expected)
 
                 def _safe_mtime(path: str | None) -> float:
                     if not path:
@@ -489,40 +442,14 @@ class PipelineRunner:
                     except Exception:
                         return -np.inf
 
-                def _try_epoch(path: str | None, dset: str | None) -> float | None:
-                    if (path is None) or (dset is None):
-                        return None
-                    try:
-                        with open_h5(path, role="reader", swmr=True) as f:
-                            if dset in f:
-                                e = f[dset].attrs.get("epoch", None)
-                                if e is None:
-                                    return None
-                                e = float(e)
-                                return e if np.isfinite(e) else None
-                    except Exception:
-                        return None
-                    return None
-
                 choose_side = False
                 if x_side is not None and x_main is None:
                     choose_side = True
                 elif x_side is None and x_main is not None:
                     choose_side = False
                 elif x_side is not None and x_main is not None:
-                    e_side = _try_epoch(sidecar, src_side)
-                    e_main = _try_epoch(self.h5_path, src_main)
-
-                    if (
-                        (e_side is not None)
-                        and (e_main is not None)
-                        and (e_side != e_main)
-                    ):
-                        choose_side = (e_side > e_main)
-                    else:
-                        choose_side = (
-                            _safe_mtime(sidecar) > _safe_mtime(self.h5_path)
-                        )
+                    choose_side = (
+                        _safe_mtime(sidecar) > _safe_mtime(self.h5_path))
 
                 vprint(
                     f"[Pipeline] Warm-start resume candidates: "
@@ -600,39 +527,17 @@ class PipelineRunner:
         if tracker_mode != "off":
             tracker = FitTracker(self.h5_path)
             vprint("[Pipeline] Using tracker with mode:", tracker_mode)
-            vprint('[Pipeline] Need to infer shapes...')
-            with open_h5(self.h5_path, role="reader") as f:
-                g = f.get("/HyperCube", None)
-                if g is not None:
-                    shp = g.attrs.get("shape")
-                    if shp is not None and len(shp) == 4:
-                        _, C, P, _ = map(int, shp)
-                if "/HyperCube/models" in f:
-                    _, C, P, _ = map(int, f["/HyperCube/models"].shape)
-                if "/LOSVD" in f and "/Templates" in f:
-                    _, _, C = map(int, f["/LOSVD"].shape)
-                    P = int(f["/Templates"].shape[0])
-            vprint(f"[Pipeline] Inferred C={C}, P={P} from HDF5")
-            tracker.set_meta(N=int(C)*int(P))
 
-        cfg = MPConfig(
-            processes=int(processes),
-            blas_threads=int(blas_threads),
-            apply_mask=bool(reader_apply_mask),
-        )
+        cfg = MPConfig(processes=int(processes), blas_threads=int(blas_threads),
+            apply_mask=bool(reader_apply_mask))
 
         try:
             with logger.capture_all_output():
 
-                x_solver, stats = solve_streaming_nnls(
-                    self.h5_path,
-                    cfg,
-                    orbit_weights=orbit_weights,
-                    x0=x0_effective,
-                    resume_state=resume_state_effective,
-                    tracker=tracker,
-                    monolithic_max_active=2000,
-                )
+                x_solver, stats = solve_streaming_nnls(self.h5_path, cfg,
+                    orbit_weights=orbit_weights, x0=x0_effective,
+                    resume_state=resume_state_effective, tracker=tracker,
+                    monolithic_max_active=2000)
                 # x_solver, stats = solve_monolithic_nnls(self.h5_path,
                     # orbit_weights=orbit_weights, 
                     # hard_project=True)
@@ -660,12 +565,8 @@ class PipelineRunner:
             if "/X_global" in f_wr:
                 del f_wr["/X_global"]
 
-            f_wr.create_dataset(
-                "/X_global",
-                data=x_solver.astype(np.float64),
-                compression="gzip",
-                compression_opts=4,
-            )
+            f_wr.create_dataset("/X_global", data=x_solver.astype(np.float64),
+                compression="gzip", compression_opts=4)
 
             f_wr["/X_global"].attrs["layout"] = "C_P"
             f_wr["/X_global"].attrs["P"] = x_solver.shape[1]
@@ -676,11 +577,8 @@ class PipelineRunner:
                 grp = f_wr.require_group("/HyperCube")
                 if "known_zero_mask" in grp:
                     del grp["known_zero_mask"]
-                grp.create_dataset(
-                    "known_zero_mask",
-                    data=stats["known_zero_mask"].astype(bool),
-                    dtype="bool",
-                )
+                grp.create_dataset("known_zero_mask",
+                    data=stats["known_zero_mask"].astype(bool), dtype="bool")
         
         logger.log(
             "[Pipeline] ===================================================")

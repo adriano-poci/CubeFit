@@ -80,6 +80,11 @@ v1.24:  Return `picks` in `plot_best_worst_spectrum_fits_stacked` for downstream
             `plot_best_worst_spectrum_fits_stacked`;
         Changed residuals in `parallel_spectrum_plots` to match new
             `r_{s,\lambda}`. 20 August 2026
+v1.25:  Allow `cpu_processes` and `blas_threads` to be passed in `kwargs` to
+            `genCubeFit`;
+        Removed all legacy checkpointing and tracking;
+        Added SFH corner plot for each phase-space pair of the SSP library in
+            `loadCubeFit`. 26 August 2026
 """
 
 # need to set up the logger before any other imports
@@ -177,61 +182,6 @@ def _MWProp(prop, aperMass):
     mwP = np.ma.sum((aperMass/np.ma.sum(aperMass, axis=1)[:, np.newaxis])*\
         prop[np.newaxis, :], axis=1)
     return mwP
-
-# ------------------------------------------------------------------------------
-
-def load_xring_best(sidecar_path: str, ring_idx: int = 95, as_physical: bool = True,
-                    cp_flux_ref: np.ndarray | None = None) -> np.ndarray:
-    """
-    Load x_ring[ring_idx] from sidecar /Fit/x_ring and return a 1-D float64
-    vector suitable as x0 for genCubeFit. If as_physical=True and a
-    cp_flux_ref array is provided, convert from solver-normalized (x_CP)
-    -> physical (X_phys) before returning.
-    """
-    with open_h5(sidecar_path, role="reader") as f:
-        fit = f.get("/Fit")
-        if fit is None:
-            raise KeyError(f"no /Fit group in {sidecar_path!r}")
-        if "x_ring" not in fit:
-            raise KeyError(f"/Fit/x_ring not found in {sidecar_path!r}")
-
-        x_ring = np.asarray(fit["x_ring"])  # shape (Nring, C*P) or (Nring, C, P)
-
-    # Accept both flattened and (C,P) forms
-    if x_ring.ndim == 1:
-        # single-vector stored (no ring axis) — treat as the vector
-        vec = x_ring.astype(np.float64).ravel(order="C")
-    elif x_ring.ndim == 2:
-        if ring_idx < 0 or ring_idx >= x_ring.shape[0]:
-            raise IndexError(f"ring_idx {ring_idx} out of range (0..{x_ring.shape[0]-1})")
-        vec = x_ring[ring_idx].astype(np.float64).ravel(order="C")
-    elif x_ring.ndim == 3:
-        # stored as (Nring, C, P) — flatten afterwards
-        if ring_idx < 0 or ring_idx >= x_ring.shape[0]:
-            raise IndexError(f"ring_idx {ring_idx} out of range (0..{x_ring.shape[0]-1})")
-        vec = x_ring[ring_idx].astype(np.float64).ravel(order="C")
-    else:
-        raise RuntimeError(f"unexpected /Fit/x_ring shape {x_ring.shape}")
-
-    # Optional conversion from normalized basis x_CP -> physical X_phys:
-    if as_physical and (cp_flux_ref is not None):
-        # cp_flux_ref expected shape (C, P)
-        CtimesP = vec.size
-        cp = np.asarray(cp_flux_ref, np.float64).ravel(order="C")
-        if cp.size != CtimesP:
-            # allow cp provided as (C,P) array
-            cp = np.asarray(cp_flux_ref, np.float64).ravel(order="C")
-            if cp.size != CtimesP:
-                raise ValueError("cp_flux_ref size does not match x_ring length")
-        inv_cp = 1.0 / np.maximum(cp, 1e-30)
-        vec = (vec * inv_cp).astype(np.float64, order="C")
-
-    return vec
-
-# --- example use in genCubeFit ---
-# sidecar_path = "/path/to/your/sidecar.h5"
-# x0 = load_xring_best(sidecar_path, ring_idx=95, as_physical=True, cp_flux_ref=maybe_cp_flux)
-# pass x0 into the routine that accepts initial x0 (shape (C*P,))
 
 # ------------------------------------------------------------------------------
 
@@ -598,8 +548,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # --- 4) Run the global Kaczmarz fit (tiled; RAM-bounded) ---
     runner = PipelineRunner(hdf5Path)
 
-    best_processes, best_blas = cu.resolve_parallelism(CPU_PROCESSES,
-        BLAS_THREADS)
+    Ncpu, Nblas = kwargs.pop('cpu_processes', CPU_PROCESSES), kwargs.pop('blas_threads', BLAS_THREADS)
+    best_processes, best_blas = cu.resolve_parallelism(Ncpu, Nblas)
 
     #####################################
     # Multi-processing Batched Kaczmarz #
@@ -2590,8 +2540,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     divcmap = colormaps.get_cmap('GECKOSdr')
     if isinstance(divcmap, mcolors.ListedColormap):
         divcmap = mcolors.LinearSegmentedColormap.from_list(
-            f"{divcmap.name}_fixed", divcmap.colors, N=256
-        )
+            f"{divcmap.name}_fixed", divcmap.colors, N=256)
     heat = colormaps.get_cmap('cet_fire')
     if not hasattr(heat, "n_variates"):
         heat.n_variates = 1
@@ -2605,14 +2554,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     ax = fig.add_subplot(111)
     # Symmetric colour scale around zero
     vlim = np.percentile(np.abs(mean_resid_sb), 99)
-    cnt = dbi(
-        xpix, ypix, mean_resid_sb[binNum],
-        pixelsize=pixs,
-        angle=PA,
-        cmap=divcmap,
-        vmin=-vlim,
-        vmax=+vlim,
-    )
+    cnt = dbi(xpix, ypix, mean_resid_sb[binNum], pixelsize=pixs, angle=PA,
+        cmap=divcmap, vmin=-vlim, vmax=+vlim)
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
     cax = POT.attachAxis(ax, "top", 0.1, mid=True)
@@ -2638,11 +2581,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         gs = gridspec.GridSpec(3, 1, hspace=0., wspace=0.)
         fig = plt.figure(figsize=plt.figaspect((yLen*3.)/xLen)*0.75)
         ax = fig.add_subplot(gs[0])
-        cnt = dbi(
-            xpix, ypix, np.log10(data_sb[binNum]),
-            pixelsize=pixs, angle=PA,
-            cmap=heat, vmin=fmin, vmax=fmax
-        )
+        cnt = dbi(xpix, ypix, np.log10(data_sb[binNum]), pixelsize=pixs,
+            angle=PA, cmap=heat, vmin=fmin, vmax=fmax)
         ax.set_xticklabels([])
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
@@ -2659,11 +2599,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             transform=cax.transAxes)
         cb.set_ticks([])
         ax = fig.add_subplot(gs[1])
-        dbi(
-            xpix, ypix, np.log10(model_sb[binNum]),
-            pixelsize=pixs, angle=PA,
-            cmap=heat, vmin=fmin, vmax=fmax
-        )
+        dbi(xpix, ypix, np.log10(model_sb[binNum]), pixelsize=pixs, angle=PA,
+            cmap=heat, vmin=fmin, vmax=fmax)
         ax.set_xticklabels([])
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
@@ -2710,40 +2647,30 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         maText = POT.prec(pren, fmax)
 
         ax = fig.add_subplot(gs[0])
-        cnt = dbi(
-            xpix, ypix, np.log10(data_sb[binNum]),
-            pixelsize=pixs, angle=PA,
-            cmap=heat, vmin=fmin, vmax=fmax
-        )
+        cnt = dbi(xpix, ypix, np.log10(data_sb[binNum]), pixelsize=pixs,
+            angle=PA, cmap=heat, vmin=fmin, vmax=fmax)
         ax.set_xticklabels([])
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
 
         # Panel 2: model
         ax = fig.add_subplot(gs[1])
-        dbi(
-            xpix, ypix, np.log10(model_sb[binNum]),
-            pixelsize=pixs, angle=PA,
-            cmap=heat, vmin=fmin, vmax=fmax
-        )
+        dbi(xpix, ypix, np.log10(model_sb[binNum]), pixelsize=pixs, angle=PA,
+            cmap=heat, vmin=fmin, vmax=fmax)
         ax.set_xticklabels([])
         ax.set_yticklabels([])
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
         cax = POT.attachAxis(ax, 'right', 0.1)
         cb = plt.colorbar(cnt, cax=cax, orientation='vertical')
-        lT = cax.text(
-            0.5, 0.5, fr"$L\ [{UTS.lsun}]$",
-            va='center', ha='center', rotation=270.,
-            color=POT.pgreen, transform=cax.transAxes
-        )
-        lT.set_path_effects([
-            PathEffects.withStroke(linewidth=1.5, foreground='k')
-        ])
+        lT = cax.text(0.5, 0.5, fr"$L\ [{UTS.lsun}]$", va='center', ha='center',
+            rotation=270., color=POT.pgreen, transform=cax.transAxes,
+            path_effects=[PathEffects.withStroke(linewidth=1.5, foreground='k')]
+            )
         cax.text(0.5, 5e-3, miText, va='bottom', ha='center', color='white',
-                transform=cax.transAxes, rotation=270.)
+            transform=cax.transAxes, rotation=270.)
         cax.text(0.5, 1.0 - 5e-3, maText, va='top', ha='center', color='black',
-                transform=cax.transAxes, rotation=270.)
+            transform=cax.transAxes, rotation=270.)
         cb.set_ticks([])
 
         # Panel 3: absolute RMS residual
@@ -2777,10 +2704,10 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             transform=cax.transAxes, path_effects=
             [PathEffects.withStroke(linewidth=1.5, foreground='k')])
         cax.text(0.5, 5e-3, '0.0', va='bottom', ha='center', color='white',
-                transform=cax.transAxes, rotation=270.)
+            transform=cax.transAxes, rotation=270.)
         cax.text(0.5, 1.0 - 5e-3, f"{rmax_frac:.1f}",
-                va='top', ha='center', color='k',
-                transform=cax.transAxes, rotation=270.)
+            va='top', ha='center', color='k',
+            transform=cax.transAxes, rotation=270.)
         cb.set_ticks([])
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
@@ -2792,19 +2719,15 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         BIG.set_xlabel(r"$x\ [{\rm arcsec}]$", labelpad=20)
         BIG.set_ylabel(r"$y\ [{\rm arcsec}]$", labelpad=20)
 
-        plt.savefig(
-            figDir / f"modelCube_sb_grid_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png"
-        )
+        plt.savefig(figDir/\
+            f"modelCube_sb_grid_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
 
         fmin, fmax = np.log10(np.min(data_raw)), np.log10(np.max(data_raw))
         gs = gridspec.GridSpec(3, 1, hspace=0., wspace=0.)
         fig = plt.figure(figsize=plt.figaspect((yLen*3.)/xLen)*0.75)
         ax = fig.add_subplot(gs[0])
-        cnt = dbi(
-            xpix, ypix, np.log10(data_raw[binNum]),
-            pixelsize=pixs, angle=PA,
-            cmap=heat, vmin=fmin, vmax=fmax
-        )
+        cnt = dbi(xpix, ypix, np.log10(data_raw[binNum]), pixelsize=pixs,
+            angle=PA, cmap=heat, vmin=fmin, vmax=fmax)
         ax.set_xticklabels([])
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
@@ -2821,11 +2744,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             transform=cax.transAxes)
         cb.set_ticks([])
         ax = fig.add_subplot(gs[1])
-        dbi(
-            xpix, ypix, np.log10(model_raw[binNum]),
-            pixelsize=pixs, angle=PA,
-            cmap=heat, vmin=fmin, vmax=fmax
-        )
+        dbi(xpix, ypix, np.log10(model_raw[binNum]), pixelsize=pixs, angle=PA,
+            cmap=heat, vmin=fmin, vmax=fmax)
         ax.set_xticklabels([])
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
@@ -2835,11 +2755,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         rmax = 200
         maText = POT.prec(pren, rmax)
         ax = fig.add_subplot(gs[2])
-        cnt = dbi(
-            xpix, ypix, rms_resid_raw[binNum],
-            pixelsize=pixs, angle=PA,
-            cmap=divcmap, vmin=0.0, vmax=rmax
-        )
+        cnt = dbi(xpix, ypix, rms_resid_raw[binNum], pixelsize=pixs, angle=PA,
+            cmap=divcmap, vmin=0.0, vmax=rmax)
         cax = POT.attachAxis(ax, 'top', 0.1, mid=True)
         cb = plt.colorbar(cnt, cax=cax, orientation='horizontal')
         lT = cax.text(0.5, 0.5,
@@ -2873,30 +2790,18 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 for prefix in ("best", "worst"):
                     for f in figDir.glob(f"{prefix}_{nComp:{pred}d}_spax*.png"):
                         f.unlink()
-            parallel_spectrum_plots(
-                h5_or_path=str(hdf5Path),
-                fit_metric=fit_metric,
-                n=50,
-                plot_dir=str(figDir),
-                n_workers=best_processes,
-                tag=f"{nComp:{pred}d}",
-                mask=mask_arr,
-            )
-            _ = plot_best_worst_spectrum_fits_stacked(
-                h5_or_path=str(hdf5Path),
-                fit_metric=p999_abs_frac_resid,
-                n_each=2,
+            parallel_spectrum_plots(h5_or_path=str(hdf5Path),
+                fit_metric=fit_metric, n=50, plot_dir=str(figDir),
+                n_workers=best_processes, tag=f"{nComp:{pred}d}", mask=mask_arr)
+            _ = plot_best_worst_spectrum_fits_stacked(h5_or_path=str(hdf5Path),
+                fit_metric=p999_abs_frac_resid, n_each=2,
                 plot_path=(figDir/\
                     f"outlier_spectrum_fits_stacked_{nComp:{pred}d}.png"),
-                mask=mask_arr,
-            )
+                mask=mask_arr)
             picks = plot_best_worst_spectrum_fits_stacked(
-                h5_or_path=str(hdf5Path),
-                fit_metric=fit_metric,
-                n_each=2,
+                h5_or_path=str(hdf5Path), fit_metric=fit_metric, n_each=2,
                 plot_path=(figDir/f"spectrum_fits_stacked_{nComp:{pred}d}.png"),
-                mask=mask_arr,
-            )
+                mask=mask_arr)
 
     if 'otype' not in oDict['cutOn']:
         return # only do orbital SFH if orbital decomposition
@@ -2944,8 +2849,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             diskSFH = np.ma.masked_less_equal(diskSFH, 0.0)
             bulgeSFH = np.ma.masked_less_equal(bulgeSFH, 0.0)
 
-            minT, maxT = np.min(uages), np.max(uages)
             minZ, maxZ = np.min(umetals), np.max(umetals)
+            minT, maxT = np.min(uages), np.max(uages)
+            minA, maxA = np.min(ualphas), np.max(ualphas)
 
             wmax = np.log10(np.max((
                 np.ma.max(coSFH[coSFH>0]) if np.ma.any(coSFH>0) else 1e-5,
@@ -2961,15 +2867,14 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             fig = plt.figure(figsize=plt.figaspect(3./4.))
             gs = gridspec.GridSpec(3, nAlphas, hspace=0., wspace=0.)
             # one column per alpha, 3 orbit types
-            print(nAlphas, ualphas)
             for ali in range(nAlphas):
                 ax = fig.add_subplot(gs[0, ali])
                 if nAlphas > 1 and ax.get_subplotspec().is_first_col() and \
                     ax.get_subplotspec().is_first_row():
-                    ax.text(1e-2, 1.05, r'$[\alpha/Fe]=$', va='bottom', ha='right', color=POT.pgreen,
-                        transform=ax.transAxes, rotation=0,
-                        path_effects=[PathEffects.withStroke(linewidth=1.5,
-                            foreground='k')])
+                    ax.text(1e-2, 1.05, r'$[\alpha/Fe]=$', va='bottom',
+                        ha='right', color=POT.pgreen, transform=ax.transAxes,
+                        rotation=0, path_effects=[
+                        PathEffects.withStroke(linewidth=1.5, foreground='k')])
                 cnt = ax.imshow(np.ma.log10(coSFH[:, :, ali]),
                     extent=[minT, maxT, minZ, maxZ],
                     aspect='auto', interpolation='none', origin='lower',
@@ -2984,12 +2889,10 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                         foreground='k')])
                 if nAlphas > 1:
-                    lT = ax.text(0.5, 1.05,
-                        rf"${ualphas[ali]:.2f}$",
+                    lT = ax.text(0.5, 1.05, rf"${ualphas[ali]:.2f}$",
                         va='bottom', ha='center', color=POT.pgreen,
-                        transform=ax.transAxes)
-                    lT.set_path_effects(
-                        [PathEffects.withStroke(linewidth=1.5, foreground='k')])
+                        transform=ax.transAxes, path_effects=[
+                        PathEffects.withStroke(linewidth=1.5, foreground='k')])
                 ax = fig.add_subplot(gs[1, ali])
                 ax.imshow(np.ma.log10(laSFH[:, :, ali]),
                     extent=[minT, maxT, minZ, maxZ],
@@ -3053,7 +2956,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     np.ma.min(diskSFH[diskSFH>0]) if np.ma.any(diskSFH>0) else 1e10,
                     np.ma.min(bulgeSFH[bulgeSFH>0]) if np.ma.any(bulgeSFH>0) else 1e10)))
                 dbmin = np.max((dbsMin, -12))
-                print(f"SFH plot limits: {dbmin:.2f} ({dbsMin:.2f}) to {dbmax:.2f}")
+                print(f"DB plot limits: {dbmin:.2f} ({dbsMin:.2f}) to "
+                    f"{dbmax:.2f}")
                 fig = plt.figure(figsize=plt.figaspect(3./4.))
                 gs = gridspec.GridSpec(2, nAlphas, hspace=0., wspace=0.)
                 # one column per alpha, 3 orbit types
@@ -3148,14 +3052,17 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             else:
                 vmin2, vmax2 = -12.0, -8.0
 
+            print(f"Zα plot limits: {vmin2:.2f} to {vmax2:.2f}")
+
             fig2 = plt.figure(figsize=plt.figaspect(1./3.)*0.75)
             gs2 = gridspec.GridSpec(1, 3, wspace=0.0, hspace=0.0)
             panels = [(coZalpha, 'Short-axis Tubes'), (laZalpha, 'Long-axis Tubes'), (boZalpha, 'Boxes')]
             for pi, (arr, title) in enumerate(panels):
                 ax = fig2.add_subplot(gs2[0, pi])
-                # arr shape (nMetals, nAlphas) -> transpose for imshow so y=alpha
+                # arr shape (nMetals, nAlphas) -> transpose for imshow so
+                # y=alpha
                 im = ax.imshow(np.log10(np.ma.masked_invalid(arr.T)),
-                    extent=[minZ, maxZ, np.min(ualphas), np.max(ualphas)],
+                    extent=[minZ, maxZ, minA, maxA],
                     aspect='auto', origin='lower', cmap=moncmapr,
                     norm=Normalize(vmin=vmin2, vmax=vmax2))
                 lT = ax.text(1e-2, 1e-2, title, va='bottom', ha='left',
@@ -3191,7 +3098,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 f"orbitSFH_alphaMetal_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
         
         except Exception as e:
-            print(f"Could not make Z-alpha plot: {e}")
+            print(f"Could not make Z-α plot: {e}")
             pass
 
         # metallicity vs alpha, per age
@@ -3201,18 +3108,19 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
             vmin3 = float(np.log10(np.max((np.min(chemSFH[chemSFH>0]), -12.0))))
             vmax3 = float(np.log10(np.max(chemSFH[chemSFH>0])))
+            print(f"Zαt plot limits: {vmin3:.2f} to {vmax3:.2f}")
 
             fig3 = plt.figure(figsize=plt.figaspect(3.)*0.75)
             gs3 = gridspec.GridSpec(3, 1, wspace=0.0, hspace=0.0)
-            print(uages)
             cuts = [(uages < 6.0), (uages >= 10.0), (uages <= 14.0)]
             labels = ['Age < 6 Gyr', 'Age ≥ 10 Gyr', 'Age < 14 Gyr']
             for pi, mask in enumerate(cuts):
                 ax = fig3.add_subplot(gs3[pi, 0])
-                # arr shape (nMetals, nAlphas) -> transpose for imshow so y=alpha
+                # arr shape (nMetals, nAlphas) -> transpose for imshow so
+                # y=alpha
                 im = ax.imshow(np.log10(np.compress(mask, chemSFH,
                     axis=1).sum(axis=1).T),
-                    extent=[minZ, maxZ, np.min(ualphas), np.max(ualphas)],
+                    extent=[minZ, maxZ, minA, maxA],
                     aspect='auto', origin='lower',
                     cmap=moncmapr, norm=Normalize(vmin=vmin3, vmax=vmax3))
                 lT = ax.text(1e-2, 1e-2, labels[pi], va='bottom', ha='left',
@@ -3245,10 +3153,76 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             cb3.set_ticks([])
 
             fig3.savefig(figDir/\
-                f"orbitSFH_alphaMetalAge_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
-
+                f"orbitSFH_alphaMetalAge_{nComp:{pred}d}_i{proj}"
+                f"{tag}_{lOrder:02d}.png")
         except Exception as e:
-            print(f"Could not make Z-alpha plot: {e}")
+            print(f"Could not make Z-t-α plot: {e}")
+            pass
+        
+        # 3D corner
+        try:
+            ageAlpha, metalAlpha, metalAge = [chemSFH.sum(axis=i).T for i in
+                range(3)]
+            vmin4 = np.log10(np.min([np.min(x[x>0]) for x in
+                [ageAlpha, metalAlpha, metalAge]]))
+            vmax4 = np.log10(np.max([np.max(x[x>0]) for x in
+                [ageAlpha, metalAlpha, metalAge]]))
+            print(f"corner plot limits: {vmin4:.2f} to {vmax4:.2f}")
+            fig4 = plt.figure(figsize=plt.figaspect(1.0)*0.75)
+            gs4 = gridspec.GridSpec(2, 2, wspace=0.0, hspace=0.0)
+            ax = fig4.add_subplot(gs4[2])
+            # arr shape (nMetals, nAlphas) -> transpose for imshow so y=alpha
+            im = ax.imshow(np.log10(metalAlpha),
+                extent=[minZ, maxZ, minA, maxA],
+                aspect='auto', origin='lower',
+                cmap=moncmapr, norm=Normalize(vmin=vmin4, vmax=vmax4))
+            ax.set_xlabel(r'$[Z/H]$')
+            ax.set_ylabel(r'$[\alpha/Fe]$')
+            ax = fig4.add_subplot(gs4[0])
+            # (nMetal, nAge) -> (nAge, nMetal)
+            im = ax.imshow(np.log10(metalAge),
+                extent=[minZ, maxZ, minT, maxT],
+                aspect='auto', origin='lower',
+                cmap=moncmapr, norm=Normalize(vmin=vmin4, vmax=vmax4))
+            ax.set_xticklabels([])
+            ax.set_ylabel(rf"$t\ [{UTS.gyr}]$")
+            ax = fig4.add_subplot(gs4[3])
+            # (nAge, nAlpha) -> (nAlpha, nAge)
+            im = ax.imshow(np.log10(ageAlpha),
+                extent=[minT, maxT, minA, maxA],
+                aspect='auto', origin='lower',
+                cmap=moncmapr, norm=Normalize(vmin=vmin4, vmax=vmax4))
+            ax.set_yticklabels([])
+            ax.set_xlabel(rf"$t\ [{UTS.gyr}]$")
+
+            ax = fig4.add_subplot(gs4[1])
+            ax.axis('off')
+            cbWidth = 0.9
+            cbHeight = 0.15
+            from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+            cax4 = inset_axes(ax, width='100%', height='100%', loc=10,
+                bbox_to_anchor=((1.0-cbWidth)/2.0, (1.0-cbHeight)/2.0,
+                cbWidth, cbHeight), bbox_transform=ax.transAxes, borderpad=0.)
+            cb4 = plt.colorbar(im, cax=cax4, orientation='horizontal')
+            lT4 = ax.text(0.5, (1.0-cbHeight)/2.0+(cbHeight)+1e-3,
+                r'$\log_{10}{\text{Mass Fraction}}$',
+                va='bottom', ha='center', color=POT.pgreen,
+                transform=ax.transAxes)
+            lT4.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                foreground='k')])
+            pren = 1
+            miText = POT.prec(pren, vmin4)
+            maText = POT.prec(pren, vmax4)
+            cax4.text(5e-3, 0.5, miText, va='center', ha='left',
+                color='k', transform=cax4.transAxes)
+            cax4.text(1.0-5e-3, 0.5, maText, va='center', ha='right',
+                color='w', transform=cax4.transAxes)
+            cb4.set_ticks([])
+
+            fig4.savefig(figDir/\
+                f"orbitSFH_corner_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+        except Exception as e:
+            print(f"Could not make corner plot: {e}")
             pass
     
     if 'proj' in pplots and nComp > 3:
@@ -3260,51 +3234,73 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 boSOL = arSOL[boxess, :, :, :]
 
                 saAge = np.nansum(np.nansum(saSOL, axis=(1,3))*\
-                    uages[np.newaxis, :] / np.nansum(saSOL, axis=(1,2,3))[:, np.newaxis],
-                    axis=1)
+                    uages[np.newaxis, :] / np.nansum(saSOL, axis=(1,2,3)
+                    )[:, np.newaxis], axis=1)
                 laAge = np.nansum(np.nansum(laSOL, axis=(1,3))*\
-                    uages[np.newaxis, :] / np.nansum(laSOL, axis=(1,2,3))[:, np.newaxis],
-                    axis=1)
-                boAge = np.nansum(np.nansum(boSOL, axis=(1,3))*uages[np.newaxis, :] / np.nansum(boSOL, axis=(1,2,3))[:, np.newaxis], axis=1)
+                    uages[np.newaxis, :] / np.nansum(laSOL, axis=(1,2,3)
+                    )[:, np.newaxis], axis=1)
+                boAge = np.nansum(np.nansum(boSOL, axis=(1,3))*\
+                    uages[np.newaxis, :] / np.nansum(boSOL, axis=(1,2,3)
+                    )[:, np.newaxis], axis=1)
 
                 saMetal = np.nansum(np.nansum(saSOL, axis=(2,3))*\
-                    umetals[np.newaxis, :] / np.nansum(saSOL, axis=(1,2,3))[:, np.newaxis],
-                    axis=1)
+                    umetals[np.newaxis, :] / np.nansum(saSOL, axis=(1,2,3)
+                    )[:, np.newaxis], axis=1)
                 laMetal = np.nansum(np.nansum(laSOL, axis=(2,3))*\
-                    umetals[np.newaxis, :] / np.nansum(laSOL, axis=(1,2,3))[:, np.newaxis],
-                    axis=1)
+                    umetals[np.newaxis, :] / np.nansum(laSOL, axis=(1,2,3)
+                    )[:, np.newaxis], axis=1)
                 boMetal = np.nansum(np.nansum(boSOL, axis=(2,3))*\
-                    umetals[np.newaxis, :] / np.nansum(boSOL, axis=(1,2,3))[:, np.newaxis],
-                    axis=1)
+                    umetals[np.newaxis, :] / np.nansum(boSOL, axis=(1,2,3)
+                    )[:, np.newaxis], axis=1)
 
                 saAlpha = np.nansum(np.nansum(saSOL, axis=(1,2))*\
-                    ualphas[np.newaxis, :] / np.nansum(saSOL, axis=(1,2,3))[:, np.newaxis],
-                    axis=1)
+                    ualphas[np.newaxis, :] / np.nansum(saSOL, axis=(1,2,3)
+                    )[:, np.newaxis], axis=1)
                 laAlpha = np.nansum(np.nansum(laSOL, axis=(1,2))*\
-                    ualphas[np.newaxis, :] / np.nansum(laSOL, axis=(1,2,3))[:, np.newaxis],
-                    axis=1)
+                    ualphas[np.newaxis, :] / np.nansum(laSOL, axis=(1,2,3)
+                    )[:, np.newaxis], axis=1)
                 boAlpha = np.nansum(np.nansum(boSOL, axis=(1,2))*\
-                    ualphas[np.newaxis, :] / np.nansum(boSOL, axis=(1,2,3))[:, np.newaxis],
-                    axis=1)
+                    ualphas[np.newaxis, :] / np.nansum(boSOL, axis=(1,2,3)
+                    )[:, np.newaxis], axis=1)
 
-                maps = dict(age=dict(sa=_MWProp(saAge, np.compress(satube, aperMass, axis=1)),
-                    la=_MWProp(laAge, np.compress(latube, aperMass, axis=1)),
-                    bo=_MWProp(boAge, np.compress(boxess, aperMass, axis=1))),
-                    metal=dict(sa=_MWProp(saMetal, np.compress(satube, aperMass, axis=1)),
-                    la=_MWProp(laMetal, np.compress(latube, aperMass, axis=1)),
-                    bo=_MWProp(boMetal, np.compress(boxess, aperMass, axis=1))),
-                    alpha=dict(sa=_MWProp(saAlpha, np.compress(satube, aperMass, axis=1)),
-                    la=_MWProp(laAlpha, np.compress(latube, aperMass, axis=1)),
-                    bo=_MWProp(boAlpha, np.compress(boxess, aperMass, axis=1))),)
+                maps = dict(
+                    age=dict(
+                        sa=_MWProp(saAge, np.compress(satube, aperMass, axis=1)),
+                        la=_MWProp(laAge, np.compress(latube, aperMass, axis=1)),
+                        bo=_MWProp(boAge, np.compress(boxess, aperMass, axis=1))
+                    ),
+                    metal=dict(
+                        sa=_MWProp(saMetal, np.compress(satube, aperMass,
+                            axis=1)),
+                        la=_MWProp(laMetal, np.compress(latube, aperMass,
+                            axis=1)),
+                        bo=_MWProp(boMetal, np.compress(boxess, aperMass,
+                            axis=1))
+                    ),
+                    alpha=dict(
+                        sa=_MWProp(saAlpha, np.compress(satube, aperMass,
+                            axis=1)),
+                        la=_MWProp(laAlpha, np.compress(latube, aperMass,
+                            axis=1)),
+                        bo=_MWProp(boAlpha, np.compress(boxess, aperMass,
+                        axis=1))
+                    )
+                )
                 
                 orbKeys = ['sa', 'la']
                 orbSpecs = [r'$z$ Tubes', r'$x$ Tubes']
-                amin = np.min([np.nanmin(maps['age'][otype]) for otype in orbKeys])
-                amax = np.max([np.nanmax(maps['age'][otype]) for otype in orbKeys])
-                mmin = np.min([np.nanmin(maps['metal'][otype]) for otype in orbKeys])
-                mmax = np.max([np.nanmax(maps['metal'][otype]) for otype in orbKeys])
-                lmin = np.min([np.nanmin(maps['alpha'][otype]) for otype in orbKeys])
-                lmax = np.max([np.nanmax(maps['alpha'][otype]) for otype in orbKeys])
+                amin = np.min([np.nanmin(maps['age'][otype]) for otype in
+                    orbKeys])
+                amax = np.max([np.nanmax(maps['age'][otype]) for otype in
+                    orbKeys])
+                mmin = np.min([np.nanmin(maps['metal'][otype]) for otype in
+                    orbKeys])
+                mmax = np.max([np.nanmax(maps['metal'][otype]) for otype in
+                    orbKeys])
+                lmin = np.min([np.nanmin(maps['alpha'][otype]) for otype in
+                    orbKeys])
+                lmax = np.max([np.nanmax(maps['alpha'][otype]) for otype in
+                    orbKeys])
                 print(f"Age map limits: {amin:.2f} to {amax:.2f}")
                 print(f"Metal map limits: {mmin:.2f} to {mmax:.2f}")
                 print(f"Alpha map limits: {lmin:.2f} to {lmax:.2f}")
@@ -3322,15 +3318,15 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
                 for ri, (prop, label, vmin, vmax) in enumerate(propSpecs):
                     mappable = None
-                    for oi, (orb_key, otype) in enumerate(zip(orbKeys, orbSpecs)):
+                    for oi, (orb_key, otype) in enumerate(zip(orbKeys,
+                        orbSpecs)):
                         ax = fig.add_subplot(gs[ri, oi])
                         arr = maps[prop][orb_key]
                         arr = np.ma.masked_invalid(arr)[binNum]
                         # vmin = np.ma.min(arr) if np.ma.any(arr) else vmin
                         # vmax = np.ma.max(arr) if np.ma.any(arr) else vmax
-                        mappable = dbi(xpix, ypix, arr,
-                            pixelsize=pixs, angle=PA,
-                            cmap=moncmap, vmin=vmin, vmax=vmax,)
+                        mappable = dbi(xpix, ypix, arr, pixelsize=pixs, angle=PA,
+                            cmap=moncmap, vmin=vmin, vmax=vmax)
                         ax.set_xlim(xmin, xmax)
                         ax.set_ylim(ymin, ymax)
                         pren = 1
@@ -3351,22 +3347,22 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                                 va="bottom", ha="left", color=POT.pgreen,
                                 transform=ax.transAxes,
                                 path_effects=[PathEffects.withStroke(
-                                        linewidth=1.5, foreground="k")],)
+                                linewidth=1.5, foreground="k")],)
                         if ax.get_subplotspec().is_last_col():
                             cax = POT.attachAxis(ax, "right", 0.1)
-                            cb = plt.colorbar(mappable, cax=cax, orientation="vertical")
-                            lT = cax.text(
-                                0.5, 0.5, label, va="center", ha="center",
-                                color=POT.pgreen, transform=cax.transAxes,
-                                rotation=270, path_effects=[
-                                    PathEffects.withStroke(
+                            cb = plt.colorbar(mappable, cax=cax,
+                                orientation="vertical")
+                            lT = cax.text(0.5, 0.5, label, va="center",
+                                ha="center", color=POT.pgreen,
+                                transform=cax.transAxes, rotation=270,
+                                path_effects=[PathEffects.withStroke(
                                     linewidth=1.5, foreground="k")])
-                            cax.text(0.45, 5e-3, miText,
-                                va="bottom", ha="center", color="w",
-                                transform=cax.transAxes, rotation=270,)
-                            cax.text(0.45, 1.0 - 5e-3, maText,
-                                va="top", ha="center", color="k",
-                                transform=cax.transAxes, rotation=270,)
+                            cax.text(0.45, 5e-3, miText, va="bottom",
+                                ha="center", color="w", transform=cax.transAxes,
+                                rotation=270,)
+                            cax.text(0.45, 1.0 - 5e-3, maText, va="top",
+                                ha="center", color="k", transform=cax.transAxes,
+                                rotation=270,)
                             cb.set_ticks([])
 
                 BIG = fig.add_subplot(gs[:])

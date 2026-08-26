@@ -262,6 +262,10 @@ def _worker_ATAz(
     partial : ndarray, shape (C * P,)
         Contribution of this worker to A^T A (S z).
     """
+    t_read = 0.0
+    t_forward = 0.0
+    t_transpose = 0.0
+
     z = np.asarray(z, dtype=np.float64).ravel(order="C")
     S_flat = np.asarray(S_flat, dtype=np.float64).ravel(order="C")
 
@@ -286,73 +290,58 @@ def _worker_ATAz(
     with open_h5(h5_path, role="reader") as f:
         M = f["/HyperCube/models"]
 
-        for (s0, s1) in batch:
+        if int(M.shape[2]) != P:
+            raise RuntimeError(
+                f"Model population dimension {M.shape[2]} != expected P={P}.")
+
+        Lk = int(keep_idx.size) if keep_idx is not None else int(M.shape[3])
+
+        for s0, s1 in batch:
             Sblk = s1 - s0
 
-            # Read one orbit slice to determine the wavelength length after mask.
-            sample = np.asarray(
-                M[s0:s1, 0, :, :],
-                dtype=np.float64,
-                order="C",
-            )
-            if keep_idx is not None:
-                sample = sample[:, :, keep_idx]
-            if sample.ndim != 3:
-                raise RuntimeError(
-                    "Unexpected model slice shape while inferring Lk."
-                )
-
-            _, Pm, Lk = sample.shape
-            if Pm != P:
-                raise RuntimeError(
-                    f"Model population dimension {Pm} != expected P={P}."
-                )
-
-            # First pass: exact v = A @ (S z), but one orbit slice at a time.
+            # First pass: exact v = A @ (S z), one orbit slice at a time.
             v = np.zeros((Sblk, Lk), dtype=np.float64)
 
             for cc in range(C):
-                M_cc = np.asarray(
-                    M[s0:s1, cc, :, :],
-                    dtype=np.float64,
-                    order="C",
-                )
+                t0 = time.perf_counter()
+                M_cc = M[s0:s1, cc, :, :][...]
                 if keep_idx is not None:
                     M_cc = M_cc[:, :, keep_idx]
+                M_cc = np.asarray(M_cc, dtype=np.float64, order="C")
+                t_read += time.perf_counter() - t0
 
                 # M_cc has shape (Sblk, P, Lk)
                 # z_cp[cc] has shape (P,)
                 # result has shape (Sblk, Lk)
-                v += np.tensordot(
-                    z_cp[cc],
-                    M_cc,
-                    axes=(0, 1),
-                )
+                t0 = time.perf_counter()
+                v += np.tensordot(z_cp[cc], M_cc, axes=(0, 1))
+                t_forward += time.perf_counter() - t0
+                del M_cc
 
             # Second pass: exact g = A^T @ v, again orbit slice by orbit slice.
             for cc in range(C):
-                M_cc = np.asarray(
-                    M[s0:s1, cc, :, :],
-                    dtype=np.float64,
-                    order="C",
-                )
+                t0 = time.perf_counter()
+                M_cc = M[s0:s1, cc, :, :][...]
                 if keep_idx is not None:
                     M_cc = M_cc[:, :, keep_idx]
+                M_cc = np.asarray(M_cc, dtype=np.float64, order="C")
+                t_read += time.perf_counter() - t0
 
                 # M_cc: (Sblk, P, Lk)
                 # v   : (Sblk, Lk)
                 # g_cc: (P,)
-                g_cc = np.tensordot(
-                    M_cc,
-                    v,
-                    axes=([0, 2], [0, 1]),
-                )
+                t0 = time.perf_counter()
+                g_cc = np.tensordot(M_cc, v, axes=([0, 2], [0, 1]))
+                t_transpose += time.perf_counter() - t0
+                del M_cc
 
                 base = cc * P
-                partial[base:base + P] += (
-                    S_flat[base:base + P] * g_cc
-                )
+                partial[base:base + P] += (S_flat[base:base + P] * g_cc)
 
+    print(
+        f"[ATAz worker {os.getpid()}] read={t_read:.1f}s "
+        f"forward={t_forward:.1f}s transpose={t_transpose:.1f}s",
+        flush=True)
     return partial
 
 # ------------------------------------------------------------------------------
@@ -3821,7 +3810,7 @@ def solve_streaming_nnls(
         print("[BC-FUSED][after-blocks] diag error:", _e, flush=True)
     # --- end after-blocks diagnostics ---
 
-    # -------------------- epoch diagnostics & best-x --------------------
+    # -------------------- final diagnostics & best-x --------------------
     # Compute simple RMSE proxy (full scan cheap relative to earlier streaming)
     rmse_curr = float("nan")
     ssq = 0.0

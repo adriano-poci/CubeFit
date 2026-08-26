@@ -421,6 +421,120 @@ def plot_model_decomposition(
 
 # ------------------------------------------------------------------------------
 
+def _fmt_compact(x, _pos=None):
+    """
+    Compact tick formatter for ordinary linear axes.
+    """
+    if not np.isfinite(x):
+        return ""
+    if abs(x) < 1e-12:
+        return "0"
+    if abs(x - round(x)) < 1e-8:
+        return f"{int(round(x))}"
+    ax = abs(x)
+    if ax >= 1e4 or ax < 1e-3:
+        return f"{x:.1e}".replace("e+0", "e+").replace("e-0", "e-")
+    return f"{x:.3g}"
+
+def _homogenise_ticks_bak(ax, *, nbins: int = 4) -> None:
+    """
+    Apply a consistent major-tick policy to an axis y-coordinate.
+
+    Logarithmic axes retain logarithmic locators and formatters. Linear
+    axes use a compact numeric formatter. The x-axis is deliberately
+    untouched because dashboard panels share iteration coordinates and
+    may have ``twinx`` axes.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axis whose y ticks are formatted.
+    nbins : int, optional
+        Approximate maximum number of major y ticks.
+
+    Returns
+    -------
+    None
+        The axis is modified in place.
+
+    Raises
+    ------
+    TypeError
+        If ``nbins`` cannot be converted to an integer.
+
+    Examples
+    --------
+    >>> fig, ax = plt.subplots()
+    >>> ax.plot([1, 2, 3], [1, 2, 3])
+    >>> _homogenise_ticks(ax)
+
+    >>> fig, ax = plt.subplots()
+    >>> ax.semilogy([1, 2, 3], [1e-8, 1e-6, 1e-4])
+    >>> _homogenise_ticks(ax)
+    """
+    nbins = int(nbins)
+
+    if ax.get_yscale() == "log":
+        ax.yaxis.set_major_locator(mticker.LogLocator(base=10.0, numticks=nbins))
+        ax.yaxis.set_major_formatter(mticker.LogFormatterMathtext(base=10.0))
+        ax.yaxis.set_minor_locator(mticker.LogLocator(base=10.0,
+            subs=np.arange(2, 10) * 0.1, numticks=100))
+        ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+    else:
+        ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=nbins))
+        formatter = mticker.ScalarFormatter(useOffset=True, useMathText=True)
+        formatter.set_powerlimits((-3, 4))
+        ax.yaxis.set_major_formatter(formatter)
+
+    ax.tick_params(axis="y", which="major", labelsize=9)
+
+def _homogenise_ticks(ax, *, nbins: int = 4) -> None:
+    """
+    Apply consistent, compact y-axis tick formatting.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axis whose y ticks are formatted.
+    nbins : int, optional
+        Approximate maximum number of major y ticks.
+
+    Returns
+    -------
+    None
+        The axis is modified in place.
+
+    Raises
+    ------
+    TypeError
+        If ``nbins`` cannot be converted to an integer.
+
+    Examples
+    --------
+    >>> fig, ax = plt.subplots()
+    >>> _homogenise_ticks(ax)
+    """
+    nbins = int(nbins)
+
+    if ax.get_yscale() == "log":
+        ax.yaxis.set_major_locator(
+            mticker.LogLocator(base=10.0, numticks=nbins))
+        ax.yaxis.set_major_formatter(
+            mticker.LogFormatterMathtext(base=10.0))
+        ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+    else:
+        formatter = mticker.ScalarFormatter(useMathText=True)
+        formatter.set_scientific(True)
+        formatter.set_powerlimits((-3, 3))
+        formatter.set_useOffset(True)
+
+        ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=nbins))
+        ax.yaxis.set_major_formatter(formatter)
+
+    ax.tick_params(axis="y", which="major", labelsize=9)
+
+# ------------------------------------------------------------------------------
+
 def plot_diagnostic_jsonl_dashboard(
     jsonl_path: str,
     *,
@@ -558,10 +672,7 @@ def plot_diagnostic_jsonl_dashboard(
                 continue
 
             try:
-                array = np.asarray(
-                    value,
-                    dtype=np.float64,
-                ).ravel(order="C")
+                array = np.asarray(value, dtype=np.float64).ravel(order="C")
             except (TypeError, ValueError):
                 continue
 
@@ -592,12 +703,8 @@ def plot_diagnostic_jsonl_dashboard(
                     non_iteration[kind] = dict(record)
                 continue
 
-            current = merged_by_iter.setdefault(
-                iteration,
-                {
-                    "iter": iteration,
-                },
-            )
+            current = merged_by_iter.setdefault(iteration,
+                {"iter": iteration})
 
             current.update(record)
 
@@ -621,30 +728,13 @@ def plot_diagnostic_jsonl_dashboard(
         *keys: str,
         default: float = np.nan,
     ) -> np.ndarray:
-        return np.asarray(
-            [
-                _finite_scalar(
-                    record,
-                    *keys,
-                    default=default,
-                )
-                for record in merged
-            ],
-            dtype=np.float64,
-        )
+        return np.asarray([_finite_scalar(record, *keys, default=default)
+                for record in merged], dtype=np.float64)
 
-    def _plot_finite(
-        axis,
-        x_values: np.ndarray,
-        y_values: np.ndarray,
-        label: str,
-        *,
-        absolute: bool = False,
-        positive_log: bool = False,
-        color: str | None = None,
-        linestyle: str | None = None,
-        **kwargs,
-    ) -> None:
+    def _plot_finite(axis, x_values: np.ndarray, y_values: np.ndarray,
+        label: str, *, absolute: bool = False, positive_log: bool = False,
+        color: str | None = None, linestyle: str | None = None, **kwargs
+        ) -> None:
         x_array = np.asarray(x_values, dtype=np.float64)
         y_array = np.asarray(y_values, dtype=np.float64)
 
@@ -663,33 +753,15 @@ def plot_diagnostic_jsonl_dashboard(
             if not np.any(positive):
                 return
 
-            axis.semilogy(
-                x_plot[positive],
-                np.maximum(y_plot[positive], eps),
-                label=label,
-                color=color,
-                linestyle=linestyle,
-                **kwargs,
-            )
+            axis.semilogy(x_plot[positive], np.maximum(y_plot[positive], eps),
+                label=label, color=color, linestyle=linestyle, **kwargs)
         else:
-            axis.plot(
-                x_plot,
-                y_plot,
-                label=label,
-                color=color,
-                linestyle=linestyle,
-                **kwargs,
-            )
+            axis.plot(x_plot, y_plot, label=label, color=color,
+                linestyle=linestyle, **kwargs)
 
-    def _latest_vector(
-        merged: list[dict],
-        *keys: str,
-    ) -> np.ndarray | None:
+    def _latest_vector(merged: list[dict], *keys: str) -> np.ndarray | None:
         for record in reversed(merged):
-            value = _vector(
-                record,
-                *keys,
-            )
+            value = _vector(record, *keys)
 
             if value is not None:
                 return value
@@ -697,20 +769,10 @@ def plot_diagnostic_jsonl_dashboard(
         return None
 
     raw_records = _load_records()
-    merged, non_iteration = _merge_iteration_records(
-        raw_records
-    )
+    merged, non_iteration = _merge_iteration_records(raw_records)
 
-    fig = plt.figure(
-        figsize=figsize,
-    )
-    grid = gridspec.GridSpec(
-        3,
-        3,
-        figure=fig,
-        hspace=0.36,
-        wspace=0.30,
-    )
+    fig = plt.figure(figsize=figsize,)
+    grid = gridspec.GridSpec(3, 3, figure=fig, hspace=0.25, wspace=0.35)
 
     axes = {
         "objective": fig.add_subplot(grid[0, 0]),
@@ -729,107 +791,42 @@ def plot_diagnostic_jsonl_dashboard(
             axis.set_axis_off()
 
         axes["objective"].set_axis_on()
-        axes["objective"].text(
-            0.5,
-            0.5,
-            "No iteration diagnostics found",
-            ha="center",
-            va="center",
-            transform=axes["objective"].transAxes,
-        )
+        axes["objective"].text(0.5, 0.5,
+            "No iteration diagnostics found", ha="center", va="center",
+            transform=axes["objective"].transAxes)
 
         if save_path:
-            fig.savefig(
-                save_path,
-                dpi=150,
-                bbox_inches="tight",
-            )
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
         if show:
             plt.show()
 
         return fig, axes, raw_records
 
-    iterations = np.asarray(
-        [
-            int(record["iter"])
-            for record in merged
-        ],
-        dtype=np.int64,
-    )
+    iterations = np.asarray([int(record["iter"]) for record in merged],
+        dtype=np.int64)
 
     # ------------------------------------------------------------------
     # Extract primary scalar histories
     # ------------------------------------------------------------------
-    data_objective = _series(
-        merged,
-        "data_objective",
-    )
-    obj_old = _series(
-        merged,
-        "obj_old",
-    )
-    obj_new = _series(
-        merged,
-        "obj_new",
-    )
-    obj_gain = _series(
-        merged,
-        "obj_gain",
-    )
+    data_objective = _series(merged, "data_objective")
+    obj_old = _series(merged, "obj_old")
+    obj_new = _series(merged, "obj_new")
+    obj_gain = _series(merged, "obj_gain")
 
-    alpha = _series(
-        merged,
-        "alpha",
-    )
-    norm_old = _series(
-        merged,
-        "norm_old",
-    )
-    norm_new = _series(
-        merged,
-        "norm_new",
-    )
+    alpha = _series(merged, "alpha")
+    norm_old = _series(merged, "norm_old")
+    norm_new = _series(merged, "norm_new")
 
-    grad_total = _series(
-        merged,
-        "max_grad_total",
-    )
-    grad_data = _series(
-        merged,
-        "max_grad_data",
-    )
-    grad_orbit = _series(
-        merged,
-        "max_grad_orbit",
-    )
-    grad_promo = _series(
-        merged,
-        "max_grad_promotable",
-        "max_grad_promo",
-    )
+    grad_total = _series(merged, "max_grad_total")
+    grad_data = _series(merged, "max_grad_data")
+    grad_orbit = _series(merged, "max_grad_orbit")
+    grad_promo = _series(merged, "max_grad_promotable", "max_grad_promo")
 
-    n_active = _series(
-        merged,
-        "n_active",
-        "k_active",
-        "active",
-    )
-    n_promoted = _series(
-        merged,
-        "n_promoted",
-        default=0.0,
-    )
-    n_failed = _series(
-        merged,
-        "n_failed",
-        default=0.0,
-    )
-    n_dropped = _series(
-        merged,
-        "n_dropped",
-        default=0.0,
-    )
+    n_active = _series(merged, "n_active", "k_active", "active")
+    n_promoted = _series(merged, "n_promoted", default=0.0,)
+    n_failed = _series(merged, "n_failed", default=0.0)
+    n_dropped = _series(merged, "n_dropped", default=0.0)
 
     constraint_l1 = _series(
         merged,
@@ -1048,448 +1045,211 @@ def plot_diagnostic_jsonl_dashboard(
     # ------------------------------------------------------------------
     axis = axes["objective"]
 
-    _plot_finite(
-        axis,
-        iterations,
-        data_objective,
-        "Global data objective",
-        lw=1.6, color="tab:blue"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        obj_new,
-        "Reduced objective",
-        lw=1.0, color="tab:orange",
-        alpha=0.75,
-    )
-
-    axis.set_title(
-        "Data-fit objective"
-    )
-    axis.set_xlabel(
-        "Iteration"
-    )
-    axis.set_ylabel(
-        "Objective"
-    )
+    _plot_finite(axis, iterations, data_objective,
+        "Global data objective", lw=1.6, color="tab:blue")
+    _plot_finite(axis, iterations, obj_new,
+        "Reduced objective", lw=1.0, color="tab:orange", alpha=0.75,)
+    axis.set_title("Data-fit objective")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel("Objective")
 
     objective_for_gain = data_objective.copy()
 
     if not np.any(np.isfinite(objective_for_gain)):
         objective_for_gain = obj_new.copy()
 
-    relative_gain = np.full_like(
-        objective_for_gain,
-        np.nan,
-    )
+    relative_gain = np.full_like(objective_for_gain, np.nan)
 
-    for index in range(
-        1,
-        objective_for_gain.size,
-    ):
+    for index in range(1, objective_for_gain.size):
         previous = objective_for_gain[index - 1]
         current = objective_for_gain[index]
 
-        if (
-            np.isfinite(previous)
-            and np.isfinite(current)
-        ):
-            relative_gain[index] = (
-                previous - current
-            ) / max(
-                1.0,
-                abs(previous),
-            )
+        if (np.isfinite(previous) and np.isfinite(current)):
+            relative_gain[index] = (previous - current) /\
+                max(1.0, abs(previous))
 
     objective_axis_right = axis.twinx()
 
-    _plot_finite(
-        objective_axis_right,
-        iterations,
-        relative_gain,
-        "Relative gain",
-        absolute=True,
-        positive_log=True,
-        lw=1.0, color="tab:green",
-        alpha=0.65,
-    )
+    _plot_finite(objective_axis_right, iterations, relative_gain,
+        "Relative gain", absolute=True, positive_log=True, lw=1.0,
+        color="tab:green", alpha=0.65)
 
-    objective_axis_right.yaxis.set_major_locator(
-        mticker.LogLocator(base=10, numticks=4)
-    )
-    objective_axis_right.yaxis.set_major_formatter(
-        mticker.LogFormatterExponent(base=10)
-    )
-    objective_axis_right.tick_params(
-        axis="y",
-        colors="tab:green",
-        labelsize=8,
-        pad=2,
-    )
+    # objective_axis_right.yaxis.set_major_locator(
+    #     mticker.LogLocator(base=10, numticks=4))
+    # objective_axis_right.yaxis.set_major_formatter(
+    #     mticker.LogFormatterExponent(base=10))
+    objective_axis_right.tick_params(axis="y", colors="tab:green",
+        labelsize=8, pad=2,)
     objective_axis_right.spines["right"].set_color("tab:green")
-    objective_axis_right.set_ylabel(
-        r"$\log_{10}|\text{Relative improvement}|$", color="tab:green"
-    )
+    objective_axis_right.set_ylabel(r"$|\mathrm{Relative\ improvement}|$",
+        color="tab:green")
+
+    _homogenise_ticks(axis)
+    _homogenise_ticks(objective_axis_right)
 
     handles_left, labels_left = axis.get_legend_handles_labels()
     handles_right, labels_right = objective_axis_right.get_legend_handles_labels()
 
     if handles_left or handles_right:
-        axis.legend(
-            handles_left + handles_right,
+        axis.legend(handles_left + handles_right,
             labels_left + labels_right,
-            fontsize=8,
-            loc="best",
-        )
+            fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 2: physical solution-vector evolution
     # ------------------------------------------------------------------
     axis = axes["amplitude"]
 
-    _plot_finite(
-        axis,
-        iterations,
-        x_norm,
-        r"$||x||_2$",
-        positive_log=True,
-        lw=1.5,
-        color="tab:blue",
-    )
+    _plot_finite(axis, iterations, x_norm,
+        r"$||x||_2$", lw=1.5, color="tab:blue")
 
-    _plot_finite(
-        axis,
-        iterations,
-        x_rel_step,
-        r"$||\Delta x||_2 / ||x||_2$",
-        positive_log=True,
-        lw=1.3,
-        color="tab:orange",
-    )
+    axis.set_title("Physical solution-vector evolution")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel(r"$||x||_2$", color="tab:blue")
+    axis.tick_params(axis="y", colors="tab:blue")
+    axis.spines["left"].set_color("tab:blue")
 
-    axis.set_title(
-        "Physical solution-vector evolution"
-    )
-    axis.set_xlabel(
-        "Iteration"
-    )
-    axis.set_ylabel(
-        "Norm / relative change"
-    )
+    step_axis = axis.twinx()
 
-    x_support_axis = axis.twinx()
+    _plot_finite(step_axis, iterations, x_rel_step,
+        r"$||\Delta x||_2/||x||_2$", positive_log=True, lw=1.3, 
+        color="tab:orange")
 
-    _plot_finite(
-        x_support_axis,
-        iterations,
-        x_eff_support,
-        "Effective support",
-        lw=1.2,
-        color="tab:green",
-    )
+    step_axis.set_ylabel(r"$||\Delta x||_2/||x||_2$", color="tab:orange")
+    step_axis.tick_params(axis="y", colors="tab:orange")
+    step_axis.spines["right"].set_color("tab:orange")
 
-    x_support_axis.tick_params(
-        axis="y",
-        colors="tab:green",
-    )
-    x_support_axis.spines[
-        "right"
-    ].set_color("tab:green")
-    x_support_axis.set_ylabel(
-        "Effective support",
-        color="tab:green",
-    )
+    _homogenise_ticks(axis)
+    _homogenise_ticks(step_axis)
 
-    handles_left, labels_left = (
-        axis.get_legend_handles_labels()
-    )
-    handles_right, labels_right = (
-        x_support_axis.get_legend_handles_labels()
-    )
-
+    handles_left, labels_left = axis.get_legend_handles_labels()
+    handles_right, labels_right = step_axis.get_legend_handles_labels()
     if handles_left or handles_right:
-        axis.legend(
-            handles_left + handles_right,
+        axis.legend(handles_left + handles_right,
             labels_left + labels_right,
-            fontsize=8,
-            loc="best",
-        )
+            fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 3: reduced-gradient optimality
     # ------------------------------------------------------------------
     axis = axes["gradients"]
 
-    _plot_finite(
-        axis,
-        iterations,
-        grad_data,
-        "Raw data gradient",
-        absolute=True,
-        positive_log=True,
-        lw=1.2, color="tab:blue"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        grad_orbit,
-        "Constraint correction",
-        absolute=True,
-        positive_log=True,
-        lw=1.2, color="tab:orange"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        grad_total,
-        "Constrained reduced gradient",
-        absolute=True,
-        positive_log=True,
-        lw=1.6, color="tab:green"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        grad_promo,
-        "Promotable reduced gradient",
-        absolute=True,
-        positive_log=True,
-        lw=1.1, color="tab:red",
-        alpha=0.85,
-    )
+    _plot_finite(axis, iterations, grad_data,
+        "Raw data gradient", absolute=True, positive_log=True, lw=1.2,
+        color="tab:blue")
+    _plot_finite(axis, iterations, grad_orbit,
+        "Constraint correction", absolute=True, positive_log=True, lw=1.2,
+        color="tab:orange")
+    _plot_finite(axis, iterations, grad_total,
+        "Constrained reduced gradient", absolute=True, positive_log=True, lw=1.6,
+        color="tab:green")
+    _plot_finite(axis, iterations, grad_promo,
+        "Promotable reduced gradient", absolute=True, positive_log=True, lw=1.1,
+        color="tab:red", alpha=0.85)
 
-    axis.set_title(
-        "Constrained optimality"
-    )
-    axis.set_xlabel(
-        "Iteration"
-    )
-    axis.set_ylabel(
-        "Absolute gradient"
-    )
-    axis.legend(
-        fontsize=8,
-        loc="best",
-    )
+    axis.set_title("Constrained optimality")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel("Absolute gradient")
+    _homogenise_ticks(axis)
+    axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 4: active and effective support
     # ------------------------------------------------------------------
     axis = axes["support"]
 
-    _plot_finite(
-        axis,
-        iterations,
-        n_active,
-        "Active columns",
-        lw=1.6, color="tab:blue"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        mean_orbit_nz,
-        "Mean nonzero/orbit",
-        lw=1.2, color="tab:orange"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        mean_eff_support,
-        "Mean effective support",
-        lw=1.2, color="tab:green"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        x_nnz,
-        "nnz(x)",
-        lw=1.2,
-        color="tab:purple",
-        alpha=0.85,
-    )
+    _plot_finite(axis, iterations, n_active,
+        "Active columns", lw=1.6, color="tab:blue")
+    _plot_finite(axis, iterations, mean_orbit_nz,
+        "Mean nonzero/orbit", lw=1.2, color="tab:orange")
+    _plot_finite(axis, iterations, mean_eff_support,
+        "Mean effective support", lw=1.2, color="tab:green")
+    _plot_finite(axis, iterations, x_nnz,
+        "nnz(x)", lw=1.2, color="tab:purple", alpha=0.85)
 
-    axis.set_title(
-        "Support size and diversity"
-    )
-    axis.set_xlabel(
-        "Iteration"
-    )
-    axis.set_ylabel(
-        "Count"
-    )
+    axis.set_title("Support size and diversity")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel("Count")
+    _homogenise_ticks(axis)
 
     share_axis = axis.twinx()
 
-    _plot_finite(
-        share_axis,
-        iterations,
-        max_top_share,
-        "Largest orbit top-share",
-        lw=1.0, color="tab:red",
-        alpha=0.70,
-    )
-    _plot_finite(
-        share_axis,
-        iterations,
-        x_top_share,
-        "max(x) / sum(x)",
-        lw=1.2,
-        color="tab:brown",
-        alpha=0.85,
-    )
+    _plot_finite(share_axis, iterations, max_top_share,
+        "Largest orbit top-share", lw=1.0, color="tab:red", alpha=0.70)
+    _plot_finite(share_axis, iterations, x_top_share,
+        "max(x) / sum(x)", lw=1.2, color="tab:brown", alpha=0.85)
 
-    share_axis.set_ylim(
-        0.0,
-        1.05,
-    )
+    share_axis.set_ylim(0.0, 1.05)
     share_axis.tick_params(axis="y", colors="tab:red")
     share_axis.spines["right"].set_color("tab:red")
-    share_axis.set_ylabel(
-        "Maximum top-share", color="tab:red"
-    )
+    share_axis.set_ylabel("Maximum top-share", color="tab:red")
+    _homogenise_ticks(share_axis)
 
     handles_left, labels_left = axis.get_legend_handles_labels()
     handles_right, labels_right = share_axis.get_legend_handles_labels()
 
     if handles_left or handles_right:
-        axis.legend(
-            handles_left + handles_right,
+        axis.legend(handles_left + handles_right,
             labels_left + labels_right,
-            fontsize=8,
-            loc="best",
-        )
+            fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 5: active-set churn
     # ------------------------------------------------------------------
     axis = axes["promotions"]
 
-    _plot_finite(
-        axis,
-        iterations,
-        n_promoted,
-        "Promoted",
-        lw=1.3, color="tab:blue"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        n_failed,
-        "Failed",
-        lw=1.3, color="tab:orange"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        n_dropped,
-        "Dropped",
-        lw=1.3, color="tab:green"
-    )
+    _plot_finite(axis, iterations, n_promoted,
+        "Promoted", lw=1.3, color="tab:blue")
+    _plot_finite(axis, iterations, n_failed,
+        "Failed", lw=1.3, color="tab:orange")
+    _plot_finite(axis, iterations, n_dropped,
+        "Dropped", lw=1.3, color="tab:green")
+    axis.set_title("Active-set churn")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel("Columns")
+    _homogenise_ticks(axis)
 
-    promotion_survival = np.divide(
-        n_promoted - n_failed,
-        n_promoted,
-        out=np.full_like(
-            n_promoted,
-            np.nan,
-        ),
-        where=n_promoted > 0.0,
-    )
+    promotion_survival = np.divide(n_promoted - n_failed, n_promoted,
+        out=np.full_like(n_promoted, np.nan),
+        where=n_promoted > 0.0)
 
     survival_axis = axis.twinx()
 
-    _plot_finite(
-        survival_axis,
-        iterations,
-        promotion_survival,
-        "Promotion survival",
-        lw=1.2, color="tab:red"
-    )
+    _plot_finite(survival_axis, iterations,promotion_survival,
+        "Promotion survival", lw=1.2, color="tab:red")
 
-    survival_axis.set_ylim(
-        -0.05,
-        1.05,
-    )
+    survival_axis.set_ylim(-0.05, 1.05)
     survival_axis.tick_params(axis="y", colors="tab:red")
     survival_axis.spines["right"].set_color("tab:red")
-    survival_axis.set_ylabel(
-        "Surviving fraction", color="tab:red"
-    )
-
-    axis.set_title(
-        "Active-set churn"
-    )
-    axis.set_xlabel(
-        "Iteration"
-    )
-    axis.set_ylabel(
-        "Columns"
-    )
+    survival_axis.set_ylabel("Surviving fraction", color="tab:red")
+    _homogenise_ticks(survival_axis)
 
     handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = (
-        survival_axis.get_legend_handles_labels()
-    )
+    handles_right, labels_right = survival_axis.get_legend_handles_labels()
 
-    axis.legend(
-        handles_left + handles_right,
+    axis.legend(handles_left + handles_right,
         labels_left + labels_right,
-        fontsize=8,
-        loc="best",
-    )
+        fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 6: exact hard-constraint diagnostics
     # ------------------------------------------------------------------
     axis = axes["constraints"]
 
-    _plot_finite(
-        axis,
-        iterations,
-        constraint_l1,
-        "Orbit residual L1",
-        absolute=True,
-        positive_log=True,
-        lw=1.3, color="tab:blue"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        constraint_linf,
-        "Orbit residual Linf",
-        absolute=True,
-        positive_log=True,
-        lw=1.3, color="tab:orange"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        alpha_stationarity,
-        "|shape dot lambda|",
-        absolute=True,
-        positive_log=True,
-        lw=1.3, color="tab:green"
-    )
-    axis.yaxis.set_major_locator(
-        mticker.LogLocator(base=10, numticks=3)
-    )
-    axis.yaxis.set_major_formatter(
-        mticker.LogFormatterExponent(base=10)
-    )
-    axis.set_title(
-        "Hard-prior feasibility"
-    )
-    axis.set_xlabel(
-        "Iteration"
-    )
-    axis.set_ylabel(
-        "Absolute residual"
-    )
-    axis.legend(
-        fontsize=8,
-        loc="best",
-    )
+    _plot_finite(axis, iterations, constraint_l1,
+        "Orbit residual L1", absolute=True, positive_log=True, lw=1.3,
+        color="tab:blue")
+    _plot_finite(axis, iterations, constraint_linf,
+        "Orbit residual Linf", absolute=True, positive_log=True, lw=1.3,
+        color="tab:orange")
+    _plot_finite(axis, iterations, alpha_stationarity,
+        "|shape dot lambda|", absolute=True, positive_log=True, lw=1.3,
+        color="tab:green")
+    axis.set_title("Hard-prior feasibility")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel("Absolute residual")
+    _homogenise_ticks(axis)
+    axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 7: orbit-ratio history
@@ -1497,383 +1257,170 @@ def plot_diagnostic_jsonl_dashboard(
     axis = axes["orbit_history"]
 
     if orbit_ratio_rows:
-        ratio_history = np.asarray(
-            orbit_ratio_rows,
-            dtype=np.float64,
-        )
-        ratio_iterations = np.asarray(
-            orbit_ratio_iters,
-            dtype=np.float64,
-        )
+        ratio_history = np.asarray(orbit_ratio_rows, dtype=np.float64)
+        ratio_iterations = np.asarray(orbit_ratio_iters, dtype=np.float64)
 
-        log_ratio = np.log10(
-            np.maximum(
-                ratio_history,
-                eps,
-            )
-        )
+        log_ratio = np.log10(np.maximum(ratio_history, eps))
 
-        finite_log = log_ratio[
-            np.isfinite(log_ratio)
-        ]
+        finite_log = log_ratio[np.isfinite(log_ratio)]
 
         if finite_log.size > 0:
-            limit = float(
-                np.nanpercentile(
-                    np.abs(finite_log),
-                    99.0,
-                )
-            )
-            limit = max(
-                limit,
-                1e-12,
-            )
+            limit = float(np.nanpercentile(np.abs(finite_log), 99.0))
+            limit = max(limit, 1e-12)
         else:
             limit = 1.0
 
-        image = axis.imshow(
-            log_ratio.T,
-            origin="lower",
-            aspect="auto",
-            interpolation="nearest",
-            extent=[
-                float(ratio_iterations[0]),
-                float(ratio_iterations[-1]),
-                -0.5,
-                float(log_ratio.shape[1]) - 0.5,
-            ],
-            cmap="coolwarm",
-            vmin=-limit,
-            vmax=limit,
-        )
+        image = axis.imshow(log_ratio.T, origin="lower", aspect="auto",
+            interpolation="nearest", extent=[float(ratio_iterations[0]),
+                float(ratio_iterations[-1]), -0.5,
+                float(log_ratio.shape[1]) - 0.5,], cmap="coolwarm", vmin=-limit,
+            vmax=limit)
 
-        axis.set_title(
-            r"Orbit prior history: "
-            r"$\log_{10}(M_c/(\alpha w_c))$"
-        )
-        axis.set_xlabel(
-            "Iteration"
-        )
-        axis.set_ylabel(
-            "Orbit index"
-        )
+        axis.set_title(r"Orbit prior history: $\log_{10}(M_c/(\alpha w_c))$")
+        axis.set_xlabel("Iteration")
+        axis.set_ylabel("Orbit index")
 
-        colorbar = fig.colorbar(
-            image,
-            ax=axis,
-            fraction=0.046,
-            pad=0.04,
-        )
-        colorbar.set_label(
-            r"$\log_{10}(M_c/(\alpha w_c))$"
-        )
+        colorbar = fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+        colorbar.set_label(r"$\log_{10}(M_c/(\alpha w_c))$")
     else:
         axis.set_axis_off()
-        axis.text(
-            0.5,
-            0.5,
-            "No orbit-ratio history",
-            ha="center",
-            va="center",
-            transform=axis.transAxes,
-        )
+        axis.text(0.5, 0.5, "No orbit-ratio history", ha="center", va="center",
+            transform=axis.transAxes)
 
     # ------------------------------------------------------------------
     # Panel 8: final orbit comparison
     # ------------------------------------------------------------------
     axis = axes["orbit_final"]
 
-    final_mass = _latest_vector(
-        merged,
-        "orbit_mass",
-    )
-    final_target = _latest_vector(
-        merged,
-        "orbit_target",
-    )
-    final_resid = _latest_vector(
-        merged,
-        "orbit_resid",
-    )
-    final_shape = _latest_vector(
-        merged,
-        "orbit_shape",
-    )
+    final_mass = _latest_vector(merged, "orbit_mass")
+    final_target = _latest_vector(merged, "orbit_target")
+    final_resid = _latest_vector(merged, "orbit_resid")
+    final_shape = _latest_vector(merged, "orbit_shape")
 
     if final_mass is not None:
-        orbit_indices = np.arange(
-            final_mass.size,
-            dtype=np.int64,
-        )
+        orbit_indices = np.arange(final_mass.size, dtype=np.int64)
         width = 0.38
 
-        axis.bar(
-            orbit_indices - width / 2.0,
-            final_mass,
-            width=width,
-            label="Fitted mass",
-        )
+        axis.bar(orbit_indices - width / 2.0, final_mass, width=width,
+            label="Fitted mass")
 
-        if (
-            final_target is not None
-            and final_target.size == final_mass.size
-        ):
-            axis.bar(
-                orbit_indices + width / 2.0,
-                final_target,
-                width=width,
-                label=r"Target $\alpha w$",
-            )
+        if (final_target is not None and final_target.size == final_mass.size):
+            axis.bar(orbit_indices + width / 2.0, final_target, width=width,
+                label=r"Target $\alpha w$")
 
-        axis.set_xlabel(
-            "Orbit index"
-        )
-        axis.set_ylabel(
-            "Physical mass"
-        )
+        axis.set_xlabel("Orbit index")
+        axis.set_ylabel("Physical mass")
 
-        if (
-            final_resid is None
-            and final_target is not None
-            and final_target.size == final_mass.size
-        ):
-            final_resid = (
-                final_mass - final_target
-            )
+        if (final_resid is None and final_target is not None and
+            final_target.size == final_mass.size):
+            final_resid = final_mass - final_target
 
         relative_residual = None
 
-        if (
-            final_resid is not None
-            and final_resid.size == final_mass.size
+        if (final_resid is not None and final_resid.size == final_mass.size
             and final_target is not None
-            and final_target.size == final_mass.size
-        ):
-            relative_residual = np.divide(
-                final_resid,
-                final_target,
-                out=np.full_like(
-                    final_resid,
-                    np.nan,
-                ),
-                where=np.abs(final_target) > 0.0,
-            )
+            and final_target.size == final_mass.size):
+            relative_residual = np.divide(final_resid, final_target,
+                out=np.full_like(final_resid, np.nan),
+                where=np.abs(final_target) > 0.0)
 
             residual_axis = axis.twinx()
-            residual_axis.plot(
-                orbit_indices,
-                relative_residual,
-                marker=".",
-                lw=1.0, color="tab:red",
-                label="Relative residual",
-            )
-            residual_axis.axhline(
-                0.0,
-                lw=0.8, c='k',
-                alpha=0.65,
-            )
+            residual_axis.plot(orbit_indices, relative_residual, marker=".",
+                lw=1.0, color="tab:red", label="Relative residual")
+            residual_axis.axhline(0.0, lw=0.8, c='k', alpha=0.65)
             residual_axis.tick_params(axis="y", colors="tab:red")
             residual_axis.spines["right"].set_color("tab:red")
-            residual_axis.set_ylabel(
-                "Relative residual", color="tab:red"
-            )
+            residual_axis.set_ylabel("Relative residual", color="tab:red")
+            _homogenise_ticks(residual_axis)
 
-        absolute_l1 = (
-            float(np.sum(np.abs(final_resid)))
-            if final_resid is not None
-            else np.nan
-        )
-        absolute_linf = (
-            float(np.max(np.abs(final_resid)))
-            if final_resid is not None
-            else np.nan
-        )
+        absolute_l1 = (float(np.sum(np.abs(final_resid))) if final_resid is not
+            None else np.nan)
+        absolute_linf = (float(np.max(np.abs(final_resid))) if final_resid is not
+            None else np.nan)
 
-        final_alpha = alpha[
-            np.flatnonzero(np.isfinite(alpha))[-1]
-        ] if np.any(np.isfinite(alpha)) else np.nan
+        final_alpha = alpha[np.flatnonzero(np.isfinite(alpha))[-1]] if \
+            np.any(np.isfinite(alpha)) else np.nan
 
-        axis.set_title(
-            "Final hard-prior match\n"
-            f"alpha={final_alpha:.4e}, "
-            f"L1={absolute_l1:.3e}, "
-            f"Linf={absolute_linf:.3e}"
-        )
-        axis.legend(
-            fontsize=8,
-            loc="best",
-        )
+        axis.set_title(f"L1={absolute_l1:.3e}, Linf={absolute_linf:.3e}")
+        axis.legend(fontsize=8, loc="best")
     else:
         axis.set_axis_off()
-        axis.text(
-            0.5,
-            0.5,
-            "No final orbit masses",
-            ha="center",
-            va="center",
-            transform=axis.transAxes,
-        )
+        axis.text(0.5, 0.5, "No final orbit masses", ha="center", va="center",
+            transform=axis.transAxes)
 
     # ------------------------------------------------------------------
     # Panel 9: runtime and numerical conditioning
     # ------------------------------------------------------------------
     axis = axes["numerics"]
 
-    _plot_finite(
-        axis,
-        iterations,
-        iteration_time,
-        "Iteration time",
-        positive_log=True,
-        lw=1.4, color="tab:blue"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        ridge,
-        "Ridge",
-        positive_log=True,
-        lw=1.1, color="tab:orange"
-    )
-    _plot_finite(
-        axis,
-        iterations,
-        x_min,
-        "min(x)",
-        lw=1.2,
-        color="tab:red",
-        alpha=0.85,
-    )
+    _plot_finite(axis, iterations, iteration_time,
+        "Iteration time", positive_log=True, lw=1.4, color="tab:blue")
+    _plot_finite(axis, iterations, ridge,
+        "Ridge", positive_log=True, lw=1.1, color="tab:orange")
+    axis.set_title("Cost and reduced-system conditioning")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel("Seconds / ridge")
+    _homogenise_ticks(axis)
 
-    axis.axhline(
-        0.0,
-        lw=0.8,
-        color="black",
-        alpha=0.5,
-    )
-
-    condition_estimate = np.divide(
-        np.abs(eig_max),
-        np.maximum(
-            np.abs(eig_min),
-            eps,
-        ),
-        out=np.full_like(
-            eig_max,
-            np.nan,
-        ),
-        where=(
-            np.isfinite(eig_max)
-            & np.isfinite(eig_min)
-        ),
-    )
+    condition_estimate = np.divide(np.abs(eig_max),
+            np.maximum(np.abs(eig_min), eps),
+        out=np.full_like(eig_max, np.nan),
+        where=(np.isfinite(eig_max) & np.isfinite(eig_min)))
 
     condition_axis = axis.twinx()
 
-    _plot_finite(
-        condition_axis,
-        iterations,
-        condition_estimate,
-        "Condition estimate",
-        positive_log=True,
-        lw=1.2, color="tab:green"
-    )
+    _plot_finite(condition_axis, iterations, condition_estimate,
+        "Condition estimate", positive_log=True, lw=1.2, color="tab:green")
 
-    axis.set_title(
-        "Cost and reduced-system conditioning"
-    )
-    axis.set_xlabel(
-        "Iteration"
-    )
-    axis.set_ylabel(
-        "Seconds / ridge"
-    )
     condition_axis.tick_params(axis="y", colors="tab:green")
     condition_axis.spines["right"].set_color("tab:green")
-    condition_axis.set_ylabel(
-        "Condition estimate", color="tab:green"
-    )
+    condition_axis.set_ylabel("Condition estimate", color="tab:green")
+    _homogenise_ticks(condition_axis)
 
     handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = (
-        condition_axis.get_legend_handles_labels()
-    )
+    handles_right, labels_right = condition_axis.get_legend_handles_labels()
 
     if handles_left or handles_right:
-        axis.legend(
-            handles_left + handles_right,
+        axis.legend(handles_left + handles_right,
             labels_left + labels_right,
-            fontsize=8,
-            loc="best",
-        )
+            fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Figure-level summary
     # ------------------------------------------------------------------
-    final_record = non_iteration.get(
-        "objective_summary",
-        {},
-    )
+    final_record = non_iteration.get("objective_summary", {})
 
-    final_data_objective = _finite_scalar(
-        final_record,
-        "data_objective",
-    )
-    final_total_objective = _finite_scalar(
-        final_record,
-        "total_objective",
-    )
+    final_data_objective = _finite_scalar(final_record, "data_objective")
+    final_total_objective = _finite_scalar(final_record, "total_objective")
 
-    final_alpha_summary = _finite_scalar(
-        final_record,
-        "alpha",
-    )
+    final_alpha_summary = _finite_scalar(final_record, "alpha")
 
     if not np.isfinite(final_alpha_summary):
-        finite_alpha = alpha[
-            np.isfinite(alpha)
-        ]
-        final_alpha_summary = (
-            float(finite_alpha[-1])
-            if finite_alpha.size
-            else np.nan
-        )
+        finite_alpha = alpha[np.isfinite(alpha)]
+        final_alpha_summary = (float(finite_alpha[-1]) if finite_alpha.size
+            else np.nan)
 
-    title_parts = [
-        "CubeFit constrained streaming diagnostics",
-        f"iterations={iterations[0]}-{iterations[-1]}",
-    ]
+    title_parts = ["CubeFit constrained streaming diagnostics",
+        f"iterations={iterations[0]}-{iterations[-1]}"]
 
     if np.isfinite(final_alpha_summary):
-        title_parts.append(
-            f"alpha={final_alpha_summary:.6e}"
-        )
+        title_parts.append(f"alpha={final_alpha_summary:.6e}")
 
     if np.isfinite(final_data_objective):
-        title_parts.append(
-            f"data objective={final_data_objective:.6e}"
-        )
+        title_parts.append(f"data objective={final_data_objective:.6e}")
     elif np.isfinite(final_total_objective):
-        title_parts.append(
-            f"objective={final_total_objective:.6e}"
-        )
+        title_parts.append(f"objective={final_total_objective:.6e}")
 
-    fig.suptitle(
-        " | ".join(title_parts),
-        fontsize=14,
-        y=0.995,
-    )
-
-    fig.tight_layout(
-        rect=(0.0, 0.0, 1.0, 0.975),
-    )
+    for axis in axes.values():
+        if axis.axison:
+            axis.xaxis.set_major_locator(mticker.MaxNLocator(nbins=5,
+                integer=True))
+            axis.xaxis.set_major_formatter(mticker.FuncFormatter(_fmt_compact))
+            axis.tick_params(axis="x", which="major", labelsize=9)
+    fig.suptitle(" | ".join(title_parts), fontsize=12)
 
     if save_path:
-        fig.savefig(
-            save_path,
-            dpi=150,
-            bbox_inches="tight",
-        )
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
     if show:
         plt.show()

@@ -65,6 +65,7 @@ def _configure_solver_environment(args, propDict):
     os.environ["CUBEFIT_DIAG_LEVEL"] = str(2)
     os.environ["CUBEFIT_DIAG_STRIDE"] = str(1)
     os.environ["CUBEFIT_DIAG_TOPK"] = str(12)
+    os.environ["CUBEFIT_SOLVER_CHECKPOINT_EVERY"] = "1"
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.environ["CUBEFIT_DIAG_JSONL"] = str(

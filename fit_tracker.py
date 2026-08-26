@@ -27,11 +27,13 @@ v1.1:   Added `save_state` to `*Tracker` classes. 1 January 2026
 v1.2:   Added atomic sidecar checkpoint support and read-side loading for matched
             `x` + solver state, enabling full resumable restarts from one
             checkpoint path. 7 August 2026
+v1.3:   Removed all legacy checkpointing and tracking;
+        Always generate new sidecar filename. 26 August 2026
 """
 
 from __future__ import annotations
 import queue as _queue
-import os, time, math, json, multiprocessing as mp
+import os, time, json, multiprocessing as mp
 from multiprocessing.queues import Queue as MPQueue  # put near other imports
 from dataclasses import dataclass
 from typing import Optional
@@ -49,17 +51,13 @@ logger = get_logger()
 
 @dataclass
 class TrackerConfig:
-    ring_size: int = 96
-    metrics_interval_sec: float = 300.0
-    diag_seed: int = 12345
+    queue_size: int = 128
 
 # ------------------------------ writer proc -----------------------------------
 
 def _writer_main(h5_path: str, cfg: TrackerConfig, rx: MPQueue) -> None:
     # Resolve/construct a sidecar path...
-    sidecar = cu._find_latest_sidecar(h5_path)
-    if not sidecar:
-        sidecar = cu._default_sidecar_path(h5_path)
+    sidecar = cu._default_sidecar_path(h5_path)
     if not sidecar:
         base = str(h5_path) if h5_path else "cube"
         sidecar = f"{base}.fit.{os.getpid()}.{int(time.time())}.h5"
@@ -103,202 +101,70 @@ def _writer_main(h5_path: str, cfg: TrackerConfig, rx: MPQueue) -> None:
             logger.log("[FitTracker] SWMR enable failed:")
             logger.log_exc(e)
 
-        # history datasets (small)
-        if "rmse_hist" not in gfit:
-            gfit.create_dataset("rmse_hist", shape=(0,), maxshape=(None,), chunks=(8192,), dtype="f4")
-        if "rmse_ewma" not in gfit:
-            gfit.create_dataset("rmse_ewma", shape=(0,), maxshape=(None,), chunks=(8192,), dtype="f4")
-        if "progress" not in gfit:
-            gfit.create_dataset("progress", shape=(0, 4), maxshape=(None, 4), chunks=(2048, 4), dtype="f4")
-
 
         # lazy x datasets are created only on first save_x
-        def _save_x(vec: np.ndarray, epoch: float, rmse: float) -> None:
+        def _save_x(vec: np.ndarray, iteration: int) -> None:
+            """Persist the physical solution vector for a solver iteration."""
             x = np.asarray(vec, dtype=np.float64).ravel(order="C")
+
             if "x_last" not in gfit:
-                gfit.create_dataset("x_last", data=x, dtype="f8", maxshape=(x.size,), chunks=(x.size,))
+                gfit.create_dataset("x_last", data=x, dtype="f8")
             else:
                 ds = gfit["x_last"]
-                if ds.shape != (x.size,):
+                if ds.shape != x.shape or ds.dtype != np.dtype("f8"):
                     del gfit["x_last"]
-                    gfit.create_dataset("x_last", data=x, dtype="f8", maxshape=(x.size,), chunks=(x.size,))
+                    gfit.create_dataset("x_last", data=x, dtype="f8")
                 else:
                     ds[...] = x
-            gfit["x_last"].attrs["epoch"] = float(epoch)
-            gfit["x_last"].attrs["rmse"]  = float(rmse)
 
-            # optional x_best (keep best-by-RMSE)
-            try:
-                keep = False
-                if "x_best" not in gfit:
-                    keep = True
-                else:
-                    cur = float(gfit["x_best"].attrs.get("rmse", np.inf))
-                    keep = (rmse < cur)
-                if keep:
-                    if "x_best" not in gfit:
-                        gfit.create_dataset("x_best", data=x, dtype="f8", maxshape=(x.size,), chunks=(x.size,))
-                    else:
-                        dsb = gfit["x_best"]
-                        if dsb.shape != (x.size,):
-                            del gfit["x_best"]
-                            gfit.create_dataset("x_best", data=x, dtype="f8", maxshape=(x.size,), chunks=(x.size,))
-                        else:
-                            dsb[...] = x
-                    gfit["x_best"].attrs["epoch"] = float(epoch)
-                    gfit["x_best"].attrs["rmse"]  = float(rmse)
-            except Exception as e:
-                logger.log("[FitTracker] x_best update failed:")
-                logger.log_exc(e)
+            gfit["x_last"].attrs["iter"] = int(iteration)
         def _save_state(state: dict) -> None:
-            """Persist a small restart marker in the sidecar."""
+            """Persist the solver restart state."""
             try:
-                gfit.attrs["solver_state_json"] = json.dumps(state, sort_keys=True)
+                gfit.attrs["solver_state_json"] = json.dumps(
+                    state, sort_keys=True)
                 gfit.attrs["solver_state_ts"] = float(time.time())
-            except Exception as e:
+            except Exception as exc:
                 logger.log("[FitTracker] solver state update failed:")
-                logger.log_exc(e)
-        def _ensure_x_ds(N: int) -> None:
-            """Create ring + last datasets if absent, sized by N."""
-            if N <= 0:
-                return
-            if "x_last" not in gfit:
-                gfit.create_dataset("x_last", shape=(N,), dtype="f4", chunks=(N,))
-            if "x_ring" not in gfit:
-                ring = gfit.create_dataset(
-                    "x_ring",
-                    shape=(cfg.ring_size, N),
-                    maxshape=(cfg.ring_size, N),
-                    chunks=(1, N),
-                    dtype="f4",
-                )
-                gfit.create_dataset("x_epoch", shape=(cfg.ring_size,), dtype="i4")
-                gfit.create_dataset("x_ts",    shape=(cfg.ring_size,), dtype="f8")
-                gfit.create_dataset("x_rmse",  shape=(cfg.ring_size,), dtype="f4")
-                gfit.attrs["x_head"] = np.int64(0)
-
-        def _append_x(x32: np.ndarray, epoch: int, rmse: float | None) -> None:
-            """Append into the ring and update x_last."""
-            N = int(x32.size)
-            _ensure_x_ds(N)
-            head = int(gfit.attrs.get("x_head", 0))
-            idx  = head % int(cfg.ring_size)
-            gfit["x_ring"][idx, :] = x32
-            gfit["x_epoch"][idx]   = int(epoch) if epoch is not None else -1
-            gfit["x_ts"][idx]      = float(time.time())
-            gfit["x_rmse"][idx]    = float(rmse) if (rmse is not None and np.isfinite(rmse)) else np.nan
-            gfit["x_last"][:]      = x32
-            gfit.attrs["x_head"]   = np.int64(head + 1)
-
-        # batching knobs
-        FLUSH_EVERY = int(os.environ.get("CUBEFIT_TRACKER_FLUSH_EVERY", "128"))
-        FLUSH_INTERVAL = float(os.environ.get("CUBEFIT_TRACKER_FLUSH_SEC", "5.0"))
-        pending = 0
-        t_last = time.monotonic()
+                logger.log_exc(exc)
 
         # main loop with timeout, so we can flush even with no messages
         while True:
             try:
-                msg = rx.get(timeout=1.0)
-            except _queue.Empty:
-                # idle tick: flush if needed
-                now = time.monotonic()
-                if (pending > 0) and (now - t_last >= FLUSH_INTERVAL):
-                    try:
-                        f.flush()
-                    except Exception as e:
-                        logger.log("[FitTracker] periodic flush failed:")
-                        logger.log_exc(e)
-                    pending = 0
-                    t_last = now
-                continue
+                msg = rx.get()
+            except Exception as exc:
+                logger.log("[FitTracker] queue read failed:")
+                logger.log_exc(exc)
+                break
 
             if msg is None or msg.get("op") == "stop":
                 break
 
             try:
                 op = msg.get("op")
-                if op == "rmse_batch":
-                    r = float(msg["value"]); e = float(msg.get("ewma", r))
-                    d1 = gfit["rmse_hist"]; n1 = d1.shape[0]; d1.resize((n1+1,)); d1[n1] = r
-                    d2 = gfit["rmse_ewma"]; n2 = d2.shape[0]; d2.resize((n2+1,)); d2[n2] = e
-                    pending += 1
 
-                elif op == "progress":
-                    epoch = float(msg.get("epoch", 0))
-                    done  = float(msg.get("done", 0))
-                    total = float(msg.get("total", 0))
-                    ewma  = float(msg.get("ewma") or np.nan)
-                    dp = gfit["progress"]; n = dp.shape[0]
-                    dp.resize((n+1, 4)); dp[n, :] = (epoch, done, total, ewma)
-                    pending += 1
+                if op == "save_checkpoint":
+                    x = np.asarray(
+                        msg["x"], dtype=np.float64).ravel(order="C")
+                    state = dict(msg.get("state", {}))
+                    iteration = int(state.get("iter", -1))
 
-                elif op == "epoch_end":
-                    epoch = float(msg.get("epoch", 0))
-                    dp = gfit["progress"]; n = dp.shape[0]
-                    dp.resize((n+1, 4)); dp[n, :] = (epoch, np.nan, np.nan, np.nan)
-                    pending += 1
+                    if iteration < 0:
+                        raise ValueError(
+                            "Checkpoint state has no valid iteration.")
 
-                elif op == "save_x":
-                    _save_x(
-                        np.asarray(msg["x"], np.float64),
-                        float(msg.get("epoch", -1)),
-                        float(msg.get("rmse", np.nan)),
-                    )
-                    pending += 1
+                    _save_x(x, iteration)
+                    _save_state(state)
+                    f.flush()
 
-                elif op == "x_snapshot":
-                    _append_x(
-                        np.asarray(msg["x"], np.float32),
-                        msg.get("epoch"),
-                        msg.get("rmse"),
-                    )
-                    pending += 1
+                    logger.log(
+                        "[FitTracker] checkpoint persisted: "
+                        f"iter={iteration}, n={x.size}.")
 
-                elif op == "x_snapshot":
-                    _append_x(
-                        np.asarray(msg["x"], np.float32),
-                        msg.get("epoch"),
-                        msg.get("rmse"),
-                    )
-                    pending += 1
-
-                elif op == "save_state":
-                    _save_state(dict(msg.get("state", {})))
-                    pending += 1
-
-                elif op == "save_checkpoint":
-                    _append_x(
-                        np.asarray(msg["x"], np.float32),
-                        msg.get("epoch"),
-                        msg.get("rmse"),
-                    )
-                    _save_state(dict(msg.get("state", {})))
-
-                    # Stamp both sides with the same checkpoint epoch so the loader can
-                    # validate that x and state correspond.
-                    ckpt_epoch = int(msg.get("epoch") if msg.get("epoch") is not None else -1)
-                    gfit.attrs["solver_state_epoch"] = ckpt_epoch
-                    gfit["x_last"].attrs["solver_state_epoch"] = ckpt_epoch
-
-                    pending += 1
-
-                # batch/interval flush
-                now = time.monotonic()
-                if pending >= FLUSH_EVERY or (now - t_last) >= FLUSH_INTERVAL:
-                    try:
-                        f.flush()
-                        pending = 0
-                        t_last = now
-                    except Exception as e:
-                        logger.log("[FitTracker] flush failed:")
-                        logger.log_exc(e)
-
-            except Exception as e:
+            except Exception as exc:
                 logger.log("[FitTracker] message handling error:")
-                logger.log_exc(e)
+                logger.log_exc(exc)
 
-        # final flush
         try:
             f.flush()
         except Exception:
@@ -311,7 +177,7 @@ def load_checkpoint(
     expected_size: int | None = None,
 ) -> tuple[np.ndarray | None, dict | None]:
     """
-    Load the latest matching coefficient vector and solver state.
+    Load the latest coefficient vector and matching solver state.
 
     Parameters
     ----------
@@ -326,67 +192,109 @@ def load_checkpoint(
         Latest coefficient vector.
     state : dict or None
         Matching solver restart state.
+
+    Raises
+    ------
+    None
+
+    Examples
+    --------
+    >>> x, state = load_checkpoint("cube.h5.fit.123.h5", 6900)
     """
     if not sidecar_path:
+        logger.log("[FitTracker] Resume rejected: no sidecar path.")
         return None, None
 
     if not os.path.exists(sidecar_path):
+        logger.log(
+            f"[FitTracker] Resume rejected: sidecar does not exist: "
+            f"{sidecar_path}")
         return None, None
 
     try:
-        with h5py.File(
-            sidecar_path,
-            "r",
-            libver="latest",
-            swmr=True,
-        ) as f:
+        with h5py.File(sidecar_path, "r", libver="latest", swmr=True) as f:
             fit = f.get("/Fit")
 
             if fit is None:
+                logger.log(
+                    f"[FitTracker] Resume rejected: no /Fit group in "
+                    f"{sidecar_path}.")
                 return None, None
 
             if "x_last" not in fit:
+                logger.log(
+                    f"[FitTracker] Resume rejected: no /Fit/x_last in "
+                    f"{sidecar_path}.")
                 return None, None
 
             x = np.asarray(
-                fit["x_last"][...],
-                dtype=np.float64,
-            ).ravel(order="C")
+                fit["x_last"][...], dtype=np.float64).ravel(order="C")
 
-            if (
-                expected_size is not None
-                and x.size != int(expected_size)
-            ):
+            if expected_size is not None and x.size != int(expected_size):
+                logger.log(
+                    f"[FitTracker] Resume rejected: /Fit/x_last has "
+                    f"{x.size} coefficients; expected "
+                    f"{int(expected_size)}.")
                 return None, None
 
-            raw = fit.attrs.get(
-                "solver_state_json",
-                None,
-            )
+            if not np.all(np.isfinite(x)):
+                nbad = int(np.count_nonzero(~np.isfinite(x)))
+                logger.log(
+                    f"[FitTracker] Resume rejected: /Fit/x_last contains "
+                    f"{nbad} non-finite coefficients.")
+                return None, None
+
+            raw = fit.attrs.get("solver_state_json", None)
 
             if raw is None:
+                logger.log(
+                    "[FitTracker] Full resume unavailable: "
+                    "solver_state_json is missing.")
                 return x, None
 
             if isinstance(raw, bytes):
-                raw = raw.decode(
-                    "utf-8",
-                    errors="replace",
-                )
+                raw = raw.decode("utf-8", errors="replace")
 
-            state = json.loads(
-                str(raw)
-            )
+            try:
+                state = json.loads(str(raw))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.log(
+                    "[FitTracker] Full resume unavailable: could not decode "
+                    f"solver_state_json: {exc}")
+                return x, None
 
             if not isinstance(state, dict):
-                state = None
+                logger.log(
+                    "[FitTracker] Full resume unavailable: "
+                    "solver_state_json is not a dictionary.")
+                return x, None
+            
+            x_iter = int(fit["x_last"].attrs.get("iter", -1))
+            state_iter = int(state.get("iter", -1))
+
+            if x_iter < 0 or state_iter < 0:
+                logger.log(
+                    "[FitTracker] Full resume unavailable: checkpoint iteration "
+                    f"is missing, x={x_iter}, state={state_iter}.")
+                return x, None
+
+            if x_iter != state_iter:
+                logger.log(
+                    "[FitTracker] Full resume unavailable: checkpoint iteration "
+                    f"mismatch, x={x_iter}, state={state_iter}.")
+                return x, None
+
+            logger.log(
+                "[FitTracker] Loaded full checkpoint: "
+                f"iter={state_iter}, phase={state.get('phase', None)}, "
+                f"final={state.get('final', None)}, n={x.size}.")
 
             return x, state
 
     except Exception as exc:
         logger.log(
-            "[FitTracker] Could not load checkpoint "
-            f"from {sidecar_path}: {exc}"
-        )
+            f"[FitTracker] Resume rejected: could not load "
+            f"{sidecar_path}: {exc}")
         return None, None
 
 # --------------------------------- public API --------------------------------
@@ -398,12 +306,6 @@ class FitTracker:
     def __init__(self, h5_path: str, cfg: Optional[TrackerConfig] = None):
         self.h5_path = str(h5_path)
         self.cfg = cfg or TrackerConfig()
-        self._ewma = None
-        self._alpha = 0.02
-
-        # Sampling & queue knobs (env-overridable)
-        self._rmse_stride = int(os.environ.get("CUBEFIT_RMSE_STRIDE", "16"))
-        self._rmse_ctr = 0
 
         prefer = (os.environ.get("FITTRACKER_START", "spawn")).lower()
         avail = mp.get_all_start_methods()
@@ -413,9 +315,6 @@ class FitTracker:
         self._q = None
         self._proc = None
         self._start_method = None
-
-        self._snap_last_t = 0.0
-        self._snap_min_sec = float(os.environ.get("CUBEFIT_X_SNAPSHOT_SEC", "3600"))  # seconds between snapshots
 
 
         for m in order:
@@ -441,139 +340,64 @@ class FitTracker:
     def set_meta(self, N: int) -> None:
         self._try_put({"op": "set_meta", "N": int(N)})
 
-    def set_orbit_weights(self, w: np.ndarray) -> None:
-        self._try_put({"op": "set_orbit_weights",
-                       "w": np.asarray(w, np.float64).ravel()})
-
-    def on_batch_rmse(self, rmse: float, *, block: bool = False) -> None:
+    def save_checkpoint(self, x: np.ndarray, state: dict, *,
+        block: bool = False) -> bool:
         """
-        Non-blocking RMSE push with optional subsampling.
-        - Updates local EWMA always.
-        - Enqueues at most every `self._rmse_stride` batches.
-        - Queue put is non-blocking by default; drops if full.
+        Persist a solution vector and its matching solver state.
+
+        Parameters
+        ----------
+        x : ndarray
+            Physical solution vector.
+        state : dict
+            Full resumable solver state.
+        block : bool, optional
+            If True, block while queueing the checkpoint.
+
+        Returns
+        -------
+        bool
+            True if the checkpoint was queued successfully.
+
+        Raises
+        ------
+        None
+
+        Examples
+        --------
+        >>> tracker.save_checkpoint(x, state, block=True)
         """
         try:
-            r = float(rmse)
-        except Exception:
-            return
-        if not np.isfinite(r):
-            return
-
-        
-        # ---- drop pathological outliers to avoid huge spikes ----
-        if self._ewma is not None:
-            # Use the current EWMA as a scale; protect against 0.
-            scale = max(self._ewma, 1.0)
-            # Factor 1e3 is deliberately generous; tune if needed.
-            if r > 1e3 * scale:
-                # Ignore this sample completely; don't update EWMA or write to disk.
-                return
-        # ----------------------------------------------------------------
-
-        # standard EWMA update
-        if self._ewma is None:
-            self._ewma = r
-        else:
-            self._ewma = (1.0 - self._alpha) * self._ewma + self._alpha * r
-
-        self._rmse_ctr += 1
-        if (self._rmse_ctr % max(1, self._rmse_stride)) != 0:
-            return
-
-        self._try_put({"op": "rmse_batch", "value": r, "ewma": float(self._ewma)}, block=block)
-
-    def on_progress(self, epoch: int, spax_done: int, spax_total: int, *, rmse_ewma: Optional[float] = None) -> None:
-        self._try_put({"op": "progress", "epoch": int(epoch),
-                    "done": int(spax_done), "total": int(spax_total),
-                    "ewma": float(rmse_ewma) if rmse_ewma is not None else None}, block=False)
-
-    def on_epoch_end(self, epoch: int, stats: dict) -> None:
-        self._try_put({"op": "epoch_end", "epoch": int(epoch), "stats": dict(stats)}, block=False)
-
-    def maybe_save(self, x_final: np.ndarray, stats: dict) -> None:
-        self._try_put({"op": "save_x",
-            "x": np.asarray(x_final, np.float32).ravel(order="C"),
-            "epoch": int(stats.get("epochs", -1)),
-            "rmse": float(stats.get("rmse_epoch_last",
-                stats.get("rmse_final", math.nan)))},
-            block=False)
-
-    def maybe_snapshot_x(self, x: np.ndarray, *, epoch: int | None = None,
-                        rmse: float | None = None, force: bool = False) -> bool:
-        """
-        Non-blocking, time-gated snapshot of the current global solution vector.
-        - Downcasts to float32 before enqueue to cut payload in half.
-        - Throttled to at most one snapshot every _snap_min_sec unless force=True.
-        Returns True if enqueued, False if skipped/dropped.
-        """
-        now = time.monotonic()
-        if (not force) and ((now - self._snap_last_t) < max(1.0, self._snap_min_sec)):
-            return False
-        self._snap_last_t = now
-
-        try:
-            x32 = np.asarray(x, np.float32).ravel(order="C")
+            x = np.asarray(x, dtype=np.float64).ravel(order="C")
+            state = dict(state)
         except Exception:
             return False
 
-        return self._try_put({"op": "x_snapshot", "x": x32,
-            "epoch": int(epoch) if epoch is not None else None,
-            "rmse": float(rmse) if (rmse is not None and np.isfinite(rmse)) else None},
-            block=False)
+        return self._try_put({
+            "op": "save_checkpoint",
+            "x": x,
+            "state": state,
+        }, block=block)
 
-    def save_state(self, state: dict, *, block: bool = False) -> bool:
-        """Persist a small JSON-serialisable solver state marker."""
-        try:
-            payload = dict(state)
-        except Exception:
-            payload = {}
-        return self._try_put({"op": "save_state", "state": payload}, block=block)
-
-    def save_checkpoint(
-        self,
-        x: np.ndarray,
-        state: dict,
-        *,
-        rmse: float | None = None,
-        block: bool = False,
-    ) -> bool:
-        """
-        Persist a coefficient vector and its matching solver state together.
-        """
-        try:
-            x32 = np.asarray(
-                x,
-                dtype=np.float32,
-            ).ravel(order="C")
-            payload = dict(state)
-        except Exception:
-            return False
-
-        return self._try_put(
-            {
-                "op": "save_checkpoint",
-                "x": x32,
-                "state": payload,
-                "rmse": (float(rmse) if (rmse is not None and np.isfinite(rmse)
-                    ) else None),
-            },
-            block=block,
-        )
-
-    def close(self, timeout: float = 2.0) -> None:
-        # send a real sentinel the writer understands
+    def close(self, timeout: float = 30.0) -> None:
+        """Flush pending checkpoints and stop the writer process."""
         q = getattr(self, "_q", None)
+
         if q is not None:
             try:
-                q.put_nowait(None)  # sentinel
+                q.put(None)
             except Exception:
                 pass
 
         if self._proc is not None:
             self._proc.join(timeout=timeout)
+
             if self._proc.is_alive():
+                logger.log(
+                    "[FitTracker] Writer did not stop cleanly; terminating.")
                 try:
                     self._proc.terminate()
+                    self._proc.join(timeout=5.0)
                 except Exception:
                     pass
 
@@ -597,12 +421,12 @@ class FitTracker:
             return False
 
 class NullTracker:
-    def set_meta(self, *a, **k): pass
-    def set_orbit_weights(self, *a, **k): pass
-    def on_progress(self, *a, **k): pass
-    def on_batch_rmse(self, *a, **k): pass
-    def on_epoch_end(self, *a, **k): pass
-    def maybe_save(self, *a, **k): pass
-    def maybe_snapshot_x(self, *a, **k): pass
-    def save_state(self, *a, **k): pass
-    def close(self, *a, **k): pass
+    """No-op tracker implementing the active checkpoint interface."""
+
+    def save_checkpoint(self, *args, **kwargs) -> bool:
+        """Discard a checkpoint request."""
+        return False
+
+    def close(self, *args, **kwargs) -> None:
+        """Close the no-op tracker."""
+        return None
