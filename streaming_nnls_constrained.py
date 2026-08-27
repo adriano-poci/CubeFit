@@ -50,6 +50,28 @@ v1.4:   Emit current `x` vector in the diagnostics to assist in debugging;
             summary. 11 August 2026
 v1.5:   Expanded exit diagnostics to include the reason, category, and
             convergence status of the solver termination. 12 August 2026
+v1.6:   Dramatically expanded diagnostics for noop columns in
+            `streamActiveSetNNLS`;
+        Added explicit constrained KKT convergence diagnostics and termination
+            in `streamActiveSetNNLS`;
+        Distinguished active-positive stationarity from inactive-column KKT
+            violations in `streamActiveSetNNLS`;
+        Added detailed promotion-attempt and promotion-outcome diagnostics in
+            `streamActiveSetNNLS`;
+        Tightened near-noop detection to require negligible objective and
+            solution-vector changes in `streamActiveSetNNLS`;
+        Made checkpointing iteration-based and removed legacy epoch semantics in
+            `streamActiveSetNNLS`;
+        Made the monolithic solver the authoritative source of final
+            checkpoint state in `streamActiveSetNNLS` and `solve_streaming_nnls`;
+        Identified post-solve support pruning as requiring a constrained
+            re-solve before the resulting state can be considered committed in
+            `streamActiveSetNNLS`;
+        No longer mutate `z` when rejecting failed promotions, restoring the
+            previous feasible solver state instead in `streamActiveSetNNLS`;
+        Removed probation pruning to prevent post-solve support changes from
+            violating the hard orbit constraints in `streamActiveSetNNLS`. 26
+            August 2026.
 """
 
 from __future__ import annotations, print_function
@@ -95,7 +117,6 @@ def _diag_json_default(obj):
         return list(obj)
     return str(obj)
 
-
 def _diag_append_jsonl(path: str | None, record: dict) -> None:
     """
     Append one JSON record to a JSONL file.
@@ -112,7 +133,6 @@ def _diag_append_jsonl(path: str | None, record: dict) -> None:
             )
             + "\n"
         )
-
 
 def _support_stats_1d(vec: np.ndarray) -> dict:
     """
@@ -1965,52 +1985,49 @@ def streamActiveSetNNLS(
                 dtype=np.float64,
             )
             grad_total = grad_data
-
+        
         orbit_s, orbit_target, orbit_deficit = _orbit_mass_and_deficit(z)
 
         candidate_mask = ~active
         if has_hard_orbit_shape:
-            candidate_mask &= (
-                orbit_shape[orbit_of_col] > 0.0
-            )
-        not_active = np.flatnonzero(
-            candidate_mask
-        )
+            candidate_mask &= (orbit_shape[orbit_of_col] > 0.0)
+        not_active = np.flatnonzero(candidate_mask)
         gvals_data = grad_data[not_active]
         gvals_total = grad_total[not_active]
         gvals_constraint = constraint_gradient[not_active]
 
         max_grad_all = float(np.max(grad_total)) if grad_total.size else 0.0
-        max_grad_promotable = (
-            float(np.max(gvals_total)) if gvals_total.size else 0.0
-        )
-        avg_grad_promotable = (
-            float(np.mean(gvals_total)) if gvals_total.size else 0.0
-        )
+        max_grad_promotable = (float(np.max(gvals_total)) if gvals_total.size
+        else 0.0)
+        avg_grad_promotable = (float(np.mean(gvals_total)) if gvals_total.size
+            else 0.0)
         max_grad_data = float(np.max(gvals_data)) if gvals_data.size else 0.0
-        max_grad_orbit = (
-            float(np.max(np.abs(gvals_constraint)))
-            if gvals_constraint.size
-            else 0.0
-        )
-        grad_before_data = max_grad_data
+        max_grad_orbit = (float(np.max(np.abs(gvals_constraint)))
+            if gvals_constraint.size else 0.0)
+
+        tol_here = max(tol_grad, tol_grad_rel * grad_ref)
+
+        # Check the full KKT conditions before attempting any promotion.
+        z_scale = max(1.0, float(np.max(z)))
+        active_positive = active & (z > 1e-12 * z_scale)
+
+        max_grad_active = (float(np.max(np.abs(grad_total[active_positive])))
+            if np.any(active_positive) else 0.0)
+
+        max_grad_inactive = (float(np.max(gvals_total))
+            if gvals_total.size else -np.inf)
+
+        kkt_converged = (max_grad_inactive <= tol_here
+            and max_grad_active <= tol_here)
 
         if diag_level >= 1 and ((it % diag_stride) == 0):
             x_phys_now = _current_x_from_z(z).reshape(C, P)
             orbit_mass_vec = np.sum(x_phys_now, axis=1)
             if has_hard_orbit_shape:
-                orbit_target = (
-                    float(alpha_current)
-                    * np.asarray(
-                        orbit_shape,
-                        dtype=np.float64,
-                    )
-                )
+                orbit_target = float(alpha_current) * np.asarray(orbit_shape,
+                    dtype=np.float64)
             else:
-                orbit_target = np.zeros(
-                    (C,),
-                    dtype=np.float64,
-                )
+                orbit_target = np.zeros((C,), dtype=np.float64,)
             orbit_resid = orbit_mass_vec - orbit_target
             orbit_ratio = orbit_mass_vec / np.maximum(orbit_target, 1e-30)
             orbit_nz = np.count_nonzero(x_phys_now > 0.0, axis=1).astype(np.int64)
@@ -2023,6 +2040,18 @@ def streamActiveSetNNLS(
                 eff_support[cc] = st["eff_support"]
                 entropy[cc] = st["entropy"]
                 top_share[cc] = st["top_share"]
+
+            best_inactive = (
+                int(not_active[int(np.argmax(gvals_total))])
+                if not_active.size
+                else -1
+            )
+
+            best_inactive_grad = (
+                float(np.max(gvals_total))
+                if gvals_total.size
+                else -np.inf
+            )
 
             _emit_diag(
                 {
@@ -2058,30 +2087,68 @@ def streamActiveSetNNLS(
                     "data_objective": float(
                         data_objective_current
                     ),
+                    "n_candidates": int(not_active.size),
+                    "n_cooldown": int(
+                        np.count_nonzero(_combined_cooldown_mask(it)[not_active])
+                    ),
+                    "n_col_cooldown": int(
+                        np.count_nonzero(_col_cooldown_mask(it)[not_active])
+                    ),
+                    "n_orbit_cooldown": int(
+                        np.count_nonzero(
+                            _combined_cooldown_mask(it)[not_active]
+                            & ~_col_cooldown_mask(it)[not_active]
+                        )
+                    ),
+                    "best_inactive_col": int(best_inactive),
+                    "best_inactive_grad": float(best_inactive_grad),
+                    "best_inactive_orbit": (
+                        int(best_inactive // P)
+                        if best_inactive >= 0
+                        else -1
+                    ),
+                    "max_grad_active": float(max_grad_active),
+                    "max_grad_inactive": float(max_grad_inactive),
+                    "kkt_converged": bool(kkt_converged),
                 }
             )
 
-        n_active = int(np.count_nonzero(active))
-        print(
-            f"[MONO][iter {it+1}] "
-            f"max_grad_total={max_grad_all:.3e} "
-            f"max_grad_data={max_grad_data:.3e} "
-            f"max_grad_orbit={max_grad_orbit:.3e} "
-            f"max_grad_promotable={max_grad_promotable:.3e} "
-            f"active={n_active}",
-            flush=True,
-        )
-        tol_here = max(tol_grad, tol_grad_rel * grad_ref)
-        # Unified promotion score: use the current combined gradient only.
-        candidate_mask = ~active
-        if has_hard_orbit_shape:
-            candidate_mask &= (
-                orbit_shape[orbit_of_col] > 0.0
+            n_active = int(np.count_nonzero(active))
+            print(
+                f"[MONO][iter {it+1}] "
+                f"max_grad_total={max_grad_all:.3e} "
+                f"max_grad_data={max_grad_data:.3e} "
+                f"max_grad_orbit={max_grad_orbit:.3e} "
+                f"max_grad_promotable={max_grad_promotable:.3e} "
+                f"active={n_active}",
+                flush=True,
             )
-        not_active = np.flatnonzero(
-            candidate_mask
-        )
-        score = gvals_total.copy()
+
+            if kkt_converged:
+                _set_stop(
+                    "kkt_converged",
+                    "converged",
+                    it,
+                    converged=True,
+                    max_grad_inactive=float(max_grad_inactive),
+                    max_grad_active=float(max_grad_active),
+                    tol_here=float(tol_here),
+                    n_active=int(np.count_nonzero(active)),
+                )
+                _emit_checkpoint(
+                    it,
+                    final=True,
+                    phase="converged",
+                )
+                break
+
+            # Unified promotion score: use the current combined gradient only.
+            candidate_mask = ~active
+            if has_hard_orbit_shape:
+                candidate_mask &= (orbit_shape[orbit_of_col] > 0.0)
+
+            not_active = np.flatnonzero(candidate_mask)
+            score = gvals_total.copy()
 
         if not_active.size > 0:
             svals = S_flat[not_active]
@@ -2168,7 +2235,7 @@ def streamActiveSetNNLS(
         else:
             negative_grad_count = 0
             positive_batch_size = min(24 if C > 3 else 8,
-                                    positive_batch_size + 1)
+                positive_batch_size + 1)
             preferred_group = min(positive_batch_size, not_active.size)
 
         cooldown_mask_full = _combined_cooldown_mask(it)
@@ -2183,6 +2250,11 @@ def streamActiveSetNNLS(
             score_eff = score.copy()
             col_cooldown_full = _col_cooldown_mask(it)
             score_eff[col_cooldown_full[not_active]] = -np.inf
+        finite_score = np.isfinite(score_eff)
+        max_grad_eligible = (float(np.max(gvals_total[finite_score]))
+            if np.any(finite_score) else -np.inf)
+        max_score_eligible = (float(np.max(score_eff[finite_score]))
+            if np.any(finite_score) else -np.inf)
 
         order = np.argsort(score_eff)[::-1]
         chosen = []
@@ -2201,14 +2273,9 @@ def streamActiveSetNNLS(
         if len(chosen) == 0:
             stalled, progress_info = _watch_progress()
             if stalled:
-                n_combined_cooldown = int(
-                    np.count_nonzero(cooldown_mask)
-                )
-                n_column_cooldown = int(
-                    np.count_nonzero(
-                        _col_cooldown_mask(it)[not_active]
-                    )
-                )
+                n_combined_cooldown = int(np.count_nonzero(cooldown_mask))
+                n_column_cooldown = int(np.count_nonzero(
+                    _col_cooldown_mask(it)[not_active]))
                 _set_stop(
                     "no_eligible_promotions_stall",
                     "stall",
@@ -2234,6 +2301,15 @@ def streamActiveSetNNLS(
         active[cols_to_activate] = True
         newly_activated = cols_to_activate.copy()
         promoted_cols = newly_activated.copy()
+        n_candidates = int(not_active.size)
+        n_cooldown = int(np.count_nonzero(cooldown_mask))
+        n_col_cooldown = int(np.count_nonzero(
+            _col_cooldown_mask(it)[not_active]))
+        n_orbit_cooldown = int(np.count_nonzero(
+            _combined_cooldown_mask(it)[not_active] & \
+            ~_col_cooldown_mask(it)[not_active]))
+        n_eligible = int(np.count_nonzero(np.isfinite(score_eff)))
+
         if has_hard_orbit_shape:
             required_orbits = positive_shape_orbits
 
@@ -2254,37 +2330,49 @@ def streamActiveSetNNLS(
                 coverage_cols.append(best_col)
 
             if coverage_cols:
-                coverage_cols = np.asarray(
-                    coverage_cols,
-                    dtype=np.int64,
-                )
-                newly_activated = np.unique(
-                    np.concatenate(
-                        (
-                            newly_activated,
-                            coverage_cols,
-                        )
-                    )
-                )
+                coverage_cols = np.asarray(coverage_cols, dtype=np.int64,)
+                newly_activated = np.unique(np.concatenate((newly_activated,
+                    coverage_cols)))
                 promoted_cols = newly_activated.copy()
+
+        candidate_order = np.argsort(gvals_total)[::-1]
+
+        diag_candidates = []
+        for local_i in candidate_order[:diag_topk]:
+            c = int(not_active[local_i])
+            diag_candidates.append({
+                "col": c,
+                "orbit": int(c // P),
+                "grad_total": float(gvals_total[local_i]),
+                "score": float(score[local_i]),
+                "cooldown": bool(cooldown_mask[local_i]),
+                "col_cooldown": bool(
+                    _col_cooldown_mask(it)[not_active][local_i]
+                ),
+            })
+
+        promoted_scores = []
+        for c in promoted_cols:
+            local = np.flatnonzero(not_active == int(c))
+            if local.size == 0:
+                continue
+
+            j = int(local[0])
+            promoted_scores.append({
+                "col": int(c),
+                "orbit": int(c // P),
+                "grad_total": float(gvals_total[j]),
+                "score": float(score[j]),
+                "cooldown": bool(cooldown_mask[j]),
+            })
 
         n_active_after = int(np.count_nonzero(active))
 
         if n_active_after > int(max_active):
-            n_requested = (
-                int(newly_activated.size)
-                if newly_activated is not None
-                else 0
-            )
-
-            n_active_before = int(
-                np.count_nonzero(active_before)
-            )
-
-            n_available = max(
-                0,
-                int(max_active) - n_active_before,
-            )
+            n_requested = (int(newly_activated.size) if newly_activated is not
+                None else 0)
+            n_active_before = int(np.count_nonzero(active_before))
+            n_available = max(0, int(max_active) - n_active_before)
 
             # Roll back this promotion before terminating.
             if (
@@ -2293,9 +2381,7 @@ def streamActiveSetNNLS(
             ):
                 active[newly_activated] = False
 
-            n_active_restored = int(
-                np.count_nonzero(active)
-            )
+            n_active_restored = int(np.count_nonzero(active))
 
             _set_stop(
                 "max_active_promotion_overflow",
@@ -2324,6 +2410,36 @@ def streamActiveSetNNLS(
                 phase="max_active_exit",
             )
             break
+
+        _emit_diag(
+            {
+                "kind": "promotion_attempt",
+                "source": "streamActiveSetNNLS",
+                "iter": int(it + 1),
+                "did_explore": bool(did_explore),
+                "force_explore": bool(force_explore),
+                "negative_grad_count": int(negative_grad_count),
+                "tol_here": float(tol_here),
+                "max_grad_total": float(max_grad_all),
+                "max_grad_promotable": float(max_grad_promotable),
+                "avg_grad_promotable": float(avg_grad_promotable),
+                "max_score": float(max_g),
+                "n_active_before": int(
+                    np.count_nonzero(active_before)
+                ),
+                "n_candidates": int(n_candidates),
+                "n_cooldown": int(n_cooldown),
+                "n_col_cooldown": int(n_col_cooldown),
+                "n_orbit_cooldown": int(n_orbit_cooldown),
+                "n_eligible": int(n_eligible),
+                "preferred_group": int(preferred_group),
+                "n_promoted": int(promoted_cols.size),
+                "candidate_topk": diag_candidates,
+                "promoted": promoted_scores,
+                "max_grad_eligible": float(max_grad_eligible),
+                "max_score_eligible": float(max_score_eligible),
+            }
+        )
 
         # --------------------------------------------------------
         # Reduced solve (assemble ATA_sub & ATy_sub) in parallel
@@ -2692,11 +2808,106 @@ def streamActiveSetNNLS(
         obj_gain = float(obj_old - obj_new)
         rel_gain = obj_gain / max(1.0, abs(obj_old))
 
+        z_step = float(np.linalg.norm(z_sub - z_old_active))
+        z_step_rel = z_step / max(1.0, norm_old)
+
+        promoted_mask = np.zeros(k, dtype=bool)
+        if promoted_cols.size > 0:
+            promoted_set = set(int(c) for c in promoted_cols)
+            promoted_mask = np.asarray(
+                [int(c) in promoted_set for c in active_idx],
+                dtype=bool,
+            )
+
+        promoted_z_old = (
+            z_old_active[promoted_mask]
+            if np.any(promoted_mask)
+            else np.zeros(0, dtype=np.float64)
+        )
+        promoted_z_new = (
+            z_sub[promoted_mask]
+            if np.any(promoted_mask)
+            else np.zeros(0, dtype=np.float64)
+        )
+
+        promoted_z_norm = (
+            float(np.linalg.norm(
+                promoted_z_new - promoted_z_old
+            ))
+            if promoted_z_new.size
+            else 0.0
+        )
+
+        promoted_new_max = (
+            float(np.max(promoted_z_new))
+            if promoted_z_new.size
+            else 0.0
+        )
+
+        promoted_new_l1 = (
+            float(np.sum(promoted_z_new))
+            if promoted_z_new.size
+            else 0.0
+        )
+
+        failed_frac = (
+            float(failed_cols.size) / float(promoted_cols.size)
+            if promoted_cols.size
+            else 0.0
+        )
+
         near_noop = (
             did_explore
             and promoted_cols.size > 0
-            and (obj_gain <= promotion_noop_abs_tol
-                 or rel_gain <= promotion_noop_rel_tol)
+            and obj_gain <= promotion_noop_abs_tol
+            and rel_gain <= promotion_noop_rel_tol
+            and z_step_rel <= 1e-8
+        )
+
+        z_scale_loc = float(np.max(z_sub)) + 1e-30
+
+        newly_positive = (int(np.count_nonzero(
+            promoted_z_new > 1e-8 * z_scale_loc)) if promoted_z_new.size
+            else 0)
+
+        surviving_promoted = promoted_cols[np.isin(promoted_cols,
+            active_idx[z_sub > 1e-8 * z_scale_loc],)] \
+            if promoted_cols.size else np.zeros(0, dtype=np.int64)
+
+        _emit_diag(
+            {
+                "kind": "promotion_outcome",
+                "source": "streamActiveSetNNLS",
+                "iter": int(it + 1),
+                "n_active_before": int(
+                    np.count_nonzero(active_before)
+                ),
+                "k_reduced": int(k),
+                "n_promoted": int(promoted_cols.size),
+                "n_failed": int(failed_cols.size),
+                "n_survived": int(surviving_promoted.size),
+                "failed_fraction": float(failed_frac),
+                "promoted_new_positive": int(newly_positive),
+                "promoted_z_norm": float(promoted_z_norm),
+                "promoted_z_max": float(promoted_new_max),
+                "promoted_z_l1": float(promoted_new_l1),
+                "obj_old": float(obj_old),
+                "obj_new": float(obj_new),
+                "obj_gain": float(obj_gain),
+                "rel_gain": float(rel_gain),
+                "z_step": float(z_step),
+                "z_step_rel": float(z_step_rel),
+                "norm_old": float(norm_old),
+                "norm_new": float(norm_new),
+                "near_noop": bool(near_noop),
+                "noop_abs_tol": float(
+                    promotion_noop_abs_tol
+                ),
+                "noop_rel_tol": float(
+                    promotion_noop_rel_tol
+                ),
+                "failed_cols": failed_cols.tolist(),
+            }
         )
 
         reject = False
@@ -2712,9 +2923,18 @@ def streamActiveSetNNLS(
 
         if did_explore and near_noop:
             _cooldown_cols(promoted_cols, it, extra_iters=3)
+
             print(
-                "[MONO][explore] cooling promoted columns after near-noop "
-                f"update: {promoted_cols}",
+                "[MONO][explore] near-noop: "
+                f"obj_gain={obj_gain:.6e} "
+                f"rel_gain={rel_gain:.6e} "
+                f"z_step_rel={z_step_rel:.6e} "
+                f"promoted={promoted_cols.size} "
+                f"failed={failed_cols.size} "
+                f"promoted_z_l1={promoted_new_l1:.6e} "
+                f"promoted_z_max={promoted_new_max:.6e} "
+                f"max_grad_promotable={max_grad_promotable:.6e} "
+                f"max_score={max_g:.6e}",
                 flush=True,
             )
 
@@ -2754,22 +2974,25 @@ def streamActiveSetNNLS(
             _emit_checkpoint(it, final=True, phase="reject_exit")
             continue
 
-        # Commit the complete reduced solution first.
+        # Commit the constrained reduced solution.
         z[active_idx] = z_sub
 
-        # Then deactivate promoted columns that received effectively zero weight.
+        # Failed promotions are removed from the active support, but the
+        # resulting state must be re-solved before it can be committed as a
+        # valid constrained solution.
         if failed_cols.size > 0:
-            z[failed_cols] = 0.0
-            active[failed_cols] = False
+            _cooldown_cols(failed_cols, it)
+            _cooldown_orbits(np.unique(failed_cols // P), it)
 
-            _cooldown_cols(
-                failed_cols,
+            active[:] = active_before
+            z[:] = z_before
+
+            _emit_checkpoint(
                 it,
+                final=False,
+                phase="failed_promotion_rollback",
             )
-            _cooldown_orbits(
-                np.unique(failed_cols // P),
-                it,
-            )
+            continue
 
         if did_explore:
             obj_tol = max(
@@ -2835,7 +3058,6 @@ def streamActiveSetNNLS(
             newly_activated_set = set()
 
         drop_cols = []
-        prune_requires_resolve = False
 
         for c in np.nonzero(active)[0]:
             c = int(c)
@@ -2874,22 +3096,11 @@ def streamActiveSetNNLS(
                 cc = c // P
 
                 base = cc * P
-                orbit_cols = np.arange(
-                    base,
-                    base + P,
-                    dtype=np.int64,
-                )
+                orbit_cols = np.arange(base, base + P, dtype=np.int64)
 
-                n_active_orbit = int(
-                    np.count_nonzero(
-                        active[orbit_cols]
-                    )
-                )
+                n_active_orbit = int(np.count_nonzero(active[orbit_cols]))
 
-                if (
-                    orbit_shape[cc] > 0.0
-                    and n_active_orbit <= 1
-                ):
+                if (orbit_shape[cc] > 0.0 and n_active_orbit <= 1):
                     provisional_hits.pop(c, None)
                     continue
 
@@ -2897,36 +3108,14 @@ def streamActiveSetNNLS(
 
             drop_cols = safe_drop_cols
 
-        if (
-            drop_cols
-            and (it + 1) < max_iter
-        ):
-            drop_cols = np.asarray(drop_cols, dtype=np.int64)
-            z[drop_cols] = 0.0
-            active[drop_cols] = False
-            _cooldown_cols(drop_cols, it, extra_iters=2)
-            print(
-                f"[MONO][probation] dropped {drop_cols.size} stale columns: "
-                f"{drop_cols}", flush=True,)
-            _emit_checkpoint(it, final=False, phase="probation_prune")
-            continue
-
         if diag_level >= 1 and ((it % diag_stride) == 0):
             x_phys_now = _current_x_from_z(z).reshape(C, P)
             orbit_mass_vec = np.sum(x_phys_now, axis=1)
             if not has_hard_orbit_shape:
-                orbit_target = np.zeros(
-                    (C,),
-                    dtype=np.float64,
-                )
+                orbit_target = np.zeros((C,), dtype=np.float64)
             else:
-                orbit_target = (
-                    float(alpha_current)
-                    * np.asarray(
-                        orbit_shape,
-                        dtype=np.float64,
-                    )
-                )
+                orbit_target = float(alpha_current) * np.asarray(orbit_shape,
+                    dtype=np.float64)
             orbit_resid = orbit_mass_vec - orbit_target
             orbit_ratio = orbit_mass_vec / np.maximum(orbit_target, 1e-30)
             orbit_nz = np.count_nonzero(x_phys_now > 0.0, axis=1).astype(np.int64)
@@ -3045,12 +3234,8 @@ def streamActiveSetNNLS(
     )
 
     if has_hard_orbit_shape:
-        orbit_mass, orbit_target, orbit_deficit = (
-            _orbit_mass_and_deficit(
-                z,
-                alpha_value=alpha_current,
-            )
-        )
+        orbit_mass, orbit_target, orbit_deficit = _orbit_mass_and_deficit(z,
+            alpha_value=alpha_current)
         orbit_resid_l1 = float(np.sum(np.abs(orbit_deficit)))
         orbit_resid_l2 = float(np.linalg.norm(orbit_deficit))
         orbit_resid_linf = float(np.max(np.abs(orbit_deficit)))
@@ -3177,8 +3362,7 @@ def monolithic_nnls_scipy(
         function forms ATA/ATy and calls the quadratic NNLS fallback
         `_nnls_from_quadratic`.
     - If `enforce_orbit_projection` is True and `orbit_weights` is provided,
-        the solution is post-scaled per-orbit exactly as your epoch-end
-        hard projection does (so results are comparable).
+        the solution is post-scaled per-orbit exactly as your hard orbit-mass projection does (so results are comparable).
     - Returns (x, stats) where x is (C,P) ndarray, stats contains simple
         diagnostics.
     """
@@ -3302,8 +3486,7 @@ def solve_streaming_nnls(
     """
     Fused single-pass block-coordinate NNLS solver (BLAS-friendly).
 
-    - Accumulates ATA and ATy for each block during one streaming pass per
-      epoch (no repeated HDF5 reads per block).
+    - Accumulates ATA and ATy for each block during one streaming pass (no repeated HDF5 reads per block).
     - Solves small quadratic NNLS problems per block using a projected-gradient
       solver on the quadratic form ATA/ATy.
     - Supports a final constrained orbit-mass correction on the final active
@@ -3406,8 +3589,6 @@ def solve_streaming_nnls(
         else:
             known_zero = np.zeros((C, P), dtype=bool)
 
-    # -------------------------------------------------------------------------------
-    # before epoch loop (after known_zero loaded)
     known_zero_orbit = np.all(known_zero, axis=1)  # shape (C,)
 
     best_x = x.copy()
@@ -3846,9 +4027,9 @@ def solve_streaming_nnls(
         best_x = x.copy()
         print(f"[BC-FUSED] new best proxy {best_proxy:.3e}", flush=True)
 
-    # --- DIAG: epoch summary (timings & numerical health) ---
+    # --- DIAG: fianl summary (timings & numerical health) ---
     try:
-        epoch_elapsed = time.perf_counter() - t0
+        elapsed = time.perf_counter() - t0
         # D_tot stats per-orbit
         D_tot_flat = D_tot.ravel(order="C")
         D_finite = D_tot_flat[np.isfinite(D_tot_flat) & (D_tot_flat > 0)]
@@ -3863,7 +4044,7 @@ def solve_streaming_nnls(
         x_norm = float(np.linalg.norm(x_flat)) if x_flat.size else 0.0
 
         print("=== [BC-FUSED][summary] ===", flush=True)
-        print(f"[BC-FUSED][summary] elapsed_total={epoch_elapsed:.1f}s", flush=True)
+        print(f"[BC-FUSED][summary] elapsed_total={elapsed:.1f}s", flush=True)
         if np.isfinite(rmse_curr):
             print(f"[BC-FUSED][summary] data_proxy={data_proxy:.3e} rmse={rmse_curr:.3e}", flush=True)
         else:
@@ -3880,7 +4061,7 @@ def solve_streaming_nnls(
 
         # sanity checks that likely indicate major numerical problems
         if x_nonzero == 0:
-            print("[BC-FUSED][summary] ALERT: x is entirely zero after epoch!", flush=True)
+            print("[BC-FUSED][summary] ALERT: x is entirely zero!", flush=True)
         if x_nonfinite > 0:
             print("[BC-FUSED][summary] ALERT: non-finite elements in x!", flush=True)
         if not np.isfinite(data_proxy) or data_proxy <= 0.0:
@@ -3947,7 +4128,7 @@ def solve_streaming_nnls(
 
                 _emit_diag(
                     {
-                        "kind": "epoch_orbit_table",
+                        "kind": "final_orbit_table",
                         "source": "solve_streaming_nnls",
                         "alpha": float(alpha_outer),
                         "orbit_shape": (
@@ -3983,12 +4164,12 @@ def solve_streaming_nnls(
         except Exception as _e:
             print("[DIAG][orbit_weights] diagnostic failed:", _e, flush=True)
 
-        print("=== [BC-FUSED][epoch-summary] end ===", flush=True)
+        print("=== [BC-FUSED][final-summary] end ===", flush=True)
     except Exception as _e:
-        print("[BC-FUSED][epoch-summary] error:", _e, flush=True)
-    # --- end epoch summary diagnostics ---
+        print("[BC-FUSED][final-summary] error:", _e, flush=True)
+    # --- end final summary diagnostics ---
 
-    # done epochs
+    # final diagnostics
     # ------------------------------------------------------------
 
 
@@ -4050,34 +4231,6 @@ def solve_streaming_nnls(
         rmse_proxy_best=float(best_proxy),
         known_zero_mask=known_zero.copy(),
     )
-
-    if tracker is not None:
-        try:
-            state = dict(stats.get("resume_state", {}))
-            if not state:
-                state = {
-                    "iter": int(stats.get("iter", -1)),
-                    "max_iter": int(stats.get("max_iter", -1)),
-                    "phase": "final",
-                    "final": True,
-                    "active": int(stats.get("active", -1)),
-                    "stall_count": int(stats.get("stall_count", -1)),
-                }
-            else:
-                state["phase"] = "final"
-                state["final"] = True
-                state.setdefault("iter", int(stats.get("iter", -1)))
-                state.setdefault("max_iter", int(stats.get("max_iter", -1)))
-                state.setdefault("active", int(stats.get("active", -1)))
-                state.setdefault("stall_count", int(stats.get("stall_count", -1)))
-
-            tracker.save_checkpoint(
-                best_x,
-                state,
-                block=True,
-            )
-        except Exception:
-            pass
 
     return best_x, stats
 
