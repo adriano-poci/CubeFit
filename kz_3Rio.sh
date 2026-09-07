@@ -14,11 +14,12 @@
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_3Rio.log" --open-mode=append
 #SBATCH -p short
 #SBATCH -M htc,arc
+#SBATCH --qos=priority
 
 #SBATCH --job-name="CubeFit_3Rio"
 #SBATCH --time=0-12:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=350G
 #SBATCH --hint=nomultithread
 #SBATCH --exclusive
@@ -30,15 +31,14 @@ module load foss/2023a
 module load Python/3.11.3-GCCcore-12.3.0
 
 # --- BLAS / OpenMP threading (per worker) ---
-export OMP_NUM_THREADS=8
-export OPENBLAS_NUM_THREADS=8
-export MKL_NUM_THREADS=8
+export OMP_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
+export MKL_NUM_THREADS=2
 export NUMEXPR_NUM_THREADS=1
 export OMP_PROC_BIND=TRUE
 export OMP_PLACES=cores
 export OMP_DYNAMIC=FALSE
 export MKL_DYNAMIC=FALSE
-# For OpenBLAS, avoid accidental main-thread reuse:
 export OPENBLAS_VERBOSE=0
 
 # --- HDF5 raw-data chunk cache (reader side) ---

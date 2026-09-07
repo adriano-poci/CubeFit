@@ -548,7 +548,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # --- 4) Run the global Kaczmarz fit (tiled; RAM-bounded) ---
     runner = PipelineRunner(hdf5Path)
 
-    Ncpu, Nblas = kwargs.pop('cpu_processes', CPU_PROCESSES), kwargs.pop('blas_threads', BLAS_THREADS)
+    Ncpu, Nblas = kwargs.pop('cpu_processes', CPU_PROCESSES), \
+        kwargs.pop('blas_threads', BLAS_THREADS)
     best_processes, best_blas = cu.resolve_parallelism(Ncpu, Nblas)
 
     #####################################
@@ -684,7 +685,6 @@ def parallel_model_cube_global_batched(
       - Multi-process path: main process holds the only "r+" handle and writes;
         workers open read-only and return their (s0, Y) blocks.
     """
-    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
     h5_path = str(h5_or_path)
 
     # decide compression kwargs once
@@ -841,18 +841,15 @@ def _init_reconstruct_worker(
     """
     global _RECON_X_CP2, _RECON_WANT_DTYPE
 
-    _RECON_X_CP2 = np.ascontiguousarray(
-        np.asarray(x_cp2, dtype=np.float64),
-        dtype=np.float64,
-    )
-    _RECON_WANT_DTYPE = (
-        np.float64 if str(want_dtype_str) == "float64" else np.float32
-    )
+    _RECON_X_CP2 = np.ascontiguousarray(np.asarray(x_cp2, dtype=np.float64),
+        dtype=np.float64)
+    _RECON_WANT_DTYPE = (np.float64 if str(want_dtype_str) == "float64" else
+        np.float32)
 
     os.environ["OMP_NUM_THREADS"] = str(int(blas_threads))
     os.environ["OPENBLAS_NUM_THREADS"] = str(int(blas_threads))
     os.environ["MKL_NUM_THREADS"] = str(int(blas_threads))
-    os.environ["NUMEXPR_NUM_THREADS"] = str(int(blas_threads))
+    # os.environ["NUMEXPR_NUM_THREADS"] = str(int(blas_threads))
 
     # rdcc settings are applied per file handle inside the worker.
 
@@ -1043,20 +1040,27 @@ def reconstruct_modelcube_fast_parallel(
 
     pbar = tqdm(total=n_tiles, desc="[Reconstruct]", mininterval=1.5)
 
+    results = []
+
     with ProcessPoolExecutor(
         max_workers=n_workers,
         mp_context=ctx,
         initializer=_init_reconstruct_worker,
         initargs=(x_cp2, out_dtype, rdcc_slots, rdcc_bytes, rdcc_w0, bt),
     ) as exe:
-        futures = {exe.submit(_reconstruct_worker, arg): arg for arg in jobs}
+        futures = [
+            exe.submit(_reconstruct_worker, arg)
+            for arg in jobs
+        ]
 
-        with open_h5(h5_path, role="writer") as f:
-            out_ds = f[out_dset]
-            for fut in as_completed(futures):
-                s0, s1, Y_tile = fut.result()
-                out_ds[s0:s1, :] = Y_tile
-                pbar.update(1)
+        for fut in as_completed(futures):
+            results.append(fut.result())
+            pbar.update(1)
+
+    with open_h5(h5_path, role="writer") as f:
+        out_ds = f[out_dset]
+        for s0, s1, Y_tile in results:
+            out_ds[s0:s1, :] = Y_tile
 
     pbar.close()
     print("[Reconstruct] Done (parallel).")
@@ -2150,13 +2154,13 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 reconstruct_modelcube_fast_parallel(
                     h5_path=str(hdf5Path),
                     x_cp=x_global,
-                    s_chunk=56,
+                    s_chunk=None,
                     out_dtype="float64",
                     rdcc_slots=1_000_003,
                     rdcc_bytes=8 * 1024**2,
                     rdcc_w0=0.90,
-                    n_workers=builtins.min(best_processes, nTiles, 4),
-                    blas_threads_per_worker=best_blas // max(1, best_processes)
+                    n_workers=builtins.min(best_processes, nTiles),
+                    blas_threads_per_worker=best_blas,
                 )
         except Exception as e:
             logger.log(
