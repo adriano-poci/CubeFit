@@ -1019,24 +1019,17 @@ class RatioCfg:
     minw: float = 1e-6
     anchor: str = "auto"       # {'target','x0','auto'}
     tile_every: int = 1
-    epoch_renorm: bool = True
-
-    # strong epoch-end projector
-    epoch_project: bool = True  # do a global pass at epoch end
-    epoch_eta: float = 1.0      # stronger than tile eta
-    epoch_gamma: float = 10.0   # allow larger rebalancing
-    epoch_beta: float = 1.0     # mixing: 1.0=full replace, <1 = blend
 
 # ------------------------------------------------------------------------------
 
 def compare_usage_to_orbit_weights(h5_path: str,
-                                   sidecar: str | None = None,
-                                   x_dset: str | None = None,
-                                   normalize: str = "unit_sum",
-                                   out_png: str | None = None,
-                                   *,
-                                   usage_metric: str = "sum",
-                                   E_cp: np.ndarray | None = None) -> dict:
+    sidecar: str | None = None,
+    x_dset: str | None = None,
+    normalize: str = "unit_sum",
+    out_png: str | None = None,
+    *,
+    usage_metric: str = "sum",
+    E_cp: np.ndarray | None = None) -> dict:
     """
     Compare the final component usage (sum over populations) against the
     input orbital weights, both read from the HDF5 store.

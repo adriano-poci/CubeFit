@@ -337,9 +337,6 @@ class FitTracker:
 
     # ------------ public methods used by PipelineRunner / solver ---------------
 
-    def set_meta(self, N: int) -> None:
-        self._try_put({"op": "set_meta", "N": int(N)})
-
     def save_checkpoint(self, x: np.ndarray, state: dict, *,
         block: bool = False) -> bool:
         """

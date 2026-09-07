@@ -552,9 +552,9 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         kwargs.pop('blas_threads', BLAS_THREADS)
     best_processes, best_blas = cu.resolve_parallelism(Ncpu, Nblas)
 
-    #####################################
-    # Multi-processing Batched Kaczmarz #
-    #####################################
+    ###########################################
+    # Multi-processing Batched Streaming NNLS #
+    ###########################################
     x_global, stats = runner.solve_all_mp_batched(
         # orbit_weights=None, # or None for “free” fit
         orbit_weights=cWeights,

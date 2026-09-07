@@ -67,6 +67,15 @@ v1.22:  Reworked resume warm-starting to load a matched sidecar checkpoint with
             `load_checkpoint` and pass only the consistent `resume_state` into
             the constrained solver. 7 August 2026
 v1.23:  Removed all legacy checkpointing and tracking. 26 August 2026
+v1.24:  Replaced legacy `seed` warm-starting with explicit `saved_x` in
+            `PipelineRunner.solve_all_mp_batched`;
+        `saved_x` restores only the latest physical solution and always starts
+            with fresh solver state in `PipelineRunner.solve_all_mp_batched`;
+        `resume` restores a complete matched sidecar checkpoint when available,
+            otherwise falling back to an x-only saved solution in
+            `PipelineRunner.solve_all_mp_batched`;
+        Explicit `x0` now always starts with fresh solver state in 
+            `PipelineRunner.solve_all_mp_batched`. 7 September 2026
 """
 
 from __future__ import annotations
@@ -214,7 +223,7 @@ class PipelineRunner:
 
         Examples
         --------
-        Used internally for x-only resume fallback.
+        Used internally for saved-x warm-start selection.
         """
         if not sidecar_path or not os.path.exists(sidecar_path):
             return None, None
@@ -261,7 +270,7 @@ class PipelineRunner:
 
         Examples
         --------
-        Used internally for x-only resume fallback.
+        Used internally for saved-x warm-start selection.
         """
         if not h5_path or not os.path.exists(h5_path):
             return None, None
@@ -283,53 +292,69 @@ class PipelineRunner:
         except Exception:
             return None, None
 
-    def _read_seed_from_h5(self,
-                        h5_path: str,
-                        N_expected: int,
-                        dset: str = "/Seeds/x0_nnls_patch",
-                        project_nonneg: bool = True) \
-                        -> tuple[np.ndarray | None, str | None]:
+    def _read_saved_x(
+        self,
+        N_expected: int,
+    ) -> tuple[np.ndarray | None, str | None, str | None]:
         """
-        Read a seed solution from the main HDF5 file.
-        Accepts either flat (N_expected,) or 2-D (C,P) and flattens
-        C-order. If the size mismatches, trims or zero-pads with a
-        warning.
+        Read the newest saved physical solution without solver state.
+
+        Parameters
+        ----------
+        N_expected : int
+            Expected flattened solution-vector length.
 
         Returns
         -------
-        (x0, src_label) or (None, None)
+        x : ndarray or None
+            Latest valid saved physical solution.
+        src : str or None
+            Dataset from which the solution was read.
+        src_file : str or None
+            HDF5 file containing the selected solution.
+
+        Raises
+        ------
+        None
+
+        Examples
+        --------
+        >>> x, src, path = runner._read_saved_x(
+        ...     runner.nComp * runner.nPop)
         """
-        try:
-            with open_h5(h5_path, role="reader") as f:
-                if dset not in f:
-                    return None, None
-                arr = np.asarray(f[dset][...], dtype=np.float64, order="C")
-                if arr.ndim == 2:
-                    arr = arr.reshape(-1, order="C")
-                x0 = arr.ravel(order="C")
+        sidecar = cu._find_latest_sidecar(self.h5_path)
 
-                if x0.size != N_expected:
-                    import warnings
-                    warnings.warn(
-                        f"[Pipeline] Seed at {dset} has length {x0.size} "
-                        f"!= expected {N_expected}; "
-                        f"{'trimming' if x0.size > N_expected else 'zero-padding'} "
-                        f"to match.",
-                        RuntimeWarning
-                    )
-                    if x0.size > N_expected:
-                        x0 = x0[:N_expected].copy()
-                    else:
-                        tmp = np.zeros(N_expected, dtype=np.float64)
-                        tmp[:x0.size] = x0
-                        x0 = tmp
+        x_side, src_side = None, None
+        if sidecar is not None:
+            x_side, src_side = self._read_latest_from_sidecar(
+                sidecar, N_expected)
 
-                if project_nonneg:
-                    np.maximum(x0, 0.0, out=x0)
+        x_main, src_main = self._read_latest_from_main(
+            self.h5_path, N_expected)
 
-                return x0, f"{dset} (main)"
-        except Exception:
-            return None, None
+        def _safe_mtime(path: str | None) -> float:
+            if not path:
+                return -np.inf
+            try:
+                return float(os.path.getmtime(path))
+            except Exception:
+                return -np.inf
+
+        choose_side = False
+
+        if x_side is not None and x_main is None:
+            choose_side = True
+        elif x_side is not None and x_main is not None:
+            choose_side = (
+                _safe_mtime(sidecar) > _safe_mtime(self.h5_path)
+            )
+
+        if choose_side:
+            return x_side, src_side, sidecar
+        if x_main is not None:
+            return x_main, src_main, self.h5_path
+
+        return None, None, None
 
     # ------------------------- Solve (multi-process) -------------------
 
@@ -344,167 +369,90 @@ class PipelineRunner:
         blas_threads=12,
         orbit_weights=None,
         x0=None,
-        resume_state=None,
-        warm_start="zeros",  # default to the new seed
+        warm_start="zeros",  # zeros, saved_x, or resume
         tracker_mode="on",
     ):
 
-        # --------------- Warm-start (same policy as SP path) -----------
+        # ---------------- Warm-start ----------------
         N_expected = int(self.nComp * self.nPop)
 
-        resume_state_effective = (
-            dict(resume_state)
-            if resume_state is not None
-            else None
-        )
+        x0_effective = None
+        resume_state_effective = None
 
         if x0 is not None:
-            x0_effective = np.asarray(x0, dtype=np.float64, order="C")
+            x0_effective = np.asarray(
+                x0, dtype=np.float64, order="C").ravel(order="C")
 
-        elif warm_start == "seed":
-            path = os.environ.get("CUBEFIT_SEED_PATH", "/Seeds/x0_nnls_patch")
-            x_seed, src_seed = self._read_seed_from_h5(self.h5_path,
-                N_expected, dset=path)
-            if x_seed is not None:
-                x0_effective = x_seed
-                vprint(f"[Pipeline] Warm-start from seed {src_seed} "
-                               f"(n={x0_effective.size}).")
+            if x0_effective.size != N_expected:
+                raise ValueError(
+                    f"x0 has size {x0_effective.size}, "
+                    f"expected {N_expected}.")
+
+            if not np.all(np.isfinite(x0_effective)):
+                raise ValueError("x0 contains non-finite values.")
+
+            vprint(
+                "[Pipeline] Warm-start from explicit x0 "
+                f"(n={x0_effective.size}); using fresh solver state.")
+
+        elif warm_start == "saved_x":
+            x0_effective, src_label, src_file = self._read_saved_x(
+                N_expected)
+
+            if x0_effective is not None:
+                vprint(
+                    f"[Pipeline] Warm-start from saved x {src_label} "
+                    f"({src_file}; n={x0_effective.size}).")
             else:
-                x0_effective = None
-                vprint(f"[Pipeline] No seed found at {path}; "
-                    f"continuing without warm-start.")
+                vprint(
+                    "[Pipeline] No saved x found; continuing without "
+                    "warm-start.")
 
         elif warm_start == "resume":
             sidecar = cu._find_latest_sidecar(self.h5_path)
 
             vprint(
-                f"[Pipeline] Warm-start mode: resume; "
-                f"sidecar found: {sidecar if sidecar else 'none'}"
-            )
+                "[Pipeline] Warm-start mode: resume; sidecar found: "
+                f"{sidecar if sidecar else 'none'}")
 
-            x_side, src_side = (None, None)
-            x_main, src_main = (None, None)
-
-            resume_state_effective = None
-            choose_side = False
+            x_resume = None
 
             if sidecar is not None:
-                x_side, resume_state_effective = load_checkpoint(
-                    sidecar,
-                    expected_size=N_expected,
-                )
-                if x_side is None:
-                    vprint(
-                        "[Pipeline] Sidecar contains no usable checkpoint x.")
-                elif resume_state_effective is None:
-                    vprint(
-                        "[Pipeline] Sidecar contains x but no resumable solver "
-                        "state.")
-                else:
-                    vprint("[Pipeline] Sidecar contains a full resumable "
-                        "checkpoint: "
-                        f"iter={resume_state_effective.get('iter', None)}, "
-                        f"phase={resume_state_effective.get('phase', None)}.")
+                x_resume, resume_state_effective = load_checkpoint(
+                    sidecar, expected_size=N_expected)
 
-            # If the sidecar contains a valid full checkpoint, always use it.
-            # That is the only source that can restore the full constrained state.
-            if x_side is not None and resume_state_effective is not None:
-                x0_effective = x_side
-                src_label = src_side = "/Fit/x_last"
-                src_file = sidecar
-                choose_side = True
+            if (x_resume is not None) and (resume_state_effective is not None):
+                x0_effective = x_resume
 
                 vprint(
                     "[Pipeline] Full solver-state resume from "
                     f"{sidecar}: "
                     f"iter={resume_state_effective.get('iter', None)}, "
                     f"phase={resume_state_effective.get('phase', None)}, "
-                    f"final={resume_state_effective.get('final', None)}."
-                )
+                    f"final={resume_state_effective.get('final', None)}.")
 
             else:
-                # Full constrained state is unavailable. The sidecar may still
-                # contain a valid x-only warm start.
                 resume_state_effective = None
+                x0_effective, src_label, src_file = self._read_saved_x(
+                    N_expected)
 
-                if sidecar is not None:
-                    x_side, src_side = self._read_latest_from_sidecar(
-                        sidecar, N_expected)
-
-                x_main, src_main = self._read_latest_from_main(
-                    self.h5_path, N_expected)
-
-                def _safe_mtime(path: str | None) -> float:
-                    if not path:
-                        return -np.inf
-                    try:
-                        return float(os.path.getmtime(path))
-                    except Exception:
-                        return -np.inf
-
-                choose_side = False
-                if x_side is not None and x_main is None:
-                    choose_side = True
-                elif x_side is None and x_main is not None:
-                    choose_side = False
-                elif x_side is not None and x_main is not None:
-                    choose_side = (
-                        _safe_mtime(sidecar) > _safe_mtime(self.h5_path))
-
-                vprint(
-                    f"[Pipeline] Warm-start resume candidates: "
-                    f"sidecar: {src_side if src_side else 'none'}, "
-                    f"main: {src_main if src_main else 'none'}; "
-                    f"choosing "
-                    f"{'sidecar' if choose_side else 'main' if (x_main is not None) else 'none'}."
-                )
-
-                x0_effective, src_label, src_file = (
-                    (x_side, src_side, sidecar)
-                    if choose_side
-                    else (x_main, src_main, self.h5_path)
-                )
-
-                # No full sidecar state is safe to reuse in this branch.
-                resume_state_effective = None
-
-                seed_used = False
-                if x0_effective is None:
-                    seed_path = os.environ.get(
-                        "CUBEFIT_SEED_PATH",
-                        "/Seeds/x0_nnls_patch",
-                    )
-                    x_seed, src_seed = self._read_seed_from_h5(
-                        self.h5_path,
-                        N_expected,
-                        dset=seed_path,
-                    )
-                    if x_seed is not None:
-                        x0_effective = x_seed
-                        src_label = src_seed
-                        src_file = self.h5_path
-                        choose_side = False
-                        seed_used = True
-                        vprint(
-                            "[Pipeline] Warm-start fallback from seed "
-                            f"{src_seed} (n={x0_effective.size})."
-                        )
-
-                if x0_effective is not None and (not seed_used):
-                    t_side = _safe_mtime(sidecar) if sidecar else -np.inf
-                    t_main = _safe_mtime(self.h5_path)
+                if x0_effective is not None:
                     vprint(
-                        f"[Pipeline] Warm-start from {src_label} "
-                        f"({'sidecar' if choose_side else 'main'}: {src_file}) "
-                        f"(n={x0_effective.size}); "
-                        f"mtime(sidecar)={t_side:.0f}, mtime(main)={t_main:.0f}."
-                    )
+                        "[Pipeline] Full solver state unavailable; "
+                        f"falling back to saved x {src_label} "
+                        f"({src_file}; n={x0_effective.size}).")
+                else:
+                    vprint(
+                        "[Pipeline] No full checkpoint or saved x found; "
+                        "continuing without warm-start.")
 
         elif warm_start == "zeros":
-            x0_effective = np.zeros(N_expected, np.float64)
+            x0_effective = np.zeros(N_expected, dtype=np.float64)
 
         else:
-            x0_effective = None
+            raise ValueError(
+                "warm_start must be one of "
+                "{'zeros', 'saved_x', 'resume'}.")
 
         # ---------------- Reader ----------------
         reader_cfg = ReaderCfg(
