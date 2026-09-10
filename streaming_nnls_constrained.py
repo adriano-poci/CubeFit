@@ -100,6 +100,22 @@ v1.7:   Removed residual probation-pruning state and bookkeeping so the
         Commit the fitted amplitude, orbit multipliers, and complete numerical
             ridge atomically with each accepted constrained solution
         Improved code formatting. 7 September 2026
+v1.8:   Added unified outer-iteration progress accounting and persistent
+            unresolved-dual stall detection to prevent repeated failed
+            promotion cycles;
+        Restricted normal promotions to genuine KKT-violating columns and
+            removed obsolete forced-coverage promotion;
+        Made failed and rejected promotions restore the previous feasible
+            solver state before progress accounting;
+        Enforced `known_zero_mask` as a hard solver constraint during
+            initialization, resume, and inactive-column promotion, with
+            explicit infeasibility detection for fully masked positive-weight
+            orbits;
+        Made the monolithic solution authoritative on return;
+        Retained the numerical ridge as part of the solved regularized
+            objective, with the committed total ridge used consistently in
+            the reduced solve, checkpoint state, and outer KKT convergence
+            test. 10 September 2026
 """
 
 from __future__ import annotations, print_function
@@ -556,29 +572,6 @@ def _canon_orbit_weights(h5_path: str,
         raise ValueError("orbit_weights must have positive total mass")
 
     return w / w_sum
-
-# ------------------------------------------------------------------------------
-
-def softbox_params_smooth(eq: int, E: int) -> tuple[float, float]:
-    """
-    Cosine ramp starting at epoch 2 (1-based):
-      eq = 1 → (band, step) = (0.30, 0.20)
-      eq = E → (band, step) = (0.15, 0.30)
-      2..E ramps smoothly between the two.
-    """
-    eq = int(eq)
-    E  = int(max(2, E))
-
-    if eq <= 1:
-        return 0.30, 0.20
-
-    # t=0 at eq=2, t=1 at eq=E
-    t = np.clip((eq - 2) / max(1, (E - 2)), 0.0, 1.0)
-    s = 0.5 - 0.5 * np.cos(np.pi * t)
-
-    band = (1.0 - s) * 0.30 + s * 0.15   # 0.30 → 0.15
-    step = (1.0 - s) * 0.20 + s * 0.30   # 0.20 → 0.30
-    return float(band), float(step)
 
 # ------------------------------------------------------------------------------
 
@@ -1250,6 +1243,7 @@ def streamActiveSetNNLS(
     executor,
     cfg: MPConfig,
     orbit_weights: Optional[np.ndarray] = None,
+    known_zero_mask: Optional[np.ndarray] = None,
     x0_flat: Optional[np.ndarray] = None,
     resume_state: Optional[dict] = None,
     max_active: int = 1000,
@@ -1273,51 +1267,18 @@ def streamActiveSetNNLS(
             return float(max(1.0, fallback))
         return ref
 
-    def _watch_progress() -> tuple[bool, dict]:
-        """
-        Update the committed-state watchdog.
-
-        Returns
-        -------
-        stalled : bool
-            True if the committed state has failed to move for too long.
-        """
-        nonlocal committed_z, committed_active, no_progress_count
-
-        z_delta = float(np.linalg.norm(z - committed_z))
-        z_ref = max(1.0, float(np.linalg.norm(committed_z)))
-        z_delta_rel = z_delta / z_ref
-
-        active_delta = int(np.count_nonzero(active ^ committed_active))
-
-        if (z_delta_rel <= z_delta_tol) and (active_delta <= active_delta_tol):
-            no_progress_count += 1
-        else:
-            no_progress_count = 0
-            committed_z = z.copy()
-            committed_active = active.copy()
-
-        stalled = no_progress_count >= hard_stall_patience
-
-        if stalled:
-            print(
-                "[MONO][watchdog] committed-state stall: "
-                f"z_delta_rel={z_delta_rel:.6e} "
-                f"active_delta={active_delta} "
-                f"no_progress={no_progress_count}/"
-                f"{hard_stall_patience} "
-                f"window={progress_window}",
-                flush=True,
-            )
-
-        return stalled, {
-            "z_delta_rel": float(z_delta_rel),
-            "active_delta": int(active_delta),
-            "no_progress_count": int(no_progress_count),
-        }
-
     CP = int(C * P)
     orbit_of_col = (np.arange(CP, dtype=np.int64) // P).astype(np.int64)
+    if known_zero_mask is None:
+        known_zero_flat = np.zeros((CP,), dtype=bool)
+    else:
+        known_zero_flat = np.asarray(known_zero_mask, dtype=bool
+            ).ravel(order="C")
+
+        if known_zero_flat.size != CP:
+            raise ValueError(
+                "known_zero_mask has wrong size in monolithic solver"
+            )
     negative_grad_count = 0
     explore_budget = max(1, min(20, CP // 50))
 
@@ -1334,13 +1295,15 @@ def streamActiveSetNNLS(
     data_scale_ref = _robust_scale_ref(ATy_scaled, fallback=grad_ref)
     tol_grad_rel = 1e-6
 
-    # --- committed-state watchdog ---
-    z_delta_tol = 1e-6
+    # --- outer-iteration progress watchdog ---
+    z_delta_tol = 1e-8
     active_delta_tol = 0
-    progress_window = 20
-    force_explore_after = 4
-    hard_stall_patience = 20
+    hard_stall_patience = 12
     no_progress_count = 0
+    dual_stall_count = 0
+    last_dual_col = -1
+    last_dual_value = np.nan
+    dual_stall_patience = 8
 
     # --- positive-gradient batch-promotion controls ---
     positive_batch_size = 8 if C <= 3 else 24
@@ -1352,17 +1315,22 @@ def streamActiveSetNNLS(
         and np.any(orbit_shape > 0.0)
     )
 
-    positive_shape_orbits = (
-        np.flatnonzero(orbit_shape > 0.0)
-        if has_hard_orbit_shape
-        else np.zeros((0,), dtype=np.int64)
-    )
+    positive_shape_orbits = (np.flatnonzero(orbit_shape > 0.0)
+        if has_hard_orbit_shape else np.zeros((0,), dtype=np.int64))
 
-    zero_shape_orbits = (
-        np.flatnonzero(orbit_shape <= 0.0)
-        if has_hard_orbit_shape
-        else np.zeros((0,), dtype=np.int64)
-    )
+    zero_shape_orbits = (np.flatnonzero(orbit_shape <= 0.0)
+        if has_hard_orbit_shape else np.zeros((0,), dtype=np.int64))
+    if has_hard_orbit_shape:
+        known_zero_cp = known_zero_flat.reshape(C, P)
+        blocked_orbits = np.flatnonzero(np.all(known_zero_cp, axis=1)
+            & (orbit_shape > 0.0))
+
+        if blocked_orbits.size > 0:
+            raise ValueError(
+                "known_zero_mask makes the hard orbit constraint "
+                "infeasible for positive-weight orbits "
+                f"{blocked_orbits.tolist()}"
+            )
 
     # Current accepted global amplitude. It is initialized below and then
     # replaced by the value fitted by each accepted KKT solve.
@@ -1427,8 +1395,6 @@ def streamActiveSetNNLS(
             "start_iter": int(start_iter),
             "max_active": int(max_active),
             "explore_budget": int(explore_budget),
-            "progress_window": int(progress_window),
-            "force_explore_after": int(force_explore_after),
             "hard_stall_patience": int(hard_stall_patience),
             "z_delta_tol": float(z_delta_tol),
             "active_delta_tol": int(active_delta_tol),
@@ -1448,15 +1414,9 @@ def streamActiveSetNNLS(
                 "x0_flat has wrong size in monolithic solver"
             )
 
-        z = np.divide(
-            x0_flat,
-            S_flat,
-            out=np.zeros_like(
-                x0_flat,
-                dtype=np.float64,
-            ),
-            where=S_flat > 0.0,
-        )
+        z = np.divide(x0_flat, S_flat,
+            out=np.zeros_like(x0_flat, dtype=np.float64),
+            where=S_flat > 0.0)
         np.maximum(z, 0.0, out=z)
 
     # Build a feasible initial state for the fixed orbit shape. The initial
@@ -1494,8 +1454,14 @@ def streamActiveSetNNLS(
                     base = cc * P
                     orbit_cols = np.arange(base, base + P, dtype=np.int64)
 
-                    local_score = ATy_scaled[orbit_cols]
-                    p_seed = int(np.argmax(local_score))
+                    allowed_p = np.flatnonzero(~known_zero_flat[orbit_cols])
+
+                    if allowed_p.size == 0:
+                        raise ValueError(
+                            f"Orbit {cc} has no allowed population columns.")
+
+                    local_score = ATy_scaled[base + allowed_p]
+                    p_seed = int(allowed_p[int(np.argmax(local_score))])
 
                     x_seed[cc, :] = 0.0
                     x_seed[cc, p_seed] = target_cc
@@ -1518,18 +1484,16 @@ def streamActiveSetNNLS(
                 or alpha_current < 0.0
             ):
                 alpha_current = 0.0
+    z[known_zero_flat] = 0.0
     z_scale0 = np.max(z) + 1e-30
     active = z > (1e-10 * z_scale0)
+    active[known_zero_flat] = False
 
     if has_hard_orbit_shape and zero_shape_orbits.size > 0:
         for cc in zero_shape_orbits:
             base = int(cc) * P
             z[base:base + P] = 0.0
             active[base:base + P] = False
-
-    # initialize committed baseline
-    committed_z = z.copy()
-    committed_active = active.copy()
 
     # Column-level tabu for genuinely unhelpful promotions.
     col_cooldown_until: dict[int, int] = {}
@@ -1544,6 +1508,10 @@ def streamActiveSetNNLS(
 
     if resume_state:
         no_progress_count = int(resume_state.get("no_progress_count", 0))
+        dual_stall_count = int(resume_state.get("dual_stall_count", 0))
+        last_dual_col = int(resume_state.get("last_dual_col", -1))
+        last_dual_value = float(
+            resume_state.get("last_dual_value", np.nan))
         negative_grad_count = int(resume_state.get("negative_grad_count", 0))
 
         if "active_mask" in resume_state:
@@ -1552,20 +1520,6 @@ def streamActiveSetNNLS(
             ).ravel(order="C")
             if am.size == CP:
                 active = am.copy()
-
-        if "committed_active_mask" in resume_state:
-            cam = np.asarray(
-                resume_state["committed_active_mask"], dtype=bool
-            ).ravel(order="C")
-            if cam.size == CP:
-                committed_active = cam.copy()
-
-        if "committed_z" in resume_state:
-            cz = np.asarray(
-                resume_state["committed_z"], dtype=np.float64
-            ).ravel(order="C")
-            if cz.size == CP:
-                committed_z = cz.copy()
 
         if "alpha_current" in resume_state:
             alpha_saved = float(
@@ -1598,8 +1552,6 @@ def streamActiveSetNNLS(
                 base = int(cc) * P
                 z[base:base + P] = 0.0
                 active[base:base + P] = False
-                committed_z[base:base + P] = 0.0
-                committed_active[base:base + P] = False
         def _pairs_to_dict(pairs):
             out = {}
             for item in pairs or []:
@@ -1619,6 +1571,8 @@ def streamActiveSetNNLS(
                 [],
             )
         )
+    z[known_zero_flat] = 0.0
+    active[known_zero_flat] = False
 
     def _on_cooldown(col: int, it: int) -> bool:
         return it < col_cooldown_until.get(int(col), -1)
@@ -1681,8 +1635,6 @@ def streamActiveSetNNLS(
             "no_progress_count": int(no_progress_count),
             "negative_grad_count": int(negative_grad_count),
             "active_mask": active.astype(bool).tolist(),
-            "committed_active_mask": committed_active.astype(bool).tolist(),
-            "committed_z": committed_z.astype(np.float64).tolist(),
             "col_cooldown_until": [
                 [int(k), int(v)] for k, v in col_cooldown_until.items()
             ],
@@ -1699,6 +1651,9 @@ def streamActiveSetNNLS(
             "stop_category": str(stop_category),
             "stop_converged": bool(stop_converged),
             "stop_details": dict(stop_details),
+            "dual_stall_count": int(dual_stall_count),
+            "last_dual_col": int(last_dual_col),
+            "last_dual_value": float(last_dual_value),
         }
     
     def _emit_checkpoint(
@@ -1887,9 +1842,6 @@ def streamActiveSetNNLS(
             info_init["lambda_orbit"], dtype=np.float64).copy()
         ridge_current = float(ridge + info_init.get("mu", 0.0))
 
-        committed_z = z.copy()
-        committed_active = active.copy()
-
         print(
             "[MONO][init] established constrained KKT state: "
             f"active={active_idx.size} alpha={alpha_current:.6e} "
@@ -2001,12 +1953,120 @@ def streamActiveSetNNLS(
                 "details": stop_details,
             }
         )
+
+    def _finish_iteration(
+        it: int,
+        phase: str,
+        z_start: np.ndarray,
+        active_start: np.ndarray,
+        *,
+        max_grad_dual: float,
+        tol_here: float,
+        best_dual_col: int,
+        best_dual_value: float,
+    ) -> bool:
+        """
+        Account for progress exactly once at the end of an outer iteration.
+
+        Returns
+        -------
+        bool
+            True when the outer solver should terminate.
+        """
+        nonlocal no_progress_count
+        nonlocal dual_stall_count, last_dual_col, last_dual_value
+
+        z_delta = float(np.linalg.norm(z - z_start))
+        z_ref = max(1.0, float(np.linalg.norm(z_start)))
+        z_delta_rel = z_delta / z_ref
+        active_delta = int(np.count_nonzero(active ^ active_start))
+
+        unchanged = (
+            z_delta_rel <= z_delta_tol
+            and active_delta <= active_delta_tol
+        )
+
+        if unchanged:
+            no_progress_count += 1
+        else:
+            no_progress_count = 0
+
+        same_dual = (
+            best_dual_col >= 0
+            and best_dual_col == last_dual_col
+            and np.isfinite(best_dual_value)
+            and np.isfinite(last_dual_value)
+            and abs(best_dual_value - last_dual_value)
+                <= 1e-8 * max(1.0, abs(last_dual_value))
+        )
+
+        if same_dual and best_dual_value > tol_here:
+            dual_stall_count += 1
+        else:
+            dual_stall_count = 0
+
+        last_dual_col = int(best_dual_col)
+        last_dual_value = float(best_dual_value)
+
+        _emit_diag({
+            "kind": "iter_progress",
+            "source": "streamActiveSetNNLS",
+            "iter": int(it + 1),
+            "phase": str(phase),
+            "z_delta_rel": float(z_delta_rel),
+            "active_delta": int(active_delta),
+            "no_progress_count": int(no_progress_count),
+            "hard_stall_patience": int(hard_stall_patience),
+            "best_dual_col": int(best_dual_col),
+            "best_dual_value": float(best_dual_value),
+            "dual_stall_count": int(dual_stall_count),
+            "dual_stall_patience": int(dual_stall_patience),
+            "max_grad_dual": float(max_grad_dual),
+            "tol_here": float(tol_here),
+        })
+
+        if dual_stall_count >= dual_stall_patience:
+            _set_stop(
+                "unresolved_dual_stall",
+                "stall",
+                it,
+                converged=False,
+                best_dual_col=int(best_dual_col),
+                best_dual_value=float(best_dual_value),
+                dual_stall_count=int(dual_stall_count),
+                tol_here=float(tol_here),
+                n_active=int(np.count_nonzero(active)),
+            )
+            _emit_checkpoint(
+                it, final=True, phase="unresolved_dual_stall")
+            return True
+
+        if no_progress_count < hard_stall_patience:
+            _emit_checkpoint(it, final=False, phase=phase)
+            return False
+
+        _set_stop(
+            "outer_iteration_stall",
+            "stall",
+            it,
+            converged=False,
+            phase=str(phase),
+            z_delta_rel=float(z_delta_rel),
+            active_delta=int(active_delta),
+            no_progress_count=int(no_progress_count),
+            max_grad_dual=float(max_grad_dual),
+            tol_here=float(tol_here),
+            n_active=int(np.count_nonzero(active)),
+        )
+        _emit_checkpoint(it, final=True, phase="outer_stall")
+        return True
     # ------------------------------------------------------------
     # Active-set outer loop
     # ------------------------------------------------------------
     for it in range(start_iter, max_iter):
         t_iter = time.perf_counter()
-        force_explore = no_progress_count >= force_explore_after
+        z_iter_start = z.copy()
+        active_iter_start = active.copy()
 
         ATAz_scaled = _compute_ATAz_scaled(z)
         data_objective_current = (0.5 * float(np.dot(z, ATAz_scaled))
@@ -2024,6 +2084,7 @@ def streamActiveSetNNLS(
         orbit_s, orbit_target, orbit_deficit = _orbit_mass_and_deficit(z)
 
         candidate_mask = ~active
+        candidate_mask &= ~known_zero_flat
         if has_hard_orbit_shape:
             candidate_mask &= (orbit_shape[orbit_of_col] > 0.0)
         not_active = np.flatnonzero(candidate_mask)
@@ -2068,6 +2129,10 @@ def streamActiveSetNNLS(
         active_ok = max_grad_active <= tol_here
         dual_ok = max_grad_dual <= tol_here
         kkt_converged = active_ok and dual_ok
+        best_dual_col = (int(not_active[np.argmax(gvals_total)])
+            if gvals_total.size else -1)
+        best_dual_value = (float(np.max(gvals_total))
+            if gvals_total.size else -np.inf)
 
         if kkt_converged:
             _set_stop(
@@ -2208,6 +2273,7 @@ def streamActiveSetNNLS(
 
             # Unified promotion score: use the current combined gradient only.
             candidate_mask = ~active
+            candidate_mask &= ~known_zero_flat
             if has_hard_orbit_shape:
                 candidate_mask &= (orbit_shape[orbit_of_col] > 0.0)
 
@@ -2226,9 +2292,11 @@ def streamActiveSetNNLS(
             score += 0.10 * (aty / aty_scale)
 
         if not_active.size == 0:
-            if _watch_progress():
+            if _finish_iteration(
+                it, "no_candidate", z_iter_start, active_iter_start,
+                max_grad_dual=max_grad_dual, tol_here=tol_here,
+                best_dual_col=best_dual_col, best_dual_value=best_dual_value):
                 break
-            _emit_checkpoint(it, final=True, phase="no_candidate_exit")
             continue
 
         max_g = float(np.max(score)) if score.size else -np.inf
@@ -2240,61 +2308,23 @@ def streamActiveSetNNLS(
 
         if did_explore:
             negative_grad_count += 1
-            allow_explore = (negative_grad_count <= explore_budget) or \
-                force_explore
+            allow_explore = negative_grad_count <= explore_budget
 
             if not allow_explore:
-                stalled, progress_info = _watch_progress()
-
-                if stalled:
-                    _set_stop(
-                        "committed_state_stall",
-                        "stall",
-                        it,
-                        converged=False,
-                        max_grad_total=float(max_grad_all),
-                        max_grad_promotable=float(
-                            max_grad_promotable
-                        ),
-                        max_score=float(max_g),
-                        tol_here=float(tol_here),
-                        negative_grad_count=int(
-                            negative_grad_count
-                        ),
-                        explore_budget=int(explore_budget),
-                        **progress_info,
-                    )
-
-                    _emit_checkpoint(
-                        it,
-                        final=True,
-                        phase="stall_exit",
-                    )
-                    break
-
                 _set_stop(
                     "exploration_budget_exhausted",
                     "active_set",
                     it,
                     converged=False,
                     max_grad_total=float(max_grad_all),
-                    max_grad_promotable=float(
-                        max_grad_promotable
-                    ),
+                    max_grad_promotable=float(max_grad_promotable),
                     max_score=float(max_g),
                     tol_here=float(tol_here),
-                    negative_grad_count=int(
-                        negative_grad_count
-                    ),
+                    negative_grad_count=int(negative_grad_count),
                     explore_budget=int(explore_budget),
-                    force_explore=bool(force_explore),
                 )
-
                 _emit_checkpoint(
-                    it,
-                    final=True,
-                    phase="no_promotable_exit",
-                )
+                    it, final=True, phase="no_promotable_exit")
                 break
 
             preferred_group = min(max(12, CP // 64), 32)
@@ -2330,42 +2360,29 @@ def streamActiveSetNNLS(
 
         order = np.argsort(score_eff)[::-1]
         chosen = []
+
         for local_i in order:
+            if not np.isfinite(score_eff[local_i]):
+                break
+
+            if not did_explore and gvals_total[local_i] <= tol_here:
+                continue
+
             gcol = int(not_active[local_i])
             cc = gcol // P
-            if (
-                (_on_cooldown(gcol, it) or _orbit_on_cooldown(cc, it))
-                and not force_explore
-            ):
+
+            if _on_cooldown(gcol, it) or _orbit_on_cooldown(cc, it):
                 continue
+
             chosen.append(gcol)
             if len(chosen) >= preferred_group:
                 break
         
         if len(chosen) == 0:
-            stalled, progress_info = _watch_progress()
-            if stalled:
-                n_combined_cooldown = int(np.count_nonzero(cooldown_mask))
-                n_column_cooldown = int(np.count_nonzero(
-                    _col_cooldown_mask(it)[not_active]))
-                _set_stop(
-                    "no_eligible_promotions_stall",
-                    "stall",
-                    it,
-                    converged=False,
-                    candidates=int(not_active.size),
-                    combined_cooldown=n_combined_cooldown,
-                    column_cooldown=n_column_cooldown,
-                    max_score=float(max_g),
-                    tol_here=float(tol_here),
-                    force_explore=bool(force_explore),
-                    **progress_info,
-                )
-                _emit_checkpoint(
-                    it,
-                    final=True,
-                    phase="no_promotable_exit",
-                )
+            if _finish_iteration(
+                it, "no_eligible_promotions", z_iter_start, active_iter_start,
+                max_grad_dual=max_grad_dual, tol_here=tol_here,
+                best_dual_col=best_dual_col, best_dual_value=best_dual_value):
                 break
             continue
 
@@ -2381,31 +2398,6 @@ def streamActiveSetNNLS(
             _combined_cooldown_mask(it)[not_active] & \
             ~_col_cooldown_mask(it)[not_active]))
         n_eligible = int(np.count_nonzero(np.isfinite(score_eff)))
-
-        if has_hard_orbit_shape:
-            required_orbits = positive_shape_orbits
-
-            coverage_cols = []
-
-            for cc in required_orbits:
-                base = int(cc) * P
-                orbit_cols = np.arange(base, base + P, dtype=np.int64)
-
-                if np.any(active[orbit_cols]):
-                    continue
-
-                # Select the best data-gradient column from this orbit.
-                local_grad = grad_total[orbit_cols]
-                best_col = int(orbit_cols[int(np.argmax(local_grad))])
-
-                active[best_col] = True
-                coverage_cols.append(best_col)
-
-            if coverage_cols:
-                coverage_cols = np.asarray(coverage_cols, dtype=np.int64,)
-                newly_activated = np.unique(np.concatenate((newly_activated,
-                    coverage_cols)))
-                promoted_cols = newly_activated.copy()
 
         candidate_order = np.argsort(gvals_total)[::-1]
 
@@ -2489,7 +2481,6 @@ def streamActiveSetNNLS(
                 "source": "streamActiveSetNNLS",
                 "iter": int(it + 1),
                 "did_explore": bool(did_explore),
-                "force_explore": bool(force_explore),
                 "negative_grad_count": int(negative_grad_count),
                 "tol_here": float(tol_here),
                 "max_grad_total": float(max_grad_all),
@@ -2519,9 +2510,11 @@ def streamActiveSetNNLS(
         active_idx = np.nonzero(active)[0].astype(np.int64)
         k = int(active_idx.size)
         if k == 0:
-            if _watch_progress():
+            if _finish_iteration(
+                it, "empty_active_set", z_iter_start, active_iter_start,
+                max_grad_dual=max_grad_dual, tol_here=tol_here,
+                best_dual_col=best_dual_col, best_dual_value=best_dual_value):
                 break
-            _emit_checkpoint(it, final=True, phase="k_zero_exit")
             continue
 
         S_active = S_flat[active_idx]
@@ -2717,57 +2710,19 @@ def streamActiveSetNNLS(
                 active[:] = active_before
                 z[:] = z_before
 
-                stalled, progress_info = _watch_progress()
-                if stalled:
-                    _set_stop(
-                        "constraint_rejection_stall",
-                        "numerical",
-                        it,
-                        converged=False,
-                        constraint_reason=str(
-                            orbit_constraint_info["reason"]
-                        ),
-                        constraint_l1=float(
-                            orbit_constraint_info["resid_l1"]
-                        ),
-                        constraint_linf=float(
-                            orbit_constraint_info["resid_linf"]
-                        ),
-                        negative_count=int(
-                            orbit_constraint_info[
-                                "negative_count"
-                            ]
-                        ),
-                        promoted=int(promoted_cols.size),
-                        **progress_info,
-                    )
-                    _emit_checkpoint(
-                        it,
-                        final=True,
-                        phase="constraint_reject_stall",
-                    )
+                if _finish_iteration(
+                    it, "constraint_reject", z_iter_start, active_iter_start,
+                    max_grad_dual=max_grad_dual, tol_here=tol_here,
+                best_dual_col=best_dual_col, best_dual_value=best_dual_value):
                     break
-
-                _emit_checkpoint(
-                    it,
-                    final=False,
-                    phase="constraint_reject",
-                )
                 continue
 
-            z_sub = np.asarray(
-                z_sub_raw,
-                dtype=np.float64,
-            ).copy()
+            z_sub = np.asarray(z_sub_raw, dtype=np.float64).copy()
 
-            alpha_candidate = float(
-                orbit_constraint_info["alpha"]
-            )
+            alpha_candidate = float(orbit_constraint_info["alpha"])
 
-            lambda_candidate = np.asarray(
-                orbit_constraint_info["lambda_orbit"],
-                dtype=np.float64,
-            ).ravel(order="C")
+            lambda_candidate = np.asarray(orbit_constraint_info["lambda_orbit"],
+                dtype=np.float64).ravel(order="C")
 
             candidate_valid = (
                 np.isfinite(alpha_candidate)
@@ -2787,53 +2742,16 @@ def streamActiveSetNNLS(
                 z[:] = z_before
 
                 if promoted_cols.size > 0:
-                    _cooldown_cols(
-                        promoted_cols,
-                        it,
-                        extra_iters=20,
-                    )
-                    _cooldown_orbits(
-                        np.unique(promoted_cols // P),
-                        it,
-                        extra_iters=20,
-                    )
+                    _cooldown_cols(promoted_cols, it, extra_iters=20)
+                    _cooldown_orbits(np.unique(promoted_cols // P), it,
+                        extra_iters=20)
 
-                stalled, progress_info = _watch_progress()
-                if stalled:
-                    _set_stop(
-                        "constraint_rejection_stall",
-                        "numerical",
-                        it,
-                        converged=False,
-                        constraint_reason=str(
-                            orbit_constraint_info["reason"]
-                        ),
-                        constraint_l1=float(
-                            orbit_constraint_info["resid_l1"]
-                        ),
-                        constraint_linf=float(
-                            orbit_constraint_info["resid_linf"]
-                        ),
-                        negative_count=int(
-                            orbit_constraint_info[
-                                "negative_count"
-                            ]
-                        ),
-                        promoted=int(promoted_cols.size),
-                        **progress_info,
-                    )
-                    _emit_checkpoint(
-                        it,
-                        final=True,
-                        phase="constraint_reject_stall",
-                    )
+                if _finish_iteration(
+                    it, "invalid_constraint_state", z_iter_start,
+                        active_iter_start, max_grad_dual=max_grad_dual,
+                        tol_here=tol_here, best_dual_col=best_dual_col,
+                        best_dual_value=best_dual_value):
                     break
-
-                _emit_checkpoint(
-                    it,
-                    final=False,
-                    phase="invalid_constraint_state",
-                )
                 continue
 
         else:
@@ -2873,8 +2791,11 @@ def streamActiveSetNNLS(
             dtype=np.int64,
         )
 
-        obj_old = _quad_obj(ATA_sub_reg, ATy_sub, z_old_active)
-        obj_new = _quad_obj(ATA_sub_reg, ATy_sub, z_sub)
+        mu_inner = float(orbit_constraint_info.get("mu", 0.0))
+        H_eval = ATA_sub_reg + mu_inner * np.eye(
+            k, dtype=np.float64)
+        obj_old = _quad_obj(H_eval, ATy_sub, z_old_active)
+        obj_new = _quad_obj(H_eval, ATy_sub, z_sub)
         norm_old = float(np.linalg.norm(z_old_active))
         norm_new = float(np.linalg.norm(z_sub))
         obj_gain = float(obj_old - obj_new)
@@ -3025,25 +2946,11 @@ def streamActiveSetNNLS(
                 active[newly_activated] = False
             z[active_idx] = z_old_active
 
-            stalled, progress_info = _watch_progress()
-            if stalled:
-                _set_stop(
-                    "exploratory_rejection_stall",
-                    "stall",
-                    it,
-                    converged=False,
-                    obj_old=float(obj_old),
-                    obj_new=float(obj_new),
-                    obj_gain=float(obj_gain),
-                    rel_gain=float(rel_gain),
-                    norm_old=float(norm_old),
-                    norm_new=float(norm_new),
-                    promoted=int(promoted_cols.size),
-                    failed=int(failed_cols.size),
-                    **progress_info,
-                )
+            if _finish_iteration(
+                it, "exploratory_reject", z_iter_start, active_iter_start,
+                max_grad_dual=max_grad_dual, tol_here=tol_here,
+                best_dual_col=best_dual_col, best_dual_value=best_dual_value):
                 break
-            _emit_checkpoint(it, final=True, phase="reject_exit")
             continue
 
         # Commit the constrained reduced solution.
@@ -3059,11 +2966,12 @@ def streamActiveSetNNLS(
             active[:] = active_before
             z[:] = z_before
 
-            _emit_checkpoint(
-                it,
-                final=False,
-                phase="failed_promotion_rollback",
-            )
+            if _finish_iteration(
+                it, "failed_promotion_rollback", z_iter_start,
+                active_iter_start, max_grad_dual=max_grad_dual,
+                tol_here=tol_here, best_dual_col=best_dual_col,
+                best_dual_value=best_dual_value):
+                break
             continue
 
         if did_explore:
@@ -3090,25 +2998,11 @@ def streamActiveSetNNLS(
                         np.unique(newly_activated // P), it, extra_iters=20,)
 
                 positive_batch_size = max(2, positive_batch_size // 2)
-                stalled, progress_info = _watch_progress()
-                if stalled:
-                    _set_stop(
-                        "exploratory_rollback_stall",
-                        "stall",
-                        it,
-                        converged=False,
-                        obj_old=float(obj_old),
-                        obj_new=float(obj_new),
-                        obj_gain=float(obj_gain),
-                        rel_gain=float(rel_gain),
-                        obj_tol=float(obj_tol),
-                        promoted=int(
-                            newly_activated.size
-                        ),
-                        **progress_info,
-                    )
+                if _finish_iteration(it, "exploratory_rollback", z_iter_start,
+                    active_iter_start, max_grad_dual=max_grad_dual,
+                    tol_here=tol_here, best_dual_col=best_dual_col,
+                    best_dual_value=best_dual_value):
                     break
-                _emit_checkpoint(it, final=True, phase="rollback_exit")
                 continue
 
         # Commit the matching equality multipliers only after the constrained
@@ -3157,7 +3051,7 @@ def streamActiveSetNNLS(
                     "diag_max": float(np.max(diag)) if diag.size else 0.0,
                     "emin": float(emin),
                     "emax": float(emax),
-                    "ridge": float(ridge),
+                    "ridge": float(ridge_current),
                     "did_explore": bool(did_explore),
                     "reject": bool(reject),
                     "orbit_constraint_ok": bool(orbit_constraint_info["accepted"]),
@@ -3203,30 +3097,11 @@ def streamActiveSetNNLS(
                 }
             )
 
-        # Finalize progress watchdog on the committed state.
-        stalled, progress_info = _watch_progress()
-        if stalled:
-            _set_stop(
-                "committed_state_stall",
-                "stall",
-                it,
-                converged=False,
-                max_grad_total=float(max_grad_all),
-                max_grad_promotable=float(
-                    max_grad_promotable
-                ),
-                tol_here=float(tol_here),
-                n_active=int(np.count_nonzero(active)),
-                **progress_info,
-            )
-            _emit_checkpoint(
-                it,
-                final=True,
-                phase="stall_exit",
-            )
+        if _finish_iteration(
+            it, "accepted", z_iter_start, active_iter_start,
+            max_grad_dual=max_grad_dual, tol_here=tol_here,
+            best_dual_col=best_dual_col, best_dual_value=best_dual_value):
             break
-
-        _emit_checkpoint(it, final=False)
 
 
     # Orbit prior is enforced in the reduced solves above; no final correction.
@@ -3958,6 +3833,7 @@ def solve_streaming_nnls(
             executor=executor,
             cfg=cfg,
             orbit_weights=orbit_weights,
+            known_zero_mask=known_zero,
             x0_flat=x.ravel(order="C"),
             resume_state=resume_state,
             max_active=monolithic_max_active,
@@ -3970,6 +3846,9 @@ def solve_streaming_nnls(
         x = x_flat_unscaled.reshape(C, P).copy()
         print("[BC-FUSED][MONO] finished streaming active-set NNLS",
             flush=True)
+
+        best_x = x.copy()
+        best_proxy = np.inf
 
     finally:
         try:
