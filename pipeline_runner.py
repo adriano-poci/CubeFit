@@ -76,6 +76,8 @@ v1.24:  Replaced legacy `seed` warm-starting with explicit `saved_x` in
             `PipelineRunner.solve_all_mp_batched`;
         Explicit `x0` now always starts with fresh solver state in 
             `PipelineRunner.solve_all_mp_batched`. 7 September 2026
+v1.25:  Added adjustable `regularisation_scale` throughout the solver pathway.
+            10 September 2026
 """
 
 from __future__ import annotations
@@ -91,7 +93,7 @@ from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
 # from CubeFit.streaming_nnls import (
     # MPConfig, solve_streaming_nnls)
 from CubeFit.streaming_nnls_constrained import (
-    MPConfig, solve_streaming_nnls)
+    MPConfig, solve_streaming_nnls, monolithicNNLS, monolithic_nnls_scipy)
 # from CubeFit.streaming_nnls_augmented_rows import (
 #     MPConfig, solve_streaming_nnls)
 from CubeFit.live_fit_dashboard import (
@@ -370,6 +372,7 @@ class PipelineRunner:
         orbit_weights=None,
         x0=None,
         warm_start="zeros",  # zeros, saved_x, or resume
+        regularisation_scale=1.0,
         tracker_mode="on",
     ):
 
@@ -482,17 +485,20 @@ class PipelineRunner:
         try:
             with logger.capture_all_output():
 
-                x_solver, stats = solve_streaming_nnls(self.h5_path, cfg,
-                    orbit_weights=orbit_weights, x0=x0_effective,
-                    resume_state=resume_state_effective, tracker=tracker,
-                    monolithic_max_active=2000)
+                # x_solver, stats = solve_streaming_nnls(self.h5_path, cfg,
+                #     orbit_weights=orbit_weights, x0=x0_effective,
+                #     resume_state=resume_state_effective, tracker=tracker,
+                #     monolithic_max_active=2000,
+                #     regularisation_scale=regularisation_scale)
                 # x_solver, stats = solve_monolithic_nnls(self.h5_path,
                     # orbit_weights=orbit_weights, 
                     # hard_project=True)
                 # cfg = MPConfig(epochs=1, processes=1, blas_threads=1, apply_mask=True)
-                # x_solver, stats = monolithic_nnls_scipy(self.h5_path, cfg,
-                #     orbit_weights=orbit_weights,
-                #     enforce_orbit_projection=True)
+                x_solver, stats = monolithicNNLS(self.h5_path, cfg,
+                    orbit_weights=orbit_weights, x0=x0_effective,
+                    resume_state=resume_state_effective, tracker=tracker,
+                    monolithic_max_active=2000,
+                    regularisation_scale=regularisation_scale)
 
         finally:
             try:
@@ -530,10 +536,9 @@ class PipelineRunner:
         
         logger.log(
             "[Pipeline] ===================================================")
-        logger.log(
-            f"[Pipeline] Multi-process solve complete:, "
-            f"processes={processes}, blas_threads={blas_threads}."
-        )
+        logger.log(f"[Pipeline] Multi-process solve complete:, "
+            f"processes={processes}, blas_threads={blas_threads}.")
+        logger.log(f"[Pipeline] Regularisation scale: {regularisation_scale}.")
         logger.log(
             '[Pipeline] ---------------------------------------------------')
         logger.log("[Pipeline] Final elapsed time: "

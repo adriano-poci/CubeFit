@@ -85,6 +85,10 @@ v1.25:  Allow `cpu_processes` and `blas_threads` to be passed in `kwargs` to
         Removed all legacy checkpointing and tracking;
         Added SFH corner plot for each phase-space pair of the SSP library in
             `loadCubeFit`. 26 August 2026
+v1.26:  Added adjustable `regularisation_scale` throughout the solver pathway.
+            10 September 2026
+v1.27:  Allow `regularisation_scale` to be zero to disable stabilisation ridge.
+            11 September 2026
 """
 
 # need to set up the logger before any other imports
@@ -315,6 +319,10 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         raise RuntimeError(f"No binned spectra.\n{'': <4s}{vbSpec}")
 
     warm_start = kwargs.pop('warm', 'zeros')
+    regularisation_scale = float(kwargs.pop('regularisation_scale', 1.0))
+
+    if (not np.isfinite(regularisation_scale)) or (regularisation_scale < 0.0):
+        raise ValueError("regularisation_scale must be nonnegative and finite.")
 
     with logger.capture_all_output():
         decDir, cDirs, cKeys, nComp, teLL, lnGrid, histBinSize, dataVelScale,\
@@ -562,7 +570,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         blas_threads=best_blas,
         reader_s_tile=128, # match /HyperCube/models chunking on S
         warm_start=warm_start,
-    )
+        regularisation_scale=regularisation_scale)
 
     xPath = hdf5Dir/hdf5Path.name.replace('hypercube', 'x')
     logger.log("[Pipeline] Writing final /X_global to ...")
