@@ -485,20 +485,27 @@ class PipelineRunner:
         try:
             with logger.capture_all_output():
 
-                # x_solver, stats = solve_streaming_nnls(self.h5_path, cfg,
-                #     orbit_weights=orbit_weights, x0=x0_effective,
-                #     resume_state=resume_state_effective, tracker=tracker,
-                #     monolithic_max_active=2000,
-                #     regularisation_scale=regularisation_scale)
-                # x_solver, stats = solve_monolithic_nnls(self.h5_path,
-                    # orbit_weights=orbit_weights, 
-                    # hard_project=True)
-                # cfg = MPConfig(epochs=1, processes=1, blas_threads=1, apply_mask=True)
-                x_solver, stats = monolithicNNLS(self.h5_path, cfg,
+                x_solver, stats = solve_streaming_nnls(self.h5_path, cfg,
                     orbit_weights=orbit_weights, x0=x0_effective,
                     resume_state=resume_state_effective, tracker=tracker,
                     monolithic_max_active=2000,
                     regularisation_scale=regularisation_scale)
+                # x_solver, stats = solve_monolithic_nnls(self.h5_path,
+                    # orbit_weights=orbit_weights, 
+                    # hard_project=True)
+                # cfg = MPConfig(epochs=1, processes=1, blas_threads=1, apply_mask=True)
+                # x_solver, stats = monolithicSolver(
+                #     self.h5_path,
+                #     cfg,
+                #     orbit_weights=orbit_weights,
+                #     x0=x0_effective,
+                #     regularisation_scale=0.0,
+                # )
+                # x_solver, stats = monolithicNNLS(
+                #     self.h5_path,
+                #     cfg,
+                #     regularisation_scale=0.0,
+                # )
 
         finally:
             try:

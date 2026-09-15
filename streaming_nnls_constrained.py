@@ -123,6 +123,9 @@ v1.9:   Allow `regularisation_scale` to be zero to disable stabilisation ridge;
             `solve_streaming_nnls` and solve the same mathematics;
         Added adjacent function `monolithicNNLS` computing a genuine
             monolithic non-negative least-squares solution. 11 September 2026
+v1.10:  Switched `monolithicNNLS` to `OSQP` solver. 13 September 2026
+v1.11:  Added diversity-aware round-robin promotion with a per-orbit batch cap
+            to reduce redundant same-orbit candidates. 14 September 2026
 """
 
 from __future__ import annotations, print_function
@@ -137,7 +140,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 import numpy as np
 try:
-    from scipy.optimize import Bounds, LinearConstraint, minimize
+    from scipy.optimize import Bounds, LinearConstraint, minimize, nnls, \
+        lsq_linear
     _HAS_SCIPY_OPTIMIZE = True
 except Exception:
     _HAS_SCIPY_OPTIMIZE = False
@@ -1316,13 +1320,11 @@ def streamActiveSetNNLS(
 
     # --- positive-gradient batch-promotion controls ---
     positive_batch_size = 8 if C <= 3 else 24
+    max_promotions_per_orbit = 3
 
     # The orbit shape is fixed a priori. Its global amplitude is a fitted
     # variable in every constrained reduced solve.
-    has_hard_orbit_shape = (
-        orbit_shape is not None
-        and np.any(orbit_shape > 0.0)
-    )
+    has_hard_orbit_shape = orbit_shape is not None and np.any(orbit_shape > 0.0)
 
     positive_shape_orbits = (np.flatnonzero(orbit_shape > 0.0)
         if has_hard_orbit_shape else np.zeros((0,), dtype=np.int64))
@@ -2448,7 +2450,7 @@ def streamActiveSetNNLS(
             if np.any(finite_score) else -np.inf)
 
         order = np.argsort(score_eff)[::-1]
-        chosen = []
+        eligible_by_orbit: dict[int, list[int]] = {}
 
         for local_i in order:
             if not np.isfinite(score_eff[local_i]):
@@ -2458,12 +2460,51 @@ def streamActiveSetNNLS(
                 continue
 
             gcol = int(not_active[local_i])
-            cc = gcol // P
+            cc = int(gcol // P)
 
             if _on_cooldown(gcol, it) or _orbit_on_cooldown(cc, it):
                 continue
 
-            chosen.append(gcol)
+            eligible_by_orbit.setdefault(cc, []).append(gcol)
+
+        order = np.argsort(score_eff)[::-1]
+        eligible_by_orbit: dict[int, list[int]] = {}
+
+        for local_i in order:
+            if not np.isfinite(score_eff[local_i]):
+                break
+
+            if not did_explore and gvals_total[local_i] <= tol_here:
+                continue
+
+            gcol = int(not_active[local_i])
+            cc = int(gcol // P)
+
+            if _on_cooldown(gcol, it) or _orbit_on_cooldown(cc, it):
+                continue
+
+            eligible_by_orbit.setdefault(cc, []).append(int(local_i))
+
+        orbit_rank = sorted(
+            eligible_by_orbit,
+            key=lambda cc: score_eff[eligible_by_orbit[cc][0]],
+            reverse=True)
+
+        chosen = []
+
+        for depth in range(max_promotions_per_orbit):
+            for cc in orbit_rank:
+                orbit_candidates = eligible_by_orbit[cc]
+
+                if depth >= len(orbit_candidates):
+                    continue
+
+                local_i = orbit_candidates[depth]
+                chosen.append(int(not_active[local_i]))
+
+                if len(chosen) >= preferred_group:
+                    break
+
             if len(chosen) >= preferred_group:
                 break
         
@@ -2476,6 +2517,11 @@ def streamActiveSetNNLS(
             continue
 
         cols_to_activate = np.asarray(chosen, dtype=np.int64)
+        promoted_orbits = cols_to_activate // P
+        n_promotion_orbits = int(np.unique(promoted_orbits).size)
+        max_promoted_per_orbit = (
+            int(np.max(np.bincount(promoted_orbits, minlength=C)))
+            if promoted_orbits.size else 0)
         active[cols_to_activate] = True
         newly_activated = cols_to_activate.copy()
         promoted_cols = newly_activated.copy()
@@ -2586,6 +2632,9 @@ def streamActiveSetNNLS(
                 "n_eligible": int(n_eligible),
                 "preferred_group": int(preferred_group),
                 "n_promoted": int(promoted_cols.size),
+                "n_promotion_orbits": int(n_promotion_orbits),
+                "max_promoted_per_orbit": int(max_promoted_per_orbit),
+                "max_promotions_per_orbit": int(max_promotions_per_orbit),
                 "candidate_topk": diag_candidates,
                 "promoted": promoted_scores,
                 "max_grad_eligible": float(max_grad_eligible),
@@ -3346,6 +3395,91 @@ def streamActiveSetNNLS(
 
 # ------------------------------------------------------------------------------
 
+def _build_literal_Ab(h5_path: str, cfg: MPConfig):
+    """Build the literal physical-space design matrix and data vector."""
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M = f["/HyperCube/models"]
+        S, L = map(int, DC.shape)
+        Sm, C, P, Lm = map(int, M.shape)
+
+        if DC.ndim != 2 or M.ndim != 4:
+            raise RuntimeError(
+                "Expected /DataCube (S,L) and /HyperCube/models (S,C,P,L).")
+        if Sm != S or Lm != L:
+            raise RuntimeError(
+                "Model and data dimensions are inconsistent.")
+
+        mask = cu._get_mask(f) if cfg.apply_mask else None
+        keep_idx = np.flatnonzero(mask) if mask is not None else None
+        chunks = M.chunks
+
+    CP = int(C * P)
+    known_zero = _get_known_zero_mask(h5_path, C, P)
+    known_zero_flat = known_zero.ravel(order="C")
+    allowed = ~known_zero_flat
+    free_idx = np.flatnonzero(allowed).astype(np.int64)
+
+    if free_idx.size == 0:
+        raise RuntimeError("No allowed columns remain for monolithic solve.")
+
+    Lk = int(keep_idx.size) if keep_idx is not None else L
+    n_rows = int(S * Lk)
+    n_free = int(free_idx.size)
+    s_tile = int(
+        cfg.s_tile_override
+        or (chunks[0] if chunks and chunks[0] else 128))
+
+    A = np.empty(
+        (n_rows, n_free), dtype=np.float64, order="F")
+    b = np.empty(n_rows, dtype=np.float64)
+
+    free_c = free_idx // P
+    free_p = free_idx % P
+    row0 = 0
+
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M = f["/HyperCube/models"]
+
+        for s0 in tqdm(
+            range(0, S, s_tile),
+            desc="[MONOLITHIC] building A",
+            disable=not getattr(cfg, "verbose", True),
+        ):
+            s1 = min(S, s0 + s_tile)
+            Y = np.asarray(
+                DC[s0:s1, :], dtype=np.float64, order="C")
+
+            if keep_idx is not None:
+                Y = Y[:, keep_idx]
+
+            rows = int(Y.size)
+            row1 = row0 + rows
+            b[row0:row1] = Y.ravel(order="C")
+
+            for j, (cc, pp) in enumerate(zip(free_c, free_p)):
+                col = np.asarray(
+                    M[s0:s1, cc, pp, :],
+                    dtype=np.float64,
+                    order="C")
+
+                if keep_idx is not None:
+                    col = col[:, keep_idx]
+
+                A[row0:row1, j] = col.ravel(order="C")
+
+            row0 = row1
+
+    if not np.all(np.isfinite(A)):
+        raise RuntimeError("Literal A contains non-finite values.")
+    if not np.all(np.isfinite(b)):
+        raise RuntimeError("Literal b contains non-finite values.")
+
+    return A, b, free_idx, known_zero, (S, L, C, P)
+
+# ------------------------------------------------------------------------------
+
 def monolithic_nnls_scipy(
     h5_path: str,
     cfg: MPConfig,
@@ -3712,266 +3846,333 @@ def monolithicNNLS(
     orbit_weights: Optional[np.ndarray] = None,
     x0: Optional[np.ndarray] = None,
     resume_state: Optional[dict] = None,
-    tracker=None,
-    monolithic_max_active: int = 2000,
-    regularisation_scale: float = 0.0,
-    max_iter: int = 2000,
-    tol: float = 1e-9,
+    tracker: Optional[object] = None,
+    block_size: Optional[int] = None,
+    monolithic_max_active: int = 1000,
+    regularisation_scale: float = 1.0,
+    cache_path: str | None = None,
+    reuse_cache: bool = True,
 ):
     """
-    Solve the literal dense CubeFit constrained least-squares problem.
+    Solve the literal unconstrained physical-space NNLS problem.
 
-    This reference solver explicitly constructs the physical-space design
-    matrix ``A`` and data vector ``b`` and minimizes
-
-        0.5 * ||A x - b||**2 + 0.5 * ridge * ||x||**2
-
-    subject to non-negativity and, when supplied, the fixed orbit-shape
-    constraint
-
-        sum_p x[c, p] = alpha * orbit_shape[c].
-
-    Unlike ``solve_streaming_nnls``, this function does not use normal
-    equations, column scaling, streamed ATA products, reduced active sets, or
-    the custom constrained KKT solver. It is intended only as an independent
-    small-C reference calculation.
+    The problem solved is exactly ``min ||A x - b||_2`` subject only to
+    non-negativity. Persistent ``known_zero_mask`` columns are excluded.
+    ``orbit_weights`` and ``regularisation_scale`` are not applied because
+    this function is the independent unconstrained NNLS reference.
 
     Parameters
     ----------
     h5_path : str
         Path to the CubeFit HDF5 file.
     cfg : MPConfig
-        Solver configuration. ``apply_mask`` controls wavelength masking.
+        HDF5, masking, and memory configuration.
     orbit_weights : ndarray, optional
-        Orbit weights defining the fixed unit-sum orbit shape.
+        Accepted for API compatibility; ignored.
     x0 : ndarray, optional
-        Physical-space initial solution with shape ``(C, P)``.
+        Accepted for API compatibility; ignored.
     resume_state : dict, optional
-        Accepted for API compatibility. Full-state resume is not supported.
-    tracker : optional
-        Accepted for API compatibility and ignored.
+        Full-state resume is unsupported.
+    tracker : object, optional
+        Accepted for API compatibility; ignored.
+    block_size : int, optional
+        Accepted for API compatibility; ignored.
     monolithic_max_active : int, optional
-        Accepted for API compatibility and ignored.
+        Accepted for API compatibility; ignored.
     regularisation_scale : float, optional
-        Physical-space L2 ridge strength. Zero gives the literal unregularized
-        constrained least-squares problem.
-    max_iter : int, optional
-        Maximum number of optimizer iterations.
-    tol : float, optional
-        Optimizer convergence tolerance.
+        Must be zero because this is the literal unregularized NNLS problem.
+    cache_path : str, optional
+        Accepted for API compatibility; ignored.
+    reuse_cache : bool, optional
+        Accepted for API compatibility; ignored.
 
     Returns
     -------
-    x : ndarray, shape (C, P)
-        Physical-space nonnegative solution.
+    x : ndarray
+        Physical-space NNLS solution with shape ``(C, P)``.
     stats : dict
-        Reference-solver diagnostics.
+        NNLS diagnostics.
 
     Raises
     ------
     RuntimeError
-        If SciPy is unavailable, the dense matrix is too large, or the
-        constrained optimization fails.
+        If SciPy NNLS fails.
     ValueError
-        If inputs or hard orbit constraints are inconsistent.
-
-    Examples
-    --------
-    >>> x, stats = monolithicNNLS(
-    ...     h5_path, cfg, orbit_weights=orbit_weights,
-    ...     regularisation_scale=0.0)
+        If a nonzero regularisation scale or full resume is requested.
     """
-    if not _HAS_SCIPY_OPTIMIZE:
-        raise RuntimeError(
-            "SciPy optimize is required for monolithicNNLS.")
+    del orbit_weights, x0, tracker, block_size
+    del monolithic_max_active, cache_path, reuse_cache
 
     if resume_state:
         raise ValueError(
-            "monolithicNNLS does not support full-state resume; "
-            "use zeros or saved_x.")
+            "monolithicNNLS does not support full-state resume.")
 
-    del tracker, monolithic_max_active
-
-    regularisation_scale = float(regularisation_scale)
-    if (not np.isfinite(regularisation_scale)
-            or regularisation_scale < 0.0):
+    if float(regularisation_scale) != 0.0:
         raise ValueError(
-            "regularisation_scale must be nonnegative and finite.")
+            "monolithicNNLS is the unregularized NNLS reference; "
+            "set regularisation_scale=0.0.")
 
     t0 = time.perf_counter()
+    A, b, free_idx, known_zero, dims = _build_literal_Ab(
+        h5_path, cfg)
+    S, L, C, P = dims
 
-    with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
-        M = f["/HyperCube/models"]
+    print(
+        f"[MONOLITHIC-NNLS] A={A.shape[0]}x{A.shape[1]}",
+        flush=True)
 
-        if DC.ndim != 2 or M.ndim != 4:
-            raise RuntimeError(
-                "Expected /DataCube (S,L) and /HyperCube/models (S,C,P,L).")
+    result = lsq_linear(
+        A, b, bounds=(0.0, np.inf), method="trf",
+        lsq_solver="lsmr", lsmr_tol="auto", lsmr_maxiter=10000,
+        max_iter=20000, tol=1e-8,
+        verbose=1 if getattr(cfg, "verbose", True) else 0)
 
-        S, L = map(int, DC.shape)
-        Sm, C, P, Lm = map(int, M.shape)
+    if not result.success:
+        raise RuntimeError(
+            f"Literal monolithic NNLS failed: {result.message}")
 
-        if Sm != S or Lm != L:
-            raise RuntimeError(
-                "Model and data dimensions are inconsistent.")
+    x_free = np.asarray(result.x, dtype=np.float64)
+    rnorm = float(np.linalg.norm(A @ x_free - b))
 
-        mask = cu._get_mask(f) if cfg.apply_mask else None
-        keep_idx = np.flatnonzero(mask) if mask is not None else None
+    CP = C * P
+    x_flat = np.zeros(CP, dtype=np.float64)
+    x_flat[free_idx] = x_free
+    x_flat[known_zero.ravel(order="C")] = 0.0
+    x = x_flat.reshape(C, P)
 
-    CP = int(C * P)
-    Lk = int(keep_idx.size) if keep_idx is not None else L
-    n_rows = int(S * Lk)
+    residual = A @ x_free - b
+    residual_ss = float(np.dot(residual, residual))
+    elapsed = float(time.perf_counter() - t0)
 
-    known_zero = _get_known_zero_mask(h5_path, C, P)
-    known_zero_flat = known_zero.ravel(order="C")
+    stats = {
+        "solver": "scipy.optimize.lsq_linear",
+        "success": True,
+        "elapsed_sec": elapsed,
+        "rows": int(A.shape[0]),
+        "cols": int(CP),
+        "n_free": int(free_idx.size),
+        "n_active": int(np.count_nonzero(x_free > 0.0)),
+        "x_nnz": int(np.count_nonzero(x > 0.0)),
+        "x_sum": float(np.sum(x)),
+        "x_norm": float(np.linalg.norm(x)),
+        "x_max": float(np.max(x)),
+        "rnorm": float(rnorm),
+        "residual_ss": residual_ss,
+        "rmse": float(np.sqrt(residual_ss / max(1, A.shape[0]))),
+        "known_zero_mask": known_zero.copy(),
+    }
+
+    print(
+        f"[MONOLITHIC-NNLS] done in {elapsed:.1f}s "
+        f"active={stats['n_active']}/{CP} "
+        f"rnorm={rnorm:.6e}",
+        flush=True)
+
+    return x, stats
+
+# ------------------------------------------------------------------------------
+
+def monolithicSolver(
+    h5_path: str,
+    cfg: MPConfig,
+    *,
+    orbit_weights: Optional[np.ndarray] = None,
+    x0: Optional[np.ndarray] = None,
+    resume_state: Optional[dict] = None,
+    tracker: Optional[object] = None,
+    block_size: Optional[int] = None,
+    monolithic_max_active: int = 1000,
+    regularisation_scale: float = 0.0,
+    cache_path: str | None = None,
+    reuse_cache: bool = True,
+):
+    """
+    Solve the literal physical-space constrained least-squares problem.
+
+    The problem solved is
+
+        min 0.5 * ||A x - b||_2^2
+
+    subject to
+
+        x >= 0
+
+    and, when ``orbit_weights`` are supplied,
+
+        sum_p x[c, p] = alpha * orbit_shape[c],
+        alpha >= 0.
+
+    The literal design matrix ``A`` and data vector ``b`` are fully formed in
+    memory. No streaming normal equations, scaled solver coordinates,
+    promotion logic, or custom constrained KKT solver are used.
+
+    ``regularisation_scale`` must be zero for a mathematically identical
+    comparison with the zero-ridge streaming problem.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the CubeFit HDF5 file.
+    cfg : MPConfig
+        HDF5, masking, and memory configuration.
+    orbit_weights : ndarray, optional
+        Orbit weights defining the fixed unit-sum orbit shape.
+    x0 : ndarray, optional
+        Physical-space warm start with shape ``(C, P)``.
+    resume_state : dict, optional
+        Full-state resume is unsupported.
+    tracker : object, optional
+        Accepted for API compatibility; ignored.
+    block_size : int, optional
+        Accepted for API compatibility; ignored.
+    monolithic_max_active : int, optional
+        Accepted for API compatibility; ignored.
+    regularisation_scale : float, optional
+        Must be zero for the literal constrained reference problem.
+    cache_path : str, optional
+        Accepted for API compatibility; ignored.
+    reuse_cache : bool, optional
+        Accepted for API compatibility; ignored.
+
+    Returns
+    -------
+    x : ndarray
+        Physical-space constrained solution with shape ``(C, P)``.
+    stats : dict
+        Constrained reference diagnostics.
+
+    Raises
+    ------
+    RuntimeError
+        If the constrained optimizer fails.
+    ValueError
+        If the inputs or orbital constraints are inconsistent.
+    """
+    del tracker, block_size, monolithic_max_active
+    del cache_path, reuse_cache
+
+    if resume_state:
+        raise ValueError(
+            "monolithicSolver does not support full-state resume.")
+
+    if float(regularisation_scale) != 0.0:
+        raise ValueError(
+            "monolithicSolver is an unregularized reference; "
+            "set regularisation_scale=0.0.")
+
+    t0 = time.perf_counter()
+    A, b, free_idx, known_zero, dims = _build_literal_Ab(
+        h5_path, cfg)
+    S, L, C, P = dims
+    CP = C * P
+
+    if orbit_weights is None:
+        raise ValueError(
+            "monolithicSolver requires orbit_weights for the constrained "
+            "reference problem.")
 
     orbit_shape = _canon_orbit_weights(
         h5_path, orbit_weights, C=C, P=P)
-    has_hard_orbit_shape = (
-        orbit_shape is not None and np.any(orbit_shape > 0.0))
 
-    if has_hard_orbit_shape:
-        orbit_shape = np.asarray(orbit_shape, dtype=np.float64)
-        positive_orbits = np.flatnonzero(orbit_shape > 0.0)
-        blocked = np.flatnonzero(
-            np.all(known_zero, axis=1) & (orbit_shape > 0.0))
+    if orbit_shape is None:
+        raise ValueError(
+            "Could not construct a valid orbit shape.")
 
-        if blocked.size:
-            raise ValueError(
-                "known_zero_mask makes the hard orbit constraint "
-                f"infeasible for positive-weight orbits {blocked.tolist()}.")
-    else:
-        positive_orbits = np.arange(C, dtype=np.int64)
+    orbit_shape = np.asarray(
+        orbit_shape, dtype=np.float64).ravel(order="C")
+    positive_orbits = np.flatnonzero(orbit_shape > 0.0)
 
-    orbit_of_col = np.arange(CP, dtype=np.int64) // P
-    allowed = ~known_zero_flat
+    known_zero_cp = known_zero.reshape(C, P)
+    blocked = np.flatnonzero(
+        np.all(known_zero_cp, axis=1) & (orbit_shape > 0.0))
 
-    if has_hard_orbit_shape:
-        allowed &= orbit_shape[orbit_of_col] > 0.0
+    if blocked.size:
+        raise ValueError(
+            "known_zero_mask blocks positive-weight orbits "
+            f"{blocked.tolist()}.")
 
-    free_idx = np.flatnonzero(allowed).astype(np.int64)
     n_free = int(free_idx.size)
-
-    if n_free == 0:
-        raise RuntimeError(
-            "monolithicNNLS has no allowed coefficient columns.")
-
-    # This is intentionally expensive: construct the literal design matrix.
-    required_bytes = int(n_rows * n_free * np.dtype(np.float64).itemsize)
-    required_gib = required_bytes / 1024.0**3
-
-    print(
-        f"[MONOLITHIC] constructing A={n_rows}x{n_free} "
-        f"({required_gib:.2f} GiB float64)",
-        flush=True)
-
-    A = np.empty((n_rows, n_free), dtype=np.float64)
-    b = np.empty((n_rows,), dtype=np.float64)
-
     free_c = free_idx // P
-    free_p = free_idx % P
+    n_var = n_free + 1
 
-    model_chunks = None
-    with open_h5(h5_path, role="reader") as f:
-        model_chunks = f["/HyperCube/models"].chunks
+    # Build the exact convex least-squares Hessian. A remains the defining
+    # model matrix; this is only the analytical Hessian for trust-constr.
+    Hx = np.asarray(
+        A.T @ A, dtype=np.float64, order="C")
+    gx = np.asarray(
+        A.T @ b, dtype=np.float64)
 
-    s_tile = int(
-        cfg.s_tile_override
-        or (model_chunks[0] if model_chunks and model_chunks[0] else 128))
+    # Numerical normalization only; the physical solution is transformed back
+    # exactly before returning.
+    diag = np.diag(Hx)
+    valid = np.isfinite(diag) & (diag > 0.0)
 
-    row0 = 0
-
-    with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
-        M = f["/HyperCube/models"]
-
-        for s0 in tqdm(
-                range(0, S, s_tile), desc="[MONOLITHIC] building A"):
-            s1 = min(S, s0 + s_tile)
-            Y = np.asarray(
-                DC[s0:s1, :], dtype=np.float64, order="C")
-
-            if keep_idx is not None:
-                Y = Y[:, keep_idx]
-
-            n_tile_rows = int(Y.size)
-            row1 = row0 + n_tile_rows
-            b[row0:row1] = Y.reshape(-1)
-
-            for j, (cc, pp) in enumerate(zip(free_c, free_p)):
-                col = np.asarray(
-                    M[s0:s1, cc, pp, :], dtype=np.float64, order="C")
-
-                if keep_idx is not None:
-                    col = col[:, keep_idx]
-
-                A[row0:row1, j] = col.reshape(-1)
-
-            row0 = row1
-
-    if row0 != n_rows:
-        raise RuntimeError(
-            f"Design-matrix row count mismatch: {row0} != {n_rows}.")
-
-    if not np.all(np.isfinite(A)):
-        raise RuntimeError(
-            "Literal design matrix contains non-finite values.")
-
-    if not np.all(np.isfinite(b)):
-        raise RuntimeError(
-            "Literal data vector contains non-finite values.")
-
-    # The reference ridge is deliberately defined in physical x space. For an
-    # exact comparison to the unregularized streaming problem, use scale=0.
-    col_energy = np.sum(A * A, axis=0)
-    positive_energy = col_energy[
-        np.isfinite(col_energy) & (col_energy > 0.0)]
-    energy_ref = (
-        float(np.median(positive_energy))
-        if positive_energy.size else 1.0)
-    ridge = regularisation_scale * 1e-2 * max(1.0, energy_ref)
-
-    if regularisation_scale == 0.0:
-        ridge = 0.0
-
-    if has_hard_orbit_shape:
-        n_constraints = int(positive_orbits.size)
-        n_var = n_free + 1
-        B = np.zeros((n_constraints, n_var), dtype=np.float64)
-        orbit_to_row = {
-            int(cc): row for row, cc in enumerate(positive_orbits)}
-
-        for j, cc in enumerate(free_c):
-            B[orbit_to_row[int(cc)], j] = 1.0
-
-        B[:, n_free] = -orbit_shape[positive_orbits]
-        zero_constraint = np.zeros(n_constraints, dtype=np.float64)
-        constraints = [
-            LinearConstraint(B, zero_constraint, zero_constraint)]
+    if np.any(valid):
+        x_scale = float(np.median(
+            np.abs(gx[valid]) / diag[valid]))
     else:
-        n_var = n_free
-        B = None
-        constraints = []
+        x_scale = 1.0
+
+    x_scale = max(1.0, x_scale)
+
+    alpha_scale = max(
+        x_scale,
+        float(P) * x_scale,
+    )
+
+    b_scale = max(
+        1.0,
+        float(np.linalg.norm(b)),
+    )
+
+    # u = x / x_scale, beta = alpha / alpha_scale.
+    H = np.zeros(
+        (n_var, n_var), dtype=np.float64)
+    H[:n_free, :n_free] = (
+        x_scale * x_scale / (b_scale * b_scale) * Hx)
+
+    def _objective(u):
+        x_free = x_scale * u[:n_free]
+        r = A @ x_free - b
+        return 0.5 * float(np.dot(r, r)) / (b_scale * b_scale)
+
+    def _gradient(u):
+        x_free = x_scale * u[:n_free]
+        r = A @ x_free - b
+        grad = np.zeros(
+            n_var, dtype=np.float64)
+        grad[:n_free] = (
+            x_scale * (A.T @ r) / (b_scale * b_scale))
+        return grad
+
+    def _hessian(u):
+        return H
+
+    B = np.zeros(
+        (positive_orbits.size, n_var),
+        dtype=np.float64)
+
+    orbit_to_row = {
+        int(cc): row
+        for row, cc in enumerate(positive_orbits)}
+
+    for j, cc in enumerate(free_c):
+        B[orbit_to_row[int(cc)], j] = x_scale
+
+    B[:, n_free] = (
+        -alpha_scale * orbit_shape[positive_orbits])
+
+    constraints = LinearConstraint(
+        B,
+        np.zeros(positive_orbits.size, dtype=np.float64),
+        np.zeros(positive_orbits.size, dtype=np.float64))
 
     bounds = Bounds(
         np.zeros(n_var, dtype=np.float64),
         np.full(n_var, np.inf, dtype=np.float64))
 
-    def _objective(u):
-        x_free = u[:n_free]
-        resid = A @ x_free - b
-        return (0.5 * float(np.dot(resid, resid))
-            + 0.5 * ridge * float(np.dot(x_free, x_free)))
-
-    def _gradient(u):
-        x_free = u[:n_free]
-        resid = A @ x_free - b
-        grad = np.zeros((n_var,), dtype=np.float64)
-        grad[:n_free] = A.T @ resid + ridge * x_free
-        return grad
-
-    u0 = np.zeros((n_var,), dtype=np.float64)
-
+    # Construct a feasible starting state. Prefer the supplied x0; otherwise
+    # use the literal unconstrained NNLS solution only as a numerical seed.
     if x0 is not None:
         x0_flat = np.asarray(
             x0, dtype=np.float64).ravel(order="C")
@@ -3981,135 +4182,148 @@ def monolithicNNLS(
                 f"x0 has size {x0_flat.size}; expected {CP}.")
 
         x0_flat = np.maximum(x0_flat, 0.0)
-        x0_flat[known_zero_flat] = 0.0
-        x0_free = x0_flat[free_idx].copy()
+        x0_flat[known_zero.ravel(order="C")] = 0.0
+        x_seed = x0_flat[free_idx].copy()
     else:
-        x0_free = np.zeros((n_free,), dtype=np.float64)
+        x_seed, _ = nnls(A, b)
 
-    if has_hard_orbit_shape:
-        free_orbits = free_idx // P
+    alpha0 = float(np.sum(x_seed))
 
-        if np.any(x0_free > 0.0):
-            alpha0 = float(np.sum(x0_free))
+    if not np.isfinite(alpha0) or alpha0 <= 0.0:
+        alpha0 = 1.0
+
+    x_seed = np.asarray(
+        x_seed,
+        dtype=np.float64).copy()
+
+    for cc in positive_orbits:
+        cc = int(cc)
+        local = np.flatnonzero(
+            free_c == cc)
+
+        if local.size == 0:
+            raise ValueError(
+                f"Orbit {cc} has no allowed population columns.")
+
+        target = alpha0 * float(orbit_shape[cc])
+        mass = float(np.sum(x_seed[local]))
+
+        if mass > 0.0:
+            x_seed[local] *= target / mass
         else:
-            # Obtain a data-informed feasible seed without solving the
-            # optimization problem.
-            alpha0 = 1.0
+            corr = A[:, local].T @ b
+            best = int(
+                local[int(np.argmax(corr))])
+            x_seed[local] = 0.0
+            x_seed[best] = target
 
-        for cc in positive_orbits:
-            cc = int(cc)
-            local = np.flatnonzero(free_orbits == cc)
-
-            if local.size == 0:
-                raise ValueError(
-                    f"Orbit {cc} has no allowed population columns.")
-
-            target = alpha0 * float(orbit_shape[cc])
-            current = float(np.sum(x0_free[local]))
-
-            if current > 0.0:
-                x0_free[local] *= target / current
-            else:
-                # Choose the column most correlated with the literal data.
-                corr = A[:, local].T @ b
-                best = int(local[int(np.argmax(corr))])
-                x0_free[local] = 0.0
-                x0_free[best] = target
-
-        u0[:n_free] = x0_free
-        u0[n_free] = alpha0
-    else:
-        u0[:n_free] = x0_free
+    u0 = np.empty(
+        n_var, dtype=np.float64)
+    u0[:n_free] = x_seed / x_scale
+    u0[n_free] = alpha0 / alpha_scale
 
     print(
         f"[MONOLITHIC] solving constrained least squares: "
-        f"rows={n_rows} free={n_free} ridge={ridge:.6e}",
+        f"rows={A.shape[0]} free={n_free}",
         flush=True)
 
-    result = minimize(_objective, u0, jac=_gradient, method="SLSQP",
-        bounds=bounds, constraints=constraints,
-        options={"maxiter": int(max_iter), "ftol": float(tol),
-            "disp": bool(getattr(cfg, "verbose", True))})
+    result = minimize(
+        _objective,
+        u0,
+        jac=_gradient,
+        hess=_hessian,
+        method="trust-constr",
+        bounds=bounds,
+        constraints=constraints,
+        options={
+            "maxiter": 20000,
+            "gtol": 1e-8,
+            "xtol": 1e-8,
+            "barrier_tol": 1e-8,
+            "verbose": 3 if getattr(cfg, "verbose", True) else 0,
+        },
+    )
 
-    x_free = np.maximum(
-        np.asarray(result.x[:n_free], dtype=np.float64), 0.0)
+    if result.x is None:
+        raise RuntimeError(
+            "Literal constrained solver returned no solution.")
 
-    x_flat = np.zeros((CP,), dtype=np.float64)
+    x_free = x_scale * np.maximum(
+        np.asarray(result.x[:n_free], dtype=np.float64),
+        0.0)
+
+    alpha = alpha_scale * max(
+        0.0,
+        float(result.x[n_free]))
+
+    x_flat = np.zeros(
+        CP, dtype=np.float64)
     x_flat[free_idx] = x_free
-    x_flat[known_zero_flat] = 0.0
+    x_flat[known_zero.ravel(order="C")] = 0.0
     x = x_flat.reshape(C, P)
 
-    resid = A @ x_free - b
-    residual_ss = float(np.dot(resid, resid))
-    rmse = float(np.sqrt(residual_ss / max(1, n_rows)))
-    data_objective = 0.5 * residual_ss
-    ridge_objective = 0.5 * ridge * float(np.dot(x_free, x_free))
-    total_objective = data_objective + ridge_objective
+    residual = A @ x_free - b
+    residual_ss = float(
+        np.dot(residual, residual))
+    rmse = float(
+        np.sqrt(residual_ss / max(1, A.shape[0])))
 
-    if has_hard_orbit_shape:
-        alpha = float(result.x[n_free])
-        orbit_mass = np.sum(x, axis=1)
-        orbit_target = alpha * orbit_shape
-        orbit_resid = orbit_mass - orbit_target
-        orbit_l1 = float(np.sum(np.abs(orbit_resid)))
-        orbit_linf = float(np.max(np.abs(orbit_resid)))
-        constraint_violation = float(np.max(np.abs(B @ result.x)))
-    else:
-        alpha = None
-        orbit_mass = np.sum(x, axis=1)
-        orbit_target = None
-        orbit_resid = None
-        orbit_l1 = None
-        orbit_linf = None
-        constraint_violation = 0.0
+    orbit_mass = np.sum(
+        x,
+        axis=1)
+    orbit_target = alpha * orbit_shape
+    orbit_resid = orbit_mass - orbit_target
+    orbit_l1 = float(
+        np.sum(np.abs(orbit_resid)))
+    orbit_linf = float(
+        np.max(np.abs(orbit_resid)))
 
-    x_scale = max(1.0, float(np.max(np.abs(x_free))))
-    positive_tol = 1e-12 * x_scale
-    positive = x_free > positive_tol
-
-    elapsed = float(time.perf_counter() - t0)
+    elapsed = float(
+        time.perf_counter() - t0)
 
     stats = {
+        "solver": "scipy.optimize.trust-constr",
+        "success": bool(result.success),
         "elapsed_sec": elapsed,
-        "rows": int(n_rows),
+        "rows": int(A.shape[0]),
         "cols": int(CP),
         "n_free": int(n_free),
-        "n_active": int(np.count_nonzero(positive)),
+        "n_active": int(np.count_nonzero(x_free > 0.0)),
         "x_nnz": int(np.count_nonzero(x > 0.0)),
         "x_sum": float(np.sum(x)),
         "x_norm": float(np.linalg.norm(x)),
         "x_max": float(np.max(x)),
-        "rmse": float(rmse),
-        "residual_ss": float(residual_ss),
-        "data_objective": float(data_objective),
-        "ridge_objective": float(ridge_objective),
-        "total_objective": float(total_objective),
-        "ridge": float(ridge),
-        "regularisation_scale": float(regularisation_scale),
-        "alpha": alpha,
+        "rmse": rmse,
+        "residual_ss": residual_ss,
+        "data_objective": 0.5 * residual_ss,
+        "alpha": float(alpha),
         "orbit_mass": orbit_mass,
         "orbit_target": orbit_target,
         "orbit_resid": orbit_resid,
         "orbit_resid_l1": orbit_l1,
         "orbit_resid_linf": orbit_linf,
-        "constraint_violation": float(constraint_violation),
-        "success": bool(result.success),
-        "status": int(result.status),
+        "constraint_violation": orbit_linf,
+        "optimality": float(result.optimality),
+        "constr_violation": float(result.constr_violation),
         "message": str(result.message),
+        "status": int(result.status),
         "iterations": int(result.nit),
+        "x_scale": float(x_scale),
+        "alpha_scale": float(alpha_scale),
         "known_zero_mask": known_zero.copy(),
     }
 
     print(
         f"[MONOLITHIC] done in {elapsed:.1f}s "
-        f"success={result.success} active={stats['n_active']}/{CP} "
-        f"x_sum={stats['x_sum']:.6e} rmse={rmse:.6e} "
-        f"orbit_Linf={constraint_violation:.3e}",
+        f"success={result.success} "
+        f"active={stats['n_active']}/{CP} "
+        f"rmse={rmse:.6e} "
+        f"orbit_Linf={orbit_linf:.3e}",
         flush=True)
 
     if not result.success:
         raise RuntimeError(
-            "Literal monolithic constrained NNLS failed: "
+            "Literal constrained solver failed: "
             f"{result.message}")
 
     return x, stats

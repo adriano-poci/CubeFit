@@ -13,8 +13,7 @@
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_3Rio.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_3Rio.log" --open-mode=append
 #SBATCH -p short
-#SBATCH -M htc,arc
-#SBATCH --qos=priority
+# #SBATCH --qos=priority
 
 #SBATCH --job-name="CubeFit_3Rio"
 #SBATCH --time=0-12:00
@@ -51,16 +50,23 @@ export HDF5_USE_FILE_LOCKING=FALSE
 # File descriptors
 ulimit -n 8192
 
-# sanity print (once) to confirm cpuset and BLAS threads
-srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python - <<'PY'
-import os, json
+# Sanity print to confirm cpuset and BLAS threads.
+python - <<'PY'
+import json
+import os
+
 print(f"[sanity] cpuset cores: {len(os.sched_getaffinity(0))}")
+
 try:
     from threadpoolctl import threadpool_info
-    print("[sanity] BLAS pools:", json.dumps(threadpool_info(), indent=2)[:600], "...")
-except Exception as e:
-    print("[sanity] threadpoolctl not available:", e)
+
+    print(
+        "[sanity] BLAS pools:",
+        json.dumps(threadpool_info(), indent=2)[:600],
+        "...",
+    )
+except Exception as exc:
+    print("[sanity] threadpoolctl not available:", exc)
 PY
 
 
@@ -162,9 +168,11 @@ fi
 # ------------------------------------------------------------------------------
 
 
-
-# run your job as a Slurm step (gives you the full cpuset)
 cd /data/phys-gal-dynamics/phys2603/CubeFit
+
 echo "Submitted cluster: ${CF_CLUSTER:-unknown}"
-srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python -m IPython --colors=NoColor kz_rio.py -- --galaxy "$GALAXY" --redraw ${NCOMP:+--ncomp="$NCOMP"}
+echo "SLURM_JOB_ID=${SLURM_JOB_ID:-unknown}"
+echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-unknown}"
+
+python -m IPython --colors=NoColor kz_rio.py -- --galaxy "$GALAXY" --redraw \
+    ${NCOMP:+--ncomp="$NCOMP"}

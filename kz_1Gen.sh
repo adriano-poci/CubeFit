@@ -147,9 +147,11 @@ fi
 # ------------------------------------------------------------------------------
 
 
-
 cd /data/phys-gal-dynamics/phys2603/CubeFit
+
 echo "Submitted cluster: ${CF_CLUSTER:-unknown}"
-# run your job as a Slurm step (gives you the full cpuset)
-srun -n1 -c${SLURM_CPUS_PER_TASK} --cpu-bind=cores \
-  python -m IPython --colors=NoColor kz_run.py -- --galaxy "$GALAXY" --run-switch 'gen' --redraw ${NCOMP:+--ncomp="$NCOMP"}
+echo "SLURM_JOB_ID=${SLURM_JOB_ID:-unknown}"
+echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-unknown}"
+
+python -m IPython --colors=NoColor kz_run.py -- --galaxy "$GALAXY" \
+    --run-switch 'gen' --redraw ${NCOMP:+--ncomp="$NCOMP"}
