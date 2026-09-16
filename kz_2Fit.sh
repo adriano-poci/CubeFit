@@ -13,14 +13,14 @@
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
 #SBATCH -p long
-#SBATCH --qos=priority
+# #SBATCH --qos=priority
 
 #SBATCH --job-name="CubeFit_2Fit"
 #SBATCH --time=6-00:00
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=48
-#SBATCH --mem=700G
+#SBATCH --mem=475G
 #SBATCH --hint=nomultithread
 #SBATCH --exclusive
 #SBATCH --mail-type=ALL
