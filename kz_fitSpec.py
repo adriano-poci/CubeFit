@@ -2816,22 +2816,65 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 mask=mask_arr)
 
     if 'otype' not in oDict['cutOn']:
-        return # only do orbital SFH if orbital decomposition
-    if oDict['cuts'] and len(oDict['cuts'])>0:
-        # determine which components belong to which orbital categories
-        allCuts = np.array([oDict['cuts'][key] for key in oDict['cuts'].keys()])
-        uCuts, uCounts = np.unique(allCuts, axis=0, return_counts=True)
-        # assert that every elemnt of uCounts is equal
-        assert np.unique(uCounts).size == 1
-        notypes = np.max(uCounts)
-        obins = np.arange(1, notypes+1) * uCuts.shape[0]
-        otypes = np.digitize(nzComp, bins=obins, right=True)
+        return
 
-        diskIdx = np.where(allCuts[:, 2][nzComp[otypes==0]] > 0.5)[0]
-        diskComps = nzComp[diskIdx]
+    if 'componentTypes' in oDict:
+        componentTypes = np.asarray(
+            oDict['componentTypes'], dtype=np.int64)
+        if componentTypes.size < np.max(nzComp):
+            raise RuntimeError(
+                "Stored componentTypes is inconsistent with nzComp.")
+
+        otypes = componentTypes[nzComp - 1]
+        if not np.all(np.isin(otypes, [0, 1, 2])):
+            raise RuntimeError(
+                f"Invalid intrinsic orbital types: {np.unique(otypes)}.")
+
+        allCuts = np.asarray(
+            [oDict['cuts'][f"{component:{pred}d}"] for component in nzComp],
+            dtype=np.float64)
+
+        diskComps = np.flatnonzero(
+            (otypes == 0) & (allCuts[:, 2] > 0.5))
+        bulgeComps = np.setdiff1d(np.arange(nComp), diskComps)
+    elif oDict['cuts'] and len(oDict['cuts']) > 0:
+        componentTypes = np.full(nzComp.size, -1, dtype=np.int64)
+
+        for ii, component in enumerate(nzComp):
+            key = f"{component:{pred}d}"
+            mask = np.asarray(oDict['wheres'][key], dtype=bool)
+            orbitTypes = np.unique(types[mask])
+
+            if orbitTypes.size != 1:
+                raise RuntimeError(
+                    f"Component {component} contains orbital types "
+                    f"{orbitTypes.tolist()}.")
+
+            if orbitTypes[0] == 3:
+                componentTypes[ii] = 0
+            elif orbitTypes[0] == 1:
+                componentTypes[ii] = 1
+            elif orbitTypes[0] == 4:
+                componentTypes[ii] = 2
+            else:
+                raise RuntimeError(
+                    f"Component {component} contains unsupported orbital type "
+                    f"{orbitTypes[0]}.")
+
+        otypes = componentTypes
+        if not np.all(np.isin(otypes, [0, 1, 2])):
+            raise RuntimeError(
+                f"Invalid intrinsic orbital types: {np.unique(otypes)}.")
+
+        allCuts = np.asarray(
+            [oDict['cuts'][f"{component:{pred}d}"] for component in nzComp],
+            dtype=np.float64)
+
+        diskComps = np.flatnonzero(
+            (otypes == 0) & (allCuts[:, 2] > 0.5))
         bulgeComps = np.setdiff1d(np.arange(nComp), diskComps)
     else:
-        otypes = copy(nzComp)-1 # zero-indexed
+        otypes = copy(nzComp) - 1
         diskComps = bulgeComps = None
 
     satube = (otypes == 0) # group short-axis tubes

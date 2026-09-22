@@ -1306,7 +1306,7 @@ def streamActiveSetNNLS(
 
     grad_ref = max(1.0, float(np.max(np.abs(ATy_scaled))))
     data_scale_ref = _robust_scale_ref(ATy_scaled, fallback=grad_ref)
-    tol_grad_rel = 1e-6
+    tol_grad_rel = 1e-11
 
     # --- outer-iteration progress watchdog ---
     z_delta_tol = 1e-8
