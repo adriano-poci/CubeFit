@@ -35,6 +35,9 @@ v1.5:   Re-worked most panels to reflect updated diagnostics around KKT
             `plot_diagnostic_jsonl_dashboard`. 26 August 2026
 v1.6:   Expanded and improved `plot_diagnostic_jsonl_dashboard` for richer
             diagnostics. 14 September 2026
+v1.7:   Made `plot_diagnostic_jsonl_dashboard` able to accept multiple file
+            paths and automatically merge run diagnostics, to support 
+            `resume` runs. 23 September 2026
 """
 
 from __future__ import annotations
@@ -506,7 +509,7 @@ def _homogenise_ticks(ax, *, nbins: int = 4) -> None:
 
 # ------------------------------------------------------------------------------
 
-def plot_diagnostic_jsonl_dashboard(jsonl_path: str, *,
+def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     max_points: int | None = 5000, save_path: str | None = None,
     show: bool = False, figsize: tuple[float, float] = (24.0, 13.0),
 ) -> list[dict]:
@@ -581,19 +584,26 @@ def plot_diagnostic_jsonl_dashboard(jsonl_path: str, *,
         raise ValueError("max_points must be positive or None.")
 
     def _load_records() -> list[dict]:
+        paths = (
+            [jsonl_paths] if isinstance(jsonl_paths, str)
+            else list(jsonl_paths)
+        )
         parsed = []
 
-        with open(jsonl_path, "r", encoding="utf-8") as handle:
-            for line in handle:
-                text = line.strip()
-                if not text:
-                    continue
-                try:
-                    record = json.loads(text)
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    continue
-                if isinstance(record, dict):
-                    parsed.append(record)
+        for path in paths:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    text = line.strip()
+                    if not text:
+                        continue
+
+                    try:
+                        record = json.loads(text)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+
+                    if isinstance(record, dict):
+                        parsed.append(record)
 
         return parsed
 
@@ -634,6 +644,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_path: str, *,
         """
         merged_by_iter: dict[int, dict] = {}
         non_iteration: dict[str, dict] = {}
+        setup_records = []
 
         for record in raw_records:
             kind = str(record.get("kind", ""))
@@ -643,6 +654,8 @@ def plot_diagnostic_jsonl_dashboard(jsonl_path: str, *,
             except (KeyError, TypeError, ValueError):
                 if kind:
                     non_iteration[kind] = dict(record)
+                    if kind == "mono_setup":
+                        setup_records.append(dict(record))
                 continue
 
             current = merged_by_iter.setdefault(iteration,
@@ -665,6 +678,8 @@ def plot_diagnostic_jsonl_dashboard(jsonl_path: str, *,
 
         if max_points is not None:
             merged = merged[-int(max_points):]
+
+        non_iteration["_setup_records"] = setup_records
 
         return merged, non_iteration
 
