@@ -2226,6 +2226,62 @@ def streamActiveSetNNLS(
             if gvals_total.size else -np.inf)
 
         if kkt_converged:
+            x_phys_now = _current_x_from_z(z).reshape(C, P)
+
+            orbit_mass_now = np.sum(x_phys_now, axis=1)
+
+            if has_hard_orbit_shape:
+                orbit_target_now = (float(alpha_current)
+                    * np.asarray(orbit_shape, dtype=np.float64))
+            else:
+                orbit_target_now = np.zeros((C,), dtype=np.float64)
+
+            orbit_resid_now = orbit_mass_now - orbit_target_now
+
+            _emit_diag(
+                {
+                    "kind": "iter_post",
+                    "source": "streamActiveSetNNLS",
+                    "iter": int(it + 1),
+                    "phase": "kkt_converged",
+                    "t_iter_sec": float(
+                        time.perf_counter() - t_iter
+                    ),
+                    "k_active": int(np.count_nonzero(active)),
+                    "n_active": int(np.count_nonzero(active)),
+                    "data_objective": float(data_objective_current),
+                    "max_grad_total": float(max_grad_all),
+                    "max_grad_data": float(max_grad_data),
+                    "max_grad_orbit": float(max_grad_orbit),
+                    "max_grad_promotable": float(max_grad_promotable),
+                    "max_grad_active": float(max_grad_active),
+                    "max_grad_zero_active": float(max_grad_zero_active),
+                    "max_grad_inactive": float(max_grad_inactive),
+                    "max_grad_dual": float(max_grad_dual),
+                    "tol_here": float(tol_here),
+                    "active_ok": bool(active_ok),
+                    "dual_ok": bool(dual_ok),
+                    "kkt_converged": True,
+                    "ridge": float(ridge_current),
+                    "alpha": (float(alpha_current)
+                        if has_hard_orbit_shape else None),
+                    "orbit_mass": orbit_mass_now.tolist(),
+                    "orbit_target": orbit_target_now.tolist(),
+                    "orbit_resid": orbit_resid_now.tolist(),
+                    "orbit_constraint_l1": float(
+                        np.sum(np.abs(orbit_resid_now))),
+                    "orbit_constraint_l2": float(
+                        np.linalg.norm(orbit_resid_now)),
+                    "orbit_constraint_linf": float(
+                        np.max(np.abs(orbit_resid_now))),
+                    "x": x_phys_now.ravel(order="C").tolist(),
+                    "x_sum": float(np.sum(x_phys_now)),
+                    "x_norm": float(np.linalg.norm(x_phys_now)),
+                    "x_nnz": int(
+                        np.count_nonzero(x_phys_now > 0.0)),
+                }
+            )
+
             _set_stop(
                 "kkt_converged",
                 "converged",
@@ -2236,7 +2292,12 @@ def streamActiveSetNNLS(
                 tol_here=float(tol_here),
                 n_active=int(np.count_nonzero(active)),
             )
-            _emit_checkpoint(it, final=True, phase="kkt_converged")
+
+            _emit_checkpoint(
+                it,
+                final=True,
+                phase="kkt_converged",
+            )
             break
 
         if dual_ok and not active_ok:
