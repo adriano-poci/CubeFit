@@ -126,6 +126,9 @@ v1.9:   Allow `regularisation_scale` to be zero to disable stabilisation ridge;
 v1.10:  Switched `monolithicNNLS` to `OSQP` solver. 13 September 2026
 v1.11:  Added diversity-aware round-robin promotion with a per-orbit batch cap
             to reduce redundant same-orbit candidates. 14 September 2026
+v1.12:  Avoid computing full gradient when initialisation is `zeros`;
+        Cache gradient in case of rejected solve, which avoids recomputing the
+            full gradient of known columns. 25 September 2026
 """
 
 from __future__ import annotations, print_function
@@ -720,58 +723,207 @@ def _nnls_from_quadratic(
     tol: float = 1e-9,
 ) -> np.ndarray:
     """
-    Solve: min_{z >= 0} 0.5 * z^T ATA z - ATy^T z
-    using projected gradient on the quadratic form (ATA small, dense).
+    Solve a small dense nonnegative quadratic problem.
+
+    The problem is
+
+        minimize
+
+            0.5 * x.T @ ATA @ x - ATy.T @ x
+
+        subject to
+
+            x >= 0.
+
+    When the quadratic matrix is positive definite, the problem is converted
+    exactly to a conventional nonnegative least-squares problem,
+
+        minimize ||R @ x - q||_2,
+
+    where ``ATA = R.T @ R`` and ``R.T @ q = ATy``. This is then solved using
+    ``scipy.optimize.nnls``.
+
+    If Cholesky factorization fails because the quadratic is numerically
+    positive-semidefinite or singular, the function falls back to projected
+    gradient descent. The fallback uses the projected KKT residual rather than
+    solution-step size alone to determine convergence.
+
+    Parameters
+    ----------
+    ATA : ndarray, shape (n, n)
+        Symmetric positive-semidefinite quadratic matrix.
+    ATy : ndarray, shape (n,)
+        Linear term of the quadratic objective.
+    x0 : ndarray, optional
+        Nonnegative initial solution used by the projected-gradient fallback.
+        It is not required by the preferred SciPy NNLS path.
+    max_iter : int, optional
+        Maximum number of iterations for SciPy NNLS and the projected-gradient
+        fallback.
+    tol : float, optional
+        Relative projected-KKT tolerance used by the fallback solver.
+
+    Returns
+    -------
+    x : ndarray, shape (n,)
+        Nonnegative solution of the quadratic problem.
+
+    Raises
+    ------
+    ValueError
+        If the supplied arrays have inconsistent dimensions or contain
+        non-finite values.
+    RuntimeError
+        If the projected-gradient fallback fails to reach the requested KKT
+        tolerance.
+
+    Examples
+    --------
+    >>> x = _nnls_from_quadratic(
+    ...     ATA_sub_reg, ATy_sub, x0=z_old_active,
+    ...     max_iter=10000, tol=1e-12)
     """
-    ATA = np.asarray(ATA, dtype=np.float64, order="C")
-    ATy = np.asarray(ATy, dtype=np.float64, order="C")
-    n = ATA.shape[0]
+    H = np.asarray(ATA, dtype=np.float64, order="C")
+    b = np.asarray(ATy, dtype=np.float64).ravel(order="C")
+
+    if H.ndim != 2 or H.shape[0] != H.shape[1]:
+        raise ValueError(
+            "ATA must be a square two-dimensional array.")
+
+    n = int(H.shape[0])
+
+    if b.size != n:
+        raise ValueError(
+            f"ATy has size {b.size}; expected {n}.")
+
     if n == 0:
         return np.zeros((0,), dtype=np.float64)
 
-    # initial guess
+    if not np.all(np.isfinite(H)) or not np.all(np.isfinite(b)):
+        raise ValueError(
+            "ATA and ATy must contain only finite values.")
+
+    # Numerical accumulation can introduce tiny asymmetries in the streamed
+    # reduced normal equations. Symmetrize before attempting factorization.
+    H = 0.5 * (H + H.T)
+
+    # ------------------------------------------------------------------
+    # Preferred path: exact conversion to a conventional NNLS problem.
+    #
+    # If H is positive definite,
+    #
+    #     H = R.T @ R
+    #
+    # and choosing q such that
+    #
+    #     R.T @ q = b
+    #
+    # gives
+    #
+    #     0.5 * ||R @ x - q||^2
+    #
+    #       = 0.5 * x.T @ H @ x - b.T @ x + constant.
+    #
+    # The nonnegative minimizer is therefore exactly the minimizer of the
+    # original quadratic problem. This avoids the mathematically incorrect
+    # operation of solving the unconstrained system and clipping x afterward.
+    # ------------------------------------------------------------------
+    if _HAS_SCIPY_OPTIMIZE:
+        try:
+            R = np.linalg.cholesky(H).T
+            q = np.linalg.solve(R.T, b)
+
+            x, _ = nnls(
+                R, q, maxiter=max(3 * n, int(max_iter)))
+
+            x = np.asarray(x, dtype=np.float64)
+
+            if np.all(np.isfinite(x)) and np.all(x >= -1e-12):
+                return np.maximum(x, 0.0)
+
+        except np.linalg.LinAlgError:
+            # A numerically singular or semidefinite reduced Hessian is
+            # expected occasionally for highly degenerate SSP columns.
+            pass
+        except Exception:
+            # Preserve the projected-gradient fallback if SciPy NNLS itself
+            # cannot solve the factored problem.
+            pass
+
+    # ------------------------------------------------------------------
+    # Fallback: projected gradient directly on the quadratic.
+    #
+    # Unlike the previous implementation, convergence is certified using
+    # the projected KKT residual. A tiny change in x is not sufficient to
+    # declare convergence in a severely ill-conditioned reduced system.
+    # ------------------------------------------------------------------
     if x0 is None:
         x = np.zeros((n,), dtype=np.float64)
     else:
-        x = np.maximum(0.0, np.asarray(x0, dtype=np.float64).ravel())
+        x = np.asarray(x0, dtype=np.float64).ravel(order="C")
 
-    # Lipschitz estimate = spectral norm of ATA (power iteration)
-    def _spectral_norm(mat, iters=10):
-        v = np.random.default_rng(123456).normal(size=(mat.shape[1],))
-        v /= (np.linalg.norm(v) + 1e-30)
-        for _ in range(iters):
-            v = mat @ v
-            nv = np.linalg.norm(v)
-            if nv == 0:
-                return 0.0
-            v /= nv
-        # Rayleigh quotient approx
-        w = mat @ v
-        return float(np.dot(v, w))
+        if x.size != n:
+            raise ValueError(
+                f"x0 has size {x.size}; expected {n}.")
 
-    L = _spectral_norm(ATA)
+        if not np.all(np.isfinite(x)):
+            raise ValueError(
+                "x0 must contain only finite values.")
+
+        x = np.maximum(x, 0.0)
+
+    # Since H is small and dense, obtain the Lipschitz constant directly
+    # rather than using a short power iteration. The projected-gradient
+    # step 1/L is then guaranteed to be non-expansive for a PSD quadratic.
+    try:
+        eigvals = np.linalg.eigvalsh(H)
+        L = float(np.max(eigvals))
+    except np.linalg.LinAlgError:
+        L = float(np.linalg.norm(H, ord=2))
+
     if not np.isfinite(L) or L <= 0.0:
         L = 1.0
+
     step = 1.0 / L
 
-    prev_norm = np.linalg.norm(x)
-    for k in range(max_iter):
-        grad = ATA @ x - ATy
+    # Scale the requested tolerance to the natural gradient scale. This is
+    # analogous to the relative gradient criterion used by the outer solver.
+    grad_scale = max(1.0, float(np.max(np.abs(b))))
+    kkt_tol = float(tol) * grad_scale
+
+    for _ in range(int(max_iter)):
+        grad = H @ x - b
         x_new = x - step * grad
-        # project
         np.maximum(x_new, 0.0, out=x_new)
-        diff = np.linalg.norm(x_new - x)
-        x = x_new
-        cur_norm = np.linalg.norm(x)
-        if diff <= tol * (1.0 + cur_norm):
-            break
-        # optionally adjust step with backtracking if divergence occurs (rare)
-        if k % 200 == 0 and k > 0:
-            # recompute Lipschitz if stagnating
-            L = _spectral_norm(ATA)
-            if np.isfinite(L) and L > 0:
-                step = 1.0 / L
-    return x
+
+        # For min f(x), x >= 0, the projected-gradient residual
+        #
+        #     x - P_+(x - grad)
+        #
+        # vanishes exactly at the NNLS KKT solution.
+        grad_new = H @ x_new - b
+        projected_grad = x_new - np.maximum(x_new - grad_new, 0.0)
+        kkt = float(np.max(np.abs(projected_grad)))
+
+        x[:] = x_new
+
+        if kkt <= kkt_tol:
+            return x
+
+    # Never silently return a non-stationary reduced solution. Doing so can
+    # make the outer active-set solver report an active-stationarity failure
+    # only after another extremely expensive full HyperCube gradient pass.
+    grad = H @ x - b
+    projected_grad = x - np.maximum(x - grad, 0.0)
+    final_kkt = float(np.max(np.abs(projected_grad)))
+
+    if not np.all(np.isfinite(x)) or final_kkt > kkt_tol:
+        raise RuntimeError(
+            "Reduced NNLS failed to reach KKT tolerance: "
+            f"kkt={final_kkt:.6e}, tol={kkt_tol:.6e}, "
+            f"iterations={int(max_iter)}.")
+
+    return np.maximum(x, 0.0)
 
 # ------------------------------------------------------------------------------
 
@@ -1747,8 +1899,23 @@ def streamActiveSetNNLS(
     # ------------------------------------------------------------
     # Helper: compute ATAz in parallel using provided executor
     # ------------------------------------------------------------
+    cached_ATAz_z = None
+    cached_ATAz = None
+
     def _compute_ATAz_scaled(z_vec):
-        x_cand = np.asarray(z_vec, dtype=np.float64)
+        nonlocal cached_ATAz_z, cached_ATAz
+        x_cand = np.asarray(z_vec, dtype=np.float64).ravel(order="C")
+
+        if not np.any(x_cand):
+            ATAz = np.zeros((CP,), dtype=np.float64)
+            cached_ATAz_z = x_cand.copy()
+            cached_ATAz = ATAz.copy()
+            return ATAz
+
+        if (cached_ATAz_z is not None
+            and np.array_equal(x_cand, cached_ATAz_z)):
+            print("[MONO] reusing cached ATAz", flush=True,)
+            return cached_ATAz.copy()
 
         n_workers = max(1, int(cfg.processes))
         batches = [[] for _ in range(n_workers)]
@@ -1776,7 +1943,11 @@ def streamActiveSetNNLS(
                 print("[ERROR] worker returned exception:", e, flush=True)
                 raise
 
+        cached_ATAz_z = x_cand.copy()
+        cached_ATAz = ATAz.copy()
+
         return ATAz
+    
     def _assemble_reduced(active_idx):
         """Assemble reduced normal equations on the supplied support."""
         active_idx = np.asarray(active_idx, dtype=np.int64)
@@ -2947,21 +3118,8 @@ def streamActiveSetNNLS(
                 continue
 
         else:
-            z_sub_raw = None
-            try:
-                z_sub_raw = np.linalg.solve(ATA_sub_reg, ATy_sub)
-            except np.linalg.LinAlgError:
-                U, svals, Vt = np.linalg.svd(ATA_sub_reg, full_matrices=False)
-                smax = svals[0] if svals.size else 1.0
-                s_thresh = max(1e-12, 1e-6 * smax)
-                s_inv = np.array(
-                    [1.0 / s if s > s_thresh else 0.0 for s in svals],
-                    dtype=np.float64,
-                )
-                z_sub_raw = Vt.T @ (s_inv * (U.T @ ATy_sub))
-
-            z_sub_raw = np.maximum(z_sub_raw, 0.0)
-            z_sub = z_sub_raw.copy()
+            z_sub = _nnls_from_quadratic(ATA_sub_reg, ATy_sub,
+                x0=z_old_active, max_iter=10000, tol=1e-12)
 
         # Track promoted columns that did not survive the reduced solve.
         failed_cols = []

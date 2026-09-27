@@ -27,6 +27,9 @@ v1.10:  Added `sspIdx` keyword to `_oneTimeSpec` to allow for thinning of the SS
 v1.11:  Reworked `resolve_parallelism` to roughly retain the hybrid parallelism
             of the provided configuration using the input ratio of cores and
             threads. 25 August 2026
+v1.12:  Added `upscaledSolution` and `constrainUpscaledSolution` to upward
+            propagate a solution from a small run to seed a production run. 25
+            September 2026 
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -3392,5 +3395,308 @@ def resolve_parallelism(
         best_processes,
         best_blas,
     )
+
+# ------------------------------------------------------------------------------
+
+def upscaleSolution(
+    solution_path: str,
+    hypercube_path: str,
+    component_map: np.ndarray,
+) -> np.ndarray:
+    """
+    Map an existing CubeFit solution onto a finer component decomposition.
+
+    Each component in the new HyperCube receives the complete SSP coefficient
+    vector of its parent component in the original solution,
+
+        x_new[c, :] = x_old[component_map[c], :].
+
+    No component-weight scaling is applied. This is the appropriate mapping
+    when the fine HyperCube components partition the corresponding coarse
+    model components and their amplitudes are already encoded in the model
+    columns.
+
+    The function does not read ``/HyperCube/models``. The new HyperCube is
+    opened only to determine and validate its component and population
+    dimensions.
+
+    Parameters
+    ----------
+    solution_path : str
+        Existing CubeFit solution file containing ``/X_global`` with shape
+        ``(C_old, P)``.
+    hypercube_path : str
+        New CubeFit HyperCube containing ``/HyperCube/models`` with shape
+        ``(S, C_new, P, L)``.
+    component_map : ndarray, shape (C_new,)
+        Zero-based parent-component index for every component in the new
+        HyperCube. Each value must lie in ``[0, C_old)``.
+
+    Returns
+    -------
+    x_new : ndarray, shape (C_new, P)
+        Physical-space coefficient vector mapped onto the new decomposition.
+
+    Raises
+    ------
+    ValueError
+        If dimensions are inconsistent or ``component_map`` contains invalid
+        parent indices.
+    RuntimeError
+        If the original solution is missing or contains invalid coefficients.
+
+    Examples
+    --------
+    >>> x0 = upscaleSolution(
+    ...     "x_3_00.h5",
+    ...     "hypercube_125_00.h5",
+    ...     component_types)
+    """
+    component_map = np.asarray(
+        component_map, dtype=np.int64).ravel(order="C")
+
+    with open_h5(solution_path, role="reader") as f:
+        if "/X_global" not in f:
+            raise RuntimeError(
+                f"{solution_path} does not contain /X_global.")
+
+        x_old = np.asarray(
+            f["/X_global"][...], dtype=np.float64)
+
+    if x_old.ndim != 2:
+        raise ValueError(
+            f"X_global has shape {x_old.shape}; expected (C_old, P).")
+
+    C_old, P_old = map(int, x_old.shape)
+
+    if not np.all(np.isfinite(x_old)):
+        raise RuntimeError(
+            "Original solution contains non-finite coefficients.")
+
+    if np.any(x_old < 0.0):
+        raise RuntimeError(
+            "Original solution contains negative coefficients.")
+
+    # Read only the dataset metadata. No HyperCube model data are loaded.
+    with open_h5(hypercube_path, role="reader") as f:
+        if "/HyperCube/models" not in f:
+            raise RuntimeError(
+                f"{hypercube_path} does not contain /HyperCube/models.")
+
+        _, C_new, P_new, _ = map(
+            int, f["/HyperCube/models"].shape)
+
+    if P_new != P_old:
+        raise ValueError(
+            f"Population dimension changed from P={P_old} to P={P_new}.")
+
+    if component_map.size != C_new:
+        raise ValueError(
+            f"component_map has size {component_map.size}; "
+            f"expected C_new={C_new}.")
+
+    if np.any(component_map < 0) or np.any(component_map >= C_old):
+        bad = np.flatnonzero(
+            (component_map < 0) | (component_map >= C_old))
+
+        raise ValueError(
+            "component_map contains invalid parent indices at "
+            f"{bad[:10].tolist()}; valid range is 0:{C_old}.")
+
+    x_new = x_old[component_map, :].copy()
+
+    print(
+        f"[UPSCALE] C={C_old} -> {C_new}, P={P_old}, "
+        f"nnz={np.count_nonzero(x_new)}/{x_new.size}",
+        flush=True,
+    )
+
+    return x_new
+
+# ------------------------------------------------------------------------------
+
+def constrainUpscaledSolution(
+    solution_path: str,
+    hypercube_path: str,
+    component_map: np.ndarray,
+    *,
+    orbit_weights: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Construct a hard-orbit-feasible warm start from an upscaled solution.
+
+    The SSP mixture of each new component is inherited from its parent
+    component in the old solution. Its total physical coefficient mass is
+    then set to
+
+        alpha_old * w_new[c],
+
+    where ``w_new`` is the unit-sum target component-weight vector and
+    ``alpha_old`` is the total mass of the original solution.
+
+    Thus,
+
+        sum_p x_new[c, p] = alpha_old * w_new[c]
+
+    exactly, while the parent's normalized SSP mixture is preserved.
+
+    Parameters
+    ----------
+    solution_path : str
+        Existing CubeFit solution containing ``/X_global``.
+    hypercube_path : str
+        New HyperCube containing ``/HyperCube/models`` and, when
+        ``orbit_weights`` is not supplied, ``/CompWeights``.
+    component_map : ndarray
+        Zero-based parent-component index for every new component.
+    orbit_weights : ndarray, optional
+        Component weights for the new decomposition. If omitted,
+        ``/CompWeights`` is read from ``hypercube_path``.
+
+    Returns
+    -------
+    x0 : ndarray, shape (C_new, P)
+        Exactly hard-prior-feasible physical-space warm start.
+
+    Raises
+    ------
+    ValueError
+        If dimensions, weights, or parent populations are inconsistent.
+    RuntimeError
+        If a required dataset is missing or the resulting seed is infeasible.
+
+    Examples
+    --------
+    >>> x0 = constrainUpscaledSolution(
+    ...     "x_3_00.h5",
+    ...     "hypercube_125_00.h5",
+    ...     component_types)
+    """
+    component_map = np.asarray(
+        component_map, dtype=np.int64).ravel(order="C")
+
+    with open_h5(solution_path, role="reader") as f:
+        if "/X_global" not in f:
+            raise RuntimeError(
+                f"{solution_path} does not contain /X_global.")
+
+        x_old = np.asarray(
+            f["/X_global"][...], dtype=np.float64)
+
+    if x_old.ndim != 2:
+        raise ValueError(
+            f"X_global has shape {x_old.shape}; expected (C_old, P).")
+
+    C_old, P_old = map(int, x_old.shape)
+
+    if not np.all(np.isfinite(x_old)) or np.any(x_old < 0.0):
+        raise RuntimeError(
+            "Original solution must be finite and nonnegative.")
+
+    with open_h5(hypercube_path, role="reader") as f:
+        if "/HyperCube/models" not in f:
+            raise RuntimeError(
+                f"{hypercube_path} does not contain /HyperCube/models.")
+
+        _, C_new, P_new, _ = map(
+            int, f["/HyperCube/models"].shape)
+
+        if orbit_weights is None:
+            if "/CompWeights" not in f:
+                raise RuntimeError(
+                    f"{hypercube_path} does not contain /CompWeights.")
+
+            weights = np.asarray(
+                f["/CompWeights"][...],
+                dtype=np.float64,
+            ).ravel(order="C")
+        else:
+            weights = np.asarray(
+                orbit_weights, dtype=np.float64).ravel(order="C")
+
+    if P_new != P_old:
+        raise ValueError(
+            f"Population dimension changed from P={P_old} to P={P_new}.")
+
+    if component_map.size != C_new:
+        raise ValueError(
+            f"component_map has size {component_map.size}; "
+            f"expected C_new={C_new}.")
+
+    if np.any(component_map < 0) or np.any(component_map >= C_old):
+        raise ValueError(
+            f"component_map values must lie in [0, {C_old}).")
+
+    if weights.size != C_new:
+        raise ValueError(
+            f"orbit_weights has size {weights.size}; expected {C_new}.")
+
+    if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+        raise ValueError(
+            "orbit_weights must be finite and nonnegative.")
+
+    weight_sum = float(np.sum(weights))
+
+    if weight_sum <= 0.0:
+        raise ValueError(
+            "orbit_weights must have positive total weight.")
+
+    weights = weights / weight_sum
+
+    alpha_old = float(np.sum(x_old))
+
+    if not np.isfinite(alpha_old) or alpha_old <= 0.0:
+        raise RuntimeError(
+            f"Original solution has invalid total mass {alpha_old:.6e}.")
+
+    parent_mass = np.sum(x_old, axis=1)
+
+    x0 = np.zeros(
+        (C_new, P_new), dtype=np.float64)
+
+    for cc in range(C_new):
+        if weights[cc] <= 0.0:
+            continue
+
+        parent = int(component_map[cc])
+        mass = float(parent_mass[parent])
+
+        if not np.isfinite(mass) or mass <= 0.0:
+            raise RuntimeError(
+                f"Parent component {parent} has zero or invalid mass, "
+                f"but new component {cc} has positive target weight.")
+
+        # Preserve the parent's SSP fractions while assigning the exact
+        # physical mass required by the new hard component-weight prior.
+        x0[cc, :] = (
+            alpha_old
+            * weights[cc]
+            * x_old[parent, :]
+            / mass
+        )
+
+    target = alpha_old * weights
+    actual = np.sum(x0, axis=1)
+    resid = actual - target
+
+    resid_linf = float(
+        np.max(np.abs(resid)))
+
+    tolerance = (
+        1e-12 * max(1.0, alpha_old))
+
+    if resid_linf > tolerance:
+        raise RuntimeError(
+            "Upscaled warm start does not satisfy the hard component "
+            f"weights: Linf={resid_linf:.6e}, tol={tolerance:.6e}.")
+
+    print(
+        f"[UPSCALE][constrained] C={C_old} -> {C_new}, P={P_old}, "
+        f"alpha={alpha_old:.6e}, nnz={np.count_nonzero(x0)}/{x0.size}, "
+        f"orbit_Linf={resid_linf:.3e}",
+        flush=True,
+    )
+
+    return x0
 
 # ------------------------------------------------------------------------------
