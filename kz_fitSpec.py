@@ -630,8 +630,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         str(hdf5Path).replace('hypercube', 'x').replace(str(nComp), str(3)),
         str(hdf5Path),
         otypes,
-        orbit_weights=cWeights,
-    )
+        orbit_weights=cWeights)
 
     ###########################################
     # Multi-processing Batched Streaming NNLS #
