@@ -144,7 +144,10 @@ v1.15:  Fixed bug in return assignments for `_solve_reduced_active`;
         Remove coefficients that return to zero from the active set in
             `streamActiveSetNNLS`;
         Simplified promotion and stopping logic around the cleaned active set in
-            `streamActiveSetNNLS`. 29 September 2026
+            `streamActiveSetNNLS`;
+        Replaced gradient-based column promotion with joint-support exploration,
+            allowing existing coefficients to re-adjust when testing new
+            populations in `streamActiveSetNNLS`. 29 September 2026
 """
 
 from __future__ import annotations, print_function
@@ -1533,25 +1536,23 @@ def streamActiveSetNNLS(
     ATy_scaled = S_flat * ATy_flat
     yty = _compute_yty(h5_path, s_ranges, keep_idx)
 
-    max_rmse_worsen_rel = 1e-3
-
     grad_ref = max(1.0, float(np.max(np.abs(ATy_scaled))))
     data_scale_ref = _robust_scale_ref(ATy_scaled, fallback=grad_ref)
     tol_grad_rel = 1e-11
 
-    # --- outer-iteration progress watchdog ---
-    z_delta_tol = 1e-8
-    active_delta_tol = 0
-    hard_stall_patience = 12
-    no_progress_count = 0
-    dual_stall_count = 0
-    last_dual_col = -1
-    last_dual_value = np.nan
-    dual_stall_patience = 8
-
-    # --- positive-gradient batch-promotion controls ---
-    positive_batch_size =  24
-    max_promotions_per_orbit = 8
+    # --- exploration controls ---
+    explore_batch_size = 64
+    explore_batches_per_iter = 4
+    explore_top_per_orbit = 4
+    explore_coverage_per_orbit = 8
+    explore_fail_patience = max(
+        8,
+        int(np.ceil(
+            P / explore_coverage_per_orbit
+        )),
+    )
+    explore_fail_count = 0
+    explore_round = 0
 
     # The orbit shape is fixed a priori. Its global amplitude is a fitted
     # variable in every constrained reduced solve.
@@ -1639,9 +1640,21 @@ def streamActiveSetNNLS(
         "max_iter": int(max_iter),
         "start_iter": int(start_iter),
         "max_active": int(max_active),
-        "hard_stall_patience": int(hard_stall_patience),
-        "z_delta_tol": float(z_delta_tol),
-        "active_delta_tol": int(active_delta_tol),
+        "explore_batch_size": int(
+            explore_batch_size
+        ),
+        "explore_batches_per_iter": int(
+            explore_batches_per_iter
+        ),
+        "explore_top_per_orbit": int(
+            explore_top_per_orbit
+        ),
+        "explore_coverage_per_orbit": int(
+            explore_coverage_per_orbit
+        ),
+        "explore_fail_patience": int(
+            explore_fail_patience
+        ),
     })
 
     if x0_flat is None:
@@ -1731,17 +1744,7 @@ def streamActiveSetNNLS(
             z[base:base + P] = 0.0
             active[base:base + P] = False
 
-    # Column-level tabu for genuinely unhelpful promotions.
-    col_cooldown_until: dict[int, int] = {}
-    cooldown_iters = 4
-    no_progress_count = 0
-
     if resume_state:
-        no_progress_count = int(resume_state.get("no_progress_count", 0))
-        dual_stall_count = int(resume_state.get("dual_stall_count", 0))
-        last_dual_col = int(resume_state.get("last_dual_col", -1))
-        last_dual_value = float(
-            resume_state.get("last_dual_value", np.nan))
 
         if "active_mask" in resume_state:
             am = np.asarray(resume_state["active_mask"], dtype=bool).ravel(
@@ -1767,50 +1770,25 @@ def streamActiveSetNNLS(
                 and np.all(np.isfinite(lambda_saved))):
                 lambda_orbit_current = lambda_saved.copy()
 
+        if "explore_fail_count" in resume_state:
+            explore_fail_count = int(
+                resume_state["explore_fail_count"])
+
+        if "explore_round" in resume_state:
+            explore_round = int(
+                resume_state["explore_round"])
+
         if has_hard_orbit_shape and zero_shape_orbits.size > 0:
             for cc in zero_shape_orbits:
                 base = int(cc) * P
                 z[base:base + P] = 0.0
                 active[base:base + P] = False
-        def _pairs_to_dict(pairs):
-            out = {}
-            for item in pairs or []:
-                try:
-                    k, v = item
-                    out[int(k)] = int(v)
-                except Exception:
-                    pass
-            return out
 
-        col_cooldown_until = _pairs_to_dict(
-            resume_state.get("col_cooldown_until", []))
     z[known_zero_flat] = 0.0
     active[known_zero_flat] = False
 
-    def _on_cooldown(col: int, it: int) -> bool:
-        return it < col_cooldown_until.get(int(col), -1)
-
-    def _cooldown_cols(cols, it: int, extra_iters: int = 0) -> None:
-        expire = int(it + cooldown_iters + extra_iters)
-
-        for c in np.asarray(cols, dtype=np.int64).ravel():
-            c = int(c)
-            col_cooldown_until[c] = max(
-                col_cooldown_until.get(c, -1), expire)
-
-    def _col_cooldown_mask(it: int) -> np.ndarray:
-        mask = np.zeros(CP, dtype=bool)
-
-        for c, expiry in col_cooldown_until.items():
-            if expiry > it:
-                mask[c] = True
-
-        return mask
-
     def _current_x_from_z(z_vec: np.ndarray) -> np.ndarray:
         return S_flat * z_vec
-    def _quad_obj(A, b, x):
-        return 0.5 * float(x @ (A @ x)) - float(b @ x)
     def _data_quad_obj(A, b, x):
         """
         Evaluate the unregularised data objective on a reduced support.
@@ -1831,107 +1809,6 @@ def streamActiveSetNNLS(
             ``0.5 * x.T @ A @ x - b.T @ x``.
         """
         return 0.5 * float(x @ (A @ x)) - float(b @ x)
-    def _rss_from_data_obj(data_obj: float) -> float:
-        """Recover RSS from the constant-free data objective."""
-        rss = 2.0 * float(data_obj) + yty
-
-        if not np.isfinite(rss):
-            return np.inf
-
-        rss_tol = 1e-12 * max(1.0, yty)
-
-        if rss < -rss_tol:
-            raise RuntimeError("Computed RSS is materially negative: "
-                f"rss={rss:.6e}, yty={yty:.6e}.")
-
-        return max(0.0, rss)
-    def _lambda_from_reduced_state(ATA, ATy, z_active, active_idx,
-        S_active, ridge_value):
-        """
-        Estimate orbit multipliers for a feasible reduced state.
-
-        The multipliers are obtained by projecting the reduced data-plus-ridge
-        gradient onto each orbit's equality-constraint direction and then enforcing
-        the global-amplitude stationarity condition.
-
-        Parameters
-        ----------
-        ATA : ndarray
-            Unregularised reduced normal matrix.
-        ATy : ndarray
-            Reduced data vector.
-        z_active : ndarray
-            Current reduced coefficient vector.
-        active_idx : ndarray
-            Global indices of the active columns.
-        S_active : ndarray
-            Scaling factors for the active columns.
-        ridge_value : float
-            Total numerical ridge used by the outer gradient.
-
-        Returns
-        -------
-        lambda_orbit : ndarray
-            Estimated orbit Lagrange multipliers.
-
-        Raises
-        ------
-        ValueError
-            If the supplied arrays have inconsistent sizes.
-        """
-        z_active = np.asarray(
-            z_active, dtype=np.float64).ravel(order="C")
-        active_idx = np.asarray(
-            active_idx, dtype=np.int64).ravel(order="C")
-        S_active = np.asarray(
-            S_active, dtype=np.float64).ravel(order="C")
-
-        if (ATA.shape != (z_active.size, z_active.size)
-            or ATy.size != z_active.size
-            or active_idx.size != z_active.size
-            or S_active.size != z_active.size):
-            raise ValueError(
-                "Reduced-state arrays have inconsistent sizes.")
-
-        grad = ATy - ATA @ z_active - float(ridge_value) * z_active
-
-        orbit_of_active = (active_idx // P).astype(np.int64)
-
-        weights = np.zeros((C,), dtype=np.float64)
-        lam = np.zeros((C,), dtype=np.float64)
-
-        for cc in positive_shape_orbits:
-            cc = int(cc)
-            mask = orbit_of_active == cc
-
-            if not np.any(mask):
-                continue
-
-            s = S_active[mask]
-            g = grad[mask]
-            denom = float(np.dot(s, s))
-
-            if denom > 0.0:
-                lam[cc] = float(np.dot(s, g) / denom)
-                weights[cc] = denom
-
-        # The fitted global amplitude is free, so alpha stationarity requires
-        #
-        #     orbit_shape.T @ lambda = 0.
-        #
-        # Project the independently estimated multipliers onto that constraint
-        # using the natural least-squares metric defined by the orbit columns.
-        inv_weights = np.divide(1.0, weights, out=np.zeros_like(weights),
-            where=weights > 0.0)
-        shape = np.asarray(orbit_shape, dtype=np.float64)
-        denom = float(np.dot(shape * inv_weights, shape))
-
-        if denom > 0.0:
-            correction = float(np.dot(shape, lam)) / denom
-
-            lam -= (correction * shape * inv_weights)
-
-        return lam
 
     if start_iter >= max_iter:
         print(
@@ -1953,10 +1830,7 @@ def streamActiveSetNNLS(
             "max_iter": int(max_iter),
             "phase": str(phase),
             "final": bool(final),
-            "no_progress_count": int(no_progress_count),
             "active_mask": active.astype(bool).tolist(),
-            "col_cooldown_until": [
-                [int(k), int(v)] for k, v in col_cooldown_until.items()],
             "lambda_orbit": lambda_orbit_current.astype(np.float64).tolist(),
             "alpha_current": float(alpha_current),
             "ridge_current": float(ridge_current),
@@ -1965,9 +1839,8 @@ def streamActiveSetNNLS(
             "stop_category": str(stop_category),
             "stop_converged": bool(stop_converged),
             "stop_details": dict(stop_details),
-            "dual_stall_count": int(dual_stall_count),
-            "last_dual_col": int(last_dual_col),
-            "last_dual_value": float(last_dual_value),
+            "explore_fail_count": int(explore_fail_count),
+            "explore_round": int(explore_round),
         }
     
     def _emit_checkpoint(
@@ -1992,7 +1865,6 @@ def streamActiveSetNNLS(
                     "phase": str(phase),
                     "final": bool(final),
                     "active": int(np.count_nonzero(active)),
-                    "stall_count": int(no_progress_count),
                     "resume_state": _pack_resume_state(it, phase, final),
                 },
             )
@@ -2026,67 +1898,6 @@ def streamActiveSetNNLS(
         deficit = t_orbit - s_orbit
 
         return s_orbit, t_orbit, deficit
-    def _estimate_orbit_lambda(z_vec: np.ndarray,
-        active_idx: np.ndarray) -> np.ndarray:
-        """
-        Estimate orbit Lagrange multipliers for the supplied feasible state.
-
-        The multipliers are chosen to remove the component of the data-plus-ridge
-        gradient along each orbit's equality-constraint direction, subject to the
-        global-amplitude stationarity condition.
-
-        Parameters
-        ----------
-        z_vec : ndarray, shape (CP,)
-            Current scaled coefficient vector.
-        active_idx : ndarray
-            Active global column indices.
-
-        Returns
-        -------
-        lambda_orbit : ndarray, shape (C,)
-            Estimated orbit multipliers satisfying
-            ``orbit_shape @ lambda_orbit = 0``.
-        """
-        z_vec = np.asarray(z_vec, dtype=np.float64).ravel(order="C")
-
-        active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
-
-        ATAz_local = _compute_ATAz_scaled(z_vec)
-        grad = ATy_scaled - ATAz_local - float(ridge_current) * z_vec
-
-        lambda_orbit = np.zeros((C,), dtype=np.float64)
-
-        for cc in positive_shape_orbits:
-            cc = int(cc)
-
-            cols = active_idx[(active_idx // P) == cc]
-
-            if cols.size == 0:
-                continue
-
-            S_loc = S_flat[cols]
-            g_loc = grad[cols]
-
-            denom = float(np.dot(S_loc, S_loc))
-
-            if denom > 0.0:
-                lambda_orbit[cc] = float(np.dot(S_loc, g_loc) / denom)
-
-        # The fitted alpha is free, so its KKT equation requires
-        #
-        #     orbit_shape.T @ lambda = 0.
-        #
-        # Remove the component parallel to the orbit-shape vector.
-        shape = np.asarray(orbit_shape, dtype=np.float64)
-
-        shape_norm2 = float(np.dot(shape, shape))
-
-        if shape_norm2 > 0.0:
-            lambda_orbit -= (shape * float(np.dot(shape, lambda_orbit))
-                / shape_norm2)
-
-        return lambda_orbit
 
     # ------------------------------------------------------------
     # Helper: compute ATAz in parallel using provided executor
@@ -2236,6 +2047,12 @@ def streamActiveSetNNLS(
                 "lambda_orbit": np.zeros((C,), dtype=np.float64),
             }
 
+        info_loc = dict(info_loc)
+        info_loc["numerical_ridge"] = float(
+            numerical_ridge_loc)
+        info_loc["condition_number"] = float(
+            cond_loc)
+
         return (
             active_idx,
             z_loc,
@@ -2249,71 +2066,48 @@ def streamActiveSetNNLS(
             cond_loc,
         )
 
-    def _canonicalize_active_support(z_vec: np.ndarray,
-        active_mask: np.ndarray) -> np.ndarray:
+    def _prune_zero_support(
+        z_vec: np.ndarray,
+        active_mask: np.ndarray,
+    ) -> np.ndarray:
         """
-        Remove numerically zero coefficients from the active support.
-
-        For hard orbit constraints, retain at least one active coefficient in
-        every positive-shape orbit.
+        Remove zero coefficients from the working support.
 
         Parameters
         ----------
-        z_vec : ndarray, shape (CP,)
+        z_vec : ndarray
             Current scaled coefficient vector.
-        active_mask : ndarray, shape (CP,)
-            Current active-set mask.
+        active_mask : ndarray
+            Current working-support mask.
 
         Returns
         -------
         dropped : ndarray
-            Global column indices removed from the active support.
+            Global indices removed from the working support.
 
         Raises
         ------
-        RuntimeError
-            If canonicalization would leave a positive-shape orbit without an
-            active coefficient.
+        None
 
         Examples
         --------
-        >>> dropped = _canonicalize_active_support(z, active)
+        >>> dropped = _prune_zero_support(z, active)
         """
-        z_scale = max(1.0, float(np.max(np.abs(z_vec))))
-        positive_tol = 1e-12 * z_scale
+        z_scale = max(
+            1.0,
+            float(np.max(np.abs(z_vec))),
+        )
 
-        drop_mask = active_mask & (z_vec <= positive_tol)
-        drop_mask &= ~known_zero_flat
+        support_tol = 1e-12 * z_scale
 
-        if has_hard_orbit_shape:
-            for cc in positive_shape_orbits:
-                cc = int(cc)
-                base = cc * P
-                sl = slice(base, base + P)
+        drop_mask = (
+            active_mask
+            & (z_vec <= support_tol)
+        )
 
-                orbit_active = active_mask[sl]
-                orbit_drop = drop_mask[sl]
-
-                if (
-                    np.count_nonzero(orbit_active)
-                    - np.count_nonzero(orbit_drop)
-                    == 0
-                ):
-                    orbit_idx = np.flatnonzero(orbit_active)
-
-                    if orbit_idx.size == 0:
-                        raise RuntimeError(
-                            f"Positive-shape orbit {cc} has no active column."
-                        )
-
-                    keep_local = int(
-                        orbit_idx[
-                            np.argmax(z_vec[base + orbit_idx])
-                        ]
-                    )
-                    drop_mask[base + keep_local] = False
-
-        dropped = np.flatnonzero(drop_mask).astype(np.int64)
+        dropped = np.flatnonzero(
+            drop_mask
+        ).astype(np.int64)
 
         if dropped.size > 0:
             active_mask[dropped] = False
@@ -2370,22 +2164,6 @@ def streamActiveSetNNLS(
             f"active={active_idx.size} alpha={alpha_current:.6e} "
             f"ridge={ridge_current:.6e}", flush=True)
 
-    # Canonicalize restored/initialized working support before the first
-    # outer KKT test. The active mask represents the reduced working
-    # support, not the historical set of previously active columns.
-    dropped_initial = _canonicalize_active_support(z, active)
-
-    if dropped_initial.size > 0:
-        _emit_diag({
-            "kind": "active_support_cleanup",
-            "source": "streamActiveSetNNLS",
-            "phase": "initial",
-            "iter": int(start_iter),
-            "n_dropped": int(dropped_initial.size),
-            "dropped": dropped_initial.tolist(),
-            "n_active_after": int(np.count_nonzero(active)),
-            "n_positive_after": int(np.count_nonzero(z > 0.0)),
-        })
 
     # ------------------------------------------------------------
     # Outer-loop termination diagnostics
@@ -2474,133 +2252,467 @@ def streamActiveSetNNLS(
             "max_iter": int(max_iter),
             "n_active": int(np.count_nonzero(active)),
             "max_active": int(max_active),
-            "no_progress_count": int(no_progress_count),
-            "hard_stall_patience": int(hard_stall_patience),
             "alpha": (float(alpha_current) if has_hard_orbit_shape
                 else None),
             "details": stop_details,
         })
 
-    def _finish_iteration(
+    def _build_exploration_batches(
+        not_active: np.ndarray,
+        grad_total: np.ndarray,
         it: int,
-        phase: str,
-        z_start: np.ndarray,
-        active_start: np.ndarray,
-        *,
-        max_grad_dual: float,
-        tol_here: float,
-        best_dual_col: int,
-        best_dual_value: float,
-        attempted_dual_cols=None,
-    ) -> bool:
+    ) -> list[np.ndarray]:
         """
-        Account for progress exactly once at the end of an outer iteration.
+        Build diverse candidate batches for joint-support exploration.
+
+        Candidate selection is deliberately independent of the sign of the
+        current reduced gradient. Each trial is evaluated only after the full
+        active support is re-solved under the hard orbit constraint.
+
+        Parameters
+        ----------
+        not_active : ndarray
+            Global indices of currently inactive candidate columns.
+        grad_total : ndarray
+            Current full-space constrained reduced gradient.
+        it : int
+            Current outer iteration index.
 
         Returns
         -------
-        bool
-            True when the outer solver should terminate.
+        batches : list of ndarray
+            Candidate batches to test.
+
+        Raises
+        ------
+        None
+
+        Examples
+        --------
+        >>> batches = _build_exploration_batches(
+        ...     not_active, grad_total, it=0)
         """
-        nonlocal no_progress_count
-        nonlocal dual_stall_count, last_dual_col, last_dual_value
+        del it
 
-        z_delta = float(np.linalg.norm(z - z_start))
-        z_ref = max(1.0, float(np.linalg.norm(z_start)))
-        z_delta_rel = z_delta / z_ref
-        active_delta = int(np.count_nonzero(active ^ active_start))
+        not_active = np.asarray(
+            not_active, dtype=np.int64).ravel(order="C")
+        grad_total = np.asarray(
+            grad_total, dtype=np.float64).ravel(order="C")
 
-        unchanged = (z_delta_rel <= z_delta_tol
-            and active_delta <= active_delta_tol)
+        if not_active.size == 0:
+            return []
 
-        if unchanged:
-            no_progress_count += 1
+        candidate_by_orbit = {}
+
+        if has_hard_orbit_shape:
+            exploration_orbits = positive_shape_orbits
         else:
-            no_progress_count = 0
-
-        if attempted_dual_cols is None:
-            attempted_dual_cols = np.zeros((0,), dtype=np.int64)
-        else:
-            attempted_dual_cols = np.asarray(attempted_dual_cols,
-                dtype=np.int64).ravel(order="C")
-
-        best_dual_attempted = (best_dual_col >= 0
-            and np.any(attempted_dual_cols == best_dual_col))
-
-        same_dual = (best_dual_col >= 0
-            and best_dual_col == last_dual_col
-            and np.isfinite(best_dual_value)
-            and np.isfinite(last_dual_value)
-            and abs(best_dual_value - last_dual_value)
-                <= 1e-8 * max(1.0, abs(last_dual_value)))
-
-        unresolved_attempt = (best_dual_attempted
-            and same_dual
-            and best_dual_value > tol_here
-            and unchanged)
-
-        if unresolved_attempt:
-            dual_stall_count += 1
-        elif not unchanged or best_dual_value <= tol_here:
-            dual_stall_count = 0
-
-        last_dual_col = int(best_dual_col)
-        last_dual_value = float(best_dual_value)
-
-        _emit_diag({
-            "kind": "iter_progress",
-            "source": "streamActiveSetNNLS",
-            "iter": int(it + 1),
-            "phase": str(phase),
-            "z_delta_rel": float(z_delta_rel),
-            "active_delta": int(active_delta),
-            "no_progress_count": int(no_progress_count),
-            "hard_stall_patience": int(hard_stall_patience),
-            "best_dual_col": int(best_dual_col),
-            "best_dual_value": float(best_dual_value),
-            "dual_stall_count": int(dual_stall_count),
-            "dual_stall_patience": int(dual_stall_patience),
-            "max_grad_dual": float(max_grad_dual),
-            "tol_here": float(tol_here),
-            "best_dual_attempted": bool(best_dual_attempted),
-            "unresolved_attempt": bool(unresolved_attempt),
-            "attempted_dual_cols": attempted_dual_cols.tolist(),
-        })
-
-        if dual_stall_count >= dual_stall_patience:
-            _set_stop(
-                "unresolved_dual_stall",
-                "stall",
-                it,
-                converged=False,
-                best_dual_col=int(best_dual_col),
-                best_dual_value=float(best_dual_value),
-                dual_stall_count=int(dual_stall_count),
-                tol_here=float(tol_here),
-                n_active=int(np.count_nonzero(active)),
+            exploration_orbits = np.arange(
+                C,
+                dtype=np.int64,
             )
-            _emit_checkpoint(
-                it, final=True, phase="unresolved_dual_stall")
-            return True
 
-        if no_progress_count < hard_stall_patience:
-            _emit_checkpoint(it, final=False, phase=phase)
-            return False
+        for cc in exploration_orbits:
+            cc = int(cc)
 
-        _set_stop(
-            "outer_iteration_stall",
-            "stall",
-            it,
-            converged=False,
-            phase=str(phase),
-            z_delta_rel=float(z_delta_rel),
-            active_delta=int(active_delta),
-            no_progress_count=int(no_progress_count),
-            max_grad_dual=float(max_grad_dual),
-            tol_here=float(tol_here),
-            n_active=int(np.count_nonzero(active)),
+            cols = not_active[
+                (not_active // P) == cc
+            ]
+
+            if cols.size == 0:
+                continue
+
+            g = np.abs(grad_total[cols])
+
+            order = np.argsort(g)[::-1]
+
+            top_n = min(
+                int(explore_top_per_orbit),
+                int(cols.size),
+            )
+
+            top_cols = cols[order[:top_n]]
+
+            n_cov = min(
+                int(explore_coverage_per_orbit),
+                int(cols.size),
+            )
+
+            if n_cov > 0:
+                stride = max(
+                    1,
+                    int(np.ceil(
+                        cols.size / n_cov
+                    )),
+                )
+
+                offset = (
+                    int(explore_round)
+                    % stride
+                )
+
+                coverage_positions = np.arange(
+                    offset,
+                    cols.size,
+                    stride,
+                    dtype=np.int64,
+                )[:n_cov]
+
+                coverage_cols = cols[
+                    coverage_positions
+                ]
+            else:
+                coverage_cols = np.zeros(
+                    (0,),
+                    dtype=np.int64,
+                )
+
+            orbit_cols = np.unique(
+                np.concatenate((
+                    top_cols,
+                    coverage_cols,
+                ))
+            ).astype(np.int64, copy=False)
+
+            candidate_by_orbit[cc] = orbit_cols
+
+        batches = []
+        used = set()
+
+        orbit_order = sorted(
+            candidate_by_orbit,
+            key=lambda cc: float(
+                np.max(np.abs(
+                    grad_total[candidate_by_orbit[cc]]
+                ))
+            ),
+            reverse=True,
         )
-        _emit_checkpoint(it, final=True, phase="outer_stall")
-        return True
+
+        current_batch = []
+
+        depth = 0
+
+        while True:
+            added = False
+
+            for cc in orbit_order:
+                cols = candidate_by_orbit[cc]
+
+                if depth >= cols.size:
+                    continue
+
+                col = int(cols[depth])
+
+                if col in used:
+                    continue
+
+                used.add(col)
+                current_batch.append(col)
+                added = True
+
+                if len(current_batch) >= int(explore_batch_size):
+                    batches.append(
+                        np.asarray(
+                            current_batch,
+                            dtype=np.int64,
+                        )
+                    )
+                    current_batch = []
+
+                    if len(batches) >= int(
+                        explore_batches_per_iter
+                    ):
+                        return batches
+
+            if not added:
+                break
+
+            depth += 1
+
+        if current_batch:
+            batches.append(
+                np.asarray(
+                    current_batch,
+                    dtype=np.int64,
+                )
+            )
+
+        return batches
+
+    def _explore_support(
+        it: int,
+        current_active: np.ndarray,
+        current_data_obj: float,
+        not_active: np.ndarray,
+        grad_data: np.ndarray,
+        constraint_gradient: np.ndarray,
+        grad_total: np.ndarray,
+    ) -> tuple[
+        bool,
+        np.ndarray,
+        np.ndarray,
+        dict,
+        np.ndarray,
+        np.ndarray,
+        float
+    ]:
+        """
+        Test candidate batches by jointly re-solving the complete support.
+
+        Parameters
+        ----------
+        it : int
+            Current outer iteration index.
+        current_active : ndarray
+            Current committed active support.
+        current_data_obj : float
+            Current unregularised data objective.
+        not_active : ndarray
+            Currently inactive candidate columns.
+        grad_total : ndarray
+            Current constrained reduced gradient.
+
+        Returns
+        -------
+        improved : bool
+            True when a trial gives a strictly better data fit.
+        best_active : ndarray
+            Best trial support found.
+        best_z : ndarray
+            Best trial reduced coefficients.
+        best_info : dict
+            Constrained-solve information for the best trial.
+
+        Raises
+        ------
+        None
+
+        Examples
+        --------
+        >>> improved, active_new, z_new, info = _explore_support(
+        ...     0, active_idx, data_object, not_active, grad_total)
+        """
+        current_active = np.asarray(
+            current_active,
+            dtype=np.int64,
+        ).ravel(order="C")
+
+        batches = _build_exploration_batches(
+            not_active,
+            grad_total,
+            it,
+        )
+
+        if not batches:
+            return (
+                False,
+                current_active.copy(),
+                z[current_active].copy(),
+                {},
+                np.zeros(
+                    (0, 0),
+                    dtype=np.float64,
+                ),
+                np.zeros(
+                    (0,),
+                    dtype=np.float64,
+                ),
+                float(current_data_obj),
+            )
+
+        best_active = current_active.copy()
+        best_z = z[current_active].copy()
+        best_info = {}
+        best_ATA = None
+        best_ATy = None
+        best_data_obj = float(current_data_obj)
+
+        for trial_number, proposal in enumerate(batches):
+
+            trial_active = np.unique(
+                np.concatenate((
+                    current_active,
+                    proposal,
+                ))
+            ).astype(
+                np.int64,
+                copy=False,
+            )
+
+            if trial_active.size > int(max_active):
+                available = max(
+                    0,
+                    int(max_active) - current_active.size,
+                )
+
+                if available <= 0:
+                    _emit_diag({
+                        "kind": "exploration_trial",
+                        "source": "streamActiveSetNNLS",
+                        "iter": int(it + 1),
+                        "explore_round": int(
+                            explore_round
+                        ),
+                        "trial": int(
+                            trial_number
+                        ),
+                        "accepted": False,
+                        "solve_accepted": False,
+                        "proposal_n": int(
+                            proposal.size
+                        ),
+                        "trial_n_active": int(
+                            current_active.size
+                        ),
+                        "reason": "max_active",
+                        "proposal": proposal.tolist(),
+                    })
+                    continue
+
+                proposal = proposal[:available]
+
+                trial_active = np.unique(
+                    np.concatenate((
+                        current_active,
+                        proposal,
+                    ))
+                ).astype(
+                    np.int64,
+                    copy=False,
+                )
+
+            (
+                trial_active,
+                z_trial,
+                info_trial,
+                alpha_trial,
+                lambda_trial,
+                ATA_trial,
+                ATy_trial,
+                S_trial,
+                ridge_trial,
+                cond_trial,
+            ) = _solve_reduced_active(trial_active)
+
+            del alpha_trial
+            del lambda_trial
+            del S_trial
+            del ridge_trial
+            del cond_trial
+
+            if (
+                z_trial is None
+                or info_trial is None
+                or not info_trial["accepted"]
+            ):
+                _emit_diag({
+                    "kind": "exploration_trial",
+                    "source": "streamActiveSetNNLS",
+                    "iter": int(it + 1),
+                    "explore_round": int(explore_round),
+                    "trial": int(trial_number),
+                    "accepted": False,
+                    "solve_accepted": False,
+                    "proposal_n": int(proposal.size),
+                    "trial_n_active": int(
+                        trial_active.size
+                    ),
+                    "current_data_obj": float(
+                        best_data_obj
+                    ),
+                    "trial_data_obj": None,
+                    "improvement": None,
+                    "relative_improvement": None,
+                    "reason": (
+                        info_trial.get(
+                            "reason",
+                            "solve_failed",
+                        )
+                        if info_trial is not None
+                        else "solve_failed"
+                    ),
+                    "proposal": proposal.tolist(),
+                })
+                continue
+
+            trial_data_obj = _data_quad_obj(
+                ATA_trial,
+                ATy_trial,
+                z_trial,
+            )
+
+            improvement = (
+                float(best_data_obj) - float(trial_data_obj)
+            )
+
+            scale = max(
+                1.0,
+                abs(float(best_data_obj)),
+            )
+
+            rel_improvement = improvement / scale
+
+            _emit_diag({
+                "kind": "exploration_trial",
+                "source": "streamActiveSetNNLS",
+                "iter": int(it + 1),
+                "explore_round": int(explore_round),
+                "trial": int(trial_number),
+                "accepted": bool(
+                    trial_data_obj < best_data_obj
+                ),
+                "proposal_n": int(proposal.size),
+                "trial_n_active": int(
+                    trial_active.size
+                ),
+                "current_data_obj": float(
+                    best_data_obj
+                ),
+                "trial_data_obj": float(
+                    trial_data_obj
+                ),
+                "improvement": float(improvement),
+                "relative_improvement": float(
+                    rel_improvement
+                ),
+                "proposal": proposal.tolist(),
+                "proposal_grad_data": (
+                    grad_data[proposal].tolist()
+                ),
+                "proposal_grad_constraint": (
+                    constraint_gradient[
+                        proposal
+                    ].tolist()
+                ),
+                "proposal_grad_total": (
+                    grad_total[proposal].tolist()
+                ),
+            })
+
+            if trial_data_obj < best_data_obj:
+                best_data_obj = float(trial_data_obj)
+                best_active = trial_active.copy()
+                best_z = z_trial.copy()
+                best_info = dict(info_trial)
+                best_ATA = ATA_trial.copy()
+                best_ATy = ATy_trial.copy()
+
+        improved = bool(
+            best_data_obj
+            < float(current_data_obj)
+        )
+
+        return (
+            improved,
+            best_active,
+            best_z,
+            best_info,
+            best_ATA,
+            best_ATy,
+            best_data_obj,
+        )
+
     # ------------------------------------------------------------
     # Active-set outer loop
     # ------------------------------------------------------------
@@ -2622,8 +2734,6 @@ def streamActiveSetNNLS(
         else:
             constraint_gradient = np.zeros(CP, dtype=np.float64)
             grad_total = grad_data - grad_ridge
-        
-        orbit_s, orbit_target, orbit_deficit = _orbit_mass_and_deficit(z)
 
         candidate_mask = ~active
         candidate_mask &= ~known_zero_flat
@@ -2631,16 +2741,17 @@ def streamActiveSetNNLS(
             candidate_mask &= (orbit_shape[orbit_of_col] > 0.0)
         not_active = np.flatnonzero(candidate_mask)
         gvals_data = grad_data[not_active]
-        gvals_total = grad_total[not_active]
         gvals_constraint = constraint_gradient[not_active]
+        gvals_total = grad_total[not_active]
 
-        max_grad_all = float(np.max(grad_total)) if grad_total.size else 0.0
-        max_grad_promotable = (float(np.max(gvals_total)) if gvals_total.size
-            else 0.0)
-        avg_grad_promotable = (float(np.mean(gvals_total)) if gvals_total.size
-            else 0.0)
-        max_grad_data = float(np.max(gvals_data)) if gvals_data.size else 0.0
-        max_grad_orbit = (float(np.max(np.abs(gvals_constraint)))
+        max_grad_all = (
+            float(np.max(grad_total))
+            if grad_total.size else 0.0)
+        max_grad_data = (
+            float(np.max(gvals_data))
+            if gvals_data.size else 0.0)
+        max_grad_orbit = (
+            float(np.max(np.abs(gvals_constraint)))
             if gvals_constraint.size else 0.0)
 
         tol_here = max(tol_grad, tol_grad_rel * grad_ref)
@@ -2687,7 +2798,7 @@ def streamActiveSetNNLS(
 
         active_ok = max_grad_active <= kkt_tol
         dual_ok = max_grad_dual <= kkt_tol
-        kkt_converged = active_ok and dual_ok
+        support_stationary = active_ok and dual_ok
 
         if np.any(zero_free_mask):
             zero_free_idx = np.flatnonzero(zero_free_mask)
@@ -2715,9 +2826,8 @@ def streamActiveSetNNLS(
                 "kkt_violation": float(kkt_violation),
                 "kkt_tol": float(kkt_tol),
                 "active_ok": bool(active_ok),
-                "active_ok": bool(active_ok),
                 "dual_ok": bool(dual_ok),
-                "converged": bool(kkt_converged),
+                "support_stationary": bool(support_stationary),
                 "best_dual_col": int(best_dual_col),
                 "best_dual_value": float(best_dual_value),
                 "best_dual_orbit": (int(best_dual_col // P)
@@ -2730,6 +2840,8 @@ def streamActiveSetNNLS(
                 "shape_dot_lambda": (
                     float(np.dot(orbit_shape, lambda_orbit_current))
                     if has_hard_orbit_shape else None),
+                "explore_fail_count": int(explore_fail_count),
+                "explore_round": int(explore_round),
             })
 
             print(f"[MONO][iter {it + 1}] "
@@ -2737,894 +2849,262 @@ def streamActiveSetNNLS(
                 f"dual={max_grad_dual:.3e} tol={tol_here:.3e} "
                 f"working={np.count_nonzero(active)} "
                 f"positive={np.count_nonzero(positive_mask)}", flush=True)
+        
+        # ------------------------------------------------------------
+        # Joint-support exploration
+        # ------------------------------------------------------------
 
+        current_active = np.flatnonzero(
+            active
+        ).astype(np.int64)
 
+        not_active = np.flatnonzero(
+            (~active)
+            & (~known_zero_flat)
+        ).astype(np.int64)
 
-        if kkt_converged:
-            x_phys_now = _current_x_from_z(z).reshape(C, P)
+        if has_hard_orbit_shape:
+            not_active = not_active[
+                orbit_shape[orbit_of_col[not_active]] > 0.0
+            ]
 
-            orbit_mass_now = np.sum(x_phys_now, axis=1)
-
-            if has_hard_orbit_shape:
-                orbit_target_now = (float(alpha_current)
-                    * np.asarray(orbit_shape, dtype=np.float64))
-            else:
-                orbit_target_now = np.zeros((C,), dtype=np.float64)
-
-            orbit_resid_now = orbit_mass_now - orbit_target_now
+        if not_active.size == 0:
+            explore_fail_count += 1
 
             _emit_diag({
-                "kind": "iter_post",
+                "kind": "exploration",
                 "source": "streamActiveSetNNLS",
                 "iter": int(it + 1),
-                "phase": "kkt_converged",
-                "t_iter_sec": float(time.perf_counter() - t_iter),
-                "k_active": int(np.count_nonzero(active)),
-                "n_active": int(np.count_nonzero(active)),
-                "data_objective": float(data_objective_current),
-                "max_grad_total": float(max_grad_all),
-                "max_grad_data": float(max_grad_data),
-                "max_grad_orbit": float(max_grad_orbit),
-                "max_grad_promotable": float(max_grad_promotable),
-                "max_grad_active": float(max_grad_active),
-                "max_grad_inactive": float(max_grad_inactive),
-                "max_grad_dual": float(max_grad_dual),
-                "kkt_violation": float(kkt_violation),
-                "kkt_tol": float(kkt_tol),
-                "tol_here": float(tol_here),
-                "active_ok": bool(active_ok),
-                "dual_ok": bool(dual_ok),
-                "kkt_converged": True,
-                "ridge": float(ridge_current),
-                "alpha": (float(alpha_current)
-                    if has_hard_orbit_shape else None),
-                "orbit_mass": orbit_mass_now.tolist(),
-                "orbit_target": orbit_target_now.tolist(),
-                "orbit_resid": orbit_resid_now.tolist(),
-                "orbit_constraint_l1": float(np.sum(np.abs(orbit_resid_now))),
-                "orbit_constraint_l2": float(np.linalg.norm(orbit_resid_now)),
-                "orbit_constraint_linf": float(np.max(np.abs(orbit_resid_now))),
-                "x": x_phys_now.ravel(order="C").tolist(),
-                "x_sum": float(np.sum(x_phys_now)),
-                "x_norm": float(np.linalg.norm(x_phys_now)),
-                "x_nnz": int(np.count_nonzero(x_phys_now > 0.0)),
+                "support_stationary": bool(support_stationary),
+                "improved": False,
+                "reason": "no_candidates",
+                "explore_fail_count": int(
+                    explore_fail_count
+                ),
             })
 
+            _emit_checkpoint(
+                it,
+                final=True,
+                phase="candidate_space_exhausted",
+            )
+
+            if support_stationary:
+                _set_stop(
+                    "candidate_space_exhausted",
+                    "converged",
+                    it,
+                    converged=True,
+                    explore_fail_count=int(
+                        explore_fail_count
+                    ),
+                    n_active=int(
+                        np.count_nonzero(active)
+                    ),
+                    max_grad_active=float(
+                        max_grad_active
+                    ),
+                    max_grad_dual=float(
+                        max_grad_dual
+                    ),
+                    tol_here=float(tol_here),
+                )
+            else:
+                _set_stop(
+                    "candidate_space_exhausted_nonstationary",
+                    "numerical",
+                    it,
+                    converged=False,
+                    explore_fail_count=int(
+                        explore_fail_count
+                    ),
+                    n_active=int(
+                        np.count_nonzero(active)
+                    ),
+                    max_grad_active=float(
+                        max_grad_active
+                    ),
+                    max_grad_dual=float(
+                        max_grad_dual
+                    ),
+                    tol_here=float(tol_here),
+                )
+            break
+
+        (
+            improved,
+            best_active,
+            best_z,
+            best_info,
+            best_ATA,
+            best_ATy,
+            best_data_obj,
+        ) = _explore_support(
+            it=it,
+            current_active=current_active,
+            current_data_obj=data_objective_current,
+            not_active=not_active,
+            grad_data=grad_data,
+            constraint_gradient=constraint_gradient,
+            grad_total=grad_total,
+        )
+        data_gain = (
+            float(data_objective_current)
+            - float(best_data_obj)
+        )
+
+        print(
+            f"[MONO][explore {explore_round}] "
+            f"candidates={not_active.size} "
+            f"working={current_active.size} "
+            f"improved={improved} "
+            f"data_gain={data_gain:.6e} "
+            f"failures={explore_fail_count}",
+            flush=True,
+        )
+
+        if improved:
+            explore_fail_count = 0
+
+            active[:] = False
+            active[best_active] = True
+
+            z[:] = 0.0
+            z[best_active] = best_z
+            dropped_zero = _prune_zero_support(
+                z,
+                active,
+            )
+
+            if has_hard_orbit_shape:
+                alpha_current = float(
+                    best_info["alpha"]
+                )
+                lambda_orbit_current = np.asarray(
+                    best_info["lambda_orbit"],
+                    dtype=np.float64,
+                ).copy()
+
+            ridge_current = float(
+                best_info.get(
+                    "numerical_ridge",
+                    ridge_current,
+                )
+            )
+
+            _emit_diag({
+                "kind": "exploration_accept",
+                "source": "streamActiveSetNNLS",
+                "iter": int(it + 1),
+                "n_active_before": int(
+                    current_active.size
+                ),
+                "n_active_after": int(
+                    np.count_nonzero(active)
+                ),
+                "data_objective_before": float(
+                    data_objective_current
+                ),
+                "data_objective_after": float(
+                    _data_quad_obj(
+                        best_ATA,
+                        best_ATy,
+                        best_z,
+                    )
+                ),
+                "explore_round": int(explore_round),
+                "explore_fail_count": int(
+                    explore_fail_count
+                ),
+                "added_columns": np.setdiff1d(
+                    np.flatnonzero(active),
+                    current_active,
+                ).tolist(),
+                "n_zero_dropped": int(
+                    dropped_zero.size
+                ),
+                "zero_dropped": (
+                    dropped_zero.tolist()
+                ),
+            })
+
+            _emit_checkpoint(
+                it,
+                final=False,
+                phase="exploration_accept",
+            )
+
+            continue
+
+        failed_round = int(explore_round)
+
+        explore_fail_count += 1
+        explore_round += 1
+
+        _emit_diag({
+            "kind": "exploration",
+            "source": "streamActiveSetNNLS",
+            "iter": int(it + 1),
+            "explore_round": int(failed_round),
+            "next_explore_round": int(
+                explore_round
+            ),
+            "support_stationary": bool(support_stationary),
+            "improved": False,
+            "explore_fail_count": int(
+                explore_fail_count
+            ),
+            "n_active": int(
+                current_active.size
+            ),
+            "n_candidates": int(
+                not_active.size
+            ),
+            "max_grad_active": float(
+                max_grad_active
+            ),
+            "max_grad_dual": float(
+                max_grad_dual
+            ),
+            "tol_here": float(tol_here),
+        })
+
+        if (
+            support_stationary
+            and explore_fail_count >= explore_fail_patience
+        ):
             _set_stop(
-                "kkt_converged",
+                "exploration_patience_reached"
                 "converged",
                 it,
                 converged=True,
-                max_grad_active=float(max_grad_active),
-                max_grad_dual=float(max_grad_dual),
-                tol_here=float(tol_here),
-                n_active=int(np.count_nonzero(active)),
-            )
-
-            _emit_checkpoint(
-                it,
-                final=True,
-                phase="kkt_converged",
-            )
-            break
-
-        if dual_ok and not active_ok:
-            _set_stop(
-                "active_stationarity_failure",
-                "numerical",
-                it,
-                converged=False,
-                max_grad_active=float(max_grad_active),
-                max_grad_dual=float(max_grad_dual),
-                ridge=float(ridge_current),
-                tol_here=float(tol_here),
-            )
-            _emit_checkpoint(
-                it, final=True, phase="active_stationarity_failure")
-            break
-
-        # Reaching this point means active stationarity is acceptable but the
-        # dual KKT condition is violated. Therefore at least one zero variable
-        # must have positive reduced gradient above tolerance.
-        has_inactive_violation = max_grad_promotable > tol_here
-
-        if not has_inactive_violation:
-            _set_stop(
-                "no_inactive_dual_violation",
-                "numerical",
-                it,
-                converged=False,
-                max_grad_active=float(max_grad_active),
-                max_grad_dual=float(max_grad_dual),
-                max_grad_promotable=float(max_grad_promotable),
+                explore_fail_count=int(
+                    explore_fail_count
+                ),
+                n_active=int(
+                    np.count_nonzero(active)
+                ),
+                max_grad_active=float(
+                    max_grad_active
+                ),
+                max_grad_dual=float(
+                    max_grad_dual
+                ),
                 tol_here=float(tol_here),
             )
 
             _emit_checkpoint(
                 it,
                 final=True,
-                phase="no_inactive_dual_violation",
+                phase="exploration_exhausted",
             )
             break
 
-        if diag_level >= 1 and ((it % diag_stride) == 0):
-            x_phys_now = _current_x_from_z(z).reshape(C, P)
-            orbit_mass_vec = np.sum(x_phys_now, axis=1)
-            if has_hard_orbit_shape:
-                orbit_target = float(alpha_current) * np.asarray(orbit_shape,
-                    dtype=np.float64)
-            else:
-                orbit_target = np.zeros((C,), dtype=np.float64,)
-            orbit_resid = orbit_mass_vec - orbit_target
-            orbit_ratio = orbit_mass_vec / np.maximum(orbit_target, 1e-30)
-            orbit_nz = np.count_nonzero(x_phys_now > 0.0, axis=1).astype(np.int64)
-
-            eff_support = np.zeros((C,), dtype=np.float64)
-            entropy = np.zeros((C,), dtype=np.float64)
-            top_share = np.zeros((C,), dtype=np.float64)
-            for cc in range(C):
-                st = _support_stats_1d(x_phys_now[cc, :])
-                eff_support[cc] = st["eff_support"]
-                entropy[cc] = st["entropy"]
-                top_share[cc] = st["top_share"]
-
-            best_inactive = (int(not_active[int(np.argmax(gvals_total))])
-                if not_active.size else -1)
-
-            best_inactive_grad = (float(np.max(gvals_total))
-                if gvals_total.size else -np.inf)
-
-            _emit_diag({
-                "kind": "iter_pre",
-                "source": "streamActiveSetNNLS",
-                "iter": int(it + 1),
-                "n_active": int(np.count_nonzero(active)),
-                "max_grad_data": float(max_grad_data),
-                "max_grad_promo": float(max_grad_promotable),
-                "avg_grad_promo": float(avg_grad_promotable),
-                "max_grad_total": float(max_grad_all),
-                "max_grad_orbit": float(max_grad_orbit),
-                "max_grad_dual": float(max_grad_dual),
-                "active_ok": bool(active_ok),
-                "dual_ok": bool(dual_ok),
-                "tol_here": float(tol_here),
-                "ridge_current": float(ridge_current),
-                "orbit_deficit_l1": float(np.sum(np.abs(orbit_deficit))),
-                "orbit_deficit_l2": float(np.linalg.norm(orbit_deficit)),
-                "orbit_mass": orbit_mass_vec.tolist(),
-                "orbit_target": orbit_target.tolist(),
-                "orbit_resid": orbit_resid.tolist(),
-                "orbit_ratio": orbit_ratio.tolist(),
-                "orbit_nz": orbit_nz.tolist(),
-                "orbit_eff_support": eff_support.tolist(),
-                "orbit_entropy": entropy.tolist(),
-                "orbit_top_share": top_share.tolist(),
-                "alpha": (float(alpha_current)
-                    if has_hard_orbit_shape else None),
-                "orbit_shape": (orbit_shape.tolist()
-                    if orbit_shape is not None else None),
-                "data_objective": float(data_objective_current),
-                "n_candidates": int(not_active.size),
-                "n_cooldown": int(
-                    np.count_nonzero(_col_cooldown_mask(it)[not_active])),
-                "n_col_cooldown": int(
-                    np.count_nonzero(_col_cooldown_mask(it)[not_active])),
-                "best_inactive_col": int(best_inactive),
-                "best_inactive_grad": float(best_inactive_grad),
-                "best_inactive_orbit": (int(best_inactive // P)
-                    if best_inactive >= 0 else -1),
-                "max_grad_active": float(max_grad_active),
-                "max_grad_inactive": float(max_grad_inactive),
-                "kkt_converged": bool(kkt_converged),
-            })
-        
-        # Ranking score only; this is not a KKT quantity.
-        score = gvals_total.copy()
-
-        if not_active.size > 0:
-            svals = S_flat[not_active]
-            s_med = np.median(svals) + 1e-30
-            score /= (1.0 + 0.25 * (svals / s_med - 1.0))
-
-            aty = ATy_scaled[not_active]
-            aty_scale = np.max(np.abs(aty)) + 1e-30
-            score += 0.10 * (aty / aty_scale)
-
-        if not_active.size == 0:
-            if _finish_iteration(
-                it, "no_candidate", z_iter_start, active_iter_start,
-                max_grad_dual=max_grad_dual, tol_here=tol_here,
-                best_dual_col=best_dual_col, best_dual_value=best_dual_value):
-                break
-            continue
-
-        newly_activated = None
-        active_before = active.copy()
-        z_before = z.copy()
-
-        positive_batch_size = min(24, positive_batch_size + 1)
-        preferred_group = min(positive_batch_size, not_active.size)
-
-        cooldown_mask_full = _col_cooldown_mask(it)
-        cooldown_mask = cooldown_mask_full[not_active]
-
-        score_eff = score.copy()
-        score_eff[cooldown_mask] = -np.inf
-        score_eff[gvals_total <= tol_here] = -np.inf
-
-        finite_score = np.isfinite(score_eff)
-        max_grad_eligible = (float(np.max(gvals_total[finite_score]))
-            if np.any(finite_score) else -np.inf)
-        max_score_eligible = (float(np.max(score_eff[finite_score]))
-            if np.any(finite_score) else -np.inf)
-
-        order = np.argsort(score_eff)[::-1]
-        eligible_by_orbit: dict[int, list[int]] = {}
-
-        for local_i in order:
-            if not np.isfinite(score_eff[local_i]):
-                break
-
-            gcol = int(not_active[local_i])
-            cc = int(gcol // P)
-
-            eligible_by_orbit.setdefault(cc, []).append(int(local_i))
-
-        orbit_rank = sorted(
-            eligible_by_orbit,
-            key=lambda cc: score_eff[eligible_by_orbit[cc][0]],
-            reverse=True)
-
-        chosen = []
-
-        for depth in range(max_promotions_per_orbit):
-            for cc in orbit_rank:
-                orbit_candidates = eligible_by_orbit[cc]
-
-                if depth >= len(orbit_candidates):
-                    continue
-
-                local_i = orbit_candidates[depth]
-                chosen.append(int(not_active[local_i]))
-
-                if len(chosen) >= preferred_group:
-                    break
-
-            if len(chosen) >= preferred_group:
-                break
-        
-        if len(chosen) == 0:
-            if _finish_iteration(
-                it, "no_eligible_promotions", z_iter_start, active_iter_start,
-                max_grad_dual=max_grad_dual, tol_here=tol_here,
-                best_dual_col=best_dual_col, best_dual_value=best_dual_value):
-                break
-            continue
-
-        cols_to_activate = np.asarray(chosen, dtype=np.int64)
-        promoted_orbits = cols_to_activate // P
-        n_promotion_orbits = int(np.unique(promoted_orbits).size)
-        max_promoted_per_orbit = (
-            int(np.max(np.bincount(promoted_orbits, minlength=C)))
-            if promoted_orbits.size else 0)
-        active[cols_to_activate] = True
-        newly_activated = cols_to_activate.copy()
-        promoted_cols = newly_activated.copy()
-        n_candidates = int(not_active.size)
-        n_cooldown = int(np.count_nonzero(cooldown_mask))
-        n_col_cooldown = n_cooldown
-        n_eligible = int(np.count_nonzero(np.isfinite(score_eff)))
-
-        candidate_order = np.argsort(gvals_total)[::-1]
-
-        diag_candidates = []
-        for local_i in candidate_order[:diag_topk]:
-            c = int(not_active[local_i])
-            diag_candidates.append({
-                "col": c,
-                "orbit": int(c // P),
-                "grad_total": float(gvals_total[local_i]),
-                "score": float(score[local_i]),
-                "cooldown": bool(cooldown_mask[local_i]),
-                "col_cooldown": bool(
-                    _col_cooldown_mask(it)[not_active][local_i]),
-            })
-
-        promoted_scores = []
-        for c in promoted_cols:
-            local = np.flatnonzero(not_active == int(c))
-            if local.size == 0:
-                continue
-
-            j = int(local[0])
-            promoted_scores.append({
-                "col": int(c),
-                "orbit": int(c // P),
-                "grad_total": float(gvals_total[j]),
-                "score": float(score[j]),
-                "cooldown": bool(cooldown_mask[j]),
-            })
-
-        n_active_after = int(np.count_nonzero(active))
-
-        if n_active_after > int(max_active):
-            n_requested = (int(newly_activated.size) if newly_activated is not
-                None else 0)
-            n_active_before = int(np.count_nonzero(active_before))
-            n_available = max(0, int(max_active) - n_active_before)
-
-            # Roll back this promotion before terminating.
-            if (
-                newly_activated is not None
-                and newly_activated.size > 0
-            ):
-                active[newly_activated] = False
-
-            n_active_restored = int(np.count_nonzero(active))
-
-            _set_stop(
-                "max_active_promotion_overflow",
-                "active_set",
-                it,
-                converged=False,
-                active_before=n_active_before,
-                requested=n_requested,
-                available=n_available,
-                active_after_provisional=n_active_after,
-                active_after_rollback=n_active_restored,
-                max_active=int(max_active),
-                overflow=max(0, n_active_after - int(max_active),),
-                max_grad_total=float(max_grad_all),
-                max_grad_promotable=float(max_grad_promotable),
-                tol_here=float(tol_here),
-            )
-
-            _emit_checkpoint(
-                it,
-                final=True,
-                phase="max_active_exit",
-            )
-            break
-
-        _emit_diag({
-            "kind": "promotion_attempt",
-            "source": "streamActiveSetNNLS",
-            "iter": int(it + 1),
-            "tol_here": float(tol_here),
-            "max_grad_total": float(max_grad_all),
-            "max_grad_promotable": float(max_grad_promotable),
-            "avg_grad_promotable": float(avg_grad_promotable),
-            "n_active_before": int(np.count_nonzero(active_before)),
-            "n_candidates": int(n_candidates),
-            "n_cooldown": int(n_cooldown),
-            "n_col_cooldown": int(n_col_cooldown),
-            "n_eligible": int(n_eligible),
-            "promotion_batch_target": int(preferred_group),
-            "n_promoted": int(promoted_cols.size),
-            "n_promotion_orbits": int(n_promotion_orbits),
-            "max_promoted_per_orbit": int(max_promoted_per_orbit),
-            "max_promotions_per_orbit": int(max_promotions_per_orbit),
-            "candidate_topk": diag_candidates,
-            "promoted": promoted_scores,
-            "max_grad_eligible": float(max_grad_eligible),
-            "max_score_eligible": float(max_score_eligible),
-        })
-
-        # --------------------------------------------------------
-        # Reduced solve (assemble ATA_sub & ATy_sub) in parallel
-        # --------------------------------------------------------
-        active_idx = np.nonzero(active)[0].astype(np.int64)
-        k = int(active_idx.size)
-        if k == 0:
-            if _finish_iteration(
-                it, "empty_active_set", z_iter_start, active_iter_start,
-                max_grad_dual=max_grad_dual, tol_here=tol_here,
-                best_dual_col=best_dual_col, best_dual_value=best_dual_value):
-                break
-            continue
-
-        S_active = S_flat[active_idx]
-
-        ATA_sub = np.zeros((k, k), dtype=np.float64)
-
-        n_workers = max(1, int(cfg.processes))
-        batches = [[] for _ in range(n_workers)]
-
-        for i, tile in enumerate(s_ranges):
-            batches[i % n_workers].append(tile)
-
-        futures = [executor.submit(_worker_reduced, h5_path, batch,
-                keep_idx, active_idx, S_active, CP, P)
-            for batch in batches if len(batch) > 0]
-
-        for f in tqdm(as_completed(futures), total=len(futures),
-            desc="[MONO] reduced tiles", leave=False):
-            ATA_loc, _ = f.result()
-            ATA_sub += ATA_loc
-
-        # Canonical linear term. Never independently reconstruct this here.
-        ATy_sub = ATy_scaled[active_idx].copy()
-
-        # ------------------ REDUCED-SOLVE DIAGNOSTICS (parent) -----------------------
-        try:
-            Sact = S_active
-            print(f"[DIAG] S_active stats: min/median/max: "
-                f"{float(np.min(Sact)):.4e}/{float(np.median(Sact)):.4e}/"
-                f"{float(np.max(Sact)):.4e}", flush=True)
-
-            ATA_norm = float(np.linalg.norm(ATA_sub))
-            ATy_norm = float(np.linalg.norm(ATy_sub))
-            ATA_diag = np.diag(ATA_sub)[: min(6, ATA_sub.shape[0])]
-            print(f"[DIAG] ATA_sub shape, ATy_sub[0:6]: "
-                f"{ATA_sub.shape}, {ATy_sub[:6].tolist()}", flush=True)
-            print(f"[DIAG] ATA_sub norm / ATy_sub norm: "
-                f"{ATA_norm:.4e} / {ATy_norm:.4e}", flush=True)
-            print(f"[DIAG] ATA_sub diag (first 6): {ATA_diag.tolist()}",
-                flush=True)
-
-        except Exception as _e:
-            print(f"[DIAG] reduced-diagnostics error: {_e}", flush=True)
-        # ----------------------------------------------------------------------
-
-        # ---- Stabilised reduced solve: stronger adaptive ridge ----
-        diag = np.diag(ATA_sub)
-        diag_med = float(np.median(diag)) if diag.size else 0.0
-
-        try:
-            eigs = np.linalg.eigvalsh(ATA_sub)
-            emin = float(np.min(eigs))
-            emax = float(np.max(eigs))
-        except Exception:
-            emin = 0.0
-            emax = float(np.max(diag)) if diag.size else 1.0
-
-        numerical_ridge, emin, emax, cond = _adaptive_numerical_ridge(
-            ATA_sub, target_cond=numerical_target_cond,
-            min_ridge=numerical_ridge_floor)
-
-        ATA_sub_reg = ATA_sub + \
-            numerical_ridge * np.eye(k, dtype=np.float64)
-
-        ATA_norm = float(np.linalg.norm(ATA_sub))
-
-        z_old_active = z[active_idx].copy()
-
-        orbit_constraint_info = {
-            "accepted": True,
-            "reason": "no_prior",
-            "alpha": None,
-            "orbit_target_mass": np.zeros((C,), dtype=np.float64),
-            "resid_l1": 0.0,
-            "resid_l2": 0.0,
-            "resid_linf": 0.0,
-            "rel_resid_linf": 0.0,
-            "alpha_stationarity": 0.0,
-            "negative_count": 0,
-            "lambda_orbit": np.zeros((C,), dtype=np.float64),
-        }
-
-        alpha_candidate = None
-        lambda_candidate = None
-        ridge_candidate = float(numerical_ridge)
-
-        if has_hard_orbit_shape:
-            z_sub_raw, orbit_constraint_info = (
-                _orbit_hard_constraint_solve(ATA_sub_reg=ATA_sub,
-                    ATy_sub=ATy_sub,
-                    active_idx=active_idx, S_active=S_active,
-                    orbit_shape=np.asarray(orbit_shape, dtype=np.float64),
-                    C=C, P=P,
-                    numerical_ridge=numerical_ridge))
-
-            if not orbit_constraint_info["accepted"]:
-                print("[MONO][constrained] rejecting infeasible reduced solve "
-                    f"(reason={orbit_constraint_info['reason']}, "
-                    f"neg={orbit_constraint_info['negative_count']}, "
-                    f"orbit_L1={orbit_constraint_info['resid_l1']:.3e}, "
-                    f"orbit_Linf={orbit_constraint_info['resid_linf']:.3e})",
-                    flush=True)
-                if promoted_cols.size > 0:
-                    _cooldown_cols(promoted_cols, it, extra_iters=20)
-                active[:] = active_before
-                z[:] = z_before
-
-                if _finish_iteration(it, "constraint_reject", z_iter_start,
-                    active_iter_start, max_grad_dual=max_grad_dual,
-                    tol_here=tol_here, best_dual_col=best_dual_col,
-                    best_dual_value=best_dual_value,
-                    attempted_dual_cols=promoted_cols):
-                    break
-                continue
-
-            z_sub = np.asarray(z_sub_raw, dtype=np.float64).copy()
-
-            alpha_candidate = float(orbit_constraint_info["alpha"])
-            lambda_candidate = np.asarray(orbit_constraint_info["lambda_orbit"],
-                dtype=np.float64).ravel(order="C")
-
-            candidate_valid = (np.isfinite(alpha_candidate)
-                and alpha_candidate >= 0.0
-                and lambda_candidate.size == C
-                and np.all(np.isfinite(lambda_candidate)))
-
-            if not candidate_valid:
-                print("[MONO][constrained] rejecting invalid "
-                    "global amplitude or orbit multipliers", flush=True)
-
-                active[:] = active_before
-                z[:] = z_before
-
-                if promoted_cols.size > 0:
-                    _cooldown_cols(promoted_cols, it, extra_iters=20)
-
-                if _finish_iteration(it, "invalid_constraint_state",
-                    z_iter_start, active_iter_start, max_grad_dual=max_grad_dual,
-                    tol_here=tol_here, best_dual_col=best_dual_col,
-                    best_dual_value=best_dual_value,
-                    attempted_dual_cols=promoted_cols):
-                    break
-                continue
-
-        else:
-            z_sub = _nnls_from_quadratic(ATA_sub_reg, ATy_sub,
-                x0=z_old_active, max_iter=10000, tol=1e-12)
-
-        # Track promoted columns that did not survive the reduced solve.
-        failed_cols = []
-
-        if newly_activated is not None and newly_activated.size > 0:
-            active_lookup = {int(c): i for i, c in enumerate(active_idx)}
-            z_scale_loc = float(np.max(z_sub)) + 1e-30
-
-            for c in newly_activated:
-                ii = active_lookup.get(int(c))
-                if ii is None:
-                    continue
-
-                if z_sub[ii] <= 1e-12 * z_scale_loc:
-                    failed_cols.append(int(c))
-
-        failed_cols = np.asarray(failed_cols, dtype=np.int64)
-        failed_cols_initial = failed_cols.copy()
-        n_failed_initial = int(failed_cols_initial.size)
-        surviving_promoted = promoted_cols[
-            ~np.isin(promoted_cols, failed_cols_initial)]
-
-        mu_inner = float(orbit_constraint_info.get("mu", 0.0))
-        H_eval = ATA_sub_reg + mu_inner * np.eye(k, dtype=np.float64)
-
-        obj_old = _quad_obj(H_eval, ATy_sub, z_old_active)
-        obj_new = _quad_obj(H_eval, ATy_sub, z_sub)
-        data_obj_old = _data_quad_obj(ATA_sub, ATy_sub, z_old_active)
-        data_obj_new = _data_quad_obj(ATA_sub, ATy_sub, z_sub)
-
-        obj_gain = float(obj_old - obj_new)
-        rel_gain = obj_gain / max(1.0, abs(obj_old))
-
-        data_obj_gain = float(data_obj_old - data_obj_new)
-        data_obj_rel_gain = data_obj_gain / max(1.0, abs(data_obj_old))
-
-        norm_old = float(np.linalg.norm(z_old_active))
-        norm_new = float(np.linalg.norm(z_sub))
-
-        rss_old = _rss_from_data_obj(data_obj_old)
-        rss_new = _rss_from_data_obj(data_obj_new)
-
-        rmse_ratio = np.sqrt(rss_new / max(rss_old, 1e-30))
-
-        rmse_worsen_rel = rmse_ratio - 1.0
-
-        if (not np.isfinite(rmse_ratio)
-            or rmse_worsen_rel > max_rmse_worsen_rel):
-            print("[MONO][reject] reduced solve materially worsens fit: "
-                f"rss_old={rss_old:.12e} rss_new={rss_new:.12e} "
-                f"rmse_worsen={100.0 * rmse_worsen_rel:.6f}% "
-                f"limit={100.0 * max_rmse_worsen_rel:.6f}%", flush=True)
-
-            active[:] = active_before
-            z[:] = z_before
-
-            if promoted_cols.size > 0:
-                _cooldown_cols(promoted_cols, it)
-
-            if _finish_iteration(it, "objective_reject",
-                z_iter_start, active_iter_start, max_grad_dual=max_grad_dual,
-                tol_here=tol_here, best_dual_col=best_dual_col,
-                best_dual_value=best_dual_value,
-                attempted_dual_cols=promoted_cols):
-                break
-
-            continue
-
-        z_step = float(np.linalg.norm(z_sub - z_old_active))
-        z_step_rel = z_step / max(1.0, norm_old)
-
-        promoted_mask = np.zeros(k, dtype=bool)
-        if promoted_cols.size > 0:
-            promoted_set = set(int(c) for c in promoted_cols)
-            promoted_mask = np.asarray([int(c) in promoted_set
-                for c in active_idx], dtype=bool)
-
-        promoted_z_old = z_old_active[promoted_mask] if np.any(promoted_mask) \
-            else np.zeros(0, dtype=np.float64)
-        promoted_z_new = z_sub[promoted_mask] if np.any(promoted_mask) \
-            else np.zeros(0, dtype=np.float64)
-
-        promoted_z_norm = float(np.linalg.norm(promoted_z_new - promoted_z_old)
-            ) if promoted_z_new.size else 0.0
-
-        promoted_new_max = float(np.max(promoted_z_new)) if promoted_z_new.size\
-            else 0.0
-
-        promoted_new_l1 = float(np.sum(promoted_z_new)) if promoted_z_new.size \
-            else 0.0
-
-        failed_frac = float(failed_cols.size) / float(promoted_cols.size) \
-            if promoted_cols.size else 0.0
-
-        z_scale_loc = float(np.max(z_sub)) + 1e-30
-
-        newly_positive = int(np.count_nonzero(
-            promoted_z_new > 1e-12 * z_scale_loc)) if promoted_z_new.size \
-            else 0
-
-        _emit_diag({
-            "kind": "promotion_outcome",
-            "source": "streamActiveSetNNLS",
-            "iter": int(it + 1),
-            "n_active_before": int(np.count_nonzero(active_before)),
-            "k_reduced": int(k),
-            "n_promoted": int(promoted_cols.size),
-            "n_failed": int(n_failed_initial),
-            "n_survived": int(surviving_promoted.size),
-            "failed_fraction": float(failed_frac),
-            "promoted_new_positive": int(newly_positive),
-            "promoted_z_norm": float(promoted_z_norm),
-            "promoted_z_max": float(promoted_new_max),
-            "promoted_z_l1": float(promoted_new_l1),
-            "obj_old": float(obj_old),
-            "obj_new": float(obj_new),
-            "obj_gain": float(obj_gain),
-            "rel_gain": float(rel_gain),
-            "data_obj_old": float(data_obj_old),
-            "data_obj_new": float(data_obj_new),
-            "data_obj_gain": float(data_obj_gain),
-            "data_obj_rel_gain": float(data_obj_rel_gain),
-            "z_step": float(z_step),
-            "z_step_rel": float(z_step_rel),
-            "norm_old": float(norm_old),
-            "norm_new": float(norm_new),
-            "failed_cols": failed_cols_initial.tolist(),
-            "surviving_promoted": surviving_promoted.tolist(),
-            "failed_re_resolved": bool(
-                n_failed_initial > 0 and surviving_promoted.size > 0),
-        })
-
-        # Commit the constrained reduced solution.
-        z[active_idx] = z_sub
-
-        # Failed promotions are removed from the active support, but the
-        # resulting state must be re-solved before it can be committed as a
-        # valid constrained solution.
-        if failed_cols.size > 0:
-
-            _cooldown_cols(failed_cols, it)
-
-            if surviving_promoted.size == 0:
-                active[:] = active_before
-                z[:] = z_before
-
-                if _finish_iteration(
-                    it, "failed_promotion_rollback", z_iter_start,
-                    active_iter_start, max_grad_dual=max_grad_dual,
-                    tol_here=tol_here, best_dual_col=best_dual_col,
-                    best_dual_value=best_dual_value,
-                    attempted_dual_cols=promoted_cols):
-                    break
-                continue
-
-            candidate_active = np.unique(np.concatenate((
-                np.flatnonzero(active_before), surviving_promoted))
-            ).astype(np.int64, copy=False)
-
-            (active_retry, z_retry, info_retry, alpha_retry, lambda_retry,
-                ATA_retry, ATy_retry, S_retry, ridge_retry,
-                cond_retry) = _solve_reduced_active(candidate_active)
-
-            ATA_retry_reg = ATA_retry + ridge_retry * np.eye(
-                active_retry.size, dtype=np.float64)
-
-            if (z_retry is None
-                or info_retry is None
-                or not info_retry["accepted"]):
-                active[:] = active_before
-                z[:] = z_before
-
-                if _finish_iteration(
-                    it, "failed_promotion_reresolve_reject", z_iter_start,
-                    active_iter_start, max_grad_dual=max_grad_dual,
-                    tol_here=tol_here, best_dual_col=best_dual_col,
-                    best_dual_value=best_dual_value,
-                    attempted_dual_cols=promoted_cols):
-                    break
-                continue
-
-            z_retry_old = z_before[active_retry].copy()
-
-            data_obj_retry_old = _data_quad_obj(ATA_retry, ATy_retry,
-                z_retry_old)
-            data_obj_retry_new = _data_quad_obj(ATA_retry, ATy_retry,
-                z_retry)
-
-            rss_retry_old = _rss_from_data_obj(data_obj_retry_old)
-            rss_retry_new = _rss_from_data_obj(data_obj_retry_new)
-            rmse_retry_ratio = np.sqrt(rss_retry_new / max(rss_retry_old,
-                1e-30))
-            rmse_retry_worsen_rel = rmse_retry_ratio - 1.0
-
-            if (not np.isfinite(rmse_retry_ratio)
-                or rmse_retry_worsen_rel > max_rmse_worsen_rel):
-                active[:] = active_before
-                z[:] = z_before
-
-                if _finish_iteration(it, "retry_objective_reject",
-                    z_iter_start, active_iter_start,
-                    max_grad_dual=max_grad_dual, tol_here=tol_here,
-                    best_dual_col=best_dual_col,
-                    best_dual_value=best_dual_value,
-                    attempted_dual_cols=promoted_cols):
-                    break
-
-                continue
-
-            active[:] = False
-            active[active_retry] = True
-            z[:] = 0.0
-            z[active_retry] = z_retry
-
-            active_idx = active_retry
-            k = int(active_idx.size)
-            z_sub = z_retry
-            S_active = S_retry
-            ATA_sub_reg = ATA_retry_reg
-
-            cond_candidate = float(cond_retry)
-            ridge_candidate = float(ridge_retry)
-            if has_hard_orbit_shape:
-                orbit_constraint_info = info_retry
-                alpha_candidate = float(alpha_retry)
-                lambda_candidate = lambda_retry.copy()
-
-            mu_inner = float(orbit_constraint_info.get("mu", 0.0))
-            H_eval = ATA_sub_reg + mu_inner * np.eye(
-                k, dtype=np.float64)
-
-            z_old_active = z_before[active_idx].copy()
-            obj_old = _quad_obj(H_eval, ATy_retry, z_old_active)
-            obj_new = _quad_obj(H_eval, ATy_retry, z_sub)
-            norm_old = float(np.linalg.norm(z_old_active))
-            norm_new = float(np.linalg.norm(z_sub))
-            obj_gain = float(obj_old - obj_new)
-            rel_gain = obj_gain / max(1.0, abs(obj_old))
-            z_step = float(np.linalg.norm(z_sub - z_old_active))
-            z_step_rel = z_step / max(1.0, norm_old)
-            promoted_mask = np.isin(active_idx, promoted_cols)
-            promoted_z_old = z_old_active[promoted_mask]
-            promoted_z_new = z_sub[promoted_mask]
-            promoted_z_norm = float(np.linalg.norm(
-                promoted_z_new - promoted_z_old))
-            promoted_new_max = (float(np.max(promoted_z_new))
-                if promoted_z_new.size else 0.0)
-            promoted_new_l1 = float(np.sum(promoted_z_new))
-            z_scale_loc = float(np.max(z_sub)) + 1e-30
-            newly_positive = int(np.count_nonzero(
-                promoted_z_new > 1e-12 * z_scale_loc))
-
-            promoted_cols = surviving_promoted
-            failed_cols = np.zeros((0,), dtype=np.int64)
-
-        # Commit the matching equality multipliers only after the constrained
-        # coefficient update has passed the feasibility and objective checks.
-        if has_hard_orbit_shape:
-            alpha_current = float(alpha_candidate)
-            lambda_orbit_current = lambda_candidate.copy()
-            ridge_current = float(
-                ridge_candidate + orbit_constraint_info.get("mu", 0.0))
-        else:
-            ridge_current = float(ridge_candidate)
-
-        dropped_active = _canonicalize_active_support(z, active)
-
-        if dropped_active.size > 0:
-            _emit_diag({
-                "kind": "active_support_cleanup",
-                "source": "streamActiveSetNNLS",
-                "iter": int(it + 1),
-                "n_dropped": int(dropped_active.size),
-                "dropped": dropped_active.tolist(),
-                "n_active_after": int(np.count_nonzero(active)),
-                "n_positive_after": int(np.count_nonzero(z > 0.0)),
-            })
-
-        active[known_zero_flat] = False
-        z[known_zero_flat] = 0.0
-
-        if diag_level >= 1 and ((it % diag_stride) == 0):
-            x_phys_now = _current_x_from_z(z).reshape(C, P)
-            orbit_mass_vec = np.sum(x_phys_now, axis=1)
-            if not has_hard_orbit_shape:
-                orbit_target = np.zeros((C,), dtype=np.float64)
-            else:
-                orbit_target = float(alpha_current) * np.asarray(orbit_shape,
-                    dtype=np.float64)
-            orbit_resid = orbit_mass_vec - orbit_target
-            orbit_ratio = orbit_mass_vec / np.maximum(orbit_target, 1e-30)
-            orbit_nz = np.count_nonzero(x_phys_now > 0.0,
-                axis=1).astype(np.int64)
-
-            eff_support = np.zeros((C,), dtype=np.float64)
-            entropy = np.zeros((C,), dtype=np.float64)
-            top_share = np.zeros((C,), dtype=np.float64)
-            for cc in range(C):
-                st = _support_stats_1d(x_phys_now[cc, :])
-                eff_support[cc] = st["eff_support"]
-                entropy[cc] = st["entropy"]
-                top_share[cc] = st["top_share"]
-
-            _emit_diag({
-                "kind": "iter_post",
-                "source": "streamActiveSetNNLS",
-                "iter": int(it + 1),
-                "t_iter_sec": float(time.perf_counter() - t_iter),
-                "k_active": int(k),
-                "ATA_norm": float(np.linalg.norm(ATA_sub)),
-                "ATA_reg_norm": float(np.linalg.norm(ATA_sub_reg)),
-                "ATy_norm": float(np.linalg.norm(ATy_sub)),
-                "diag_med": float(diag_med),
-                "diag_min": float(np.min(diag)) if diag.size else 0.0,
-                "diag_max": float(np.max(diag)) if diag.size else 0.0,
-                "emin": float(emin),
-                "emax": float(emax),
-                "ridge": float(ridge_current),
-                "orbit_constraint_ok": bool(
-                    orbit_constraint_info["accepted"]),
-                "orbit_constraint_l1": float(
-                    orbit_constraint_info["resid_l1"]),
-                "orbit_constraint_l2": float(
-                    orbit_constraint_info["resid_l2"]),
-                "orbit_constraint_linf": float(
-                    orbit_constraint_info["resid_linf"]),
-                "n_promoted": int(promoted_cols.size),
-                "n_failed": int(failed_cols.size),
-                "obj_old": float(obj_old),
-                "obj_new": float(obj_new),
-                "obj_gain": float(obj_gain),
-                "norm_old": float(norm_old),
-                "norm_new": float(norm_new),
-                "orbit_mass": orbit_mass_vec.tolist(),
-                "orbit_target": orbit_target.tolist(),
-                "orbit_resid": orbit_resid.tolist(),
-                "orbit_ratio": orbit_ratio.tolist(),
-                "orbit_nz": orbit_nz.tolist(),
-                "orbit_eff_support": eff_support.tolist(),
-                "orbit_entropy": entropy.tolist(),
-                "orbit_top_share": top_share.tolist(),
-                "alpha": (float(alpha_current) if has_hard_orbit_shape
-                    else None),
-                "alpha_stationarity": (float(orbit_constraint_info.get(
-                            "alpha_stationarity", 0.0))
-                    if has_hard_orbit_shape else None),
-                "orbit_shape": (orbit_shape.tolist()
-                    if orbit_shape is not None else None),
-                "x": x_phys_now.ravel(order="C").tolist(),
-            })
-
-        if _finish_iteration(
-            it, "accepted", z_iter_start, active_iter_start,
-            max_grad_dual=max_grad_dual, tol_here=tol_here,
-            best_dual_col=best_dual_col, best_dual_value=best_dual_value,
-            attempted_dual_cols=promoted_cols):
-            break
+        _emit_checkpoint(
+            it,
+            final=False,
+            phase="exploration",
+        )
 
     try:
         final_it = int(it)
