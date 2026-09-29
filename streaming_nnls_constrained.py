@@ -2682,9 +2682,11 @@ def streamActiveSetNNLS(
         )
 
         max_grad_dual = max(max_grad_inactive, 0.0)
+        kkt_violation = max(max_grad_active, max_grad_dual)
+        kkt_tol = float(tol_here)
 
-        active_ok = max_grad_active <= tol_here
-        dual_ok = max_grad_dual <= tol_here
+        active_ok = max_grad_active <= kkt_tol
+        dual_ok = max_grad_dual <= kkt_tol
         kkt_converged = active_ok and dual_ok
 
         if np.any(zero_free_mask):
@@ -2710,6 +2712,9 @@ def streamActiveSetNNLS(
                 "max_grad_active": float(max_grad_active),
                 "max_grad_inactive": float(max_grad_inactive),
                 "max_grad_dual": float(max_grad_dual),
+                "kkt_violation": float(kkt_violation),
+                "kkt_tol": float(kkt_tol),
+                "active_ok": bool(active_ok),
                 "active_ok": bool(active_ok),
                 "dual_ok": bool(dual_ok),
                 "converged": bool(kkt_converged),
@@ -2764,6 +2769,8 @@ def streamActiveSetNNLS(
                 "max_grad_active": float(max_grad_active),
                 "max_grad_inactive": float(max_grad_inactive),
                 "max_grad_dual": float(max_grad_dual),
+                "kkt_violation": float(kkt_violation),
+                "kkt_tol": float(kkt_tol),
                 "tol_here": float(tol_here),
                 "active_ok": bool(active_ok),
                 "dual_ok": bool(dual_ok),

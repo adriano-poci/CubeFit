@@ -38,6 +38,8 @@ v1.6:   Expanded and improved `plot_diagnostic_jsonl_dashboard` for richer
 v1.7:   Made `plot_diagnostic_jsonl_dashboard` able to accept multiple file
             paths and automatically merge run diagnostics, to support 
             `resume` runs. 23 September 2026
+v1.8:   Updated `plot_diagnostic_jsonl_dashboard` to latest diagnostic outputs.
+            29 September 2026
 """
 
 from __future__ import annotations
@@ -794,58 +796,112 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     norm_new = _series(merged, "norm_new")
     z_step_rel = _series(merged, "promotion_outcome_z_step_rel")
 
-    grad_total = _series(merged, "max_grad_total")
-    grad_active = _series(merged, "max_grad_active")
-    grad_inactive = _series(merged, "max_grad_inactive")
-    grad_promo = _series(merged, "max_grad_promo")
-    tol_here = _series(merged, "promotion_attempt_tol_here")
-    grad_data = _series(merged, "max_grad_data")
-    grad_orbit = _series(merged, "max_grad_orbit")
-    grad_dual = _series(merged, "max_grad_dual")
-    grad_zero_active = _series(merged, "max_grad_zero_active")
-    avg_grad_promo = _series(merged, "avg_grad_promo",
-        "promotion_attempt_avg_grad_promotable")
-    best_inactive_grad = _series(merged, "best_inactive_grad")
+    grad_active = _series(
+        merged, "max_grad_active")
 
-    n_active = _series(merged, "n_active", "k_active", "active")
-    n_promoted = _series(merged, "n_promoted", default=0.0)
-    n_attempted = _series(merged, "promotion_attempt_n_promoted",
-        default=0.0)
-    n_failed = _series(merged, "promotion_outcome_n_failed",
-        "n_failed", default=0.0)
-    n_dropped = _series(merged, "n_dropped", default=0.0)
-    n_survived = _series(merged, "promotion_outcome_n_survived",
-        default=0.0)
-    n_promotion_orbits = _series(merged,
-        "promotion_attempt_n_promotion_orbits")
-    max_promoted_per_orbit = _series(merged,
-        "promotion_attempt_max_promoted_per_orbit")
-    failed_fraction = _series(merged,
-        "promotion_outcome_failed_fraction")
-    promoted_positive = _series(merged,
-        "promotion_outcome_promoted_new_positive")
-    promoted_z_norm = _series(merged,
-        "promotion_outcome_promoted_z_norm")
-    promoted_z_l1 = _series(merged,
-        "promotion_outcome_promoted_z_l1")
-    promoted_z_max = _series(merged,
-        "promotion_outcome_promoted_z_max")
+    grad_inactive = _series(
+        merged, "max_grad_inactive")
 
-    n_candidates = _series(merged, "promotion_attempt_n_candidates")
-    n_eligible = _series(merged, "promotion_attempt_n_eligible")
-    n_cooldown = _series(merged, "promotion_attempt_n_cooldown")
-    n_col_cooldown = _series(merged,
-        "promotion_attempt_n_col_cooldown")
-    n_orbit_cooldown = _series(merged,
-        "promotion_attempt_n_orbit_cooldown")
+    grad_promotable = _series(
+        merged,
+        "max_grad_promotable",
+        "max_grad_promo",
+    )
 
-    grad_eligible = _series(merged,
-        "promotion_attempt_max_grad_eligible")
-    score_eligible = _series(merged,
-        "promotion_attempt_max_score_eligible")
-    max_score = _series(merged, "promotion_attempt_max_score")
-    negative_grad_count = _series(merged,
-        "promotion_attempt_negative_grad_count")
+    grad_data = _series(
+        merged, "max_grad_data")
+
+    grad_orbit = _series(
+        merged, "max_grad_orbit")
+
+    grad_dual = _series(
+        merged, "max_grad_dual")
+
+    kkt_violation = _series(
+        merged,
+        "kkt_violation",
+        "kkt_kkt_violation",
+    )
+
+    kkt_tol = _series(
+        merged,
+        "kkt_tol",
+        "tol_here",
+        "kkt_kkt_tol",
+    )
+
+    avg_grad_promotable = _series(
+        merged,
+        "avg_grad_promo",
+        "avg_grad_promotable",
+    )
+
+    best_inactive_grad = _series(
+        merged, "best_inactive_grad")
+
+    n_active = _series(
+        merged, "n_active", "k_active", "active")
+
+    n_attempted = _series(
+        merged,
+        "promotion_attempt_n_promoted",
+        "n_promoted",
+        default=0.0,
+    )
+
+    n_failed = _series(
+        merged,
+        "promotion_outcome_n_failed",
+        "n_failed",
+        default=0.0,
+    )
+
+    n_survived = _series(
+        merged,
+        "promotion_outcome_n_survived",
+        default=0.0,
+    )
+
+    n_promotion_orbits = _series(
+        merged,
+        "promotion_attempt_n_promotion_orbits",
+    )
+
+    failed_fraction = _series(
+        merged,
+        "promotion_outcome_failed_fraction",
+    )
+
+    promoted_z_norm = _series(
+        merged,
+        "promotion_outcome_promoted_z_norm",
+    )
+
+    promoted_z_max = _series(
+        merged,
+        "promotion_outcome_promoted_z_max",
+    )
+
+    n_candidates = _series(
+        merged,
+        "promotion_attempt_n_candidates",
+        "n_candidates",
+    )
+
+    n_eligible = _series(
+        merged,
+        "promotion_attempt_n_eligible",
+        "n_eligible",
+    )
+
+    n_cooldown = _series(merged, "promotion_attempt_n_cooldown",
+        "n_cooldown")
+
+    grad_eligible = _series(merged, "promotion_attempt_max_grad_eligible",
+        "max_grad_eligible")
+
+    score_eligible = _series(merged, "promotion_attempt_max_score_eligible",
+        "max_score_eligible")
 
     constraint_l1 = _series(merged, "orbit_constraint_l1",
         "orbit_resid_l1")
@@ -867,23 +923,6 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     ridge = _series(merged, "ridge")
     eig_min = _series(merged, "emin")
     eig_max = _series(merged, "emax")
-
-    did_explore = np.asarray([
-        bool(record.get("promotion_attempt_did_explore",
-            record.get("did_explore", False))) for record in merged],
-        dtype=bool)
-
-    force_explore = np.asarray([
-        bool(record.get("promotion_attempt_force_explore", False))
-        for record in merged], dtype=bool)
-
-    near_noop = np.asarray([
-        bool(record.get("promotion_outcome_near_noop", False))
-        for record in merged], dtype=bool)
-
-    rejected = np.asarray([
-        bool(record.get("reject", False)) for record in merged],
-        dtype=bool)
 
     mean_orbit_nz = np.full(iterations.shape, np.nan, dtype=np.float64)
     mean_eff_support = np.full(iterations.shape, np.nan, dtype=np.float64)
@@ -1041,27 +1080,69 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     # ------------------------------------------------------------------
     axis = axes["kkt"]
 
-    active_ratio = np.divide(np.abs(grad_active), tol_here,
-        out=np.full_like(grad_active, np.nan), where=tol_here > 0.0)
-    inactive_ratio = np.divide(np.maximum(grad_inactive, 0.0), tol_here,
-        out=np.full_like(grad_inactive, np.nan), where=tol_here > 0.0)
-    promo_ratio = np.divide(np.maximum(grad_promo, 0.0), tol_here,
-        out=np.full_like(grad_promo, np.nan), where=tol_here > 0.0)
+    kkt_ratio = np.divide(
+        kkt_violation,
+        kkt_tol,
+        out=np.full_like(kkt_violation, np.nan),
+        where=kkt_tol > 0.0,
+    )
 
-    _plot_finite(axis, iterations, active_ratio,
-        "Active / tolerance", positive_log=True, lw=1.4, color="tab:blue")
-    _plot_finite(axis, iterations, inactive_ratio,
-        "Inactive / tolerance", positive_log=True, lw=1.4,
-        color="tab:orange")
-    _plot_finite(axis, iterations, promo_ratio,
-        "Promotable / tolerance", positive_log=True, lw=1.1,
-        color="tab:green")
+    active_ratio = np.divide(
+        np.abs(grad_active),
+        kkt_tol,
+        out=np.full_like(grad_active, np.nan),
+        where=kkt_tol > 0.0,
+    )
 
-    axis.axhline(1.0, lw=1.0, color="black", linestyle="--",
-        label="Convergence boundary")
-    axis.set_title("Normalized KKT convergence")
+    dual_ratio = np.divide(
+        np.maximum(grad_dual, 0.0),
+        kkt_tol,
+        out=np.full_like(grad_dual, np.nan),
+        where=kkt_tol > 0.0,
+    )
+
+    _plot_finite(
+        axis,
+        iterations,
+        kkt_ratio,
+        "Overall KKT / tolerance",
+        positive_log=True,
+        lw=1.6,
+        color="tab:red",
+    )
+
+    _plot_finite(
+        axis,
+        iterations,
+        active_ratio,
+        "Active stationarity / tolerance",
+        positive_log=True,
+        lw=1.2,
+        color="tab:blue",
+    )
+
+    _plot_finite(
+        axis,
+        iterations,
+        dual_ratio,
+        "Inactive dual / tolerance",
+        positive_log=True,
+        lw=1.2,
+        color="tab:orange",
+    )
+
+    axis.axhline(
+        1.0,
+        lw=1.0,
+        color="black",
+        linestyle="--",
+        label="Convergence boundary",
+    )
+
+    axis.set_title("Constrained KKT convergence")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Violation / tolerance")
+    axis.set_ylabel("Residual / tolerance")
+
     _homogenise_ticks(axis)
     axis.legend(fontsize=8, loc="best")
 
@@ -1131,29 +1212,42 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     # ------------------------------------------------------------------
     axis = axes["promotions"]
 
-    _plot_finite(axis, iterations, n_promoted, "Attempted",
-        lw=1.3, color="tab:blue")
-    _plot_finite(axis, iterations, n_survived, "Survived",
-        lw=1.3, color="tab:green")
-    _plot_finite(axis, iterations, n_failed, "Failed",
-        lw=1.3, color="tab:orange")
-    _plot_finite(axis, iterations, n_promotion_orbits,
-        "Promotion orbits", lw=1.1, color="tab:brown", alpha=0.8)
+    _plot_finite(
+        axis,
+        iterations,
+        n_attempted,
+        "Promoted",
+        lw=1.3,
+        color="tab:blue",
+    )
 
-    explore_mask = did_explore | force_explore
-    if np.any(explore_mask):
-        axis.scatter(iterations[explore_mask], n_attempted[explore_mask],
-            marker="x", s=28, color="tab:red", label="Exploration", zorder=5)
+    _plot_finite(
+        axis,
+        iterations,
+        n_survived,
+        "Survived",
+        lw=1.3,
+        color="tab:green",
+    )
 
-    if np.any(near_noop):
-        axis.scatter(iterations[near_noop], n_attempted[near_noop], marker="o",
-            s=38, facecolors="none", edgecolors="black", label="Near-noop",
-            zorder=6)
+    _plot_finite(
+        axis,
+        iterations,
+        n_failed,
+        "Failed",
+        lw=1.3,
+        color="tab:orange",
+    )
 
-    if np.any(rejected):
-        axis.scatter(iterations[rejected], n_attempted[rejected], marker="s",
-            s=30, facecolors="none", edgecolors="tab:red", label="Rejected",
-            zorder=6)
+    _plot_finite(
+        axis,
+        iterations,
+        n_promotion_orbits,
+        "Promotion orbits",
+        lw=1.1,
+        color="tab:brown",
+        alpha=0.8,
+    )
 
     axis.set_title("Active-set dynamics")
     axis.set_xlabel("Iteration")
@@ -1246,10 +1340,6 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         lw=1.3, color="tab:green")
     _plot_finite(axis, iterations, n_cooldown, "Combined cooldown",
         lw=1.2, color="tab:red")
-    _plot_finite(axis, iterations, n_col_cooldown, "Column cooldown",
-        lw=1.0, color="tab:orange", alpha=0.75)
-    _plot_finite(axis, iterations, n_orbit_cooldown, "Orbit cooldown",
-        lw=1.0, color="tab:purple", alpha=0.75)
 
     axis.set_title("Promotion eligibility and cooldown")
     axis.set_xlabel("Iteration")
@@ -1264,7 +1354,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     _plot_finite(gradient_axis, iterations, score_eligible,
         "Best eligible score", positive_log=True, lw=1.0,
         color="tab:pink", alpha=0.8)
-    _plot_finite(gradient_axis, iterations, np.abs(avg_grad_promo),
+    _plot_finite(gradient_axis, iterations, np.abs(avg_grad_promotable),
         "Mean promotable |gradient|", positive_log=True, lw=1.0,
         color="tab:gray", alpha=0.8)
 
