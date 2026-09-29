@@ -47,7 +47,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional, Dict, Any, List, Tuple
 import os, math, builtins
+import multiprocessing as mp
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
 from dynamics.IFU.Constants import Constants
@@ -890,6 +892,38 @@ def _frac_shift_last_axis(X: np.ndarray, shift: float) -> np.ndarray:
     Y = np.fft.irfft(F * phase[(...,) + (None,)* (F.ndim-1 - 1)], n=T, axis=-1)
     return Y
 
+# ------------------------- parallel builder workers ---------------------------
+
+_HC_T_fft = None
+_HC_R_T = None
+_HC_km = None
+_HC_n_fft = None
+_HC_T = None
+_HC_phase_shift = None
+
+def _init_hypercube_worker(T_fft, R_T, km, n_fft, T, phase_shift):
+    """Initialize read-only arrays used by HyperCube worker processes."""
+    global _HC_T_fft, _HC_R_T, _HC_km, _HC_n_fft, _HC_T, _HC_phase_shift
+    _HC_T_fft = T_fft
+    _HC_R_T = R_T
+    _HC_km = km
+    _HC_n_fft = int(n_fft)
+    _HC_T = int(T)
+    _HC_phase_shift = phase_shift
+
+def _hypercube_worker(args):
+    """Compute one ``(s, c, P-block)`` HyperCube slab."""
+    s_idx, c_idx, p0, p1, H_native, scale = args
+    conv_td = _fft_conv_centered(_HC_T_fft[p0:p1, :], H_native, _HC_km,
+        _HC_n_fft, _HC_T, phase_shift=_HC_phase_shift)
+    Ycp = conv_td @ _HC_R_T
+    np.maximum(Ycp, 0.0, out=Ycp)
+    if scale != 0.0:
+        Ycp *= np.float32(scale)
+    else:
+        Ycp.fill(0.0)
+    return s_idx, c_idx, p0, p1, Ycp
+
 # ------------------------- main builder ---------------------------------------
 
 def build_hypercube(
@@ -904,6 +938,7 @@ def build_hypercube(
     P_chunk: int = 360,
     compression: str | None = None,
     vel_bias_kms: float = 0.0,
+    processes: int | None = None,
 ) -> None:
     """
     Build /HyperCube/models with LOSVD convolution on the template grid,
@@ -920,6 +955,9 @@ def build_hypercube(
         raise ValueError("norm_mode must be 'model' or 'data'.")
     if cp_flux_ref_mode not in ("median", "mean", "off"):
         raise ValueError("cp_flux_ref_mode must be 'median', 'mean', or 'off'.")
+    if processes is None:
+        processes = int(os.environ.get("CUBEFIT_GEN_PROCESSES", "1"))
+    processes = max(1, int(processes))
 
     # -------- Fast preflight: exit early if fully complete (reader-only)
     with open_h5(base_h5, "reader") as f_rd:
@@ -1166,98 +1204,77 @@ def build_hypercube(
         total_tiles = rem
 
         pbar = tqdm(total=total_tiles, desc="[HyperCube] tiles",
-                    mininterval=2.0)
+            mininterval=2.0)
 
         eps = 1e-30  # avoids 0/0 in data mode
-        for (p0, p1, s0, s1, c0, c1, idx3) in _iter_all_tiles():
-            if _done_get(done, idx3) != 0:
-                continue
+        ctx = mp.get_context("spawn")
+        print(f"[HyperCube] parallel build: {processes} processes", flush=True)
 
-            # Frequency-domain template slice for this P-block
-            T_fft_slice = T_fft[p0:p1, :]  # (ΔP, rfft_len)
+        with ProcessPoolExecutor(max_workers=processes, mp_context=ctx,
+            initializer=_init_hypercube_worker,
+            initargs=(T_fft, R_T, km, n_fft, T, phase_shift)) as executor:
 
-            # For each (s,c) in this tile:
-            for s_idx in range(s0, s1):
+            for (p0, p1, s0, s1, c0, c1, idx3) in _iter_all_tiles():
+                if _done_get(done, idx3) != 0:
+                    continue
 
-                a_sum = float(A_sum[s_idx])  # scalar
-                for c_idx in range(c0, c1):
-                    # 1) build unit-area kernel for (s,c)
-                    H_native = np.asarray(losvd_ds[s_idx, :, c_idx],
-                                         dtype=np.float64, order="C")
-                    # Hk_unit = _losvd_to_unit_kernel(H_native, km)
+                jobs = []
+                for s_idx in range(s0, s1):
+                    a_sum = float(A_sum[s_idx])
+                    for c_idx in range(c0, c1):
+                        H_native = np.asarray(losvd_ds[s_idx, :, c_idx],
+                            dtype=np.float64, order="C")
 
-                    # 2) FFT conv (centered 'same' crop on template grid)
-                    conv_td = _fft_conv_centered(T_fft_slice, H_native, km,
-                        n_fft, int(T), phase_shift=phase_shift)
-
-                    # 3) rebin AFTER convolution
-                    Ycp = conv_td @ R_T  # (ΔP, L)
-                    np.maximum(Ycp, 0.0, out=Ycp)
-
-                    # 4) apply FINAL scale according to norm_mode
-                    if norm_mode == "model":
-                        # model-mode: A already encodes the desired per-(s,c) column amplitude
-                        scale = float(A[s_idx, c_idx])
-                    else:
-                        if a_sum <= 0.0 or L_vec[s_idx] <= 0.0:
+                        if norm_mode == "model":
+                            scale = float(A[s_idx, c_idx])
+                        elif a_sum <= 0.0 or L_vec[s_idx] <= 0.0:
                             scale = 0.0
                         else:
-                            frac = float(A[s_idx, c_idx]) / np.maximum(a_sum, 1.0e-30)
-                            # guard: if binCounts missing fall back to 1
+                            frac = float(A[s_idx, c_idx]) / \
+                                np.maximum(a_sum, eps)
                             scale = float(L_vec[s_idx]) * frac
 
-                    if scale != 0.0:
-                        Ycp *= np.float32(scale)
-                    else:
-                        Ycp.fill(0.0)
+                        jobs.append(executor.submit(_hypercube_worker,
+                            (s_idx, c_idx, p0, p1, H_native, scale)))
 
-                    # 6b) accumulate global energy E[c,p] with same λ-view:
-                    # mask if present, and apply √w if lambda_weights exist.
+                for future in as_completed(jobs):
+                    s_idx, c_idx, pp0, pp1, Ycp = future.result()
+
                     if masked_flag:
-                        Yv = Ycp[:, keep_idx]  # (ΔP, Lk)
+                        Yv = Ycp[:, keep_idx]
                     else:
-                        Yv = Ycp               # (ΔP, L or Lk)
+                        Yv = Ycp
 
-                    # Compute per-population contribution for this (s_idx, c_idx, P-block)
                     if w_lam_sqrt is not None:
-                        # weighted: sum_λ (√w·Y)^2 = sum_λ (w * Y^2)
-                        e_local = np.sum(
-                            np.square(Yv, dtype=np.float64) * w_lam_sqrt[None, :],
-                            axis=1
-                        )  # (ΔP,)
+                        e_local = np.sum(np.square(Yv, dtype=np.float64) *
+                            w_lam_sqrt[None, :], axis=1)
                     else:
-                        # unweighted: sum_λ Y^2
-                        e_local = np.sum(
-                            np.square(Yv, dtype=np.float64),
-                            axis=1
-                        )  # (ΔP,)
+                        e_local = np.sum(np.square(Yv, dtype=np.float64),
+                            axis=1)
 
-                    E_acc[c_idx, p0:p1] += e_local
-                    # --- accumulate tile-wise component energy ---
+                    E_acc[c_idx, pp0:pp1] += e_local
                     tile_idx = s_idx // S_chunk
-                    E_tile_comp[tile_idx, c_idx] += float(np.sum(e_local))
-                    
-                    # 7) write
-                    models[s_idx, c_idx, p0:p1, 0:L] = Ycp
+                    E_tile_comp[tile_idx, c_idx] += float(
+                        np.sum(e_local))
 
+                    models[s_idx, c_idx, pp0:pp1, 0:L] = Ycp
 
-            _done_set(done, idx3)
+                _done_set(done, idx3)
 
-            # SWMR visibility
-            try:
-                models.id.flush()
-            except Exception:
-                pass
-            try:
-                done.id.flush()
-            except Exception:
-                pass
-            try:
-                f.flush()
-            except Exception:
-                pass
+                try:
+                    models.id.flush()
+                except Exception:
+                    pass
+                try:
+                    done.id.flush()
+                except Exception:
+                    pass
+                try:
+                    f.flush()
+                except Exception:
+                    pass
 
-            pbar.update(1)
+                pbar.update(1)
 
         pbar.close()
 
@@ -1548,26 +1565,20 @@ def assert_preflight_ok(
     ...                     c_list=[124, 197],
     ...                     p_list=[42, 44, 88, 89])
     """
-    res = preflight_hypercube_convolution(
-        h5_path,
-        s_list=s_list,
-        c_list=c_list,
-        p_list=p_list,
+    res = preflight_hypercube_convolution(h5_path,
+        s_list=s_list, c_list=c_list, p_list=p_list,
         max_spax=int(max_spax),
         max_comp=int(max_comp),
         max_pop=int(max_pop),
         tol_rel=float(tol_rel),
         tol_shift_px=float(tol_shift_px),
         tol_flat_valid=float(tol_flat_valid),
-        verbose=bool(verbose),
-    )
+        verbose=bool(verbose))
 
     # Optional global rebin flatness guard
     if require_rt_flat and (float(res["rt_flat_check"]) > float(rt_flat_tol)):
-        raise RuntimeError(
-            "[preflight] R_T flatness failed: max|R_T @ 1 − 1| = "
-            f"{float(res['rt_flat_check']):.3e} > {float(rt_flat_tol):.3e}"
-        )
+        raise RuntimeError("[preflight] R_T flatness failed: max|R_T @ 1 − 1| = "
+            f"{float(res['rt_flat_check']):.3e} > {float(rt_flat_tol):.3e}")
 
     if bool(res["all_pass"]):
         return res
@@ -1590,17 +1601,13 @@ def assert_preflight_ok(
     show = bad[: np.minimum(bad.size, 8)]
     lines = []
     for i in show:
-        lines.append(
-            f"  case {i}: (s,c,p0)={triples[i]}  "
+        lines.append(f"  case {i}: (s,c,p0)={triples[i]}  "
             f"rel={rel[i]:.3e}  shift={sh[i]:+d}px  "
-            f"flat_valid={fv[i]:.3e}"
-        )
+            f"flat_valid={fv[i]:.3e}")
 
-    msg = [
-        "[preflight] convolution checks failed.",
+    msg = ["[preflight] convolution checks failed.",
         f"  worst rel={worst_rel:.3e}  worst |shift|={worst_abs_shift:d}px  "
-        f"worst flat_valid={worst_flat:.3e}",
-    ]
+        f"worst flat_valid={worst_flat:.3e}",]
     if lines:
         msg.append("  examples:")
         msg.extend(lines)

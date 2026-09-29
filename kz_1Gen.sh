@@ -30,15 +30,19 @@ module load Python/3.11.3-GCCcore-12.3.0
 # glibc / allocator hygiene
 export MALLOC_ARENA_MAX=2
 
-# Threading (OpenBLAS-backed NumPy)
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-48}
-export OPENBLAS_NUM_THREADS=$OMP_NUM_THREADS
+# HyperCube multiprocessing + BLAS threading
+export CUBEFIT_GEN_BLAS_THREADS=2
+export CUBEFIT_GEN_PROCESSES=$((
+    ${SLURM_CPUS_PER_TASK:-12} / CUBEFIT_GEN_BLAS_THREADS
+))
+export OMP_NUM_THREADS=$CUBEFIT_GEN_BLAS_THREADS
+export OPENBLAS_NUM_THREADS=$CUBEFIT_GEN_BLAS_THREADS
+export MKL_NUM_THREADS=$CUBEFIT_GEN_BLAS_THREADS
 export OMP_DYNAMIC=FALSE
 export OMP_PROC_BIND=false
 unset GOMP_CPU_AFFINITY
 export KMP_AFFINITY=disabled
-export MKL_NUM_THREADS=1 # harmless, prevents surprise MKL use elsewhere
-export NUMEXPR_NUM_THREADS=1 # avoid hidden extra threads
+export NUMEXPR_NUM_THREADS=1
 
 # File descriptors
 ulimit -n 8192
@@ -152,6 +156,8 @@ cd /data/phys-gal-dynamics/phys2603/CubeFit
 echo "Submitted cluster: ${CF_CLUSTER:-unknown}"
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-unknown}"
 echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-unknown}"
+echo "CUBEFIT_GEN_PROCESSES=$CUBEFIT_GEN_PROCESSES"
+echo "CUBEFIT_GEN_BLAS_THREADS=$CUBEFIT_GEN_BLAS_THREADS"
 
 python -m IPython --colors=NoColor kz_run.py -- --galaxy "$GALAXY" \
     --run-switch 'gen' --redraw ${NCOMP:+--ncomp="$NCOMP"}

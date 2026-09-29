@@ -1423,9 +1423,9 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         title_parts.append(rf"$\alpha={_fmt_sci(final_alpha_summary)}$")
 
     if np.isfinite(final_data_objective):
-        title_parts.append(rf"data objective={_fmt_sci(final_data_objective)}")
+        title_parts.append(rf"data objective=${_fmt_sci(final_data_objective)}$")
     elif np.isfinite(final_total_objective):
-        title_parts.append(rf"objective={_fmt_sci(final_total_objective)}")
+        title_parts.append(rf"objective=${_fmt_sci(final_total_objective)}$")
 
     for axis in axes.values():
         if axis.axison:

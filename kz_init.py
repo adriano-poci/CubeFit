@@ -36,7 +36,7 @@ def props(galaxy, **kwargs):
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6]),
             # regularisation_scale=0.0, **kwargs)
-            regularisation_scale=0.02, **kwargs)
+            regularisation_scale=0.0, **kwargs)
     elif 'FCC170' in galaxy:
         propDict = dict(galaxy='FCC170', mPath='hd170', SN=100, nCuts=3,
             lOrder=0, specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI',

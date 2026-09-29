@@ -92,6 +92,10 @@ v1.27:  Allow `regularisation_scale` to be zero to disable stabilisation ridge.
 v1.28:  Use the smaller `C=3` intrinsic orbital type fit a seed for the larger
             runs, properly upscaled using `constrainUpscaledSolution`, in
             `genCubeFit`. 25 September 2026
+v1.29:  Pull `validationPath`, `validationDataset`, and `validationTag` from
+            kwargs in order to load a synthetic validation cube in `genCubeFit`;
+        Added `bias` keyword to `genCubeFit` to control whether the velocity bias
+            is estimated before the hypercube construction. 29 September 2026
 """
 
 # need to set up the logger before any other imports
@@ -192,11 +196,124 @@ def _MWProp(prop, aperMass):
 
 # ------------------------------------------------------------------------------
 
+def loadValidationCube(validationPath, spLL, nSpat, *, dataset="/ModelCube"):
+    """
+    Load a CubeFit model cube for use as synthetic validation data.
+
+    The returned array follows the orientation expected internally by
+    ``genCubeFit``: ``(nLSpec, nSpat)``. CubeFit HDF5 datasets use the
+    opposite orientation, ``(nSpat, nLSpec)``, so the selected dataset
+    is transposed before returning.
+
+    The wavelength grid stored in the validation file is required to
+    agree with the wavelength grid produced by ``_oneTimeSpec``. This
+    prevents a model cube generated on one spectral grid from being
+    silently fitted on another.
+
+    Parameters
+    ----------
+    validationPath : str or pathlib.Path
+        CubeFit HDF5 file containing the synthetic validation cube.
+    spLL : ndarray
+        Current observed log-wavelength grid from ``_oneTimeSpec``, with
+        shape ``(nLSpec,)``.
+    nSpat : int
+        Number of spatial bins expected by the current CubeFit run.
+    dataset : str, optional
+        HDF5 dataset containing the validation spectra. Default is
+        ``"/ModelCube"``.
+
+    Returns
+    -------
+    validationCube : ndarray
+        Synthetic spectral cube with shape ``(nLSpec, nSpat)`` and
+        dtype ``float64``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``validationPath`` does not exist.
+    RuntimeError
+        If the requested dataset or wavelength grid is missing, or if
+        the validation cube contains non-finite values.
+    ValueError
+        If the validation cube dimensions or wavelength grid do not
+        match the current CubeFit configuration.
+
+    Examples
+    --------
+    >>> laGrid = loadValidationCube(
+    ...     "NGC4365/hypercube_003_00.h5",
+    ...     spLL,
+    ...     nSpat,
+    ... )
+    """
+    validationPath = plp.Path(validationPath)
+
+    if not validationPath.is_file():
+        raise FileNotFoundError(
+            f"Validation HDF5 file not found: {validationPath}")
+
+    spLL = np.asarray(spLL, dtype=np.float64).ravel(order="C")
+
+    with open_h5(str(validationPath), role="reader") as f:
+        if dataset not in f:
+            raise RuntimeError(f"{validationPath} does not contain {dataset}.")
+
+        if "/ObsPix" not in f:
+            raise RuntimeError(f"{validationPath} does not contain /ObsPix.")
+
+        cube = np.asarray(f[dataset][...], dtype=np.float64, order="C")
+
+        obs_pix = np.asarray(f["/ObsPix"][...], dtype=np.float64).ravel(
+            order="C")
+
+    if cube.ndim != 2:
+        raise ValueError(f"{dataset} must be two-dimensional; "
+            f"got shape {cube.shape}.")
+
+    expected_shape = (int(nSpat), int(spLL.size),)
+
+    if cube.shape != expected_shape:
+        raise ValueError("Validation cube shape mismatch: "
+            f"{dataset} has {cube.shape}, but the current run "
+            f"expects {expected_shape} = (nSpat, nLSpec).")
+
+    if obs_pix.shape != spLL.shape:
+        raise ValueError("Validation wavelength-grid length mismatch: "
+            f"{obs_pix.size} != {spLL.size}.")
+
+    if not np.allclose(obs_pix, spLL, rtol=1e-12, atol=1e-12,):
+        max_diff = float(np.max(np.abs(obs_pix - spLL)))
+
+        raise ValueError("Validation /ObsPix does not match the current "
+            "_oneTimeSpec wavelength grid. "
+            f"Maximum absolute difference = {max_diff:.6e}.")
+
+    if not np.all(np.isfinite(cube)):
+        n_bad = int(np.count_nonzero(~np.isfinite(cube)))
+
+        raise RuntimeError(f"{dataset} contains {n_bad} non-finite values.")
+
+    # HDF5 CubeFit convention: (nSpat, nLSpec)
+    # kz_fitSpec convention:    (nLSpec, nSpat)
+    validationCube = np.ascontiguousarray(cube.T, dtype=np.float64,)
+
+    logger.log("[CubeFit][validation] Loaded synthetic data from "
+        f"{validationPath}:{dataset}; "
+        f"shape={validationCube.shape}, "
+        f"min={np.min(validationCube):.6e}, "
+        f"max={np.max(validationCube):.6e}")
+
+    return validationCube
+
+# ------------------------------------------------------------------------------
+
 def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     full=False, slope=1.30, IMF='KB', iso='pad', weighting='luminosity',
     lOrder=4, rescale=False, specRange=None, lsf=False, band='r', smask=None,
     method='fsf', varIMF=False, source='ppxf', redraw=False, runSwitch='gen',
-    **kwargs):
+    bias=True, **kwargs):
     """
     Overarching generative function controlling the hypercube build and
         streaming solver.
@@ -248,6 +365,9 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     runSwitch : str, optional
         Switch to control the run mode; either 'gen' the hypercube or 'run' the
             fitting. Default 'gen'.
+    bias : bool, optional
+        Whether to estimate the velocity bias before the hypercube construction. 
+        Default True.
     **kwargs : dict, optional
         Additional keyword arguments for the function.
     """
@@ -323,9 +443,12 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     warm_start = kwargs.pop('warm', 'zeros')
     regularisation_scale = float(kwargs.pop('regularisation_scale', 1.0))
-
     if (not np.isfinite(regularisation_scale)) or (regularisation_scale < 0.0):
         raise ValueError("regularisation_scale must be nonnegative and finite.")
+
+    validationPath = kwargs.pop('validationPath', None)
+    validationDataset = kwargs.pop('validationDataset', '/ModelCube')
+    validationTag = kwargs.pop('validationTag', None)
 
     with logger.capture_all_output():
         decDir, cDirs, cKeys, nComp, teLL, lnGrid, histBinSize, dataVelScale,\
@@ -340,6 +463,14 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     nSSP = int(np.prod((nMetals, nAges, nAlphas), dtype=int))
     pred = f"0{len(repr(nComp)):d}"
     nComp = int(nComp)
+
+    if validationPath is not None:
+        laGrid = loadValidationCube(validationPath, spLL, nSpat,
+            dataset=validationDataset)
+
+        if laGrid.shape != (nLSpec, nSpat):
+            raise RuntimeError("Internal validation-cube shape error: "
+                f"{laGrid.shape} != {(nLSpec, nSpat)}.")
 
     oDict = cu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
     binFN = oDict['binFN']
@@ -482,18 +613,17 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
-    hdf5Path = (hdf5Dir/
-        f"hypercube_{nComp:{pred}d}_{lOrder:02d}").with_suffix('.h5')
+    hdf5Path = (hdf5Dir/(f"hypercube_{nComp:{pred}d}_{lOrder:02d}" + 
+        (f"_{validationTag}" if validationTag is not None else ""))
+        ).with_suffix('.h5')
 
     # --- Initialize and load data ---
     mgr = H5Manager(hdf5Path)
     arDims = mgr.populate_from_arrays(
         losvd=nApHists,
-        datacube=laGrid,
-        templates=lnGrid,
+        datacube=laGrid, templates=lnGrid,
         mask=spmask,
-        tem_pix=copy(teLL), obs_pix=copy(spLL),
-        vel_pix=copy(vbins),
+        tem_pix=copy(teLL), obs_pix=copy(spLL), vel_pix=copy(vbins),
         xpix=xpix, ypix=ypix,
         binnum=binNum,
         bincounts=binCounts,
@@ -507,7 +637,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             '/HyperCube.')
         invalidate_done(hdf5Path)
 
-    nS, nC, nP = 128, 1, 360
+    nS, nC, nP = 128, 2, 360
+    biasVel = 0.0
     # --- Optional hard gate before any heavy work
     # Use small prefix slices if nothing is specified.
     with logger.capture_all_output():
@@ -523,22 +654,22 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             rt_flat_tol=3e-8,
             verbose=True,
         )
-
-        est = estimate_global_velocity_bias_prebuild(hdf5Path,
-            n_spax=96, n_features=24, window_len=31, lag_px=12)
-
-    logger.log(f"[CubeFit] Estimated global velocity bias (km/s): "\
-        f"{est['vel_bias_kms']:.3f}")
+        if bias:
+            est = estimate_global_velocity_bias_prebuild(hdf5Path,
+                n_spax=128, n_features=24, window_len=31, lag_px=12)
+            biasVel = est['vel_bias_kms']
+            logger.log(f"[CubeFit] Estimated global velocity bias (km/s): "
+                f"{biasVel:.3f}")
+    
     logger.log(f"[CubeFit] Building /HyperCube in {hdf5Path}...")
     with logger.capture_all_output():
-        build_hypercube(
-            hdf5Path,
+        build_hypercube(hdf5Path,
             norm_mode="model", # choose "model" or "data"
-            # "model" preserves relative contribution to both spaxel and components
+            # "model" preserves relative contribution to both spaxel and
+            # components
             amp_mode="sum", # "sum" or "trapz"
             S_chunk=nS, C_chunk=nC, P_chunk=nP,
-            vel_bias_kms=est["vel_bias_kms"]
-        )
+            vel_bias_kms=biasVel)
     # even if runSwitch is fit only, we want to ensure the HyperCube
     # is built, so we don't return early here.
     # Should be zero-cost if already built
@@ -546,7 +677,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     prefit_png = figDir / f"prefit_overlay_from_models_{nComp:{pred}d}.png"
     with logger.capture_all_output():
         live_prefit_snapshot_from_models(h5_path=str(hdf5Path),
-            max_components=4, templates_per_pair=3,
+            max_components=4, templates_per_pair=4,
             out_png=str(prefit_png),)
     logger.log(f"[Prefit] wrote {prefit_png}")
     if 'gen' in runSwitch:
@@ -564,73 +695,61 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     best_processes, best_blas = cu.resolve_parallelism(Ncpu, Nblas)
 
 
-
-    # ------------------------------------
-    # upscaled solution from the hypercube
-    # ------------------------------------
-    if 'componentTypes' in oDict:
-        componentTypes = np.asarray(
-            oDict['componentTypes'], dtype=np.int64)
-        if componentTypes.size < np.max(nzComp):
-            raise RuntimeError(
-                "Stored componentTypes is inconsistent with nzComp.")
-
-        otypes = componentTypes[nzComp - 1]
-        if not np.all(np.isin(otypes, [0, 1, 2])):
-            raise RuntimeError(
-                f"Invalid intrinsic orbital types: {np.unique(otypes)}.")
-
-        allCuts = np.asarray(
-            [oDict['cuts'][f"{component:{pred}d}"] for component in nzComp],
-            dtype=np.float64)
-
-        diskComps = np.flatnonzero(
-            (otypes == 0) & (allCuts[:, 2] > 0.5))
-        bulgeComps = np.setdiff1d(np.arange(nComp), diskComps)
-    elif oDict['cuts'] and len(oDict['cuts']) > 0:
-        componentTypes = np.full(nzComp.size, -1, dtype=np.int64)
-
-        for ii, component in enumerate(nzComp):
-            key = f"{component:{pred}d}"
-            mask = np.asarray(oDict['wheres'][key], dtype=bool)
-            orbitTypes = np.unique(types[mask])
-
-            if orbitTypes.size != 1:
+    if 'upscale' in warm_start:
+        logger.log("[Pipeline] Using upscaled solution as warm start.")
+        # ------------------------------------
+        # upscaled solution from the hypercube
+        # ------------------------------------
+        if 'componentTypes' in oDict:
+            componentTypes = np.asarray(
+                oDict['componentTypes'], dtype=np.int64)
+            if componentTypes.size < np.max(nzComp):
                 raise RuntimeError(
-                    f"Component {component} contains orbital types "
-                    f"{orbitTypes.tolist()}.")
+                    "Stored componentTypes is inconsistent with nzComp.")
 
-            if orbitTypes[0] == 3:
-                componentTypes[ii] = 0
-            elif orbitTypes[0] == 1:
-                componentTypes[ii] = 1
-            elif orbitTypes[0] == 4:
-                componentTypes[ii] = 2
-            else:
+            otypes = componentTypes[nzComp - 1]
+            if not np.all(np.isin(otypes, [0, 1, 2])):
                 raise RuntimeError(
-                    f"Component {component} contains unsupported orbital type "
-                    f"{orbitTypes[0]}.")
+                    f"Invalid intrinsic orbital types: {np.unique(otypes)}.")
+        elif oDict['cuts'] and len(oDict['cuts']) > 0:
+            componentTypes = np.full(nzComp.size, -1, dtype=np.int64)
 
-        otypes = componentTypes
-        if not np.all(np.isin(otypes, [0, 1, 2])):
-            raise RuntimeError(
-                f"Invalid intrinsic orbital types: {np.unique(otypes)}.")
+            for ii, component in enumerate(nzComp):
+                key = f"{component:{pred}d}"
+                mask = np.asarray(oDict['wheres'][key], dtype=bool)
+                orbitTypes = np.unique(types[mask])
 
-        allCuts = np.asarray(
-            [oDict['cuts'][f"{component:{pred}d}"] for component in nzComp],
-            dtype=np.float64)
+                if orbitTypes.size != 1:
+                    raise RuntimeError(
+                        f"Component {component} contains orbital types "
+                        f"{orbitTypes.tolist()}.")
 
-        diskComps = np.flatnonzero(
-            (otypes == 0) & (allCuts[:, 2] > 0.5))
-        bulgeComps = np.setdiff1d(np.arange(nComp), diskComps)
+                if orbitTypes[0] == 3:
+                    componentTypes[ii] = 0
+                elif orbitTypes[0] == 1:
+                    componentTypes[ii] = 1
+                elif orbitTypes[0] == 4:
+                    componentTypes[ii] = 2
+                else:
+                    raise RuntimeError(
+                        f"Component {component} contains unsupported orbital "
+                        f"type {orbitTypes[0]}.")
+
+            otypes = componentTypes
+            if not np.all(np.isin(otypes, [0, 1, 2])):
+                raise RuntimeError(
+                    f"Invalid intrinsic orbital types: {np.unique(otypes)}.")
+
+        else:
+            otypes = copy(nzComp) - 1
+        x0 = cu.constrainUpscaledSolution(
+            str(hdf5Path).replace('hypercube', 'x').replace(str(nComp), str(3)),
+            str(hdf5Path),
+            otypes, orbit_weights=cWeights)
+
+        warm_start = None
     else:
-        otypes = copy(nzComp) - 1
-        diskComps = bulgeComps = None
-    x0 = cu.constrainUpscaledSolution(
-        str(hdf5Path).replace('hypercube', 'x').replace(str(nComp), str(3)),
-        str(hdf5Path),
-        otypes,
-        orbit_weights=cWeights)
+        x0 = None
 
     ###########################################
     # Multi-processing Batched Streaming NNLS #
@@ -654,27 +773,22 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         if "/X_global" in f_wr:
             del f_wr["/X_global"]
 
-        f_wr.create_dataset(
-            "/X_global",
+        f_wr.create_dataset( "/X_global",
             data=x_global.astype(np.float64),
             compression="gzip",
-            compression_opts=4,
-        )
+            compression_opts=4)
 
         f_wr["/X_global"].attrs["layout"] = "C_P"
         f_wr["/X_global"].attrs["P"] = x_global.shape[1]
 
-        if "known_zero_mask" in stats:
-            print("[pipeline] writing KNOWN_ZERO mask to /HyperCube/known_zero_mask",
-                flush=True)
+        if 'known_zero_mask' in stats:
+            print('[pipeline] writing KNOWN_ZERO mask to '
+                '/HyperCube/known_zero_mask', flush=True)
             grp = f_wr.require_group("/HyperCube")
             if "known_zero_mask" in grp:
                 del grp["known_zero_mask"]
-            grp.create_dataset(
-                "known_zero_mask",
-                data=stats["known_zero_mask"].astype(bool),
-                dtype="bool",
-            )
+            grp.create_dataset("known_zero_mask",
+                data=stats["known_zero_mask"].astype(bool), dtype="bool")
 
     logger.log("[CubeFit] Global fit completed.")
 
@@ -794,7 +908,8 @@ def parallel_model_cube_global_batched(
             assert L_disk == nLSpec, f"L mismatch: {L_disk} vs {nLSpec}"
             S_chunk, C_chunk, P_chunk, L_chunk = (B, C_disk, P_disk, L_disk)
         else:
-            raise RuntimeError(f"Unexpected HyperCube/models rank: {models0.ndim}")
+            raise RuntimeError('Unexpected HyperCube/models rank: '
+                f"{models0.ndim}")
 
     # Tile size along S
     if spat_tile is None:
@@ -815,7 +930,8 @@ def parallel_model_cube_global_batched(
 
     # Precompute 2-D view of x (C,P) for GEMMs
     nC, nP = int(C_disk), int(P_disk)
-    x_cp = (x_global.reshape(nC, nP) if getattr(x_global, "ndim", 1) == 1 else x_global)
+    x_cp = (x_global.reshape(nC, nP) if getattr(x_global, "ndim", 1) == 1
+        else x_global)
     x_cp = np.asarray(x_cp, dtype=np.float64, order="C")
 
     # Build ranges
@@ -827,7 +943,9 @@ def parallel_model_cube_global_batched(
         s = e
 
     L_chunk = L_chunk
-    print(f"[Reconstruct] S={nSpat} L={nLSpec} (L_band={L_chunk}) spat_tile={spat_tile} nTiles={len(ranges)} n_workers(requested)={n_workers}")
+    print(f"[Reconstruct] S={nSpat} L={nLSpec} (L_band={L_chunk}) "
+        f"spat_tile={spat_tile} nTiles={len(ranges)} "
+        f"n_workers(requested)={n_workers}")
 
     # Single-process path
     if n_workers <= 1:
@@ -848,15 +966,17 @@ def parallel_model_cube_global_batched(
 
             # reconstruct each spaxel tile without opening a second handle
             for (s0, s1) in tqdm(ranges, desc="[Reconstruct] tiles"):
-                slab = np.asarray(models[s0:s1, :, :, :], dtype=np.float64, order="C")
+                slab = np.asarray(models[s0:s1, :, :, :], dtype=np.float64,
+                    order="C")
                 dS, C, P, L = slab.shape
                 # A(s) is (N,L) with N=C*P.  Compute y_hat(s) = A(s)^T @ x.
                 # AFTER (mirror the worker logic)
                 # slab: (dS, C, P, L), x_cp: (C, P)
                 Y = np.tensordot(slab, x_cp, axes=([1, 2], [0, 1])) # -> (dS, L)
-                # (optional) ensure dtype/layout
-                if Y.dtype != np.float64: Y = Y.astype(np.float64, copy=False)
-                if not Y.flags["C_CONTIGUOUS"]: Y = np.ascontiguousarray(Y)
+                if Y.dtype != np.float64:
+                    Y = Y.astype(np.float64, copy=False)
+                if not Y.flags["C_CONTIGUOUS"]:
+                    Y = np.ascontiguousarray(Y)
                 out[s0:s1, :] = Y
 
         logger.log("[Reconstruct] Done (single-process).")
@@ -872,24 +992,17 @@ def parallel_model_cube_global_batched(
         if array_name in f:
             del f[array_name]
         out = f.create_dataset(array_name, shape=(S_disk, L_disk), dtype="f8",
-                               chunks=(min(S_tile, S_disk), L_disk))
+            chunks=(min(S_tile, S_disk), L_disk))
 
     # Don’t fork the parent’s big arrays
     ctx = mp.get_context("fork")
     with ProcessPoolExecutor(max_workers=min(n_workers, len(ranges)),
-                             mp_context=ctx,
-                             initializer=_init_worker) as pool:
+        mp_context=ctx, initializer=_init_worker) as pool:
         futs = [pool.submit(_worker_compute_tile, h5_path, s0, s1, x_cp)
-                for (s0, s1) in ranges]
-        for fut in tqdm(
-            as_completed(futs),
-            total=len(ranges),
-            desc="[Reconstruct] tiles",
-            unit="tile",
-            dynamic_ncols=True,
-            miniters=1,
-            leave=True,
-        ):
+            for (s0, s1) in ranges]
+        for fut in tqdm(as_completed(futs), total=len(ranges),
+            desc="[Reconstruct] tiles", unit="tile",
+            dynamic_ncols=True, miniters=1, leave=True):
             s0, Y = fut.result()
             s1 = s0 + Y.shape[0]
             with open_h5(h5_path, role="writer") as f:
@@ -953,34 +1066,21 @@ def _reconstruct_worker(args):
 
     global _RECON_X_CP2, _RECON_WANT_DTYPE
     if _RECON_X_CP2 is None:
-        raise RuntimeError(
-            "Reconstruction worker not initialised with x_cp2."
-        )
+        raise RuntimeError("Reconstruction worker not initialised with x_cp2.")
 
     h5_path, s0, s1, rdcc_slots, rdcc_bytes, rdcc_w0 = args
 
     with open_h5(h5_path, role="reader") as f:
         M = f["/HyperCube/models"]
         try:
-            M.id.set_chunk_cache(
-                int(rdcc_slots),
-                int(rdcc_bytes),
-                float(rdcc_w0),
-            )
+            M.id.set_chunk_cache(int(rdcc_slots), int(rdcc_bytes),
+            float(rdcc_w0))
         except Exception:
             pass
 
-        slab = _np.asarray(
-            M[s0:s1, :, :, :],
-            dtype=_np.float64,
-            order="C",
-        )
+        slab = _np.asarray(M[s0:s1, :, :, :], dtype=_np.float64, order="C")
 
-        Y_tile = _np.tensordot(
-            slab,
-            _RECON_X_CP2,
-            axes=([1, 2], [0, 1]),
-        )
+        Y_tile = _np.tensordot(slab, _RECON_X_CP2, axes=([1, 2], [0, 1]))
 
         if _RECON_WANT_DTYPE != _np.float64:
             Y_tile = Y_tile.astype(_RECON_WANT_DTYPE, copy=False)
@@ -1006,13 +1106,10 @@ def reconstruct_modelcube_fast_parallel(
     only the output tile. The parent performs only HDF5 writes.
     """
 
-    if (
-        n_workers is None
-        or blas_threads_per_worker is None
-    ):
-        cpu_processes, blas_threads = (
-            cu.resolve_parallelism(CPU_PROCESSES, BLAS_THREADS)
-        )
+    if (n_workers is None
+        or blas_threads_per_worker is None):
+        cpu_processes, blas_threads = cu.resolve_parallelism(CPU_PROCESSES,
+            BLAS_THREADS)
 
         if n_workers is None:
             n_workers = cpu_processes
@@ -1021,21 +1118,16 @@ def reconstruct_modelcube_fast_parallel(
             blas_threads_per_worker = blas_threads
 
     want_dtype = np.float64 if str(out_dtype) == "float64" else np.float32
-    x_in = np.ascontiguousarray(
-        np.asarray(x_cp, dtype=np.float64).ravel(),
-        dtype=np.float64,
-    )
+    x_in = np.ascontiguousarray(np.asarray(x_cp, dtype=np.float64).ravel(),
+        dtype=np.float64)
 
     with open_h5(h5_path, role="writer") as f:
         if "/HyperCube/models" not in f:
             raise RuntimeError("No /HyperCube/models found.")
         M = f["/HyperCube/models"]
         try:
-            M.id.set_chunk_cache(
-                int(rdcc_slots),
-                int(rdcc_bytes),
-                float(rdcc_w0),
-            )
+            M.id.set_chunk_cache(int(rdcc_slots), int(rdcc_bytes),
+                float(rdcc_w0))
         except Exception:
             pass
 
@@ -1048,30 +1140,23 @@ def reconstruct_modelcube_fast_parallel(
             # conservative default: ~8 GiB slabs per worker
             bytes_per_s = C * P * L * np.dtype(np.float64).itemsize
             target_worker_gib = 8.0
-            s_chunk = max(
-                1,
-                int((target_worker_gib * 1024**3) // bytes_per_s),
-            )
+            s_chunk = max(1, int((target_worker_gib * 1024**3) // bytes_per_s))
 
         S_blk = max(1, min(int(s_chunk), S))
         n_tiles = math.ceil(S / S_blk)
 
         ds = f.get(out_dset, None)
         if ds is not None:
-            ok = (tuple(ds.shape) == (S, L) and str(ds.dtype) == str(want_dtype))
+            ok = (tuple(ds.shape) == (S, L) and
+                str(ds.dtype) == str(want_dtype))
             if not ok:
                 del f[out_dset]
                 ds = None
 
         if ds is None:
-            ds = f.create_dataset(
-                out_dset,
-                shape=(S, L),
-                dtype=want_dtype,
-                chunks=(S_blk, L),
-                compression=None,
-                shuffle=False,
-            )
+            ds = f.create_dataset(out_dset,
+                shape=(S, L), dtype=want_dtype,
+                chunks=(S_blk, L), compression=None, shuffle=False)
         out_ds = ds
 
     x_cp2 = x_in.reshape(C, P).astype(np.float64, copy=False)
