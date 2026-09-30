@@ -147,7 +147,13 @@ v1.15:  Fixed bug in return assignments for `_solve_reduced_active`;
             `streamActiveSetNNLS`;
         Replaced gradient-based column promotion with joint-support exploration,
             allowing existing coefficients to re-adjust when testing new
-            populations in `streamActiveSetNNLS`. 29 September 2026
+            populations in `streamActiveSetNNLS`;
+        Introduced `explore_obj_tol` to make the exploration tolerance
+            scale-aware in `streamActiveSetNNLS`. 29 September 2026
+v1.16:  Reworked support exploration to screen candidates by constrained
+            gradient, data-fit gradient, and rotating population coverage before
+            joint constrained re-solving in `streamActiveSetNNLS`;
+        Made exploration acceptance consistent with the scientific regularisation objective in `streamActiveSetNNLS`. 30 September 2026
 """
 
 from __future__ import annotations, print_function
@@ -950,6 +956,7 @@ def _orbit_hard_constraint_solve(
     P: int,
     *,
     numerical_ridge: float = 0.0,
+    scientific_regularisation: float = 0.0,
     negative_tol: float = 1e-10,
     constraint_tol: float = 1e-8,
 ) -> tuple[np.ndarray, dict]:
@@ -1032,6 +1039,25 @@ def _orbit_hard_constraint_solve(
     active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
     S_active = np.asarray(S_active, dtype=np.float64).ravel(order="C")
     shape = np.asarray(orbit_shape, dtype=np.float64).ravel(order="C")
+
+    # The solver works in z-space, but the scientific penalty is defined
+    # in physical x-space:
+    #
+    #     0.5 * scientific_regularisation * sum(x_j^2)
+    #
+    # Since x = S * z, its z-space Hessian contribution is
+    #
+    #     scientific_regularisation * diag(S^2).
+    #
+    # This is the scientific penalty. Keep it completely separate from the
+    # numerical ridge, which exists only to control ill-conditioning.
+    scientific_regularisation = float(scientific_regularisation)
+    if (not np.isfinite(scientific_regularisation)
+        or scientific_regularisation < 0.0):
+        raise ValueError(
+            "scientific_regularisation must be nonnegative and finite.")
+
+    reg_diag = scientific_regularisation * (S_active * S_active)
 
     k = int(active_idx.size)
     lambda_zero = np.zeros((C,), dtype=np.float64)
@@ -1183,9 +1209,15 @@ def _orbit_hard_constraint_solve(
         n_primal = n_free + 1
         n_total = n_primal + n_constraints
 
-        KKT = np.zeros((n_total, n_total), dtype=np.float64,)
-        KKT[:n_free, :n_free] = (Hff + float(numerical_ridge) *
-            np.eye(n_free, dtype=np.float64))
+        KKT = np.zeros((n_total, n_total), dtype=np.float64)
+
+        Hff_reg = Hff + np.diag(reg_diag[free_idx])
+
+        # Scientific regularisation acts in physical x-space and therefore
+        # enters the z-space Hessian as diag(S_active^2).
+        # The numerical ridge remains a separate identity term.
+        KKT[:n_free, :n_free] = (Hff_reg + float(numerical_ridge) * np.eye(
+                n_free, dtype=np.float64))
 
         # Coupling to the equality multipliers.
         KKT[:n_free, n_primal:] = B.T
@@ -1262,8 +1294,9 @@ def _orbit_hard_constraint_solve(
             # The alpha stationarity equation should satisfy
             # shape.T @ lambda == 0.
             alpha_stationarity = float(np.dot(shape, lambda_orbit))
-            dual_grad = (b - (H @ z_out) - (float(numerical_ridge) * z_out) -
-                (S_active * lambda_orbit[orbit_of_col]))
+            dual_grad = (b - (H @ z_out) - (reg_diag * z_out)
+                - (float(numerical_ridge) * z_out)
+                - (S_active * lambda_orbit[orbit_of_col]))
             free_dual = dual_grad[free]
 
             free_dual_linf = (float(np.max(np.abs(free_dual)))
@@ -1540,17 +1573,15 @@ def streamActiveSetNNLS(
     data_scale_ref = _robust_scale_ref(ATy_scaled, fallback=grad_ref)
     tol_grad_rel = 1e-11
 
-    # --- exploration controls ---
-    explore_batch_size = 64
-    explore_batches_per_iter = 4
-    explore_top_per_orbit = 4
-    explore_coverage_per_orbit = 8
-    explore_fail_patience = max(
-        8,
-        int(np.ceil(
-            P / explore_coverage_per_orbit
-        )),
-    )
+    # Exploration first screens the full inactive population space cheaply, then
+    # spends expensive reduced solves only on compact, diverse candidate sets.
+    explore_batch_size = 24
+    explore_batches_per_iter = 3
+    explore_top_per_orbit = 6
+    explore_coverage_per_orbit = 3
+    # Number of consecutive unsuccessful coverage rounds required before
+    # exploration is considered exhausted on a stationary support.
+    explore_fail_patience = 12
     explore_fail_count = 0
     explore_round = 0
 
@@ -1997,8 +2028,15 @@ def streamActiveSetNNLS(
 
         ATA_loc, ATy_loc, S_loc = _assemble_reduced(active_idx)
 
+        # Scientific L2 regularisation is defined in physical x-space.
+        # Since x = S * z, its Hessian contribution in z-space is
+        # regularisation_scale * diag(S^2). Include it when assessing
+        # conditioning so the numerical ridge is only as large as necessary.
+        scientific_diag_loc = regularisation_scale * (S_loc * S_loc)
+        ATA_scientific_loc = ATA_loc + np.diag(scientific_diag_loc)
+
         numerical_ridge_loc, emin_loc, emax_loc, cond_loc = \
-            _adaptive_numerical_ridge(ATA_loc,
+            _adaptive_numerical_ridge(ATA_scientific_loc,
                 target_cond=numerical_target_cond,
                 min_ridge=numerical_ridge_floor)
 
@@ -2008,7 +2046,8 @@ def streamActiveSetNNLS(
                 active_idx=active_idx, S_active=S_loc,
                 orbit_shape=np.asarray(orbit_shape, dtype=np.float64),
                 C=C, P=P,
-                numerical_ridge=numerical_ridge_loc)
+                numerical_ridge=numerical_ridge_loc,
+                scientific_regularisation=regularisation_scale,)
 
             if not info_loc["accepted"]:
                 return active_idx, None, None, None, None, None, None, None,\
@@ -2020,8 +2059,9 @@ def streamActiveSetNNLS(
                 ).ravel(order="C")
 
         else:
-            ATA_reg_loc = ATA_loc + \
-                (numerical_ridge_loc * np.eye(k_loc, dtype=np.float64))
+            ATA_reg_loc = (ATA_loc +
+                regularisation_scale * np.diag(S_loc * S_loc) +
+                numerical_ridge_loc * np.eye(k_loc, dtype=np.float64))
 
             try:
                 z_loc = np.linalg.solve(ATA_reg_loc, ATy_loc)
@@ -2138,8 +2178,11 @@ def streamActiveSetNNLS(
             emax_init = (
                 float(np.max(diag_init)) if diag_init.size else 1.0)
 
+        scientific_diag_init = regularisation_scale * (S_init * S_init)
+        ATA_scientific_init = ATA_init + np.diag(scientific_diag_init)
+
         numerical_ridge_init, emin_init, emax_init, cond_init = \
-            _adaptive_numerical_ridge(ATA_init,
+            _adaptive_numerical_ridge(ATA_scientific_init,
                 target_cond=numerical_target_cond,
                 min_ridge=numerical_ridge_floor)
 
@@ -2147,7 +2190,8 @@ def streamActiveSetNNLS(
             ATA_sub_reg=ATA_init, ATy_sub=ATy_init,
             active_idx=active_idx, S_active=S_init,
             orbit_shape=np.asarray(orbit_shape, dtype=np.float64), C=C, P=P,
-            numerical_ridge=numerical_ridge_init)
+            numerical_ridge=numerical_ridge_init,
+            scientific_regularisation=regularisation_scale)
 
         if not info_init["accepted"]:
             raise RuntimeError("Initial constrained KKT solve failed: "
@@ -2259,6 +2303,7 @@ def streamActiveSetNNLS(
 
     def _build_exploration_batches(
         not_active: np.ndarray,
+        grad_data: np.ndarray,
         grad_total: np.ndarray,
         it: int,
     ) -> list[np.ndarray]:
@@ -2322,123 +2367,98 @@ def streamActiveSetNNLS(
             if cols.size == 0:
                 continue
 
-            g = np.abs(grad_total[cols])
+            # The constrained reduced gradient is the correct local first-order
+            # score. Positive values identify zero columns that locally want to 
+            # enter the constrained solution. The raw data gradient is retained 
+            # as a secondary score because a candidate can have strong data
+            # leverage even when the present orbit multipliers make its local 
+            # constrained gradient unfavourable.
+            g_total = grad_total[cols]
+            g_data = grad_data[cols]
 
-            order = np.argsort(g)[::-1]
+            # Rank primarily by positive constrained gradient. Break near-ties 
+            # using the raw data gradient. Negative constrained gradients are 
+            # deliberately left to the rotating coverage part of the search.
+            order = np.lexsort((g_data, g_total))[::-1]
+            n_top = min(int(explore_top_per_orbit), int(cols.size))
+            order_total = np.argsort(g_total)[::-1]
+            top_total = cols[order_total[:n_top]]
 
-            top_n = min(
-                int(explore_top_per_orbit),
-                int(cols.size),
-            )
+            # Strong data-fit candidates. These are intentionally retained 
+            # separately because the current equality multipliers can hide 
+            # columns that become useful only after the complete support is re-
+            # optimised.
+            order_data = np.argsort(g_data)[::-1]
+            top_data = cols[order_data[:n_top]]
 
-            top_cols = cols[order[:top_n]]
-
-            n_cov = min(
-                int(explore_coverage_per_orbit),
-                int(cols.size),
-            )
+            # Rotating coverage prevents the screening gradients from 
+            # permanently excluding populations that are useful only through 
+            # joint redistribution.
+            n_cov = min(int(explore_coverage_per_orbit), int(cols.size))
 
             if n_cov > 0:
-                stride = max(
-                    1,
-                    int(np.ceil(
-                        cols.size / n_cov
-                    )),
-                )
-
-                offset = (
-                    int(explore_round)
-                    % stride
-                )
+                stride = max(1, int(np.ceil(cols.size / n_cov)))
+                offset = int(explore_round) % stride
 
                 coverage_positions = np.arange(
-                    offset,
-                    cols.size,
-                    stride,
-                    dtype=np.int64,
-                )[:n_cov]
+                    offset, cols.size, stride, dtype=np.int64)[:n_cov]
 
-                coverage_cols = cols[
-                    coverage_positions
-                ]
+                coverage_cols = cols[coverage_positions]
             else:
-                coverage_cols = np.zeros(
-                    (0,),
-                    dtype=np.int64,
-                )
+                coverage_cols = np.zeros((0,), dtype=np.int64)
 
-            orbit_cols = np.unique(
-                np.concatenate((
-                    top_cols,
-                    coverage_cols,
-                ))
-            ).astype(np.int64, copy=False)
+            candidate_by_orbit[cc] = {
+                "total": top_total,
+                "data": top_data,
+                "coverage": coverage_cols,
+            }
 
-            candidate_by_orbit[cc] = orbit_cols
-
+        # Build compact joint trials with distinct purposes. Every trial spans
+        # all available orbits, allowing the hard-constrained re-solve to 
+        # redistribute mass globally rather than judging candidates one column at 
+        # a time.
         batches = []
-        used = set()
 
-        orbit_order = sorted(
-            candidate_by_orbit,
-            key=lambda cc: float(
-                np.max(np.abs(
-                    grad_total[candidate_by_orbit[cc]]
-                ))
-            ),
-            reverse=True,
-        )
+        for key in ("total", "data", "coverage"):
+            pieces = []
 
-        current_batch = []
+            for cc in exploration_orbits:
+                cc = int(cc)
 
-        depth = 0
-
-        while True:
-            added = False
-
-            for cc in orbit_order:
-                cols = candidate_by_orbit[cc]
-
-                if depth >= cols.size:
+                if cc not in candidate_by_orbit:
                     continue
 
-                col = int(cols[depth])
+                cols_cc = candidate_by_orbit[cc][key]
 
-                if col in used:
-                    continue
+                if cols_cc.size > 0:
+                    pieces.append(cols_cc)
 
-                used.add(col)
-                current_batch.append(col)
-                added = True
+            if not pieces:
+                continue
 
-                if len(current_batch) >= int(explore_batch_size):
-                    batches.append(
-                        np.asarray(
-                            current_batch,
-                            dtype=np.int64,
-                        )
-                    )
-                    current_batch = []
+            batch = np.unique(np.concatenate(pieces)).astype(np.int64,
+                copy=False)
 
-                    if len(batches) >= int(
-                        explore_batches_per_iter
-                    ):
-                        return batches
+            # Keep the expensive reduced solve bounded. Rank oversized gradient
+            # batches by the relevant screening score. Coverage is already 
+            # sparse and normally remains below this limit.
+            if batch.size > int(explore_batch_size):
+                if key == "total":
+                    score = grad_total[batch]
+                elif key == "data":
+                    score = grad_data[batch]
+                else:
+                    score = np.zeros(batch.size, dtype=np.float64)
 
-            if not added:
-                break
+                if key != "coverage":
+                    order = np.argsort(score)[::-1]
+                    batch = batch[order[:int(explore_batch_size)]]
+                else:
+                    batch = batch[:int(explore_batch_size)]
 
-            depth += 1
+            batches.append(batch)
 
-        if current_batch:
-            batches.append(
-                np.asarray(
-                    current_batch,
-                    dtype=np.int64,
-                )
-            )
-
-        return batches
+        return batches[:int(explore_batches_per_iter)]
 
     def _explore_support(
         it: int,
@@ -2493,16 +2513,11 @@ def streamActiveSetNNLS(
         >>> improved, active_new, z_new, info = _explore_support(
         ...     0, active_idx, data_object, not_active, grad_total)
         """
-        current_active = np.asarray(
-            current_active,
-            dtype=np.int64,
-        ).ravel(order="C")
+        current_active = np.asarray(current_active, dtype=np.int64,).ravel(
+            order="C")
 
-        batches = _build_exploration_batches(
-            not_active,
-            grad_total,
-            it,
-        )
+        batches = _build_exploration_batches(not_active, grad_data, grad_total,
+            it)
 
         if not batches:
             return (
@@ -2510,14 +2525,8 @@ def streamActiveSetNNLS(
                 current_active.copy(),
                 z[current_active].copy(),
                 {},
-                np.zeros(
-                    (0, 0),
-                    dtype=np.float64,
-                ),
-                np.zeros(
-                    (0,),
-                    dtype=np.float64,
-                ),
+                np.zeros((0, 0), dtype=np.float64),
+                np.zeros((0,), dtype=np.float64),
                 float(current_data_obj),
             )
 
@@ -2526,45 +2535,32 @@ def streamActiveSetNNLS(
         best_info = {}
         best_ATA = None
         best_ATy = None
+        current_reg_obj = (0.5 * float(regularisation_scale) * float(np.sum(
+            (S_flat[current_active] * z[current_active]) ** 2)))
         best_data_obj = float(current_data_obj)
+        best_total_obj = float(current_data_obj) + current_reg_obj
+        explore_obj_tol = (64.0 * np.finfo(np.float64).eps
+            * max(1.0, abs(float(best_total_obj))))
 
         for trial_number, proposal in enumerate(batches):
 
-            trial_active = np.unique(
-                np.concatenate((
-                    current_active,
-                    proposal,
-                ))
-            ).astype(
-                np.int64,
-                copy=False,
-            )
+            trial_active = np.unique(np.concatenate((current_active, proposal))
+            ).astype(np.int64, copy=False)
 
             if trial_active.size > int(max_active):
-                available = max(
-                    0,
-                    int(max_active) - current_active.size,
-                )
+                available = max(0, int(max_active) - current_active.size,)
 
                 if available <= 0:
                     _emit_diag({
                         "kind": "exploration_trial",
                         "source": "streamActiveSetNNLS",
                         "iter": int(it + 1),
-                        "explore_round": int(
-                            explore_round
-                        ),
-                        "trial": int(
-                            trial_number
-                        ),
+                        "explore_round": int(explore_round),
+                        "trial": int(trial_number),
                         "accepted": False,
                         "solve_accepted": False,
-                        "proposal_n": int(
-                            proposal.size
-                        ),
-                        "trial_n_active": int(
-                            current_active.size
-                        ),
+                        "proposal_n": int(proposal.size),
+                        "trial_n_active": int(current_active.size),
                         "reason": "max_active",
                         "proposal": proposal.tolist(),
                     })
@@ -2572,15 +2568,8 @@ def streamActiveSetNNLS(
 
                 proposal = proposal[:available]
 
-                trial_active = np.unique(
-                    np.concatenate((
-                        current_active,
-                        proposal,
-                    ))
-                ).astype(
-                    np.int64,
-                    copy=False,
-                )
+                trial_active = np.unique(np.concatenate((current_active,
+                    proposal))).astype(np.int64, copy=False)
 
             (
                 trial_active,
@@ -2597,7 +2586,6 @@ def streamActiveSetNNLS(
 
             del alpha_trial
             del lambda_trial
-            del S_trial
             del ridge_trial
             del cond_trial
 
@@ -2615,43 +2603,29 @@ def streamActiveSetNNLS(
                     "accepted": False,
                     "solve_accepted": False,
                     "proposal_n": int(proposal.size),
-                    "trial_n_active": int(
-                        trial_active.size
-                    ),
-                    "current_data_obj": float(
-                        best_data_obj
-                    ),
+                    "trial_n_active": int(trial_active.size),
+                    "current_data_obj": float(best_data_obj),
                     "trial_data_obj": None,
                     "improvement": None,
                     "relative_improvement": None,
-                    "reason": (
-                        info_trial.get(
-                            "reason",
-                            "solve_failed",
-                        )
-                        if info_trial is not None
-                        else "solve_failed"
-                    ),
+                    "reason": (info_trial.get("reason", "solve_failed")
+                        if info_trial is not None else "solve_failed"),
                     "proposal": proposal.tolist(),
                 })
                 continue
 
-            trial_data_obj = _data_quad_obj(
-                ATA_trial,
-                ATy_trial,
-                z_trial,
-            )
+            trial_data_obj = _data_quad_obj(ATA_trial, ATy_trial, z_trial,)
+            trial_reg_obj = (0.5 * float(regularisation_scale) * float(np.sum(
+                    (S_trial * z_trial) ** 2)))
 
-            improvement = (
-                float(best_data_obj) - float(trial_data_obj)
-            )
+            trial_total_obj = trial_data_obj + trial_reg_obj
+            improvement = best_total_obj - trial_total_obj
 
-            scale = max(
-                1.0,
-                abs(float(best_data_obj)),
-            )
+            scale = max(1.0, abs(float(best_data_obj)))
 
             rel_improvement = improvement / scale
+
+            accepted_trial = trial_total_obj < best_total_obj - explore_obj_tol
 
             _emit_diag({
                 "kind": "exploration_trial",
@@ -2659,38 +2633,30 @@ def streamActiveSetNNLS(
                 "iter": int(it + 1),
                 "explore_round": int(explore_round),
                 "trial": int(trial_number),
-                "accepted": bool(
-                    trial_data_obj < best_data_obj
-                ),
+                "accepted": bool(accepted_trial),
+                "current_total_obj": float(best_total_obj),
+                "trial_total_obj": float(trial_total_obj),
+                "trial_regularisation_obj": float(trial_reg_obj),
                 "proposal_n": int(proposal.size),
-                "trial_n_active": int(
-                    trial_active.size
-                ),
-                "current_data_obj": float(
-                    best_data_obj
-                ),
-                "trial_data_obj": float(
-                    trial_data_obj
-                ),
+                "trial_n_active": int(trial_active.size),
+                "current_data_obj": float(best_data_obj),
+                "trial_data_obj": float(trial_data_obj),
                 "improvement": float(improvement),
-                "relative_improvement": float(
-                    rel_improvement
-                ),
+                "relative_improvement": float(rel_improvement),
                 "proposal": proposal.tolist(),
-                "proposal_grad_data": (
-                    grad_data[proposal].tolist()
-                ),
+                "proposal_grad_data": (grad_data[proposal].tolist()),
                 "proposal_grad_constraint": (
-                    constraint_gradient[
-                        proposal
-                    ].tolist()
-                ),
-                "proposal_grad_total": (
-                    grad_total[proposal].tolist()
-                ),
+                    constraint_gradient[proposal].tolist()),
+                "proposal_grad_total": grad_total[proposal].tolist(),
+                "improvement_tol": float(explore_obj_tol),
             })
 
-            if trial_data_obj < best_data_obj:
+            # Exploration must compare the objective actually being optimized:
+            # data fit plus the scientific x-space regularisation. The
+            # numerical ridge is deliberately excluded because it is only a
+            # linear-algebra stabiliser, not part of the scientific objective.
+            if accepted_trial:
+                best_total_obj = float(trial_total_obj)
                 best_data_obj = float(trial_data_obj)
                 best_active = trial_active.copy()
                 best_z = z_trial.copy()
@@ -2698,10 +2664,8 @@ def streamActiveSetNNLS(
                 best_ATA = ATA_trial.copy()
                 best_ATy = ATy_trial.copy()
 
-        improved = bool(
-            best_data_obj
-            < float(current_data_obj)
-        )
+        improved = bool(best_total_obj < (float(current_data_obj) +
+            current_reg_obj - explore_obj_tol))
 
         return (
             improved,
@@ -2726,14 +2690,23 @@ def streamActiveSetNNLS(
             - float(np.dot(ATy_scaled, z)))
 
         grad_data = ATy_scaled - ATAz_scaled
-        grad_ridge = float(ridge_current) * z
+
+        # Scientific regularisation is defined on physical x = S * z.
+        # Its gradient in z-space is regularisation_scale * S^2 * z.
+        grad_regularisation = (float(regularisation_scale) * (S_flat * S_flat)
+            * z)
+
+        # Numerical ridge is deliberately separate from the scientific
+        # penalty and exists only to stabilise the reduced linear algebra.
+        grad_numerical_ridge = float(ridge_current) * z
 
         if has_hard_orbit_shape:
             constraint_gradient = S_flat * lambda_orbit_current[orbit_of_col]
-            grad_total = grad_data - grad_ridge - constraint_gradient
+            grad_total = (grad_data - grad_regularisation
+                - grad_numerical_ridge - constraint_gradient)
         else:
             constraint_gradient = np.zeros(CP, dtype=np.float64)
-            grad_total = grad_data - grad_ridge
+            grad_total = grad_data - grad_regularisation - grad_numerical_ridge
 
         candidate_mask = ~active
         candidate_mask &= ~known_zero_flat
@@ -2823,6 +2796,13 @@ def streamActiveSetNNLS(
                 "max_grad_active": float(max_grad_active),
                 "max_grad_inactive": float(max_grad_inactive),
                 "max_grad_dual": float(max_grad_dual),
+                "max_grad_data": float(np.max(np.abs(grad_data))),
+                "max_grad_regularisation": float(
+                    np.max(np.abs(grad_regularisation))),
+                "max_grad_numerical_ridge": float(
+                    np.max(np.abs(grad_numerical_ridge))),
+                "max_grad_constraint": float(
+                    np.max(np.abs(constraint_gradient))),
                 "kkt_violation": float(kkt_violation),
                 "kkt_tol": float(kkt_tol),
                 "active_ok": bool(active_ok),
@@ -2854,19 +2834,13 @@ def streamActiveSetNNLS(
         # Joint-support exploration
         # ------------------------------------------------------------
 
-        current_active = np.flatnonzero(
-            active
-        ).astype(np.int64)
+        current_active = np.flatnonzero(active).astype(np.int64)
 
-        not_active = np.flatnonzero(
-            (~active)
-            & (~known_zero_flat)
-        ).astype(np.int64)
+        not_active = np.flatnonzero((~active) & (~known_zero_flat)
+            ).astype(np.int64)
 
         if has_hard_orbit_shape:
-            not_active = not_active[
-                orbit_shape[orbit_of_col[not_active]] > 0.0
-            ]
+            not_active = not_active[orbit_shape[orbit_of_col[not_active]] > 0.0]
 
         if not_active.size == 0:
             explore_fail_count += 1
@@ -2878,9 +2852,7 @@ def streamActiveSetNNLS(
                 "support_stationary": bool(support_stationary),
                 "improved": False,
                 "reason": "no_candidates",
-                "explore_fail_count": int(
-                    explore_fail_count
-                ),
+                "explore_fail_count": int(explore_fail_count),
             })
 
             _emit_checkpoint(
@@ -2895,18 +2867,10 @@ def streamActiveSetNNLS(
                     "converged",
                     it,
                     converged=True,
-                    explore_fail_count=int(
-                        explore_fail_count
-                    ),
-                    n_active=int(
-                        np.count_nonzero(active)
-                    ),
-                    max_grad_active=float(
-                        max_grad_active
-                    ),
-                    max_grad_dual=float(
-                        max_grad_dual
-                    ),
+                    explore_fail_count=int(explore_fail_count),
+                    n_active=int(np.count_nonzero(active)),
+                    max_grad_active=float(max_grad_active),
+                    max_grad_dual=float(max_grad_dual),
                     tol_here=float(tol_here),
                 )
             else:
@@ -2915,18 +2879,10 @@ def streamActiveSetNNLS(
                     "numerical",
                     it,
                     converged=False,
-                    explore_fail_count=int(
-                        explore_fail_count
-                    ),
-                    n_active=int(
-                        np.count_nonzero(active)
-                    ),
-                    max_grad_active=float(
-                        max_grad_active
-                    ),
-                    max_grad_dual=float(
-                        max_grad_dual
-                    ),
+                    explore_fail_count=int(explore_fail_count),
+                    n_active=int(np.count_nonzero(active)),
+                    max_grad_active=float(max_grad_active),
+                    max_grad_dual=float(max_grad_dual),
                     tol_here=float(tol_here),
                 )
             break
@@ -2948,20 +2904,12 @@ def streamActiveSetNNLS(
             constraint_gradient=constraint_gradient,
             grad_total=grad_total,
         )
-        data_gain = (
-            float(data_objective_current)
-            - float(best_data_obj)
-        )
+        data_gain = float(data_objective_current) - float(best_data_obj)
 
-        print(
-            f"[MONO][explore {explore_round}] "
-            f"candidates={not_active.size} "
-            f"working={current_active.size} "
-            f"improved={improved} "
-            f"data_gain={data_gain:.6e} "
-            f"failures={explore_fail_count}",
-            flush=True,
-        )
+        print(f"[MONO][explore {explore_round}] "
+            f"candidates={not_active.size} working={current_active.size} "
+            f"improved={improved} data_gain={data_gain:.6e} "
+            f"failures={explore_fail_count}", flush=True)
 
         if improved:
             explore_fail_count = 0
@@ -2971,61 +2919,31 @@ def streamActiveSetNNLS(
 
             z[:] = 0.0
             z[best_active] = best_z
-            dropped_zero = _prune_zero_support(
-                z,
-                active,
-            )
+            dropped_zero = _prune_zero_support(z, active)
 
             if has_hard_orbit_shape:
-                alpha_current = float(
-                    best_info["alpha"]
-                )
-                lambda_orbit_current = np.asarray(
-                    best_info["lambda_orbit"],
-                    dtype=np.float64,
-                ).copy()
+                alpha_current = float(best_info["alpha"])
+                lambda_orbit_current = np.asarray(best_info["lambda_orbit"],
+                    dtype=np.float64).copy()
 
-            ridge_current = float(
-                best_info.get(
-                    "numerical_ridge",
-                    ridge_current,
-                )
-            )
+            ridge_current = float(best_info.get("numerical_ridge",
+                ridge_current))
 
             _emit_diag({
                 "kind": "exploration_accept",
                 "source": "streamActiveSetNNLS",
                 "iter": int(it + 1),
-                "n_active_before": int(
-                    current_active.size
-                ),
-                "n_active_after": int(
-                    np.count_nonzero(active)
-                ),
-                "data_objective_before": float(
-                    data_objective_current
-                ),
-                "data_objective_after": float(
-                    _data_quad_obj(
-                        best_ATA,
-                        best_ATy,
-                        best_z,
-                    )
-                ),
+                "n_active_before": int(current_active.size),
+                "n_active_after": int(np.count_nonzero(active)),
+                "data_objective_before": float(data_objective_current),
+                "data_objective_after": float(_data_quad_obj(best_ATA,
+                    best_ATy,best_z)),
                 "explore_round": int(explore_round),
-                "explore_fail_count": int(
-                    explore_fail_count
-                ),
-                "added_columns": np.setdiff1d(
-                    np.flatnonzero(active),
-                    current_active,
-                ).tolist(),
-                "n_zero_dropped": int(
-                    dropped_zero.size
-                ),
-                "zero_dropped": (
-                    dropped_zero.tolist()
-                ),
+                "explore_fail_count": int(explore_fail_count),
+                "added_columns": np.setdiff1d(np.flatnonzero(active),
+                    current_active).tolist(),
+                "n_zero_dropped": int(dropped_zero.size),
+                "zero_dropped": (dropped_zero.tolist()),
             })
 
             _emit_checkpoint(
@@ -3046,26 +2964,14 @@ def streamActiveSetNNLS(
             "source": "streamActiveSetNNLS",
             "iter": int(it + 1),
             "explore_round": int(failed_round),
-            "next_explore_round": int(
-                explore_round
-            ),
+            "next_explore_round": int(explore_round),
             "support_stationary": bool(support_stationary),
             "improved": False,
-            "explore_fail_count": int(
-                explore_fail_count
-            ),
-            "n_active": int(
-                current_active.size
-            ),
-            "n_candidates": int(
-                not_active.size
-            ),
-            "max_grad_active": float(
-                max_grad_active
-            ),
-            "max_grad_dual": float(
-                max_grad_dual
-            ),
+            "explore_fail_count": int(explore_fail_count),
+            "n_active": int(current_active.size),
+            "n_candidates": int(not_active.size),
+            "max_grad_active": float(max_grad_active),
+            "max_grad_dual": float(max_grad_dual),
             "tol_here": float(tol_here),
         })
 
@@ -3074,22 +2980,14 @@ def streamActiveSetNNLS(
             and explore_fail_count >= explore_fail_patience
         ):
             _set_stop(
-                "exploration_patience_reached"
+                "exploration_patience_reached",
                 "converged",
                 it,
                 converged=True,
-                explore_fail_count=int(
-                    explore_fail_count
-                ),
-                n_active=int(
-                    np.count_nonzero(active)
-                ),
-                max_grad_active=float(
-                    max_grad_active
-                ),
-                max_grad_dual=float(
-                    max_grad_dual
-                ),
+                explore_fail_count=int(explore_fail_count),
+                n_active=int(np.count_nonzero(active)),
+                max_grad_active=float(max_grad_active),
+                max_grad_dual=float(max_grad_dual),
                 tol_here=float(tol_here),
             )
 
@@ -3117,8 +3015,17 @@ def streamActiveSetNNLS(
 
     data_objective = (0.5 * float(np.dot(z, ATAz_final))
         - float(np.dot(ATy_scaled, z)))
-    ridge_objective = 0.5 * float(ridge_current) * float(np.dot(z, z))
-    total_objective = data_objective + ridge_objective
+    scientific_regularisation_objective = (0.5 * float(regularisation_scale)
+        * float(np.sum((S_flat * z) ** 2)))
+
+    numerical_ridge_objective = 0.5 * float(ridge_current) * float(np.dot(z, z))
+
+    # Scientific objective actually being optimized conceptually.
+    total_objective = data_objective + scientific_regularisation_objective
+
+    # The numerical ridge is reported separately because it perturbs the
+    # reduced solve for conditioning but is not a scientific penalty.
+    stabilised_objective = total_objective + numerical_ridge_objective
 
     if has_hard_orbit_shape:
         orbit_mass, orbit_target, orbit_deficit = _orbit_mass_and_deficit(z,
@@ -3167,8 +3074,15 @@ def streamActiveSetNNLS(
         "n_active_final": int(np.count_nonzero(active)),
         "max_active": int(max_active),
         "stop_details": dict(stop_details),
-        "ridge_objective": float(ridge_objective),
-        "ridge": float(ridge_current),
+        "scientific_regularisation": float(regularisation_scale),
+        "data_objective": float(data_objective),
+        "scientific_regularisation_objective": float(
+            scientific_regularisation_objective),
+        "total_objective": float(total_objective),
+        "numerical_ridge_objective": float(numerical_ridge_objective),
+        "stabilised_objective": float(stabilised_objective),
+        "scientific_regularisation": float(regularisation_scale),
+        "numerical_ridge": float(ridge_current),
     })
     _emit_diag({
         "kind": "final_solution",
@@ -3501,9 +3415,8 @@ def monolithic_nnls_scipy(
             active_idx=free_idx,
             S_active=S_active,
             orbit_shape=np.asarray(orbit_shape, dtype=np.float64),
-            C=C,
-            P=P,
-            regularisation_scale=regularisation_scale)
+            C=C, P=P,
+            scientific_regularisation=regularisation_scale)
 
         if not ref_info["accepted"]:
             raise RuntimeError(

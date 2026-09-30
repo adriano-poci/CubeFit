@@ -40,6 +40,9 @@ v1.7:   Made `plot_diagnostic_jsonl_dashboard` able to accept multiple file
             `resume` runs. 23 September 2026
 v1.8:   Updated `plot_diagnostic_jsonl_dashboard` to latest diagnostic outputs.
             29 September 2026
+v1.9:   Reworked `plot_diagnostic_jsonl_dashboard` for joint-support
+            exploration, replacing obsolete promotion and stall diagnostics. 30
+            September 2026
 """
 
 from __future__ import annotations
@@ -526,20 +529,18 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
 
     The panels show:
 
-    The panels show:
-
-    1. Global data-objective evolution and relative improvement.
-    2. Physical solution-vector norm and relative solution change.
-    3. KKT violations normalized by the current convergence tolerance.
-    4. Data, orbit, and constrained-dual gradient decomposition.
-    5. Active, nonzero, effective-support, and concentration evolution.
-    6. Promotion survival, failure, exploration, and rejection dynamics.
-    7. Promotion gain, solution displacement, and promoted-weight strength.
-    8. Candidate funnel, cooldown state, and eligible-gradient strength.
-    9. Hard-prior residuals and alpha stationarity.
-    10. Orbit-level effective support, entropy, concentration, and mass ratio.
-    11. Active/solution progress and dual/no-progress stall counters.
-    12. Iteration runtime, ridge, and reduced-system conditioning.
+    1. Accepted and trial data-objective evolution.
+    2. Exploration objective gains and acceptance threshold.
+    3. Current-support KKT convergence.
+    4. Inactive-column constrained-gradient state.
+    5. Committed and trial support sizes.
+    6. Exploration rounds and consecutive failures.
+    7. Proposed, retained, and discarded trial columns.
+    8. Remaining candidate search space.
+    9. Fitted hard-orbit amplitude and numerical ridge.
+    10. Orbit-amplitude stationarity.
+    11. Cumulative and per-iteration runtime.
+    12. Current-support stationarity versus exploration acceptance.
 
     Parameters
     ----------
@@ -642,7 +643,27 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         raw_records: list[dict],
     ) -> tuple[list[dict], dict]:
         """
-        Merge solver diagnostics by iteration without losing event semantics.
+        Merge exploration-solver diagnostics by outer iteration.
+
+        Parameters
+        ----------
+        raw_records : list of dict
+            Raw JSONL diagnostic records.
+
+        Returns
+        -------
+        merged : list of dict
+            One merged diagnostic record per outer iteration.
+        non_iteration : dict
+            Setup and final records without an iteration number.
+
+        Raises
+        ------
+        None
+
+        Examples
+        --------
+        >>> merged, non_iteration = _merge_iteration_records(records)
         """
         merged_by_iter: dict[int, dict] = {}
         non_iteration: dict[str, dict] = {}
@@ -656,19 +677,46 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
             except (KeyError, TypeError, ValueError):
                 if kind:
                     non_iteration[kind] = dict(record)
+
                     if kind == "mono_setup":
                         setup_records.append(dict(record))
+
                 continue
 
             current = merged_by_iter.setdefault(iteration,
                 {"iter": iteration})
 
-            if kind in {"iter_pre", "iter_post"}:
-                current.update(record)
-                current[f"_has_{kind}"] = True
+            if kind == "exploration_trial":
+                current.setdefault("_exploration_trials", []).append(dict(record))
+
+                # Retain the best successful trial as the scalar representative of this
+                # iteration. The complete trial set remains available above.
+                old_obj = _finite_scalar(current,
+                    "exploration_trial_trial_total_obj",
+                    "exploration_trial_trial_data_obj")
+                new_obj = _finite_scalar(record,
+                    "trial_total_obj",
+                    "trial_data_obj")
+
+                if not np.isfinite(old_obj) or (
+                    np.isfinite(new_obj) and new_obj < old_obj):
+                    for key, value in record.items():
+                        if key not in {"kind", "iter"}:
+                            current[f"exploration_trial_{key}"] = value
+
+                current["_has_exploration_trial"] = True
                 continue
 
-            prefix = f"{kind}_" if kind else "event_"
+            if kind == "kkt":
+                for key, value in record.items():
+                    if key not in {"kind", "iter"}:
+                        current[key] = value
+
+                current["_has_kkt"] = True
+                continue
+
+            prefix = f"{kind}_"
+
             for key, value in record.items():
                 if key not in {"kind", "iter"}:
                     current[f"{prefix}{key}"] = value
@@ -676,7 +724,10 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
             if kind:
                 current[f"_has_{kind}"] = True
 
-        merged = [merged_by_iter[key] for key in sorted(merged_by_iter)]
+        merged = [
+            merged_by_iter[key]
+            for key in sorted(merged_by_iter)
+        ]
 
         if max_points is not None:
             merged = merged[-int(max_points):]
@@ -691,7 +742,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         default: float = np.nan,
     ) -> np.ndarray:
         return np.asarray([_finite_scalar(record, *keys, default=default)
-                for record in merged], dtype=np.float64)
+            for record in merged], dtype=np.float64)
 
     def _plot_finite(axis, x_values: np.ndarray, y_values: np.ndarray,
         label: str, *, absolute: bool = False, positive_log: bool = False,
@@ -749,17 +800,17 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
 
     axes = {
         "objective": fig.add_subplot(grid[0, 0]),
-        "amplitude": fig.add_subplot(grid[0, 1]),
+        "improvement": fig.add_subplot(grid[0, 1]),
         "kkt": fig.add_subplot(grid[0, 2]),
-        "gradients": fig.add_subplot(grid[0, 3]),
+        "dual": fig.add_subplot(grid[0, 3]),
         "support": fig.add_subplot(grid[1, 0]),
-        "promotions": fig.add_subplot(grid[1, 1]),
-        "promotion_quality": fig.add_subplot(grid[1, 2]),
-        "eligibility": fig.add_subplot(grid[1, 3]),
-        "constraints": fig.add_subplot(grid[2, 0]),
-        "orbit_structure": fig.add_subplot(grid[2, 1]),
-        "progress": fig.add_subplot(grid[2, 2]),
-        "numerics": fig.add_subplot(grid[2, 3]),
+        "exploration": fig.add_subplot(grid[1, 1]),
+        "support_changes": fig.add_subplot(grid[1, 2]),
+        "candidate_space": fig.add_subplot(grid[1, 3]),
+        "amplitude": fig.add_subplot(grid[2, 0]),
+        "stationarity": fig.add_subplot(grid[2, 1]),
+        "runtime": fig.add_subplot(grid[2, 2]),
+        "search_state": fig.add_subplot(grid[2, 3]),
     }
 
     if not merged:
@@ -783,125 +834,75 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         dtype=np.int64)
 
     # ------------------------------------------------------------------
-    # Extract primary scalar histories
+    # Extract exploration-solver histories
     # ------------------------------------------------------------------
-    data_objective = _series(merged, "data_objective")
-    obj_old = _series(merged, "obj_old")
-    obj_new = _series(merged, "obj_new")
-    obj_gain = _series(merged, "obj_gain")
-    rel_gain = _series(merged, "promotion_outcome_rel_gain")
+    data_objective = _series(merged, "exploration_accept_data_objective_after",
+        "exploration_trial_current_data_obj",)
+    trial_objective = _series(merged, "exploration_trial_trial_data_obj")
+    trial_improvement = _series(merged, "exploration_trial_improvement",)
+    trial_rel_improvement = _series(merged,
+        "exploration_trial_relative_improvement")
+    improvement_tol = _series(merged, "exploration_trial_improvement_tol",)
 
     alpha = _series(merged, "alpha")
-    norm_old = _series(merged, "norm_old")
-    norm_new = _series(merged, "norm_new")
-    z_step_rel = _series(merged, "promotion_outcome_z_step_rel")
+    ridge = _series(merged, "ridge")
+    grad_active = _series(merged, "max_grad_active")
+    grad_inactive = _series(merged, "max_grad_inactive")
+    grad_dual = _series(merged, "max_grad_dual")
 
-    grad_active = _series(
-        merged, "max_grad_active")
+    kkt_violation = _series(merged, "kkt_violation")
+    kkt_tol = _series(merged, "kkt_tol", "tol")
 
-    grad_inactive = _series(
-        merged, "max_grad_inactive")
+    best_dual_value = _series(merged, "best_dual_value")
+    n_active = _series(merged, "n_working_active",
+        "exploration_accept_n_active_after", "exploration_n_active")
+    n_positive = _series(merged, "n_positive")
+    n_zero_free = _series(merged, "n_zero_free",)
+    n_candidates = _series(merged, "exploration_n_candidates",)
 
-    grad_promotable = _series(
+    trial_support = _series(merged, "exploration_trial_trial_n_active",)
+    proposal_n = _series(merged, "exploration_trial_proposal_n",)
+    n_added = np.asarray([float(len(record.get(
+        "exploration_accept_added_columns", [])))
+        if "_has_exploration_accept" in record else np.nan
+        for record in merged], dtype=np.float64)
+    n_zero_dropped = _series(merged,"exploration_accept_n_zero_dropped",)
+
+    explore_round = _series(
         merged,
-        "max_grad_promotable",
-        "max_grad_promo",
+        "explore_round",
+        "exploration_explore_round",
+        "exploration_trial_explore_round",
     )
 
-    grad_data = _series(
-        merged, "max_grad_data")
-
-    grad_orbit = _series(
-        merged, "max_grad_orbit")
-
-    grad_dual = _series(
-        merged, "max_grad_dual")
-
-    kkt_violation = _series(
+    explore_fail_count = _series(
         merged,
-        "kkt_violation",
-        "kkt_kkt_violation",
-    )
-
-    kkt_tol = _series(
-        merged,
-        "kkt_tol",
-        "tol_here",
-        "kkt_kkt_tol",
-    )
-
-    avg_grad_promotable = _series(
-        merged,
-        "avg_grad_promo",
-        "avg_grad_promotable",
-    )
-
-    best_inactive_grad = _series(
-        merged, "best_inactive_grad")
-
-    n_active = _series(
-        merged, "n_active", "k_active", "active")
-
-    n_attempted = _series(
-        merged,
-        "promotion_attempt_n_promoted",
-        "n_promoted",
+        "exploration_explore_fail_count",
+        "explore_fail_count",
         default=0.0,
     )
 
-    n_failed = _series(
+    support_stationary = _series(
         merged,
-        "promotion_outcome_n_failed",
-        "n_failed",
-        default=0.0,
+        "support_stationary",
+        default=np.nan,
     )
 
-    n_survived = _series(
+    trial_accepted = _series(
         merged,
-        "promotion_outcome_n_survived",
-        default=0.0,
+        "exploration_trial_accepted",
+        default=np.nan,
     )
 
-    n_promotion_orbits = _series(
+    shape_dot_lambda = _series(
         merged,
-        "promotion_attempt_n_promotion_orbits",
+        "shape_dot_lambda",
     )
 
-    failed_fraction = _series(
+    elapsed_time = _series(
         merged,
-        "promotion_outcome_failed_fraction",
+        "t_sec",
     )
-
-    promoted_z_norm = _series(
-        merged,
-        "promotion_outcome_promoted_z_norm",
-    )
-
-    promoted_z_max = _series(
-        merged,
-        "promotion_outcome_promoted_z_max",
-    )
-
-    n_candidates = _series(
-        merged,
-        "promotion_attempt_n_candidates",
-        "n_candidates",
-    )
-
-    n_eligible = _series(
-        merged,
-        "promotion_attempt_n_eligible",
-        "n_eligible",
-    )
-
-    n_cooldown = _series(merged, "promotion_attempt_n_cooldown",
-        "n_cooldown")
-
-    grad_eligible = _series(merged, "promotion_attempt_max_grad_eligible",
-        "max_grad_eligible")
-
-    score_eligible = _series(merged, "promotion_attempt_max_score_eligible",
-        "max_score_eligible")
 
     constraint_l1 = _series(merged, "orbit_constraint_l1",
         "orbit_resid_l1")
@@ -911,169 +912,113 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         "orbit_resid_linf")
     alpha_stationarity = _series(merged, "alpha_stationarity")
 
-    iteration_time = _series(merged, "t_iter_sec")
-    active_delta = _series(merged, "iter_progress_active_delta")
-    z_delta_rel = _series(merged, "iter_progress_z_delta_rel")
-    dual_stall_count = _series(merged,
-        "iter_progress_dual_stall_count")
-    no_progress_count = _series(merged,
-        "iter_progress_no_progress_count")
-    best_dual_value = _series(merged,
-        "iter_progress_best_dual_value")
-    ridge = _series(merged, "ridge")
-    eig_min = _series(merged, "emin")
-    eig_max = _series(merged, "emax")
+    proposal_grad_data_max = np.asarray([
+        np.max(np.abs(_vector(
+            record,
+            "exploration_trial_proposal_grad_data",
+        )))
+        if _vector(
+            record,
+            "exploration_trial_proposal_grad_data",
+        ) is not None
+        else np.nan
+        for record in merged
+    ], dtype=np.float64)
 
-    mean_orbit_nz = np.full(iterations.shape, np.nan, dtype=np.float64)
-    mean_eff_support = np.full(iterations.shape, np.nan, dtype=np.float64)
-    median_eff_support = np.full(iterations.shape, np.nan, dtype=np.float64)
-    p90_eff_support = np.full(iterations.shape, np.nan, dtype=np.float64)
-    mean_entropy = np.full(iterations.shape, np.nan, dtype=np.float64)
-    median_top_share = np.full(iterations.shape, np.nan, dtype=np.float64)
-    max_top_share = np.full(iterations.shape, np.nan, dtype=np.float64)
-    ratio_p05 = np.full(iterations.shape, np.nan, dtype=np.float64)
-    ratio_median = np.full(iterations.shape, np.nan, dtype=np.float64)
-    ratio_p95 = np.full(iterations.shape, np.nan, dtype=np.float64)
+    proposal_grad_constraint_max = np.asarray([
+        np.max(np.abs(_vector(
+            record,
+            "exploration_trial_proposal_grad_constraint",
+        )))
+        if _vector(
+            record,
+            "exploration_trial_proposal_grad_constraint",
+        ) is not None
+        else np.nan
+        for record in merged
+    ], dtype=np.float64)
 
-    # ------------------------------------------------------------------
-    # Physical solution-vector histories
-    # ------------------------------------------------------------------
-    n_iter = iterations.size
+    proposal_grad_total_max = np.asarray([
+        np.max(np.abs(_vector(
+            record,
+            "exploration_trial_proposal_grad_total",
+        )))
+        if _vector(
+            record,
+            "exploration_trial_proposal_grad_total",
+        ) is not None
+        else np.nan
+        for record in merged
+    ], dtype=np.float64)
 
-    x_norm = np.full(n_iter, np.nan, dtype=np.float64)
-    x_rel_step = np.full(n_iter, np.nan, dtype=np.float64)
-    x_nnz = np.full(n_iter, np.nan, dtype=np.float64)
-    x_eff_support = np.full(n_iter, np.nan, dtype=np.float64)
-    x_top_share = np.full(n_iter, np.nan, dtype=np.float64)
-    x_min = np.full(n_iter, np.nan, dtype=np.float64)
-
-    previous_x = None
-
-    for index, record in enumerate(merged):
-        x_vec = _vector(record, "x", "x_current")
-
-        if x_vec is None:
-            continue
-
-        finite = np.isfinite(x_vec)
-
-        if not np.all(finite):
-            continue
-
-        norm = float(np.linalg.norm(x_vec))
-        mass = float(np.sum(x_vec))
-        sq_mass = float(np.dot(x_vec, x_vec))
-
-        x_norm[index] = norm
-        x_nnz[index] = float(
-            np.count_nonzero(x_vec > 0.0)
-        )
-        x_min[index] = float(np.min(x_vec))
-
-        if sq_mass > 0.0:
-            x_eff_support[index] = mass * mass / sq_mass
-
-        if mass > 0.0:
-            x_top_share[index] = float(np.max(x_vec)) / mass
-
-        if (previous_x is not None
-            and previous_x.size == x_vec.size):
-            dx = x_vec - previous_x
-            x_rel_step[index] = float(np.linalg.norm(dx))/ max(norm, eps)
-
-        previous_x = x_vec.copy()
-
-    for index, record in enumerate(merged):
-        orbit_nz = _vector(record, "orbit_nz")
-        orbit_eff = _vector(record, "orbit_eff_support")
-        orbit_entropy = _vector(record, "orbit_entropy")
-        orbit_top = _vector(record, "orbit_top_share")
-        orbit_ratio = _vector(record, "orbit_ratio")
-
-        if orbit_nz is not None:
-            mean_orbit_nz[index] = float(np.nanmean(orbit_nz))
-
-        if orbit_eff is not None:
-            mean_eff_support[index] = float(np.nanmean(orbit_eff))
-            median_eff_support[index] = float(np.nanmedian(orbit_eff))
-            p90_eff_support[index] = float(np.nanpercentile(orbit_eff, 90))
-
-        if orbit_entropy is not None:
-            mean_entropy[index] = float(np.nanmean(orbit_entropy))
-
-        if orbit_top is not None:
-            median_top_share[index] = float(np.nanmedian(orbit_top))
-            max_top_share[index] = float(np.nanmax(orbit_top))
-
-        if orbit_ratio is not None:
-            finite_ratio = orbit_ratio[np.isfinite(orbit_ratio)]
-            if finite_ratio.size:
-                ratio_p05[index], ratio_median[index], ratio_p95[index] = (
-                    np.nanpercentile(finite_ratio, [5, 50, 95]))
 
     # ------------------------------------------------------------------
     # Panel 1: objective convergence
     # ------------------------------------------------------------------
     axis = axes["objective"]
 
-    _plot_finite(axis, iterations, data_objective, "Global data objective",
-        lw=1.6, color="tab:blue")
-    _plot_finite(axis, iterations, obj_new, "Reduced objective",
-        lw=1.0, color="tab:orange", alpha=0.75)
+    _plot_finite(
+        axis,
+        iterations,
+        data_objective,
+        "Accepted data objective",
+        lw=1.6,
+        color="tab:blue",
+    )
 
-    axis.set_title("Objective convergence")
+    _plot_finite(
+        axis,
+        iterations,
+        trial_objective,
+        "Trial data objective",
+        lw=1.0,
+        color="tab:orange",
+        alpha=0.75,
+    )
+
+    axis.set_title("Data-fit evolution")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Objective")
+    axis.set_ylabel("Data objective")
     _homogenise_ticks(axis)
-
-    gain_axis = axis.twinx()
-    _plot_finite(gain_axis, iterations, np.abs(rel_gain),
-        "Reduced relative gain", positive_log=True, lw=1.1,
-        color="tab:green")
-
-    gain_axis.set_ylabel("Relative objective gain", color="tab:green")
-    gain_axis.tick_params(axis="y", colors="tab:green")
-    gain_axis.spines["right"].set_color("tab:green")
-    _homogenise_ticks(gain_axis)
-
-    handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = gain_axis.get_legend_handles_labels()
-    axis.legend(handles_left + handles_right, labels_left + labels_right,
-        fontsize=8, loc="best")
+    axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 2: solution-vector convergence
     # ------------------------------------------------------------------
-    axis = axes["amplitude"]
+    axis = axes["improvement"]
 
-    _plot_finite(axis, iterations, x_norm, r"$||x||_2$",
-        positive_log=True, lw=1.5, color="tab:blue")
+    _plot_finite(
+        axis,
+        iterations,
+        trial_improvement,
+        "Regularised objective gain",
+        lw=1.4,
+        color="tab:blue",
+    )
 
-    axis.set_title("Solution-vector convergence")
+    axis.axhline(
+        0.0,
+        lw=0.9,
+        color="black",
+        linestyle=":",
+    )
+
+    _plot_finite(
+        axis,
+        iterations,
+        improvement_tol,
+        "Acceptance threshold",
+        positive_log=True,
+        lw=1.2,
+        color="tab:red",
+        linestyle="--",
+    )
+
+    axis.set_title("Joint re-solve improvement")
+    axis.set_ylabel(r"$J_\mathrm{current} - J_\mathrm{trial}$")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel(r"$||x||_2$", color="tab:blue")
-    axis.tick_params(axis="y", which="both", colors="tab:blue")
-    axis.spines["left"].set_color("tab:blue")
     _homogenise_ticks(axis)
-
-    step_axis = axis.twinx()
-
-    _plot_finite(step_axis, iterations, x_rel_step,
-        r"$||\Delta x||_2/||x||_2$", positive_log=True, lw=1.3,
-        color="tab:orange")
-    _plot_finite(step_axis, iterations, z_step_rel,
-        r"$||\Delta z||_2/||z||_2$", positive_log=True, lw=1.1,
-        color="tab:green", alpha=0.8)
-
-    step_axis.set_ylabel("Relative change", color="tab:orange")
-    step_axis.tick_params(axis="y", which="both", colors="tab:orange")
-    step_axis.spines["right"].set_color("tab:orange")
-    _homogenise_ticks(step_axis)
-
-    handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = step_axis.get_legend_handles_labels()
-    axis.legend(handles_left + handles_right, labels_left + labels_right,
-        fontsize=8, loc="best")
+    axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 3: constrained KKT convergence
@@ -1115,7 +1060,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         axis,
         iterations,
         active_ratio,
-        "Active stationarity / tolerance",
+        "Positive stationarity / tolerance",
         positive_log=True,
         lw=1.2,
         color="tab:blue",
@@ -1125,7 +1070,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         axis,
         iterations,
         dual_ratio,
-        "Inactive dual / tolerance",
+        "Zero-variable dual / tolerance",
         positive_log=True,
         lw=1.2,
         color="tab:orange",
@@ -1136,34 +1081,41 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         lw=1.0,
         color="black",
         linestyle="--",
-        label="Convergence boundary",
+        label="KKT boundary",
     )
 
-    axis.set_title("Constrained KKT convergence")
+    axis.set_title("Current-support KKT")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Residual / tolerance")
-
+    axis.set_ylabel("Violation / tolerance")
     _homogenise_ticks(axis)
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 4: constrained-gradient decomposition
     # ------------------------------------------------------------------
-    axis = axes["gradients"]
+    axis = axes["dual"]
 
-    _plot_finite(axis, iterations, grad_data, "Data gradient",
-        absolute=True, positive_log=True, lw=1.3, color="tab:blue")
-    _plot_finite(axis, iterations, grad_orbit, "Orbit term",
-        absolute=True, positive_log=True, lw=1.3, color="tab:orange")
-    _plot_finite(axis, iterations, grad_dual, "Dual violation",
-        absolute=True, positive_log=True, lw=1.3, color="tab:red")
-    _plot_finite(axis, iterations, best_inactive_grad,
-        "Best inactive", absolute=True, positive_log=True, lw=1.0,
-        color="tab:purple", alpha=0.8)
+    _plot_finite(
+        axis, iterations, proposal_grad_data_max,
+        "Data gradient", positive_log=True,
+        lw=1.3, color="tab:blue",
+    )
 
-    axis.set_title("Gradient decomposition")
+    _plot_finite(
+        axis, iterations, proposal_grad_constraint_max,
+        "Orbit-constraint term", positive_log=True,
+        lw=1.3, color="tab:orange",
+    )
+
+    _plot_finite(
+        axis, iterations, proposal_grad_total_max,
+        "Combined constrained gradient", positive_log=True,
+        lw=1.4, color="tab:green",
+    )
+
+    axis.set_title("Candidate screening")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Gradient magnitude")
+    axis.set_ylabel("Maximum |gradient|")
     _homogenise_ticks(axis)
     axis.legend(fontsize=8, loc="best")
 
@@ -1172,51 +1124,94 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     # ------------------------------------------------------------------
     axis = axes["support"]
 
-    _plot_finite(axis, iterations, n_active,
-        "Active columns", lw=1.6, color="tab:blue")
-    _plot_finite(axis, iterations, mean_orbit_nz,
-        "Mean nonzero/orbit", lw=1.2, color="tab:orange")
-    _plot_finite(axis, iterations, mean_eff_support,
-        "Mean effective support", lw=1.2, color="tab:green")
-    _plot_finite(axis, iterations, x_nnz,
-        "nnz(x)", lw=1.2, color="tab:purple", alpha=0.85)
-
-    axis.set_title("Support evolution")
-    axis.set_xlabel("Iteration")
-    axis.set_ylabel("Count")
-    _homogenise_ticks(axis)
-
-    share_axis = axis.twinx()
-
-    _plot_finite(share_axis, iterations, max_top_share,
-        "Largest orbit top-share", lw=1.0, color="tab:red", alpha=0.70)
-    _plot_finite(share_axis, iterations, x_top_share,
-        "max(x) / sum(x)", lw=1.2, color="tab:brown", alpha=0.85)
-
-    share_axis.set_ylim(0.0, 1.05)
-    share_axis.tick_params(axis="y", which="both", colors="tab:red")
-    share_axis.spines["right"].set_color("tab:red")
-    share_axis.set_ylabel("Maximum top-share", color="tab:red")
-    _homogenise_ticks(share_axis)
-
-    handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = share_axis.get_legend_handles_labels()
-
-    if handles_left or handles_right:
-        axis.legend(handles_left + handles_right,
-            labels_left + labels_right,
-            fontsize=8, loc="best")
-
-    # ------------------------------------------------------------------
-    # Panel 6: active-set dynamics
-    # ------------------------------------------------------------------
-    axis = axes["promotions"]
+    _plot_finite(
+        axis,
+        iterations,
+        n_active,
+        "Working support",
+        lw=1.6,
+        color="tab:blue",
+    )
 
     _plot_finite(
         axis,
         iterations,
-        n_attempted,
-        "Promoted",
+        n_positive,
+        "Positive coefficients",
+        lw=1.2,
+        color="tab:green",
+    )
+
+    _plot_finite(
+        axis,
+        iterations,
+        trial_support,
+        "Trial support",
+        lw=1.0,
+        color="tab:orange",
+        alpha=0.8,
+    )
+
+    axis.set_title("Support evolution")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel("Columns")
+    _homogenise_ticks(axis)
+    axis.legend(fontsize=8, loc="best")
+
+    # ------------------------------------------------------------------
+    # Panel 6: active-set dynamics
+    # ------------------------------------------------------------------
+    axis = axes["exploration"]
+
+    _plot_finite(
+        axis,
+        iterations,
+        explore_round,
+        "Exploration round",
+        lw=1.4,
+        color="tab:blue",
+    )
+
+    _plot_finite(
+        axis,
+        iterations,
+        explore_fail_count,
+        "Consecutive failures",
+        lw=1.4,
+        color="tab:red",
+    )
+
+    setup_record = non_iteration.get("mono_setup", {})
+    explore_patience = _finite_scalar(
+        setup_record,
+        "explore_fail_patience",
+    )
+
+    if np.isfinite(explore_patience):
+        axis.axhline(
+            explore_patience,
+            lw=1.0,
+            color="black",
+            linestyle="--",
+            label="Failure patience",
+        )
+
+    axis.set_title("Exploration progress")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel("Round / count")
+    _homogenise_ticks(axis)
+    axis.legend(fontsize=8, loc="best")
+
+    # ------------------------------------------------------------------
+    # Panel 7: promotion quality
+    # ------------------------------------------------------------------
+    axis = axes["support_changes"]
+
+    _plot_finite(
+        axis,
+        iterations,
+        proposal_n,
+        "Proposed columns",
         lw=1.3,
         color="tab:blue",
     )
@@ -1224,8 +1219,8 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     _plot_finite(
         axis,
         iterations,
-        n_survived,
-        "Survived",
+        n_added,
+        "Columns retained",
         lw=1.3,
         color="tab:green",
     )
@@ -1233,248 +1228,194 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     _plot_finite(
         axis,
         iterations,
-        n_failed,
-        "Failed",
-        lw=1.3,
+        n_zero_dropped,
+        "Trial columns dropped",
+        lw=1.2,
         color="tab:orange",
+    )
+
+    axis.set_title("Exploration support changes")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel("Columns")
+    _homogenise_ticks(axis)
+    axis.legend(fontsize=8, loc="best")
+
+    # ------------------------------------------------------------------
+    # Panel 8: hard-prior feasibility
+    # ------------------------------------------------------------------
+    axis = axes["candidate_space"]
+
+    _plot_finite(
+        axis,
+        iterations,
+        n_zero_free,
+        "Zero free columns",
+        lw=1.4,
+        color="tab:blue",
     )
 
     _plot_finite(
         axis,
         iterations,
-        n_promotion_orbits,
-        "Promotion orbits",
-        lw=1.1,
-        color="tab:brown",
-        alpha=0.8,
+        n_candidates,
+        "Exploration candidates",
+        lw=1.2,
+        color="tab:orange",
     )
 
-    axis.set_title("Active-set dynamics")
+    axis.set_title("Remaining search space")
     axis.set_xlabel("Iteration")
     axis.set_ylabel("Columns")
-    _homogenise_ticks(axis)
-
-    survival_axis = axis.twinx()
-
-    promotion_survival = np.divide(n_survived, n_attempted,
-        out=np.full_like(n_attempted, np.nan), where=n_attempted > 0.0)
-
-    _plot_finite(survival_axis, iterations, promotion_survival,
-        "Survival fraction", lw=1.3, color="tab:purple")
-    _plot_finite(survival_axis, iterations, failed_fraction,
-        "Failure fraction", lw=1.0, color="tab:red", linestyle="--")
-
-    survival_axis.set_ylim(-0.05, 1.05)
-    survival_axis.set_ylabel("Surviving fraction", color="tab:purple")
-    survival_axis.tick_params(axis="y", which="both", colors="tab:purple")
-    survival_axis.spines["right"].set_color("tab:purple")
-    _homogenise_ticks(survival_axis)
-
-    handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = survival_axis.get_legend_handles_labels()
-    axis.legend(handles_left + handles_right, labels_left + labels_right,
-        fontsize=8, loc="best")
-
-    # ------------------------------------------------------------------
-    # Panel 7: promotion quality
-    # ------------------------------------------------------------------
-    axis = axes["promotion_quality"]
-
-    _plot_finite(axis, iterations, np.abs(rel_gain),
-        "Relative objective gain", positive_log=True, lw=1.3,
-        color="tab:blue")
-    _plot_finite(axis, iterations, z_step_rel,
-        r"$||\Delta z||/||z||$", positive_log=True, lw=1.2,
-        color="tab:orange")
-
-    axis.set_title("Promotion quality")
-    axis.set_xlabel("Iteration")
-    axis.set_ylabel("Relative gain / displacement")
-    _homogenise_ticks(axis)
-
-    weight_axis = axis.twinx()
-    _plot_finite(weight_axis, iterations, promoted_z_norm,
-        r"$||z_{\rm promoted}||_2$", positive_log=True, lw=1.1,
-        color="tab:green")
-    _plot_finite(weight_axis, iterations, promoted_z_max,
-        r"$\max z_{\rm promoted}$", positive_log=True, lw=1.0,
-        color="tab:red", alpha=0.8)
-
-    weight_axis.set_ylabel("Promoted coefficient scale")
-    _homogenise_ticks(weight_axis)
-
-    handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = weight_axis.get_legend_handles_labels()
-    axis.legend(handles_left + handles_right, labels_left + labels_right,
-        fontsize=8, loc="best")
-
-    # ------------------------------------------------------------------
-    # Panel 8: hard-prior feasibility
-    # ------------------------------------------------------------------
-    axis = axes["constraints"]
-
-    _plot_finite(axis, iterations, constraint_l1, "Orbit residual L1",
-        absolute=True, positive_log=True, lw=1.3, color="tab:blue")
-    _plot_finite(axis, iterations, constraint_l2, "Orbit residual L2",
-        absolute=True, positive_log=True, lw=1.1, color="tab:purple")
-    _plot_finite(axis, iterations, constraint_linf, "Orbit residual Linf",
-        absolute=True, positive_log=True, lw=1.3, color="tab:orange")
-    _plot_finite(axis, iterations, alpha_stationarity,
-        r"$|w^T\lambda|$", absolute=True, positive_log=True, lw=1.2,
-        color="tab:green")
-
-    axis.set_title("Hard-prior feasibility")
-    axis.set_xlabel("Iteration")
-    axis.set_ylabel("Constraint residual")
     _homogenise_ticks(axis)
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 9: promotion eligibility and cooldown
     # ------------------------------------------------------------------
-    axis = axes["eligibility"]
+    axis = axes["amplitude"]
 
-    _plot_finite(axis, iterations, n_candidates, "Inactive candidates",
-        lw=1.3, color="tab:blue")
-    _plot_finite(axis, iterations, n_eligible, "Eligible candidates",
-        lw=1.3, color="tab:green")
-    _plot_finite(axis, iterations, n_cooldown, "Combined cooldown",
-        lw=1.2, color="tab:red")
+    _plot_finite(
+        axis,
+        iterations,
+        alpha,
+        r"Fitted $\alpha$",
+        lw=1.5,
+        color="tab:blue",
+    )
 
-    axis.set_title("Promotion eligibility and cooldown")
+    axis.set_title("Hard-orbit amplitude")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Candidate count")
+    axis.set_ylabel(r"$\alpha$")
     _homogenise_ticks(axis)
 
-    gradient_axis = axis.twinx()
+    ridge_axis = axis.twinx()
 
-    _plot_finite(gradient_axis, iterations, grad_eligible,
-        "Best eligible gradient", positive_log=True, lw=1.3,
-        color="tab:brown")
-    _plot_finite(gradient_axis, iterations, score_eligible,
-        "Best eligible score", positive_log=True, lw=1.0,
-        color="tab:pink", alpha=0.8)
-    _plot_finite(gradient_axis, iterations, np.abs(avg_grad_promotable),
-        "Mean promotable |gradient|", positive_log=True, lw=1.0,
-        color="tab:gray", alpha=0.8)
+    _plot_finite(
+        ridge_axis,
+        iterations,
+        ridge,
+        "Numerical ridge",
+        positive_log=True,
+        lw=1.1,
+        color="tab:orange",
+    )
 
-    gradient_axis.axhline(0.0, lw=0.8, color="black", alpha=0.5)
-    gradient_axis.set_ylabel("Eligible gradient / score")
-    _homogenise_ticks(gradient_axis)
+    ridge_axis.set_ylabel("Numerical ridge", color="tab:orange")
+    ridge_axis.tick_params(axis="y", colors="tab:orange")
+    _homogenise_ticks(ridge_axis)
 
     handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = gradient_axis.get_legend_handles_labels()
-    axis.legend(handles_left + handles_right, labels_left + labels_right,
-        fontsize=8, loc="best")
+    handles_right, labels_right = ridge_axis.get_legend_handles_labels()
+
+    axis.legend(
+        handles_left + handles_right,
+        labels_left + labels_right,
+        fontsize=8,
+        loc="best",
+    )
 
     # ------------------------------------------------------------------
     # Panel 10: orbit-level population structure
     # ------------------------------------------------------------------
-    axis = axes["orbit_structure"]
+    axis = axes["stationarity"]
 
-    _plot_finite(axis, iterations, median_eff_support,
-        "Median effective support", lw=1.3, color="tab:blue")
-    _plot_finite(axis, iterations, p90_eff_support,
-        "P90 effective support", lw=1.1, color="tab:cyan")
-    _plot_finite(axis, iterations, mean_entropy,
-        "Mean entropy", lw=1.2, color="tab:green")
+    _plot_finite(
+        axis,
+        iterations,
+        np.abs(shape_dot_lambda),
+        r"$|w^T\lambda|$",
+        positive_log=True,
+        lw=1.4,
+        color="tab:blue",
+    )
 
-    axis.set_title("Orbit population structure")
+    axis.set_title("Orbit-amplitude stationarity")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Effective support / entropy")
+    axis.set_ylabel(r"$|w^T\lambda|$")
     _homogenise_ticks(axis)
-
-    concentration_axis = axis.twinx()
-
-    _plot_finite(concentration_axis, iterations, median_top_share,
-        "Median top-share", lw=1.2, color="tab:orange")
-    _plot_finite(concentration_axis, iterations, max_top_share,
-        "Maximum top-share", lw=1.0, color="tab:red", alpha=0.8)
-
-    concentration_axis.set_ylim(0.0, 1.05)
-    concentration_axis.set_ylabel("Population concentration")
-    _homogenise_ticks(concentration_axis)
-
-    handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = (
-        concentration_axis.get_legend_handles_labels())
-    axis.legend(handles_left + handles_right, labels_left + labels_right,
-        fontsize=8, loc="best")
+    axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 11: solver progress and stall state
     # ------------------------------------------------------------------
-    axis = axes["progress"]
+    axis = axes["runtime"]
 
-    _plot_finite(axis, iterations, active_delta,
-        "Active-set gain", lw=1.3, color="tab:blue")
-    _plot_finite(axis, iterations, dual_stall_count,
-        "Dual stall count", lw=1.2, color="tab:orange")
-    _plot_finite(axis, iterations, no_progress_count,
-        "No-progress count", lw=1.2, color="tab:red")
+    _plot_finite(
+        axis,
+        iterations,
+        elapsed_time,
+        "Elapsed runtime",
+        lw=1.5,
+        color="tab:blue",
+    )
 
-    axis.set_title("Progress and stall state")
+    iter_time = np.full_like(
+        elapsed_time,
+        np.nan,
+    )
+
+    if elapsed_time.size > 1:
+        iter_time[1:] = np.diff(
+            elapsed_time
+        )
+    time_axis = axis.twinx()
+
+    _plot_finite(
+        time_axis,
+        iterations,
+        iter_time,
+        "Iteration time",
+        lw=1.1,
+        color="tab:orange",
+    )
+
+    time_axis.set_ylabel(
+        "Seconds / iteration",
+        color="tab:orange",
+    )
+    time_axis.tick_params(
+        axis="y",
+        colors="tab:orange",
+    )
+    _homogenise_ticks(time_axis)
+
+    axis.set_title("Runtime")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Count")
+    axis.set_ylabel("Elapsed seconds")
     _homogenise_ticks(axis)
-
-    progress_axis = axis.twinx()
-
-    _plot_finite(progress_axis, iterations, z_delta_rel,
-        r"$||\Delta z||/||z||$", positive_log=True, lw=1.2,
-        color="tab:green")
-    _plot_finite(progress_axis, iterations, best_dual_value,
-        "Best dual violation", positive_log=True, lw=1.1,
-        color="tab:purple")
-
-    progress_axis.set_ylabel("Relative step / dual violation")
-    _homogenise_ticks(progress_axis)
-
-    handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = progress_axis.get_legend_handles_labels()
-    axis.legend(handles_left + handles_right, labels_left + labels_right,
-        fontsize=8, loc="best")
+    axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 12: runtime and numerical conditioning
     # ------------------------------------------------------------------
-    axis = axes["numerics"]
+    axis = axes["search_state"]
 
-    _plot_finite(axis, iterations, iteration_time, "Iteration time",
-        positive_log=True, lw=1.4, color="tab:blue")
-    _plot_finite(axis, iterations, ridge, "Ridge", positive_log=True,
-        lw=1.1, color="tab:orange")
+    _plot_finite(
+        axis,
+        iterations,
+        support_stationary,
+        "Support KKT stationary",
+        lw=1.4,
+        color="tab:blue",
+    )
 
-    axis.set_title("Runtime and numerical conditioning")
+    _plot_finite(
+        axis,
+        iterations,
+        trial_accepted,
+        "Exploration accepted",
+        lw=1.2,
+        color="tab:green",
+    )
+
+    axis.set_ylim(-0.05, 1.05)
+    axis.set_yticks([0.0, 1.0])
+    axis.set_yticklabels(["No", "Yes"])
+
+    axis.set_title("KKT versus exploration")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Seconds / ridge")
-    _homogenise_ticks(axis)
-
-    condition_estimate = np.divide(np.abs(eig_max),
-        np.maximum(np.abs(eig_min), np.finfo(np.float64).eps
-            * np.maximum(np.abs(eig_max), 1.0)),
-        out=np.full_like(eig_max, np.nan),
-        where=np.isfinite(eig_max) & np.isfinite(eig_min))
-
-    condition_axis = axis.twinx()
-    diag_min = _series(merged, "diag_min")
-    diag_med = _series(merged, "diag_med")
-    diag_max = _series(merged, "diag_max")
-
-    _plot_finite(condition_axis, iterations, condition_estimate,
-        "Condition estimate", positive_log=True, lw=1.2, color="tab:green")
-    _plot_finite(condition_axis, iterations, diag_med,
-        "Median diagonal", positive_log=True, lw=0.9,
-        color="tab:purple", alpha=0.75)
-
-    condition_axis.set_ylabel(
-        r"Condition estimate / $|\lambda_{\min}|$")
-    _homogenise_ticks(condition_axis)
-
-    handles_left, labels_left = axis.get_legend_handles_labels()
-    handles_right, labels_right = condition_axis.get_legend_handles_labels()
-    axis.legend(handles_left + handles_right, labels_left + labels_right,
-        fontsize=8, loc="best")
+    axis.set_ylabel("State")
+    axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Figure-level summary
@@ -1483,6 +1424,15 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
 
     final_data_objective = _finite_scalar(final_record, "data_objective")
     final_total_objective = _finite_scalar(final_record, "total_objective")
+
+    final_scientific_obj = _finite_scalar(final_record,
+        "scientific_regularisation_objective")
+    final_numerical_obj = _finite_scalar(final_record,
+        "numerical_ridge_objective")
+    final_scientific_scale = _finite_scalar(final_record,
+        "scientific_regularisation", "regularisation_scale")
+    final_numerical_ridge = _finite_scalar(final_record, "numerical_ridge",
+        "ridge")
 
     final_alpha_summary = _finite_scalar(final_record, "alpha")
     if not np.isfinite(final_alpha_summary):
@@ -1501,13 +1451,56 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     if np.isfinite(setup_reg):
         title_parts.append(
             rf"$\mathrm{{reg}}={_fmt_sci(setup_reg)}$")
+    if np.isfinite(final_scientific_obj):
+        title_parts.append(
+            rf"$J_\mathrm{{reg}}={_fmt_sci(final_scientific_obj)}$"
+        )
 
     finite_dual = grad_dual[np.isfinite(grad_dual)]
-    finite_tol = tol_here[np.isfinite(tol_here)]
-    if finite_dual.size and finite_tol.size and finite_tol[-1] > 0.0:
-        kkt_ratio = finite_dual[-1] / finite_tol[-1]
+    finite_kkt = kkt_violation[
+        np.isfinite(kkt_violation)
+    ]
+    finite_tol = kkt_tol[
+        np.isfinite(kkt_tol)
+    ]
+
+    if (
+        finite_kkt.size
+        and finite_tol.size
+        and finite_tol[-1] > 0.0
+    ):
+        final_kkt_ratio = (
+            finite_kkt[-1]
+            / finite_tol[-1]
+        )
+
         title_parts.append(
-            rf"$\mathrm{{KKT}}/\mathrm{{tol}}={_fmt_sci(kkt_ratio)}$")
+            rf"$\mathrm{{KKT}}/\mathrm{{tol}}="
+            rf"{_fmt_sci(final_kkt_ratio)}$"
+        )
+    finite_fail = explore_fail_count[
+        np.isfinite(explore_fail_count)
+    ]
+
+    finite_round = explore_round[
+        np.isfinite(explore_round)
+    ]
+
+    if finite_round.size:
+        title_parts.append(
+            f"explore={int(finite_round[-1])}"
+        )
+
+    if finite_fail.size:
+        if np.isfinite(explore_patience):
+            title_parts.append(
+                f"fail={int(finite_fail[-1])}/"
+                f"{int(explore_patience)}"
+            )
+        else:
+            title_parts.append(
+                f"fail={int(finite_fail[-1])}"
+            )
 
     if np.isfinite(final_alpha_summary):
         title_parts.append(rf"$\alpha={_fmt_sci(final_alpha_summary)}$")
