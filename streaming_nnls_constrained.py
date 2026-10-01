@@ -156,7 +156,11 @@ v1.16:  Reworked support exploration to screen candidates by constrained
         Made exploration acceptance consistent with the scientific regularisation objective in `streamActiveSetNNLS`. 30 September 2026
 v1.17:  Changed `_canon_orbit_weights` to accept a `None` value for
             `orbit_weights` and return `None` in that case, rather than
-            automatically reading the weights from the HDF5 file. 1 October 2026
+            automatically reading the weights from the HDF5 file;
+        Implemented a special case for when the solution is entirely zero --- 
+            possible when `orbit_weights=None` --- to ensure termination
+            proceeds, since there is no KKT support for all-zeros, in 
+            `streamActiveSetNNLS`. 1 October 2026
 """
 
 from __future__ import annotations, print_function
@@ -3029,7 +3033,7 @@ def streamActiveSetNNLS(
             "tol_here": float(tol_here),
         })
 
-        x_is_zero = np.all(x <= 0.0)
+        x_is_zero = np.all(z <= positive_tol)
 
         if (
             explore_fail_count >= explore_fail_patience
