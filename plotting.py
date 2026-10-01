@@ -792,8 +792,73 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
 
         return None
 
+    def _trial_records(merged: list[dict]) -> list[dict]:
+        """
+        Flatten all exploration trials while retaining their iteration.
+
+        Parameters
+        ----------
+        merged : list of dict
+            Merged outer-iteration diagnostic records.
+
+        Returns
+        -------
+        trials : list of dict
+            Individual exploration-trial records.
+
+        Raises
+        ------
+        None
+
+        Examples
+        --------
+        >>> trials = _trial_records(merged)
+        """
+        trials = []
+
+        for record in merged:
+            iteration = int(record["iter"])
+
+            for trial in record.get("_exploration_trials", []):
+                item = dict(trial)
+                item["_plot_iter"] = iteration
+                trials.append(item)
+
+        return trials
+
+    def _trial_series(trials: list[dict], *keys: str, default: float = np.nan,
+    ) -> np.ndarray:
+        """
+        Extract a scalar series from individual exploration trials.
+
+        Parameters
+        ----------
+        trials : list of dict
+            Exploration-trial records.
+        *keys : str
+            Keys searched in priority order.
+        default : float, optional
+            Value used when no finite scalar is available.
+
+        Returns
+        -------
+        values : ndarray
+            Extracted float64 values.
+
+        Raises
+        ------
+        None
+
+        Examples
+        --------
+        >>> values = _trial_series(trials, "trial_total_obj")
+        """
+        return np.asarray([_finite_scalar(record, *keys, default=default)
+            for record in trials], dtype=np.float64)
+
     raw_records = _load_records()
     merged, non_iteration = _merge_iteration_records(raw_records)
+    trials = _trial_records(merged)
 
     fig = plt.figure(figsize=figsize)
     grid = gridspec.GridSpec(3, 4, figure=fig)
@@ -836,13 +901,50 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     # ------------------------------------------------------------------
     # Extract exploration-solver histories
     # ------------------------------------------------------------------
-    data_objective = _series(merged, "exploration_accept_data_objective_after",
-        "exploration_trial_current_data_obj",)
-    trial_objective = _series(merged, "exploration_trial_trial_data_obj")
-    trial_improvement = _series(merged, "exploration_trial_improvement",)
-    trial_rel_improvement = _series(merged,
-        "exploration_trial_relative_improvement")
-    improvement_tol = _series(merged, "exploration_trial_improvement_tol",)
+    # Committed state at the start of each exploration iteration.
+    data_objective = _series(merged,
+        "exploration_trial_current_data_obj",
+        "exploration_accept_data_objective_before")
+
+    regularisation_objective = _series(merged,
+        "exploration_trial_current_regularisation_obj")
+
+    total_objective = _series(merged,
+        "exploration_trial_current_total_obj")
+
+    # Every joint-support trial is retained separately. This is essential now
+    # that several candidate batches may be tested within one outer iteration.
+    trial_iterations = np.asarray([int(record["_plot_iter"]) for record in trials
+        ], dtype=np.int64)
+
+    trial_numbers = _trial_series(trials, "trial")
+    trial_data_objective = _trial_series(trials, "trial_data_obj")
+    trial_regularisation_objective = _trial_series(
+        trials, "trial_regularisation_obj")
+    trial_total_objective = _trial_series(trials, "trial_total_obj")
+
+    trial_data_improvement = _trial_series(trials, "data_improvement")
+    trial_regularisation_change = _trial_series(
+        trials, "regularisation_change")
+    trial_total_improvement = _trial_series(
+        trials, "total_improvement", "improvement")
+    trial_best_improvement = _trial_series(
+        trials, "best_total_improvement")
+
+    trial_rel_data_improvement = _trial_series(
+        trials, "relative_data_improvement")
+    trial_rel_total_improvement = _trial_series(
+        trials, "relative_total_improvement", "relative_improvement")
+
+    trial_improvement_tol = _trial_series(trials, "improvement_tol")
+
+    trial_accepted_all = _trial_series(
+        trials, "accepted", default=0.0)
+    trial_solve_accepted = _trial_series(
+        trials, "solve_accepted", default=np.nan)
+
+    trial_support_all = _trial_series(trials, "trial_n_active")
+    proposal_n_all = _trial_series(trials, "proposal_n")
 
     alpha = _series(merged, "alpha")
     ridge = _series(merged, "ridge")
@@ -868,41 +970,21 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         for record in merged], dtype=np.float64)
     n_zero_dropped = _series(merged,"exploration_accept_n_zero_dropped",)
 
-    explore_round = _series(
-        merged,
-        "explore_round",
-        "exploration_explore_round",
-        "exploration_trial_explore_round",
-    )
+    explore_round = _series(merged, "explore_round",
+        "exploration_explore_round", "exploration_trial_explore_round")
 
-    explore_fail_count = _series(
-        merged,
-        "exploration_explore_fail_count",
-        "explore_fail_count",
-        default=0.0,
-    )
+    explore_fail_count = _series(merged, "exploration_explore_fail_count",
+        "explore_fail_count", default=0.0)
 
-    support_stationary = _series(
-        merged,
-        "support_stationary",
-        default=np.nan,
-    )
+    support_stationary = _series(merged, "support_stationary",
+        default=np.nan)
 
-    trial_accepted = _series(
-        merged,
-        "exploration_trial_accepted",
-        default=np.nan,
-    )
+    trial_accepted = _series(merged, "exploration_trial_accepted",
+        default=np.nan)
 
-    shape_dot_lambda = _series(
-        merged,
-        "shape_dot_lambda",
-    )
+    shape_dot_lambda = _series(merged, "shape_dot_lambda",)
 
-    elapsed_time = _series(
-        merged,
-        "t_sec",
-    )
+    elapsed_time = _series(merged, "t_sec",)
 
     constraint_l1 = _series(merged, "orbit_constraint_l1",
         "orbit_resid_l1")
@@ -912,109 +994,104 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         "orbit_resid_linf")
     alpha_stationarity = _series(merged, "alpha_stationarity")
 
-    proposal_grad_data_max = np.asarray([
-        np.max(np.abs(_vector(
-            record,
-            "exploration_trial_proposal_grad_data",
-        )))
-        if _vector(
-            record,
-            "exploration_trial_proposal_grad_data",
-        ) is not None
-        else np.nan
-        for record in merged
-    ], dtype=np.float64)
+    def _trial_gradient_max(record: dict, scalar_key: str, vector_key: str,
+        ) -> float:
+        value = _finite_scalar(record, scalar_key)
 
-    proposal_grad_constraint_max = np.asarray([
-        np.max(np.abs(_vector(
-            record,
-            "exploration_trial_proposal_grad_constraint",
-        )))
-        if _vector(
-            record,
-            "exploration_trial_proposal_grad_constraint",
-        ) is not None
-        else np.nan
-        for record in merged
-    ], dtype=np.float64)
+        if np.isfinite(value):
+            return value
 
-    proposal_grad_total_max = np.asarray([
-        np.max(np.abs(_vector(
-            record,
-            "exploration_trial_proposal_grad_total",
-        )))
-        if _vector(
-            record,
-            "exploration_trial_proposal_grad_total",
-        ) is not None
-        else np.nan
-        for record in merged
-    ], dtype=np.float64)
+        vector = _vector(record, vector_key)
+
+        if vector is None:
+            return np.nan
+
+        return float(np.max(np.abs(vector)))
+
+    trial_grad_data_max = np.asarray([_trial_gradient_max(record,
+            "proposal_grad_data_max", "proposal_grad_data")
+        for record in trials], dtype=np.float64)
+
+    trial_grad_constraint_max = np.asarray([_trial_gradient_max(record,
+            "proposal_grad_constraint_max", "proposal_grad_constraint")
+        for record in trials], dtype=np.float64)
+
+    trial_grad_total_max = np.asarray([_trial_gradient_max(record,
+            "proposal_grad_total_max","proposal_grad_total")
+        for record in trials], dtype=np.float64)
+
+
+    any_trial_accepted = np.asarray([float(any(bool(trial.get("accepted", False))
+            for trial in record.get("_exploration_trials", [])))
+        if record.get("_exploration_trials") else np.nan for record in merged
+        ], dtype=np.float64)
 
 
     # ------------------------------------------------------------------
-    # Panel 1: objective convergence
+    # Panel 1: scientific-objective evolution
     # ------------------------------------------------------------------
     axis = axes["objective"]
 
-    _plot_finite(
-        axis,
-        iterations,
-        data_objective,
-        "Accepted data objective",
-        lw=1.6,
-        color="tab:blue",
-    )
+    _plot_finite(axis, iterations, data_objective,
+        "Committed data objective", lw=1.5, color="tab:blue")
 
-    _plot_finite(
-        axis,
-        iterations,
-        trial_objective,
-        "Trial data objective",
-        lw=1.0,
-        color="tab:orange",
-        alpha=0.75,
-    )
+    _plot_finite(axis, iterations, total_objective,
+        "Committed total objective", lw=1.6, color="tab:green")
 
-    axis.set_title("Data-fit evolution")
+    # Show every tested joint-support solution rather than only the best
+    # representative trial retained by the iteration merger.
+    finite_trial = (np.isfinite(trial_iterations)
+        & np.isfinite(trial_total_objective))
+
+    if np.any(finite_trial):
+        axis.scatter(trial_iterations[finite_trial],
+            trial_total_objective[finite_trial], s=14, alpha=0.45,
+            color="tab:orange", label="Trial total objective")
+
+    accepted_trial = (finite_trial & np.isfinite(trial_accepted_all)
+        & (trial_accepted_all > 0.5))
+
+    if np.any(accepted_trial):
+        axis.scatter(trial_iterations[accepted_trial],
+            trial_total_objective[accepted_trial], s=28, marker="o",
+            facecolors="none", edgecolors="tab:green", label="Accepted trial",
+            zorder=4)
+
+    axis.set_title("Scientific objective evolution")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Data objective")
+    axis.set_ylabel(r"$J_\mathrm{data} + J_\mathrm{reg}$")
     _homogenise_ticks(axis)
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 2: solution-vector convergence
+    # Panel 2: joint-support objective-gain decomposition
     # ------------------------------------------------------------------
     axis = axes["improvement"]
 
-    _plot_finite(
-        axis,
-        iterations,
-        trial_improvement,
-        "Regularised objective gain",
-        lw=1.4,
-        color="tab:blue",
-    )
+    _plot_finite(axis, trial_iterations, trial_data_improvement,
+        "Data-fit gain", lw=1.0, color="tab:blue", alpha=0.75)
 
-    axis.axhline(
-        0.0,
-        lw=0.9,
-        color="black",
-        linestyle=":",
-    )
+    _plot_finite(axis, trial_iterations, trial_regularisation_change,
+        "Regularisation gain", lw=1.0, color="tab:orange", alpha=0.75)
 
-    _plot_finite(
-        axis,
-        iterations,
-        improvement_tol,
-        "Acceptance threshold",
-        positive_log=True,
-        lw=1.2,
-        color="tab:red",
-        linestyle="--",
-    )
+    _plot_finite(axis, trial_iterations, trial_total_improvement,
+        "Total scientific gain", lw=1.5, color="tab:green")
 
-    axis.set_title("Joint re-solve improvement")
+    axis.axhline(0.0, lw=0.9, color="black", linestyle=":",
+        label="No improvement")
+
+    # The tolerance is tiny compared with genuine improvements, but plotting
+    # it makes numerical non-improvements such as ~1e-2 objective changes
+    # immediately identifiable.
+    finite_tol = (np.isfinite(trial_iterations)
+        & np.isfinite(trial_improvement_tol))
+
+    if np.any(finite_tol):
+        axis.plot(trial_iterations[finite_tol],
+            trial_improvement_tol[finite_tol], lw=1.0, color="tab:red",
+            linestyle="--", label="Acceptance tolerance")
+
+    axis.set_title("Joint re-solve gain decomposition")
     axis.set_ylabel(r"$J_\mathrm{current} - J_\mathrm{trial}$")
     axis.set_xlabel("Iteration")
     _homogenise_ticks(axis)
@@ -1091,31 +1168,24 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 4: constrained-gradient decomposition
+    # Panel 4: candidate-screening decomposition
     # ------------------------------------------------------------------
     axis = axes["dual"]
 
-    _plot_finite(
-        axis, iterations, proposal_grad_data_max,
-        "Data gradient", positive_log=True,
-        lw=1.3, color="tab:blue",
-    )
+    _plot_finite(axis, trial_iterations, trial_grad_data_max,
+        "Data term", positive_log=True, lw=1.2, color="tab:blue", alpha=0.8)
 
-    _plot_finite(
-        axis, iterations, proposal_grad_constraint_max,
-        "Orbit-constraint term", positive_log=True,
-        lw=1.3, color="tab:orange",
-    )
+    _plot_finite(axis, trial_iterations, trial_grad_constraint_max,
+        "Orbit-constraint term", positive_log=True,lw=1.2, color="tab:orange",
+        alpha=0.8)
 
-    _plot_finite(
-        axis, iterations, proposal_grad_total_max,
-        "Combined constrained gradient", positive_log=True,
-        lw=1.4, color="tab:green",
-    )
+    _plot_finite(axis, trial_iterations, trial_grad_total_max,
+        "Combined screening gradient", positive_log=True, lw=1.5,
+        color="tab:green")
 
     axis.set_title("Candidate screening")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Maximum |gradient|")
+    axis.set_ylabel(r"Maximum $|g|$ in proposal")
     _homogenise_ticks(axis)
     axis.legend(fontsize=8, loc="best")
 
@@ -1203,38 +1273,20 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 7: promotion quality
+    # Panel 7: proposal and support survival
     # ------------------------------------------------------------------
     axis = axes["support_changes"]
 
-    _plot_finite(
-        axis,
-        iterations,
-        proposal_n,
-        "Proposed columns",
-        lw=1.3,
-        color="tab:blue",
-    )
+    _plot_finite(axis, trial_iterations, proposal_n_all,
+        "Columns tested", lw=1.0, color="tab:blue", alpha=0.65)
 
-    _plot_finite(
-        axis,
-        iterations,
-        n_added,
-        "Columns retained",
-        lw=1.3,
-        color="tab:green",
-    )
+    _plot_finite(axis, iterations, n_added,
+        "Columns retained", lw=1.4, color="tab:green")
 
-    _plot_finite(
-        axis,
-        iterations,
-        n_zero_dropped,
-        "Trial columns dropped",
-        lw=1.2,
-        color="tab:orange",
-    )
+    _plot_finite(axis, iterations, n_zero_dropped,
+        "Trial columns returned to zero", lw=1.2, color="tab:orange")
 
-    axis.set_title("Exploration support changes")
+    axis.set_title("Joint-support survival")
     axis.set_xlabel("Iteration")
     axis.set_ylabel("Columns")
     _homogenise_ticks(axis)
@@ -1245,32 +1297,24 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     # ------------------------------------------------------------------
     axis = axes["candidate_space"]
 
-    _plot_finite(
-        axis,
-        iterations,
-        n_zero_free,
-        "Zero free columns",
-        lw=1.4,
-        color="tab:blue",
-    )
+    _plot_finite(axis, iterations, n_candidates, "Remaining candidates",
+        lw=1.4, color="tab:blue")
 
-    _plot_finite(
-        axis,
-        iterations,
-        n_candidates,
-        "Exploration candidates",
-        lw=1.2,
-        color="tab:orange",
-    )
+    coverage_axis = axis.twinx()
+    tested_fraction = np.divide(proposal_n, n_candidates,
+        out=np.full_like(proposal_n, np.nan), where=n_candidates > 0.0,)
+    _plot_finite(coverage_axis, iterations, 100.0 * tested_fraction,
+        "Batch fraction", lw=1.2, color="tab:orange")
 
-    axis.set_title("Remaining search space")
+    axis.set_title("Candidate search effort")
+    axis.set_ylabel("Remaining columns")
+    coverage_axis.set_ylabel("Batch [% of candidates]", color="tab:orange")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Columns")
     _homogenise_ticks(axis)
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 9: promotion eligibility and cooldown
+    # Panel 9: hard-orbit amplitude and numerical stabilisation
     # ------------------------------------------------------------------
     axis = axes["amplitude"]
 
@@ -1283,7 +1327,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         color="tab:blue",
     )
 
-    axis.set_title("Hard-orbit amplitude")
+    axis.set_title("Orbit amplitude & numerical stability")
     axis.set_xlabel("Iteration")
     axis.set_ylabel(r"$\alpha$")
     _homogenise_ticks(axis)
@@ -1294,7 +1338,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         ridge_axis,
         iterations,
         ridge,
-        "Numerical ridge",
+        "Numerical stabilisation",
         positive_log=True,
         lw=1.1,
         color="tab:orange",
@@ -1402,8 +1446,8 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     _plot_finite(
         axis,
         iterations,
-        trial_accepted,
-        "Exploration accepted",
+        any_trial_accepted,
+        "Joint search improved",
         lw=1.2,
         color="tab:green",
     )
@@ -1412,7 +1456,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     axis.set_yticks([0.0, 1.0])
     axis.set_yticklabels(["No", "Yes"])
 
-    axis.set_title("KKT versus exploration")
+    axis.set_title("Local stationarity vs joint search")
     axis.set_xlabel("Iteration")
     axis.set_ylabel("State")
     axis.legend(fontsize=8, loc="best")

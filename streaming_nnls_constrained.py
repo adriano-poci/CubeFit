@@ -2535,17 +2535,19 @@ def streamActiveSetNNLS(
         best_info = {}
         best_ATA = None
         best_ATy = None
-        current_reg_obj = (0.5 * float(regularisation_scale) * float(np.sum(
-            (S_flat[current_active] * z[current_active]) ** 2)))
+        current_reg_obj = (0.5 * float(regularisation_scale)
+            * float(np.sum((S_flat[current_active] * z[current_active]) ** 2)))
+        current_total_obj = float(current_data_obj) + current_reg_obj
         best_data_obj = float(current_data_obj)
-        best_total_obj = float(current_data_obj) + current_reg_obj
+        best_reg_obj = float(current_reg_obj)
+        best_total_obj = float(current_total_obj)
         explore_obj_tol = (64.0 * np.finfo(np.float64).eps
-            * max(1.0, abs(float(best_total_obj))))
+            * max(1.0, abs(float(current_total_obj))))
 
         for trial_number, proposal in enumerate(batches):
 
             trial_active = np.unique(np.concatenate((current_active, proposal))
-            ).astype(np.int64, copy=False)
+                ).astype(np.int64, copy=False)
 
             if trial_active.size > int(max_active):
                 available = max(0, int(max_active) - current_active.size,)
@@ -2559,9 +2561,15 @@ def streamActiveSetNNLS(
                         "trial": int(trial_number),
                         "accepted": False,
                         "solve_accepted": False,
+                        "reason": "max_active",
                         "proposal_n": int(proposal.size),
                         "trial_n_active": int(current_active.size),
-                        "reason": "max_active",
+                        "current_data_obj": float(current_data_obj),
+                        "current_regularisation_obj": float(current_reg_obj),
+                        "current_total_obj": float(current_total_obj),
+                        "best_data_obj": float(best_data_obj),
+                        "best_regularisation_obj": float(best_reg_obj),
+                        "best_total_obj": float(best_total_obj),
                         "proposal": proposal.tolist(),
                     })
                     continue
@@ -2589,11 +2597,8 @@ def streamActiveSetNNLS(
             del ridge_trial
             del cond_trial
 
-            if (
-                z_trial is None
-                or info_trial is None
-                or not info_trial["accepted"]
-            ):
+            if (z_trial is None or info_trial is None
+                or not info_trial["accepted"]):
                 _emit_diag({
                     "kind": "exploration_trial",
                     "source": "streamActiveSetNNLS",
@@ -2604,28 +2609,42 @@ def streamActiveSetNNLS(
                     "solve_accepted": False,
                     "proposal_n": int(proposal.size),
                     "trial_n_active": int(trial_active.size),
-                    "current_data_obj": float(best_data_obj),
-                    "trial_data_obj": None,
-                    "improvement": None,
-                    "relative_improvement": None,
                     "reason": (info_trial.get("reason", "solve_failed")
                         if info_trial is not None else "solve_failed"),
+                    "current_data_obj": float(current_data_obj),
+                    "current_regularisation_obj": float(current_reg_obj),
+                    "current_total_obj": float(current_total_obj),
+                    "best_data_obj": float(best_data_obj),
+                    "best_regularisation_obj": float(best_reg_obj),
+                    "best_total_obj": float(best_total_obj),
                     "proposal": proposal.tolist(),
+                    "proposal_grad_data": grad_data[proposal].tolist(),
+                    "proposal_grad_constraint": (
+                        constraint_gradient[proposal].tolist()),
+                    "proposal_grad_total": grad_total[proposal].tolist(),
                 })
                 continue
 
-            trial_data_obj = _data_quad_obj(ATA_trial, ATy_trial, z_trial,)
-            trial_reg_obj = (0.5 * float(regularisation_scale) * float(np.sum(
-                    (S_trial * z_trial) ** 2)))
+            trial_data_obj = _data_quad_obj(ATA_trial, ATy_trial, z_trial)
+            trial_reg_obj = (0.5 * float(regularisation_scale)
+                * float(np.sum((S_trial * z_trial) ** 2)))
+            trial_total_obj = float(trial_data_obj) + float(trial_reg_obj)
+            total_improvement = float(current_total_obj) - float(trial_total_obj)
+            data_improvement = float(current_data_obj) - float(trial_data_obj)
+            regularisation_change = float(current_reg_obj) - float(trial_reg_obj)
+            best_total_improvement = (
+                float(best_total_obj) - float(trial_total_obj))
+            rel_total_improvement = (total_improvement
+                / max(1.0, abs(float(current_total_obj))))
+            rel_data_improvement = (data_improvement
+                / max(1.0, abs(float(current_data_obj))))
 
-            trial_total_obj = trial_data_obj + trial_reg_obj
-            improvement = best_total_obj - trial_total_obj
+            proposal_grad_data_values = grad_data[proposal]
+            proposal_grad_constraint_values = constraint_gradient[proposal]
+            proposal_grad_total_values = grad_total[proposal]
 
-            scale = max(1.0, abs(float(best_data_obj)))
-
-            rel_improvement = improvement / scale
-
-            accepted_trial = trial_total_obj < best_total_obj - explore_obj_tol
+            accepted_trial = (trial_total_obj
+                < best_total_obj - explore_obj_tol)
 
             _emit_diag({
                 "kind": "exploration_trial",
@@ -2633,39 +2652,78 @@ def streamActiveSetNNLS(
                 "iter": int(it + 1),
                 "explore_round": int(explore_round),
                 "trial": int(trial_number),
+
+                # Trial outcome.
                 "accepted": bool(accepted_trial),
-                "current_total_obj": float(best_total_obj),
-                "trial_total_obj": float(trial_total_obj),
-                "trial_regularisation_obj": float(trial_reg_obj),
+                "solve_accepted": True,
                 "proposal_n": int(proposal.size),
                 "trial_n_active": int(trial_active.size),
-                "current_data_obj": float(best_data_obj),
+
+                # Objective of the committed state entering exploration.
+                "current_data_obj": float(current_data_obj),
+                "current_regularisation_obj": float(current_reg_obj),
+                "current_total_obj": float(current_total_obj),
+
+                # Best trial found before this trial.
+                "best_data_obj": float(best_data_obj),
+                "best_regularisation_obj": float(best_reg_obj),
+                "best_total_obj": float(best_total_obj),
+
+                # This trial.
                 "trial_data_obj": float(trial_data_obj),
-                "improvement": float(improvement),
-                "relative_improvement": float(rel_improvement),
-                "proposal": proposal.tolist(),
-                "proposal_grad_data": (grad_data[proposal].tolist()),
-                "proposal_grad_constraint": (
-                    constraint_gradient[proposal].tolist()),
-                "proposal_grad_total": grad_total[proposal].tolist(),
+                "trial_regularisation_obj": float(trial_reg_obj),
+                "trial_total_obj": float(trial_total_obj),
+
+                # Improvement relative to the committed state.
+                "data_improvement": float(data_improvement),
+                "regularisation_change": float(regularisation_change),
+                "total_improvement": float(total_improvement),
+                "relative_data_improvement": float(rel_data_improvement),
+                "relative_total_improvement": float(rel_total_improvement),
+
+                # Improvement relative to the best trial already seen.
+                "best_total_improvement": float(best_total_improvement),
+
                 "improvement_tol": float(explore_obj_tol),
+
+                # Exact candidate identities.
+                "proposal": proposal.tolist(),
+
+                # What each proposed column looked like before the
+                # joint re-solve.
+                "proposal_grad_data": proposal_grad_data_values.tolist(),
+                "proposal_grad_constraint": (
+                    proposal_grad_constraint_values.tolist()),
+                "proposal_grad_total": proposal_grad_total_values.tolist(),
+
+                # Compact screening summaries for plotting without
+                # needing to decode the full proposal vectors.
+                "proposal_grad_data_max": float(np.max(
+                    np.abs(proposal_grad_data_values))),
+                "proposal_grad_constraint_max": float(np.max(
+                    np.abs(proposal_grad_constraint_values))),
+                "proposal_grad_total_max": float(np.max(
+                    np.abs(proposal_grad_total_values))),
+                "proposal_grad_data_max_signed": float(np.max(
+                    proposal_grad_data_values)),
+                "proposal_grad_constraint_max_signed": float(np.max(
+                    proposal_grad_constraint_values)),
+                "proposal_grad_total_max_signed": float(np.max(
+                    proposal_grad_total_values)),
             })
 
-            # Exploration must compare the objective actually being optimized:
-            # data fit plus the scientific x-space regularisation. The
-            # numerical ridge is deliberately excluded because it is only a
-            # linear-algebra stabiliser, not part of the scientific objective.
             if accepted_trial:
                 best_total_obj = float(trial_total_obj)
                 best_data_obj = float(trial_data_obj)
+                best_reg_obj = float(trial_reg_obj)
                 best_active = trial_active.copy()
                 best_z = z_trial.copy()
                 best_info = dict(info_trial)
                 best_ATA = ATA_trial.copy()
                 best_ATy = ATy_trial.copy()
 
-        improved = bool(best_total_obj < (float(current_data_obj) +
-            current_reg_obj - explore_obj_tol))
+        improved = bool(best_total_obj
+            < float(current_total_obj) - explore_obj_tol)
 
         return (
             improved,
