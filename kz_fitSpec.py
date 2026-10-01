@@ -100,8 +100,9 @@ v1.30:  Added `orbitWeights` kwarg to toggle whether the orbit weights are used
             as constraints in `genCubeFit`;
         Switched to using `pipeline_runner.PipelineRunner.build_hypercube` for 
             internal consistency;
-        Pass parallelism to `pipeline_runner.PipelineRunner.build_hypercube`. 1
-            October 2026
+        Pass parallelism to `pipeline_runner.PipelineRunner.build_hypercube`;
+        Changed residual panel to `scatter` in `parallel_spectrum_plots` and 
+            `plot_best_worst_spectrum_fits_stacked`. 1 October 2026
 """
 
 # need to set up the logger before any other imports
@@ -1569,8 +1570,8 @@ def parallel_spectrum_plots(
         # --------------------------------------------------------
         # Fractional residual
         # --------------------------------------------------------
-        ax_resid.plot(obs[valid], frac_resid_pct[valid], lw=0.75,
-            color="tab:green",)
+        ax_resid.scatter(obs[valid], frac_resid_pct[valid], s=2,
+            color="tab:green", marker='^')
         ax_resid.axhline(0.0, lw=0.55, color="tab:green", alpha=0.7)
 
         # --------------------------------------------------------
@@ -1701,15 +1702,11 @@ def plot_best_worst_spectrum_fits_stacked(
 
         if data_ds.shape != model_ds.shape:
             raise RuntimeError(
-                f"Shape mismatch: {data_ds.shape} vs {model_ds.shape}"
-            )
+                f"Shape mismatch: {data_ds.shape} vs {model_ds.shape}")
 
         L = int(model_ds.shape[1])
-        obs = (
-            np.asarray(f["/ObsPix"][...], dtype=np.float64)
-            if "/ObsPix" in f
-            else np.arange(L, dtype=np.float64)
-        )
+        obs = (np.asarray(f["/ObsPix"][...], dtype=np.float64) if "/ObsPix" in f
+            else np.arange(L, dtype=np.float64))
 
         if mask is None and "/Mask" in f:
             m = np.asarray(f["/Mask"][...], dtype=bool).ravel()
@@ -1777,16 +1774,11 @@ def plot_best_worst_spectrum_fits_stacked(
 
     if plot_path is None:
         base = plp.Path(h5_path)
-        plot_path = base.with_name(
-            base.stem + f"_{tag}_stacked.png"
-        )
+        plot_path = base.with_name(base.stem + f"_{tag}_stacked.png")
     else:
         plot_path = plp.Path(plot_path)
 
-    plot_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------
     # Prepare spectra and fractional residuals
@@ -1904,8 +1896,8 @@ def plot_best_worst_spectrum_fits_stacked(
 
         if np.any(valid_resid):
             resid_y = resid_off + residual_amp * resid / residual_scale
-            ax.plot(obs[valid_resid], resid_y[valid_resid], lw=0.75,
-                color=resid_c, alpha=0.95)
+            ax.scatter(obs[valid_resid], resid_y[valid_resid], s=2,
+                color=resid_c, alpha=0.95, marker='^')
         # r = 0 baseline.
         ax.axhline(resid_off, lw=0.45, color=resid_c, alpha=0.65)
 

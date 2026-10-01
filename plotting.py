@@ -687,10 +687,12 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
                 {"iter": iteration})
 
             if kind == "exploration_trial":
-                current.setdefault("_exploration_trials", []).append(dict(record))
+                current.setdefault(
+                    "_exploration_trials", []).append(dict(record))
 
-                # Retain the best successful trial as the scalar representative of this
-                # iteration. The complete trial set remains available above.
+                # Retain the best successful trial as the scalar representative
+                # of this iteration. The complete trial set remains available 
+                # above.
                 old_obj = _finite_scalar(current,
                     "exploration_trial_trial_total_obj",
                     "exploration_trial_trial_data_obj")

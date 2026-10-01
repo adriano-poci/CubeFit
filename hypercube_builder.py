@@ -236,9 +236,9 @@ def _compute_and_store_losvd_amplitudes(f, *, amp_mode: str) -> tuple[str, str]:
         del ng["losvd_amp_sum"]
 
     A = ng.create_dataset("losvd_amp", shape=(S, C), dtype="f8",
-                          chunks=(min(64, S), min(32, C)))
+        chunks=(min(64, S), min(32, C)))
     A_sum = ng.create_dataset("losvd_amp_sum", shape=(S,), dtype="f8",
-                              chunks=(min(64, S),))
+        chunks=(min(64, S),))
 
     if amp_mode == "trapz":
         vel_pix = np.asarray(f["/VelPix"][...], np.float64)
@@ -282,7 +282,7 @@ class _KM:
     dlog: float
 
 def _kernel_map_from_grids(tem_loglam: np.ndarray,
-                           vel_pix: np.ndarray) -> _KM:
+        vel_pix: np.ndarray) -> _KM:
     logL = np.asarray(tem_loglam, dtype=np.float64)
     dlog = float(np.median(np.diff(logL)))
     V = np.asarray(vel_pix, dtype=np.float64)
@@ -305,16 +305,10 @@ def _kernel_map_from_grids(tem_loglam: np.ndarray,
 
     center_idx = int(np.searchsorted(k_offsets, 0))
 
-    return _KM(
-        k_offsets=k_offsets,
-        il=il.astype(np.int64, copy=False),
-        ir=ir.astype(np.int64, copy=False),
-        t=t.astype(np.float64, copy=False),
-        out_mask=out_mask.astype(bool, copy=False),
-        center_idx=center_idx,
-        m=int(k_offsets.size),
-        dlog=dlog,
-    )
+    return _KM(k_offsets=k_offsets, il=il.astype(np.int64, copy=False),
+        ir=ir.astype(np.int64, copy=False), t=t.astype(np.float64, copy=False),
+        out_mask=out_mask.astype(bool, copy=False), center_idx=center_idx,
+        m=int(k_offsets.size), dlog=dlog)
 
 def _losvd_to_unit_kernel(H_native: np.ndarray, km: _KM) -> np.ndarray:
     H = np.asarray(H_native, dtype=np.float64, order="C")
@@ -330,12 +324,8 @@ def _losvd_to_unit_kernel(H_native: np.ndarray, km: _KM) -> np.ndarray:
         Hk /= s
     return Hk
 
-def _fft_conv_centered(T_fft_slice: np.ndarray,
-                       Hk_unit: np.ndarray,
-                       km: _KM,
-                       n_fft: int,
-                       T: int,
-                       phase_shift: np.ndarray | None = None) -> np.ndarray:
+def _fft_conv_centered(T_fft_slice: np.ndarray, Hk_unit: np.ndarray, km: _KM,
+    n_fft: int, T: int, phase_shift: np.ndarray | None = None) -> np.ndarray:
     """
     FFT-based centered convolution of templates with a unit-area LOSVD kernel,
     followed by a 'same' crop aligned on km.center_idx.
