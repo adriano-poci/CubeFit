@@ -3700,3 +3700,2404 @@ def constrainUpscaledSolution(
     return x0
 
 # ------------------------------------------------------------------------------
+
+def diagnose_hypercube_scaling(
+    h5_c3: str,
+    h5_c20: str | None = None,
+    *,
+    sample_spaxels: int = 8,
+    sample_pops: int = 24,
+    seed: int = 7,
+    verbose: bool = True,
+) -> dict:
+    """
+    Diagnose HyperCube, LOSVD, column scaling, and fitted-model differences.
+
+    The HDF5 files are treated as self-contained CubeFit run products. The
+    function reads the stored data, LOSVDs, templates/grids, HyperCube,
+    column energies, orbital weights, and ``X_global`` directly from each
+    file. It is strictly read-only.
+
+    Parameters
+    ----------
+    h5_c3 : str
+        C3 HDF5 file. Required datasets are ``/DataCube``, ``/LOSVD``,
+        ``/VelPix``, ``/ObsPix``, ``/Templates``, ``/TemPix``, ``/R_T``,
+        ``/HyperCube/models``, ``/HyperCube/col_energy``, and ``/X_global``.
+    h5_c20 : str, optional
+        Second HDF5 file, normally the C20 run. If omitted, only the
+        single-run diagnostics are performed.
+    sample_spaxels : int
+        Number of evenly spaced spaxels used for model-column and
+        fitted-model checks.
+    sample_pops : int
+        Number of population columns sampled for spectral-shape checks.
+    seed : int
+        Seed for deterministic population sampling.
+    verbose : bool
+        Print a compact diagnostic report.
+
+    Returns
+    -------
+    dict
+        Nested diagnostics. ``result["runs"]["c3"]`` always exists.
+        With two files, ``result["runs"]["c20"]`` and
+        ``result["comparison"]`` are also returned.
+
+    Raises
+    ------
+    RuntimeError
+        If a required dataset is missing.
+    ValueError
+        If HDF5 dimensions or stored arrays are inconsistent.
+
+    Examples
+    --------
+    >>> d = diagnose_hypercube_scaling(
+    ...     "hypercube_003_04.h5",
+    ...     "hypercube_020_04.h5",
+    ... )
+    >>> d["comparison"]["fit_difference"][
+    ...     "fit_rmse_ratio_20_over_3"
+    ... ]
+    1.2
+    """
+
+    required = (
+        "/DataCube",
+        "/LOSVD",
+        "/VelPix",
+        "/ObsPix",
+        "/Templates",
+        "/TemPix",
+        "/R_T",
+        "/HyperCube/models",
+        "/HyperCube/col_energy",
+        "/X_global",
+    )
+
+    def qstats(x):
+        x = np.asarray(x, dtype=np.float64).ravel()
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            return {
+                "n": 0,
+                "min": np.nan,
+                "p05": np.nan,
+                "p25": np.nan,
+                "median": np.nan,
+                "p75": np.nan,
+                "p95": np.nan,
+                "max": np.nan,
+            }
+
+        return {
+            "n": int(x.size),
+            "min": float(np.min(x)),
+            "p05": float(np.percentile(x, 5)),
+            "p25": float(np.percentile(x, 25)),
+            "median": float(np.median(x)),
+            "p75": float(np.percentile(x, 75)),
+            "p95": float(np.percentile(x, 95)),
+            "max": float(np.max(x)),
+        }
+
+    def ratio(a, b):
+        a = float(a)
+        b = float(b)
+
+        if not np.isfinite(a) or not np.isfinite(b) or b == 0.0:
+            return np.nan
+
+        return float(a / b)
+
+    def cosine(a, b):
+        a = np.asarray(a, dtype=np.float64).ravel()
+        b = np.asarray(b, dtype=np.float64).ravel()
+
+        na = float(np.linalg.norm(a))
+        nb = float(np.linalg.norm(b))
+
+        if na == 0.0 or nb == 0.0:
+            return np.nan
+
+        return float(np.dot(a, b) / (na * nb))
+
+    def get_mask(f, L):
+        if "/Mask" not in f:
+            return np.arange(L, dtype=np.int64)
+
+        m = np.asarray(
+            f["/Mask"][...],
+            dtype=bool,
+        ).ravel()
+
+        if m.size != L:
+            raise ValueError(
+                f"/Mask has size {m.size}; expected L={L}."
+            )
+
+        idx = np.flatnonzero(m)
+
+        if idx.size == 0:
+            raise ValueError(
+                "/Mask contains no kept wavelengths."
+            )
+
+        return idx.astype(
+            np.int64,
+            copy=False,
+        )
+
+    def losvd_amplitudes(f, amp_mode):
+        H = f["/LOSVD"]
+
+        S, V, C = map(
+            int,
+            H.shape,
+        )
+
+        vel = np.asarray(
+            f["/VelPix"][...],
+            dtype=np.float64,
+        )
+
+        A = np.empty(
+            (S, C),
+            dtype=np.float64,
+        )
+
+        for s0 in range(0, S, 64):
+            s1 = min(S, s0 + 64)
+
+            slab = np.asarray(
+                H[s0:s1, :, :],
+                dtype=np.float64,
+            )
+
+            if amp_mode == "trapz":
+                try:
+                    A[s0:s1] = np.trapezoid(
+                        slab,
+                        vel,
+                        axis=1,
+                    )
+                except AttributeError:
+                    A[s0:s1] = np.trapz(
+                        slab,
+                        vel,
+                        axis=1,
+                    )
+            else:
+                A[s0:s1] = np.sum(
+                    slab,
+                    axis=1,
+                )
+
+        return A
+
+    def data_energy(f, keep_idx, weighted):
+        DC = f["/DataCube"]
+        total = 0.0
+        w = None
+
+        if weighted:
+            if "/HyperCube/lambda_weights" not in f:
+                return np.nan
+
+            w = np.asarray(
+                f["/HyperCube/lambda_weights"][...],
+                dtype=np.float64,
+            ).ravel()
+
+            if w.size != DC.shape[1]:
+                return np.nan
+
+            w = w[keep_idx]
+
+        for s0 in range(
+            0,
+            int(DC.shape[0]),
+            128,
+        ):
+            s1 = min(
+                int(DC.shape[0]),
+                s0 + 128,
+            )
+
+            Y = np.asarray(
+                DC[s0:s1, :],
+                dtype=np.float64,
+            )[:, keep_idx]
+
+            if w is None:
+                total += float(
+                    np.sum(Y * Y)
+                )
+            else:
+                total += float(
+                    np.sum(
+                        Y * Y * w[None, :]
+                    )
+                )
+
+        return float(total)
+
+    def sample_prediction(
+        f,
+        X,
+        s_sel,
+        keep_idx,
+    ):
+        M = f["/HyperCube/models"]
+
+        data = []
+        pred = []
+
+        for s in s_sel:
+            Y = np.asarray(
+                f["/DataCube"][int(s), :],
+                dtype=np.float64,
+            )
+
+            A = np.asarray(
+                M[int(s), :, :, :],
+                dtype=np.float64,
+            )
+
+            Y = Y[keep_idx]
+            A = A[:, :, keep_idx]
+
+            data.append(Y)
+
+            pred.append(
+                np.tensordot(
+                    A,
+                    X,
+                    axes=([0, 1], [0, 1]),
+                )
+            )
+
+        return (
+            np.asarray(data),
+            np.asarray(pred),
+        )
+
+    def model_columns(
+        f,
+        A_los,
+        E,
+        keep_idx,
+        s_sel,
+        p_sel,
+    ):
+        M = f["/HyperCube/models"]
+
+        amps = []
+        norms = []
+        shapes = []
+
+        for s in s_sel:
+            slab = np.asarray(
+                M[int(s), :, p_sel, :],
+                dtype=np.float64,
+            )[:, :, keep_idx]
+
+            for c in range(slab.shape[0]):
+                for j, p in enumerate(p_sel):
+                    col = slab[c, j, :]
+
+                    nrm = float(
+                        np.linalg.norm(col)
+                    )
+
+                    amp = float(
+                        A_los[int(s), c]
+                    )
+
+                    amps.append(amp)
+                    norms.append(nrm)
+
+                    if nrm > 0.0:
+                        shapes.append(
+                            col / nrm
+                        )
+
+        amps = np.asarray(
+            amps,
+            dtype=np.float64,
+        )
+
+        norms = np.asarray(
+            norms,
+            dtype=np.float64,
+        )
+
+        good = (
+            np.isfinite(amps)
+            & np.isfinite(norms)
+            & (amps > 0.0)
+            & (norms > 0.0)
+        )
+
+        if np.count_nonzero(good) >= 2:
+            la = np.log10(
+                np.maximum(
+                    amps[good],
+                    1e-300,
+                )
+            )
+
+            ln = np.log10(
+                np.maximum(
+                    norms[good],
+                    1e-300,
+                )
+            )
+
+            la -= np.mean(la)
+            ln -= np.mean(ln)
+
+            corr = cosine(
+                la,
+                ln,
+            )
+
+            norm_over_amp = (
+                norms[good]
+                / np.maximum(
+                    amps[good],
+                    1e-300,
+                )
+            )
+        else:
+            corr = np.nan
+            norm_over_amp = np.array(
+                [],
+                dtype=np.float64,
+            )
+
+        return {
+            "n_columns_sampled": int(
+                amps.size
+            ),
+            "log_amp_log_modelnorm_cosine": float(
+                corr
+            ),
+            "modelnorm_over_amp": qstats(
+                norm_over_amp
+            ),
+            "shape_vectors": (
+                np.asarray(
+                    shapes,
+                    dtype=np.float64,
+                )
+                if shapes
+                else np.empty(
+                    (0, 0),
+                    dtype=np.float64,
+                )
+            ),
+        }
+
+    def summed_losvd_compare(f1, f2):
+        H1 = f1["/LOSVD"]
+        H2 = f2["/LOSVD"]
+
+        if H1.shape[:2] != H2.shape[:2]:
+            return {
+                "same_SV": False,
+                "max_abs": np.nan,
+                "max_rel": np.nan,
+                "median_spaxel_rel_l2": np.nan,
+                "p95_spaxel_rel_l2": np.nan,
+            }
+
+        rel = []
+        max_abs = 0.0
+        max_rel = 0.0
+
+        S = int(H1.shape[0])
+
+        for s0 in range(0, S, 64):
+            s1 = min(S, s0 + 64)
+
+            a = np.asarray(
+                H1[s0:s1],
+                dtype=np.float64,
+            ).sum(axis=2)
+
+            b = np.asarray(
+                H2[s0:s1],
+                dtype=np.float64,
+            ).sum(axis=2)
+
+            d = np.abs(a - b)
+
+            max_abs = max(
+                max_abs,
+                float(np.max(d)),
+            )
+
+            max_rel = max(
+                max_rel,
+                float(
+                    np.max(
+                        d / np.maximum(
+                            np.maximum(
+                                np.abs(a),
+                                np.abs(b),
+                            ),
+                            1e-300,
+                        )
+                    )
+                ),
+            )
+
+            rel.extend(
+                (
+                    np.linalg.norm(
+                        a - b,
+                        axis=1,
+                    )
+                    / np.maximum(
+                        np.linalg.norm(
+                            a,
+                            axis=1,
+                        ),
+                        1e-300,
+                    )
+                ).tolist()
+            )
+
+        return {
+            "same_SV": True,
+            "max_abs": max_abs,
+            "max_rel": max_rel,
+            "median_spaxel_rel_l2": float(
+                np.median(rel)
+            ),
+            "p95_spaxel_rel_l2": float(
+                np.percentile(rel, 95)
+            ),
+        }
+
+    def _component_amplitude_audit(h5, C, P, sample_models=32):
+        """
+        Compare integrated LOSVD/component amplitudes with CompWeights.
+
+        The purpose is to determine whether component amplitude is already
+        encoded in ``HyperCube/models`` while the constrained solver also
+        imposes a coefficient-mass pattern proportional to ``CompWeights``.
+        """
+        models = np.asarray(h5["HyperCube/models"], dtype=np.float64)
+
+        # Expected shape is (S, C, P, F). Only use the model axis here.
+        if models.ndim != 4:
+            raise ValueError(
+                f"Expected HyperCube/models to be 4-D, got {models.shape}")
+
+        if models.shape[1] != C or models.shape[2] != P:
+            raise ValueError(
+                "HyperCube/models shape is inconsistent with C and P: "
+                f"{models.shape} vs C={C}, P={P}")
+
+        comp_weights = np.asarray(
+            h5["CompWeights"],
+            dtype=np.float64,
+        ).ravel(order="C")
+
+        if comp_weights.size != C:
+            raise ValueError(
+                f"CompWeights has size {comp_weights.size}, expected {C}")
+
+        # Integrated model amplitude per component, using the model's
+        # spectral axis. This is intentionally computed before any column
+        # normalisation or solver scaling.
+        component_amp = np.sum(
+            models,
+            axis=(0, 2, 3),
+            dtype=np.float64,
+        )
+
+        # Scale-free comparison: if component_amp tracks CompWeights,
+        # then the model construction already carries the same component
+        # weighting later imposed by the hard orbit constraint.
+        w = np.abs(comp_weights)
+        a = np.abs(component_amp)
+
+        w_ref = np.median(w[w > 0.0]) if np.any(w > 0.0) else 1.0
+        a_ref = np.median(a[a > 0.0]) if np.any(a > 0.0) else 1.0
+
+        w_norm = w / max(w_ref, 1e-300)
+        a_norm = a / max(a_ref, 1e-300)
+
+        valid = (w > 0.0) & (a > 0.0) & np.isfinite(w) & np.isfinite(a)
+
+        if np.count_nonzero(valid) >= 2:
+            logw = np.log(w[valid])
+            loga = np.log(a[valid])
+
+            corr = float(np.corrcoef(logw, loga)[0, 1])
+
+            slope, intercept = np.polyfit(logw, loga, 1)
+
+            ratio = a[valid] / w[valid]
+
+            ratio_median = float(np.median(ratio))
+            ratio_p05 = float(np.percentile(ratio, 5))
+            ratio_p95 = float(np.percentile(ratio, 95))
+        else:
+            corr = float("nan")
+            slope = float("nan")
+            intercept = float("nan")
+            ratio_median = float("nan")
+            ratio_p05 = float("nan")
+            ratio_p95 = float("nan")
+
+        # This is the quantity we particularly care about if both the model
+        # amplitude and the coefficient constraint are proportional to w.
+        effective_w2 = w_norm * w_norm
+
+        # Small diagnostic samples for readability; the full vectors remain
+        # available in the returned structure.
+        n_show = min(int(sample_models), C)
+
+        order = np.argsort(w)[::-1]
+        show_idx = order[:n_show]
+
+        component_table = []
+
+        for cc in show_idx:
+            cc = int(cc)
+            component_table.append({
+                "component": cc,
+                "comp_weight": float(comp_weights[cc]),
+                "model_integrated_amplitude": float(component_amp[cc]),
+                "model_amp_over_weight": (
+                    float(component_amp[cc] / comp_weights[cc])
+                    if comp_weights[cc] != 0.0 else None
+                ),
+                "weight_norm": float(w_norm[cc]),
+                "model_amp_norm": float(a_norm[cc]),
+                "weight_squared_norm": float(effective_w2[cc]),
+            })
+
+        return {
+            "comp_weights": comp_weights.tolist(),
+            "integrated_model_amplitude": component_amp.tolist(),
+            "weight_amp_log_correlation": corr,
+            "weight_amp_log_slope": float(slope),
+            "weight_amp_log_intercept": float(intercept),
+            "amp_over_weight_median": ratio_median,
+            "amp_over_weight_p05": ratio_p05,
+            "amp_over_weight_p95": ratio_p95,
+            "component_table": component_table,
+        }
+
+    def coarse_model_in_fine_basis_vectorised(
+        f_coarse,
+        f_fine,
+        X_coarse,
+        s_sel,
+        p_sel,
+        keep_coarse,
+        keep_fine,
+        *,
+        p_block=8,
+    ):
+        """
+        Test whether the fitted coarse-C model is representable by the
+        fine-C HyperCube using memory-bounded vectorised projections.
+
+        The calculation is vectorised over coarse/fine components and
+        wavelengths, but populations are streamed in small blocks so that
+        memory use is independent of the total number of active populations.
+
+        Parameters
+        ----------
+        f_coarse : h5py.File
+            Open coarse-C HDF5 file.
+        f_fine : h5py.File
+            Open fine-C HDF5 file.
+        X_coarse : ndarray
+            Coarse fitted coefficients with shape (C_coarse, P).
+        s_sel : ndarray
+            Sampled spaxel indices.
+        p_sel : ndarray
+            Sampled population indices.
+        keep_coarse : ndarray
+            Kept wavelength indices in the coarse run.
+        keep_fine : ndarray
+            Kept wavelength indices in the fine run.
+        p_block : int, optional
+            Number of populations processed simultaneously.
+
+        Returns
+        -------
+        dict
+            Projection and reconstruction diagnostics.
+
+        Raises
+        ------
+        ValueError
+            If the two HyperCubes are incompatible.
+
+        Examples
+        --------
+        >>> d = coarse_model_in_fine_basis_vectorised(
+        ...     f3, f20, X3, s_sel, p_sel, keep3, keep20,
+        ...     p_block=8)
+        """
+        M_coarse = f_coarse["/HyperCube/models"]
+        M_fine = f_fine["/HyperCube/models"]
+
+        _, C_coarse, P_coarse, _ = map(int, M_coarse.shape)
+        _, C_fine, P_fine, _ = map(int, M_fine.shape)
+
+        if P_coarse != P_fine:
+            raise ValueError(
+                "Coarse and fine HyperCubes have different P."
+            )
+
+        if keep_coarse.size != keep_fine.size:
+            raise ValueError(
+                "Coarse and fine wavelength masks have different sizes."
+            )
+
+        eps = np.finfo(np.float64).tiny
+
+        cosine_all = []
+        projection_scale_all = []
+        projection_error_all = []
+        prediction_cosine = []
+        prediction_rel_error = []
+        prediction_rmse = []
+
+        active_p = np.flatnonzero(
+            np.any(X_coarse > 0.0, axis=0)
+        )
+
+        p_use = np.intersect1d(
+            np.asarray(p_sel, dtype=np.int64),
+            active_p,
+            assume_unique=False,
+        )
+
+        if p_use.size == 0:
+            p_use = active_p
+
+        if p_use.size == 0:
+            return {
+                "n_spaxels": int(len(s_sel)),
+                "n_populations": 0,
+                "n_column_matches": 0,
+                "matched_column_cosine": qstats([]),
+                "projection_scale": qstats([]),
+                "column_relative_projection_error": qstats([]),
+                "prediction_cosine": qstats([]),
+                "prediction_relative_error": qstats([]),
+                "prediction_rmse": qstats([]),
+            }
+
+        p_block = max(1, int(p_block))
+
+        for ss in np.asarray(s_sel, dtype=np.int64):
+            n_lambda = int(keep_coarse.size)
+
+            y_coarse = np.zeros(
+                n_lambda,
+                dtype=np.float64,
+            )
+
+            y_projected = np.zeros(
+                n_lambda,
+                dtype=np.float64,
+            )
+
+            for p0 in range(0, p_use.size, p_block):
+                p1 = min(
+                    p0 + p_block,
+                    p_use.size,
+                )
+
+                pb = p_use[p0:p1]
+
+                # Read only a tiny population block.
+                #
+                # HDF5 arrays are normally float32. Keep them float32
+                # during the large read to halve memory traffic. The
+                # reductions below explicitly accumulate in float64
+                # where needed.
+                A_coarse = np.asarray(
+                    M_coarse[
+                        int(ss),
+                        :,
+                        pb,
+                        :,
+                    ],
+                    dtype=np.float32,
+                )
+
+                A_fine = np.asarray(
+                    M_fine[
+                        int(ss),
+                        :,
+                        pb,
+                        :,
+                    ],
+                    dtype=np.float32,
+                )
+
+                # Apply wavelength mask.
+                #
+                # These are the largest live arrays in the function.
+                A_coarse = A_coarse[
+                    ...,
+                    keep_coarse,
+                ]
+
+                A_fine = A_fine[
+                    ...,
+                    keep_fine,
+                ]
+
+                # (C, B, L) -> (B, C, L)
+                A_coarse = np.moveaxis(
+                    A_coarse,
+                    1,
+                    0,
+                )
+
+                A_fine = np.moveaxis(
+                    A_fine,
+                    1,
+                    0,
+                )
+
+                B = int(pb.size)
+
+                # Only this small object is float64:
+                #
+                #     (B, C_coarse, C_fine)
+                #
+                # For C3 -> C20 and B=8 this is only
+                # 8 * 3 * 20 * 8 = 3840 bytes.
+                dot = np.einsum(
+                    "bil,bjl->bij",
+                    A_coarse,
+                    A_fine,
+                    dtype=np.float64,
+                    optimize=True,
+                )
+
+                norm2_coarse = np.einsum(
+                    "bil,bil->bi",
+                    A_coarse,
+                    A_coarse,
+                    dtype=np.float64,
+                    optimize=True,
+                )
+
+                norm2_fine = np.einsum(
+                    "bjl,bjl->bj",
+                    A_fine,
+                    A_fine,
+                    dtype=np.float64,
+                    optimize=True,
+                )
+
+                denom = np.sqrt(
+                    norm2_coarse[:, :, None]
+                    * norm2_fine[:, None, :]
+                )
+
+                cos = np.divide(
+                    dot,
+                    denom,
+                    out=np.full_like(
+                        dot,
+                        -np.inf,
+                    ),
+                    where=denom > eps,
+                )
+
+                best_j = np.argmax(
+                    cos,
+                    axis=2,
+                )
+
+                bb = np.arange(
+                    B,
+                    dtype=np.int64,
+                )[:, None]
+
+                cc = np.arange(
+                    C_coarse,
+                    dtype=np.int64,
+                )[None, :]
+
+                best_cos = cos[
+                    bb,
+                    cc,
+                    best_j,
+                ]
+
+                best_dot = dot[
+                    bb,
+                    cc,
+                    best_j,
+                ]
+
+                best_norm2_fine = norm2_fine[
+                    bb,
+                    best_j,
+                ]
+
+                proj_scale = np.divide(
+                    best_dot,
+                    best_norm2_fine,
+                    out=np.zeros_like(best_dot),
+                    where=best_norm2_fine > eps,
+                )
+
+                np.maximum(
+                    proj_scale,
+                    0.0,
+                    out=proj_scale,
+                )
+
+                proj_resid2 = (
+                    norm2_coarse
+                    - 2.0 * proj_scale * best_dot
+                    + proj_scale**2 * best_norm2_fine
+                )
+
+                np.maximum(
+                    proj_resid2,
+                    0.0,
+                    out=proj_resid2,
+                )
+
+                proj_rel = np.sqrt(
+                    np.divide(
+                        proj_resid2,
+                        norm2_coarse,
+                        out=np.zeros_like(proj_resid2),
+                        where=norm2_coarse > eps,
+                    )
+                )
+
+                valid = (
+                    (norm2_coarse > eps)
+                    & np.isfinite(best_cos)
+                )
+
+                cosine_all.extend(
+                    best_cos[valid].tolist()
+                )
+
+                projection_scale_all.extend(
+                    proj_scale[valid].tolist()
+                )
+
+                projection_error_all.extend(
+                    proj_rel[valid].tolist()
+                )
+
+                # Coarse coefficients for this population block:
+                #
+                # X_coarse[:, pb] = (C_coarse, B)
+                # transpose       = (B, C_coarse)
+                x_block = np.asarray(
+                    X_coarse[:, pb].T,
+                    dtype=np.float64,
+                )
+
+                # Accumulate actual C3 prediction.
+                y_coarse += np.einsum(
+                    "bi,bil->l",
+                    x_block,
+                    A_coarse,
+                    dtype=np.float64,
+                    optimize=True,
+                )
+
+                # Do NOT construct:
+                #
+                #     chosen_fine =
+                #         A_fine[bb, best_j, :]
+                #
+                # because advanced indexing materialises another
+                # (B, C_coarse, L) array.
+                #
+                # C_coarse is tiny, so accumulate directly instead.
+                for ci in range(C_coarse):
+                    jj = best_j[:, ci]
+
+                    chosen = A_fine[
+                        np.arange(B),
+                        jj,
+                        :,
+                    ]
+
+                    weights = (
+                        x_block[:, ci]
+                        * proj_scale[:, ci]
+                    )
+
+                    y_projected += np.einsum(
+                        "b,bl->l",
+                        weights,
+                        chosen,
+                        dtype=np.float64,
+                        optimize=True,
+                    )
+
+                del A_coarse
+                del A_fine
+                del dot
+                del norm2_coarse
+                del norm2_fine
+                del denom
+                del cos
+
+            delta = y_projected - y_coarse
+
+            norm_coarse = float(
+                np.linalg.norm(y_coarse)
+            )
+
+            norm_projected = float(
+                np.linalg.norm(y_projected)
+            )
+
+            if (
+                norm_coarse > 0.0
+                and norm_projected > 0.0
+            ):
+                prediction_cosine.append(
+                    float(
+                        np.dot(
+                            y_coarse,
+                            y_projected,
+                        )
+                        / (
+                            norm_coarse
+                            * norm_projected
+                        )
+                    )
+                )
+
+                prediction_rel_error.append(
+                    float(
+                        np.linalg.norm(delta)
+                        / norm_coarse
+                    )
+                )
+
+                prediction_rmse.append(
+                    float(
+                        np.sqrt(
+                            np.mean(delta**2)
+                        )
+                    )
+                )
+
+        return {
+            "n_spaxels": int(len(s_sel)),
+            "n_populations": int(p_use.size),
+            "population_block": int(p_block),
+            "n_column_matches": int(len(cosine_all)),
+            "matched_column_cosine": qstats(
+                cosine_all
+            ),
+            "projection_scale": qstats(
+                projection_scale_all
+            ),
+            "column_relative_projection_error": qstats(
+                projection_error_all
+            ),
+            "prediction_cosine": qstats(
+                prediction_cosine
+            ),
+            "prediction_relative_error": qstats(
+                prediction_rel_error
+            ),
+            "prediction_rmse": qstats(
+                prediction_rmse
+            ),
+        }
+    def run_one(path):
+        path = str(path)
+
+        with open_h5(
+            path,
+            role="reader",
+        ) as f:
+            for key in required:
+                if key not in f:
+                    raise RuntimeError(
+                        f"{path} is missing {key}."
+                    )
+
+            DC = f["/DataCube"]
+            H = f["/LOSVD"]
+            M = f["/HyperCube/models"]
+
+            E = np.asarray(
+                f["/HyperCube/col_energy"][...],
+                dtype=np.float64,
+            )
+
+            X = np.asarray(
+                f["/X_global"][...],
+                dtype=np.float64,
+            )
+
+            obs = np.asarray(
+                f["/ObsPix"][...],
+                dtype=np.float64,
+            )
+
+            tem = np.asarray(
+                f["/TemPix"][...],
+                dtype=np.float64,
+            )
+
+            vel = np.asarray(
+                f["/VelPix"][...],
+                dtype=np.float64,
+            )
+
+            S, L = map(
+                int,
+                DC.shape,
+            )
+
+            Sl, V, C = map(
+                int,
+                H.shape,
+            )
+
+            Sm, Cm, P, Lm = map(
+                int,
+                M.shape,
+            )
+
+            PT, T = map(
+                int,
+                f["/Templates"].shape,
+            )
+
+            if (
+                Sl != S
+                or Sm != S
+                or Cm != C
+                or Lm != L
+            ):
+                raise ValueError(
+                    f"Inconsistent HDF5 dimensions in {path}."
+                )
+
+            if (
+                PT != P
+                or E.shape != (C, P)
+            ):
+                raise ValueError(
+                    f"Population/energy shape mismatch in {path}."
+                )
+
+            if X.ndim == 1:
+                if X.size != C * P:
+                    raise ValueError(
+                        "X_global has the wrong size."
+                    )
+
+                X = X.reshape(
+                    C,
+                    P,
+                    order="C",
+                )
+
+            elif X.shape != (C, P):
+                raise ValueError(
+                    "X_global must have shape (C,P)."
+                )
+
+            if (
+                obs.size != L
+                or tem.size != T
+                or vel.size != V
+            ):
+                raise ValueError(
+                    f"Grid lengths are inconsistent in {path}."
+                )
+
+            keep_idx = get_mask(
+                f,
+                L,
+            )
+
+            g = f["/HyperCube"]
+            ng = f.get(
+                "/HyperCube/norm",
+                None,
+            )
+
+            norm_mode = str(
+                g.attrs.get(
+                    "norm.mode",
+                    "model",
+                )
+            ).lower()
+
+            amp_mode = str(
+                g.attrs.get(
+                    "losvd_amplitude_mode",
+                    "sum",
+                )
+            ).lower()
+
+            weighted_E = bool(
+                f["/HyperCube/col_energy"].attrs.get(
+                    "lambda_weights",
+                    False,
+                )
+            )
+
+            masked_E = bool(
+                f["/HyperCube/col_energy"].attrs.get(
+                    "masked",
+                    False,
+                )
+            )
+
+            global_scale = np.nan
+
+            if (
+                ng is not None
+                and "global_scale" in ng.attrs
+            ):
+                global_scale = float(
+                    ng.attrs["global_scale"]
+                )
+
+            reg = np.nan
+
+            for name in (
+                "regularisation_scale",
+                "scientific_regularisation",
+            ):
+                if name in g.attrs:
+                    try:
+                        reg = float(
+                            g.attrs[name]
+                        )
+                    except Exception:
+                        pass
+
+                    if np.isfinite(reg):
+                        break
+
+            if (
+                ng is not None
+                and "losvd_amp" in ng
+            ):
+                A = np.asarray(
+                    ng["losvd_amp"][...],
+                    dtype=np.float64,
+                )
+                amp_source = "stored"
+            else:
+                A = losvd_amplitudes(
+                    f,
+                    amp_mode,
+                )
+                amp_source = "recomputed"
+
+            if not np.all(np.isfinite(A)):
+                raise ValueError(
+                    f"Non-finite LOSVD amplitudes in {path}."
+                )
+
+            rng = np.random.default_rng(
+                int(seed)
+            )
+
+            ns = min(
+                S,
+                max(
+                    1,
+                    int(sample_spaxels),
+                ),
+            )
+
+            s_sel = np.unique(
+                np.linspace(
+                    0,
+                    S - 1,
+                    ns,
+                    dtype=np.int64,
+                )
+            )
+
+            npop = min(
+                P,
+                max(
+                    1,
+                    int(sample_pops),
+                ),
+            )
+
+            if npop >= P:
+                p_sel = np.arange(
+                    P,
+                    dtype=np.int64,
+                )
+            else:
+                e_pop = np.nanmedian(
+                    np.maximum(
+                        E,
+                        0.0,
+                    ),
+                    axis=0,
+                )
+
+                order = np.argsort(
+                    e_pop
+                )[::-1]
+
+                nh = max(
+                    1,
+                    npop // 2,
+                )
+
+                head = order[:nh]
+                tail = order[nh:]
+                nt = npop - head.size
+
+                if (
+                    nt > 0
+                    and tail.size > 0
+                ):
+                    tail = rng.choice(
+                        tail,
+                        size=min(
+                            nt,
+                            tail.size,
+                        ),
+                        replace=False,
+                    )
+
+                    p_sel = np.unique(
+                        np.concatenate(
+                            (
+                                head,
+                                tail,
+                            )
+                        )
+                    )
+                else:
+                    p_sel = np.asarray(
+                        head,
+                        dtype=np.int64,
+                    )
+
+                p_sel.sort()
+
+            pos_E = E[
+                np.isfinite(E)
+                & (E > 0.0)
+            ]
+
+            x_flat = X.ravel()
+
+            pos_x = x_flat[
+                x_flat > 0.0
+            ]
+
+            A_pos = A[
+                np.isfinite(A)
+                & (A > 0.0)
+            ]
+
+            n_tiles = (
+                int(
+                    np.ceil(
+                        S / float(M.chunks[0])
+                    )
+                )
+                if M.chunks
+                else S
+            )
+
+            solver_E_exact = not weighted_E
+
+            if solver_E_exact:
+                E_avg = (
+                    E / float(
+                        max(
+                            1,
+                            n_tiles,
+                        )
+                    )
+                )
+
+                S_vec = (
+                    1.0
+                    / np.sqrt(
+                        E_avg[
+                            E_avg > 0.0
+                        ]
+                    )
+                )
+
+                z_equiv = (
+                    X
+                    * np.sqrt(
+                        np.maximum(
+                            E_avg,
+                            0.0,
+                        )
+                    )
+                )
+
+                z_pos = z_equiv.ravel()[
+                    x_flat > 0.0
+                ]
+
+                x_sqrtE = (
+                    x_flat[x_flat > 0.0]
+                    * np.sqrt(
+                        np.maximum(
+                            E.ravel()[
+                                x_flat > 0.0
+                            ],
+                            0.0,
+                        )
+                    )
+                )
+            else:
+                S_vec = np.array(
+                    [],
+                    dtype=np.float64,
+                )
+
+                z_pos = np.array(
+                    [],
+                    dtype=np.float64,
+                )
+
+                x_sqrtE = np.array(
+                    [],
+                    dtype=np.float64,
+                )
+
+            dE = data_energy(
+                f,
+                keep_idx,
+                weighted_E,
+            )
+
+            model_E = float(
+                np.sum(E)
+            )
+
+            implied_scale = (
+                float(
+                    np.sqrt(
+                        dE / model_E
+                    )
+                )
+                if (
+                    np.isfinite(dE)
+                    and model_E > 0.0
+                )
+                else np.nan
+            )
+
+            data_s, pred_s = sample_prediction(
+                f,
+                X,
+                s_sel,
+                keep_idx,
+            )
+
+            res_s = (
+                data_s - pred_s
+            )
+
+            data_norm = float(
+                np.linalg.norm(
+                    data_s
+                )
+            )
+
+            pred_norm = float(
+                np.linalg.norm(
+                    pred_s
+                )
+            )
+
+            res_norm = float(
+                np.linalg.norm(
+                    res_s
+                )
+            )
+
+            fit_rmse = (
+                float(
+                    np.sqrt(
+                        np.mean(
+                            res_s * res_s
+                        )
+                    )
+                )
+                if res_s.size
+                else np.nan
+            )
+
+            col = model_columns(
+                f,
+                A,
+                E,
+                keep_idx,
+                s_sel,
+                p_sel,
+            )
+
+            component_amp_audit = None
+
+            if "/CompWeights" in f:
+                component_amp_audit = _component_amplitude_audit(
+                    f,
+                    C,
+                    P,
+                )
+
+            mean_v = []
+            sigma_v = []
+
+            for s in s_sel:
+                hs = np.maximum(
+                    np.asarray(
+                        H[int(s), :, :],
+                        np.float64,
+                    ),
+                    0.0,
+                )
+
+                for c in range(C):
+                    h = hs[:, c]
+
+                    if amp_mode == "trapz":
+                        try:
+                            den = float(
+                                np.trapezoid(
+                                    h,
+                                    vel,
+                                )
+                            )
+
+                            mu = float(
+                                np.trapezoid(
+                                    h * vel,
+                                    vel,
+                                ) / den
+                            )
+
+                            var = float(
+                                np.trapezoid(
+                                    h * (
+                                        vel - mu
+                                    ) ** 2,
+                                    vel,
+                                ) / den
+                            )
+                        except AttributeError:
+                            den = float(
+                                np.trapz(
+                                    h,
+                                    vel,
+                                )
+                            )
+
+                            mu = float(
+                                np.trapz(
+                                    h * vel,
+                                    vel,
+                                ) / den
+                            )
+
+                            var = float(
+                                np.trapz(
+                                    h * (
+                                        vel - mu
+                                    ) ** 2,
+                                    vel,
+                                ) / den
+                            )
+                    else:
+                        den = float(
+                            np.sum(h)
+                        )
+
+                        mu = (
+                            float(
+                                np.sum(
+                                    h * vel
+                                ) / den
+                            )
+                            if den > 0.0
+                            else np.nan
+                        )
+
+                        var = (
+                            float(
+                                np.sum(
+                                    h
+                                    * (
+                                        vel - mu
+                                    ) ** 2
+                                )
+                                / den
+                            )
+                            if den > 0.0
+                            else np.nan
+                        )
+
+                    if den > 0.0:
+                        mean_v.append(mu)
+                        sigma_v.append(
+                            np.sqrt(
+                                max(
+                                    var,
+                                    0.0,
+                                )
+                            )
+                        )
+
+            out = {
+                "path": path,
+                "dims": {
+                    "S": S,
+                    "V": V,
+                    "C": C,
+                    "P": P,
+                    "L": L,
+                    "T": T,
+                    "solver_n_tiles": n_tiles,
+                },
+                "metadata": {
+                    "norm_mode": norm_mode,
+                    "losvd_amplitude_mode": amp_mode,
+                    "amp_source": amp_source,
+                    "col_energy_masked": masked_E,
+                    "col_energy_lambda_weighted": weighted_E,
+                    "global_scale": global_scale,
+                    "regularisation_scale": reg,
+                },
+                "losvd": {
+                    "amplitude_stats": qstats(A_pos),
+                    "total_amplitude": float(
+                        np.sum(A)
+                    ),
+                    "component_total_amplitude": (
+                        np.sum(
+                            A,
+                            axis=0,
+                        ).tolist()
+                    ),
+                    "component_fraction": (
+                        np.sum(
+                            A,
+                            axis=0,
+                        )
+                        / max(
+                            float(np.sum(A)),
+                            1e-300,
+                        )
+                    ).tolist(),
+                    "sample_mean_velocity_kms": qstats(
+                        mean_v
+                    ),
+                    "sample_sigma_kms": qstats(
+                        sigma_v
+                    ),
+                },
+                "column_energy": {
+                    "global_stats": qstats(
+                        pos_E
+                    ),
+                    "sum": model_E,
+                    "median_by_component": (
+                        np.nanmedian(
+                            E,
+                            axis=1,
+                        ).tolist()
+                    ),
+                    "median_by_population": (
+                        np.nanmedian(
+                            E,
+                            axis=0,
+                        ).tolist()
+                    ),
+                    "solver_S_stats": qstats(
+                        S_vec
+                    ),
+                    "solver_energy_exact_from_stored": (
+                        solver_E_exact
+                    ),
+                },
+                "solution": {
+                    "sum": float(
+                        np.sum(X)
+                    ),
+                    "norm": float(
+                        np.linalg.norm(X)
+                    ),
+                    "max": float(
+                        np.max(X)
+                    ),
+                    "nnz": int(
+                        np.count_nonzero(
+                            X > 0.0
+                        )
+                    ),
+                    "size": int(
+                        X.size
+                    ),
+                    "nnz_fraction": float(
+                        np.count_nonzero(
+                            X > 0.0
+                        ) / max(
+                            1,
+                            X.size,
+                        )
+                    ),
+                    "x_positive_stats": qstats(
+                        pos_x
+                    ),
+                    "x_sqrtE_stats": qstats(
+                        x_sqrtE
+                    ),
+                    "z_equiv_stats": qstats(
+                        z_pos
+                    ),
+                },
+                "energy_scale": {
+                    "data_energy": dE,
+                    "model_energy": model_E,
+                    "implied_global_scale": implied_scale,
+                    "stored_global_scale": global_scale,
+                    "stored_over_implied": ratio(
+                        global_scale,
+                        implied_scale,
+                    ),
+                },
+                "fit_sample": {
+                    "spaxels": s_sel.tolist(),
+                    "data_norm": data_norm,
+                    "model_norm": pred_norm,
+                    "residual_norm": res_norm,
+                    "relative_residual_norm": ratio(
+                        res_norm,
+                        data_norm,
+                    ),
+                    "rmse": fit_rmse,
+                    "model_to_data_norm": ratio(
+                        pred_norm,
+                        data_norm,
+                    ),
+                },
+                "sample_column_check": {
+                    key: value
+                    for key, value in col.items()
+                    if key != "shape_vectors"
+                },
+                "sample_selection": {
+                    "spaxels": s_sel.tolist(),
+                    "populations": p_sel.tolist(),
+                },
+                "component_amplitude_audit": component_amp_audit,
+                "_shape_vectors": col[
+                    "shape_vectors"
+                ],
+            }
+
+            if "/CompWeights" in f:
+                w = np.asarray(
+                    f["/CompWeights"][...],
+                    dtype=np.float64,
+                ).ravel()
+
+                out["orbit_weights"] = {
+                    "size": int(
+                        w.size
+                    ),
+                    "positive": int(
+                        np.count_nonzero(
+                            w > 0.0
+                        )
+                    ),
+                    "sum": float(
+                        np.sum(
+                            np.maximum(
+                                w,
+                                0.0,
+                            )
+                        )
+                    ),
+                    "stats": qstats(
+                        w[w > 0.0]
+                    ),
+                }
+            else:
+                out["orbit_weights"] = None
+
+            return out
+
+    r3 = run_one(h5_c3)
+
+    result = {
+        "runs": {
+            "c3": r3,
+        }
+    }
+
+    if h5_c20 is None:
+        result["comparison"] = None
+
+        if verbose:
+            print(
+                "=== HyperCube diagnostic ==="
+            )
+
+            print(
+                f"C3: C={r3['dims']['C']} "
+                f"P={r3['dims']['P']}"
+            )
+
+            print(
+                "  fit RMSE = "
+                f"{r3['fit_sample']['rmse']:.4e}; "
+                "relative residual = "
+                f"{r3['fit_sample']['relative_residual_norm']:.4e}"
+            )
+
+            print(
+                "  x median = "
+                f"{r3['solution']['x_positive_stats']['median']:.4e}; "
+                "x*sqrt(E) median = "
+                f"{r3['solution']['x_sqrtE_stats']['median']:.4e}"
+            )
+
+        return result
+
+    r20 = run_one(h5_c20)
+    result["runs"]["c20"] = r20
+
+    with open_h5(
+        str(h5_c3),
+        role="reader",
+    ) as f3, open_h5(
+        str(h5_c20),
+        role="reader",
+    ) as f20:
+        static = {}
+
+        for name in (
+            "/ObsPix",
+            "/TemPix",
+            "/VelPix",
+        ):
+            a = np.asarray(
+                f3[name][...],
+                dtype=np.float64,
+            )
+
+            b = np.asarray(
+                f20[name][...],
+                dtype=np.float64,
+            )
+
+            if a.shape != b.shape:
+                static[name] = {
+                    "same_shape": False,
+                    "max_abs": np.nan,
+                    "max_rel": np.nan,
+                }
+            else:
+                d = np.abs(
+                    a - b
+                )
+
+                static[name] = {
+                    "same_shape": True,
+                    "max_abs": float(
+                        np.max(d)
+                    ),
+                    "max_rel": float(
+                        np.max(
+                            d / np.maximum(
+                                np.maximum(
+                                    np.abs(a),
+                                    np.abs(b),
+                                ),
+                                1e-300,
+                            )
+                        )
+                    ),
+                }
+
+        m3 = (
+            np.asarray(
+                f3["/Mask"][...],
+                bool,
+            )
+            if "/Mask" in f3
+            else None
+        )
+
+        m20 = (
+            np.asarray(
+                f20["/Mask"][...],
+                bool,
+            )
+            if "/Mask" in f20
+            else None
+        )
+
+        static["/Mask"] = {
+            "equal": bool(
+                np.array_equal(
+                    m3,
+                    m20,
+                )
+                if m3 is not None
+                and m20 is not None
+                else (
+                    m3 is None
+                    and m20 is None
+                )
+            ),
+            "both_present": (
+                m3 is not None
+                and m20 is not None
+            ),
+        }
+
+        keep3 = get_mask(
+            f3,
+            r3["dims"]["L"],
+        )
+
+        keep20 = get_mask(
+            f20,
+            r20["dims"]["L"],
+        )
+
+        if np.array_equal(
+            keep3,
+            keep20,
+        ):
+            dc3 = f3["/DataCube"]
+            dc20 = f20["/DataCube"]
+
+            max_abs = 0.0
+            max_rel = 0.0
+
+            if dc3.shape == dc20.shape:
+                for s0 in range(
+                    0,
+                    int(dc3.shape[0]),
+                    128,
+                ):
+                    s1 = min(
+                        int(dc3.shape[0]),
+                        s0 + 128,
+                    )
+
+                    a = np.asarray(
+                        dc3[s0:s1],
+                        np.float64,
+                    )[:, keep3]
+
+                    b = np.asarray(
+                        dc20[s0:s1],
+                        np.float64,
+                    )[:, keep20]
+
+                    d = np.abs(
+                        a - b
+                    )
+
+                    max_abs = max(
+                        max_abs,
+                        float(np.max(d)),
+                    )
+
+                    max_rel = max(
+                        max_rel,
+                        float(
+                            np.max(
+                                d / np.maximum(
+                                    np.maximum(
+                                        np.abs(a),
+                                        np.abs(b),
+                                    ),
+                                    1e-300,
+                                )
+                            )
+                        ),
+                    )
+
+                static["/DataCube"] = {
+                    "same_shape": True,
+                    "max_abs": max_abs,
+                    "max_rel": max_rel,
+                }
+            else:
+                static["/DataCube"] = {
+                    "same_shape": False,
+                    "max_abs": np.nan,
+                    "max_rel": np.nan,
+                }
+        else:
+            static["/DataCube"] = {
+                "same_fit_mask": False,
+                "max_abs": np.nan,
+                "max_rel": np.nan,
+            }
+
+        losvd_cmp = summed_losvd_compare(
+            f3,
+            f20,
+        )
+
+        s_sel = np.asarray(
+            r3["sample_selection"]["spaxels"],
+            dtype=np.int64,
+        )
+
+        p_sel = np.asarray(
+            r3["sample_selection"]["populations"],
+            dtype=np.int64,
+        )
+
+        M3 = f3["/HyperCube/models"]
+        M20 = f20["/HyperCube/models"]
+
+        pair_cos = []
+        near_3 = []
+        near_20 = []
+
+        for s in s_sel:
+            a = np.asarray(
+                M3[int(s), :, p_sel, :],
+                dtype=np.float64,
+            )
+
+            b = np.asarray(
+                M20[int(s), :, p_sel, :],
+                dtype=np.float64,
+            )
+
+            a = a[:, :, keep3]
+            b = b[:, :, keep20]
+
+            a /= np.maximum(
+                np.linalg.norm(
+                    a,
+                    axis=2,
+                    keepdims=True,
+                ),
+                1e-300,
+            )
+
+            b /= np.maximum(
+                np.linalg.norm(
+                    b,
+                    axis=2,
+                    keepdims=True,
+                ),
+                1e-300,
+            )
+
+            for j in range(
+                p_sel.size
+            ):
+                cc = (
+                    a[:, j, :]
+                    @ b[:, j, :].T
+                )
+
+                pair_cos.extend(
+                    cc.ravel().tolist()
+                )
+
+                near_3.extend(
+                    np.max(
+                        cc,
+                        axis=1,
+                    ).tolist()
+                )
+
+                near_20.extend(
+                    np.max(
+                        cc,
+                        axis=0,
+                    ).tolist()
+                )
+
+    with open_h5(
+        str(h5_c3),
+        role="reader",
+    ) as f3, open_h5(
+        str(h5_c20),
+        role="reader",
+    ) as f20:
+        X3 = np.asarray(
+            f3["/X_global"][...],
+            dtype=np.float64,
+        )
+
+        X20 = np.asarray(
+            f20["/X_global"][...],
+            dtype=np.float64,
+        )
+
+        if X3.ndim == 1:
+            X3 = X3.reshape(
+                r3["dims"]["C"],
+                r3["dims"]["P"],
+            )
+
+        if X20.ndim == 1:
+            X20 = X20.reshape(
+                r20["dims"]["C"],
+                r20["dims"]["P"],
+            )
+
+        keep3 = get_mask(
+            f3,
+            r3["dims"]["L"],
+        )
+
+        keep20 = get_mask(
+            f20,
+            r20["dims"]["L"],
+        )
+
+        coarse_in_fine = coarse_model_in_fine_basis_vectorised(
+            f3,
+            f20,
+            X3,
+            s_sel,
+            p_sel,
+            keep3,
+            keep20,
+            p_block=4,
+        )
+        p3 = []
+        p20 = []
+
+        for s in s_sel:
+            A3 = np.asarray(
+                f3["/HyperCube/models"][int(s)],
+                dtype=np.float64,
+            )
+
+            A20 = np.asarray(
+                f20["/HyperCube/models"][int(s)],
+                dtype=np.float64,
+            )
+
+            p3.append(
+                np.tensordot(
+                    A3[:, :, keep3],
+                    X3,
+                    axes=([0, 1], [0, 1]),
+                )
+            )
+
+            p20.append(
+                np.tensordot(
+                    A20[:, :, keep20],
+                    X20,
+                    axes=([0, 1], [0, 1]),
+                )
+            )
+
+    p3 = np.asarray(
+        p3,
+        dtype=np.float64,
+    )
+
+    p20 = np.asarray(
+        p20,
+        dtype=np.float64,
+    )
+
+    dp = p20 - p3
+
+    comparison = {
+        "static_inputs": static,
+        "summed_losvd": losvd_cmp,
+        "solution_scale": {
+            "x_sum_ratio_20_over_3": ratio(
+                r20["solution"]["sum"],
+                r3["solution"]["sum"],
+            ),
+            "x_norm_ratio_20_over_3": ratio(
+                r20["solution"]["norm"],
+                r3["solution"]["norm"],
+            ),
+            "x_max_ratio_20_over_3": ratio(
+                r20["solution"]["max"],
+                r3["solution"]["max"],
+            ),
+            "x_sqrtE_median_ratio_20_over_3": ratio(
+                r20["solution"]["x_sqrtE_stats"][
+                    "median"
+                ],
+                r3["solution"]["x_sqrtE_stats"][
+                    "median"
+                ],
+            ),
+            "z_equiv_median_ratio_20_over_3": ratio(
+                r20["solution"]["z_equiv_stats"][
+                    "median"
+                ],
+                r3["solution"]["z_equiv_stats"][
+                    "median"
+                ],
+            ),
+        },
+        "column_scaling": {
+            "column_energy_median_ratio_20_over_3": ratio(
+                r20["column_energy"]["global_stats"][
+                    "median"
+                ],
+                r3["column_energy"]["global_stats"][
+                    "median"
+                ],
+            ),
+            "solver_S_median_ratio_20_over_3": ratio(
+                r20["column_energy"]["solver_S_stats"][
+                    "median"
+                ],
+                r3["column_energy"]["solver_S_stats"][
+                    "median"
+                ],
+            ),
+            "model_energy_ratio_20_over_3": ratio(
+                r20["energy_scale"]["model_energy"],
+                r3["energy_scale"]["model_energy"],
+            ),
+        },
+        "fit_difference": {
+            "fit_rmse_c3": r3["fit_sample"]["rmse"],
+            "fit_rmse_c20": r20["fit_sample"]["rmse"],
+            "fit_rmse_ratio_20_over_3": ratio(
+                r20["fit_sample"]["rmse"],
+                r3["fit_sample"]["rmse"],
+            ),
+            "relative_residual_c3": r3[
+                "fit_sample"
+            ]["relative_residual_norm"],
+            "relative_residual_c20": r20[
+                "fit_sample"
+            ]["relative_residual_norm"],
+            "sampled_prediction_cosine": cosine(
+                p3,
+                p20,
+            ),
+            "sampled_prediction_relative_difference": ratio(
+                float(
+                    np.linalg.norm(dp)
+                ),
+                float(
+                    np.linalg.norm(p3)
+                ),
+            ),
+        },
+        "column_shape_similarity": {
+            "all_pair_cosine": qstats(
+                pair_cos
+            ),
+            "nearest_c3_to_c20": qstats(
+                near_3
+            ),
+            "nearest_c20_to_c3": qstats(
+                near_20
+            ),
+        },
+        "coarse_in_fine_basis": coarse_in_fine,
+        "global_scale": {
+            "implied_c3": r3[
+                "energy_scale"
+            ]["implied_global_scale"],
+            "implied_c20": r20[
+                "energy_scale"
+            ]["implied_global_scale"],
+            "implied_ratio_20_over_3": ratio(
+                r20[
+                    "energy_scale"
+                ]["implied_global_scale"],
+                r3[
+                    "energy_scale"
+                ]["implied_global_scale"],
+            ),
+            "stored_c3": r3[
+                "energy_scale"
+            ]["stored_global_scale"],
+            "stored_c20": r20[
+                "energy_scale"
+            ]["stored_global_scale"],
+        },
+        "regularisation": {
+            "c3": r3[
+                "metadata"
+            ]["regularisation_scale"],
+            "c20": r20[
+                "metadata"
+            ]["regularisation_scale"],
+        },
+    }
+
+    result["comparison"] = comparison
+
+    r3.pop(
+        "_shape_vectors",
+        None,
+    )
+
+    r20.pop(
+        "_shape_vectors",
+        None,
+    )
+
+    if verbose:
+        print(
+            "=== HyperCube scaling diagnostic ==="
+        )
+
+        for label, rr in (
+            ("C3", r3),
+            ("C20", r20),
+        ):
+            print(
+                f"{label}: "
+                f"C={rr['dims']['C']} "
+                f"P={rr['dims']['P']} "
+                f"norm={rr['metadata']['norm_mode']} "
+                f"amp={rr['metadata']['losvd_amplitude_mode']}"
+            )
+
+            print(
+                "  x sum/norm/max = "
+                f"{rr['solution']['sum']:.4e} / "
+                f"{rr['solution']['norm']:.4e} / "
+                f"{rr['solution']['max']:.4e}"
+            )
+
+            print(
+                "  x*sqrt(E) median = "
+                f"{rr['solution']['x_sqrtE_stats']['median']:.4e}; "
+                "solver S median = "
+                f"{rr['column_energy']['solver_S_stats']['median']:.4e}"
+            )
+
+            print(
+                "  fit RMSE = "
+                f"{rr['fit_sample']['rmse']:.4e}; "
+                "relative residual = "
+                f"{rr['fit_sample']['relative_residual_norm']:.4e}"
+            )
+
+            print(
+                "  implied global scale = "
+                f"{rr['energy_scale']['implied_global_scale']:.4e}"
+            )
+
+        print(
+            "--- C20 / C3 ---"
+        )
+
+        for key, value in comparison[
+            "solution_scale"
+        ].items():
+            print(
+                f"  {key} = {value:.4e}"
+            )
+
+        print(
+            "  summed-LOSVD max relative difference = "
+            f"{comparison['summed_losvd']['max_rel']:.4e}"
+        )
+
+        print(
+            "  fit RMSE ratio 20/3 = "
+            f"{comparison['fit_difference']['fit_rmse_ratio_20_over_3']:.4e}"
+        )
+
+        shape_med = comparison[
+            "column_shape_similarity"
+        ][
+            "nearest_c3_to_c20"
+        ]["median"]
+
+        print(
+            "  nearest C3->C20 column cosine median = "
+            f"{shape_med:.4e}"
+        )
+
+        cf = comparison["coarse_in_fine_basis"]
+
+        print(
+            "  C3 -> C20 projected column cosine median = "
+            f"{cf['matched_column_cosine']['median']:.6e}"
+        )
+
+        print(
+            "  C3 -> C20 column projection error median = "
+            f"{cf['column_relative_projection_error']['median']:.6e}"
+        )
+
+        print(
+            "  C3 fit represented in C20 basis: "
+            "prediction cosine median = "
+            f"{cf['prediction_cosine']['median']:.6e}"
+        )
+
+        print(
+            "  C3 fit represented in C20 basis: "
+            "relative error median = "
+            f"{cf['prediction_relative_error']['median']:.6e}"
+        )
+
+        for label, rr in (
+            ("C3", r3),
+            ("C20", r20),
+        ):
+            audit = rr[
+                "component_amplitude_audit"
+            ]
+
+            if audit is None:
+                continue
+
+            print(
+                f"  {label} model amplitude vs CompWeights:"
+            )
+
+            print(
+                "    log correlation / slope = "
+                f"{audit['weight_amp_log_correlation']:.6f} / "
+                f"{audit['weight_amp_log_slope']:.6f}"
+            )
+    return result
+
+# ------------------------------------------------------------------------------

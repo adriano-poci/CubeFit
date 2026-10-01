@@ -96,6 +96,12 @@ v1.29:  Pull `validationPath`, `validationDataset`, and `validationTag` from
             kwargs in order to load a synthetic validation cube in `genCubeFit`;
         Added `bias` keyword to `genCubeFit` to control whether the velocity bias
             is estimated before the hypercube construction. 29 September 2026
+v1.30:  Added `orbitWeights` kwarg to toggle whether the orbit weights are used
+            as constraints in `genCubeFit`;
+        Switched to using `pipeline_runner.PipelineRunner.build_hypercube` for 
+            internal consistency;
+        Pass parallelism to `pipeline_runner.PipelineRunner.build_hypercube`. 1
+            October 2026
 """
 
 # need to set up the logger before any other imports
@@ -610,12 +616,24 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             spmask[(spLL>=np.log(pair[0])) & (spLL<=np.log(pair[1]))] = False
     logger.log('Done.', flush=True)
 
+
+    Ncpu, Nblas = kwargs.pop('cpu_processes', CPU_PROCESSES), \
+        kwargs.pop('blas_threads', BLAS_THREADS)
+    best_processes, best_blas = cu.resolve_parallelism(Ncpu, Nblas)
+
+
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
     hdf5Path = (hdf5Dir/(f"hypercube_{nComp:{pred}d}_{lOrder:02d}" + 
         (f"_{validationTag}" if validationTag is not None else ""))
         ).with_suffix('.h5')
+    
+    # Control runner
+    runner = PipelineRunner(hdf5Path)
+    
+    if not kwargs.pop('orbitWeights', False):
+        cWeights = None
 
     # --- Initialize and load data ---
     mgr = H5Manager(hdf5Path)
@@ -663,13 +681,12 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     
     logger.log(f"[CubeFit] Building /HyperCube in {hdf5Path}...")
     with logger.capture_all_output():
-        build_hypercube(hdf5Path,
-            norm_mode="model", # choose "model" or "data"
+        runner.build_hypercube(vel_bias_kms=biasVel, norm_mode="model",
+            # choose "model" or "data"
             # "model" preserves relative contribution to both spaxel and
             # components
-            amp_mode="sum", # "sum" or "trapz"
-            S_chunk=nS, C_chunk=nC, P_chunk=nP,
-            vel_bias_kms=biasVel)
+            amp_mode="sum", S_chunk=nS, C_chunk=nC, P_chunk=nP,
+            processes=best_processes, blas_threads=best_blas)
     # even if runSwitch is fit only, we want to ensure the HyperCube
     # is built, so we don't return early here.
     # Should be zero-cost if already built
@@ -687,12 +704,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         logger.log(f"[CubeFit] runSwitch={runSwitch} is not understood; "
             "exiting.")
         raise RuntimeError("Invalid runSwitch")
-    # --- 4) Run the global Kaczmarz fit (tiled; RAM-bounded) ---
-    runner = PipelineRunner(hdf5Path)
-
-    Ncpu, Nblas = kwargs.pop('cpu_processes', CPU_PROCESSES), \
-        kwargs.pop('blas_threads', BLAS_THREADS)
-    best_processes, best_blas = cu.resolve_parallelism(Ncpu, Nblas)
 
 
     if 'upscale' in warm_start:

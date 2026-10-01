@@ -78,6 +78,8 @@ v1.24:  Replaced legacy `seed` warm-starting with explicit `saved_x` in
             `PipelineRunner.solve_all_mp_batched`. 7 September 2026
 v1.25:  Added adjustable `regularisation_scale` throughout the solver pathway.
             10 September 2026
+v1.26:  Cleaned `build_hypercube` for use by passing through all `kwargs`. 1
+            October 2026
 """
 
 from __future__ import annotations
@@ -188,13 +190,8 @@ class PipelineRunner:
             nSpat=self.nSpat, nLSpec=self.nLSpec, nTSpec=int(self.nTSpec or 0),
             nVel=self.nVel, nComp=self.nComp, nPop=self.nPop
         ))
-
-    def build_hypercube(self, *, S=16, C=1, P=256, galaxy=None, check="auto",
-                        extra_manifest=None) -> None:
-        nS, nC, nP = 128, 1, 360
-        build_hypercube(
-            self.h5_path, S_chunk=nS, C_chunk=nC, P_chunk=nP,
-        )
+    def build_hypercube(self, **kwargs) -> None:
+        build_hypercube(self.h5_path, **kwargs)
 
         with open_h5(self.h5_path, "reader") as f:
             self.has_models = ("/HyperCube/models" in f)
@@ -294,9 +291,7 @@ class PipelineRunner:
         except Exception:
             return None, None
 
-    def _read_saved_x(
-        self,
-        N_expected: int,
+    def _read_saved_x(self, N_expected: int,
     ) -> tuple[np.ndarray | None, str | None, str | None]:
         """
         Read the newest saved physical solution without solver state.

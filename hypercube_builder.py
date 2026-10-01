@@ -29,6 +29,7 @@ v1.3:   Improved speed of `col_energy` computation, switching from `einsum` to
 v1.4:   Compute and apply a global scale to the Hypercube model to improve
             numerical stability during fitting. 8 January 2026
 v1.5:   Universally removed all ad-hoc scalings. 26 January 2026
+v1.7:   Added parallelism to `build_hypercube`. 1 October 2026
 
 
 Hypercube builder (LOSVD convolution in log-λ, then rebin to observed grid)
@@ -901,8 +902,13 @@ _HC_n_fft = None
 _HC_T = None
 _HC_phase_shift = None
 
-def _init_hypercube_worker(T_fft, R_T, km, n_fft, T, phase_shift):
+def _init_hypercube_worker(T_fft, R_T, km, n_fft, T, phase_shift,
+    blas_threads):
     """Initialize read-only arrays used by HyperCube worker processes."""
+    os.environ["OMP_NUM_THREADS"] = str(blas_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
+    os.environ["MKL_NUM_THREADS"] = str(blas_threads)
+
     global _HC_T_fft, _HC_R_T, _HC_km, _HC_n_fft, _HC_T, _HC_phase_shift
     _HC_T_fft = T_fft
     _HC_R_T = R_T
@@ -912,17 +918,30 @@ def _init_hypercube_worker(T_fft, R_T, km, n_fft, T, phase_shift):
     _HC_phase_shift = phase_shift
 
 def _hypercube_worker(args):
-    """Compute one ``(s, c, P-block)`` HyperCube slab."""
-    s_idx, c_idx, p0, p1, H_native, scale = args
-    conv_td = _fft_conv_centered(_HC_T_fft[p0:p1, :], H_native, _HC_km,
-        _HC_n_fft, _HC_T, phase_shift=_HC_phase_shift)
-    Ycp = conv_td @ _HC_R_T
-    np.maximum(Ycp, 0.0, out=Ycp)
-    if scale != 0.0:
-        Ycp *= np.float32(scale)
-    else:
-        Ycp.fill(0.0)
-    return s_idx, c_idx, p0, p1, Ycp
+    """Compute one ``(s-tile,c-tile,P-block)`` HyperCube slab."""
+    s0, s1, c0, c1, p0, p1, H_native, scales = args
+
+    out = []
+
+    for i, s_idx in enumerate(range(s0, s1)):
+        for j, c_idx in enumerate(range(c0, c1)):
+            H = H_native[i, j]
+
+            conv_td = _fft_conv_centered(_HC_T_fft[p0:p1, :], H,
+                _HC_km, _HC_n_fft, _HC_T, phase_shift=_HC_phase_shift)
+
+            Ycp = conv_td @ _HC_R_T
+            np.maximum(Ycp, 0.0, out=Ycp)
+
+            scale = scales[i, j]
+            if scale != 0.0:
+                Ycp *= np.float32(scale)
+            else:
+                Ycp.fill(0.0)
+
+            out.append((s_idx, c_idx, p0, p1, Ycp))
+
+    return out
 
 # ------------------------- main builder ---------------------------------------
 
@@ -932,13 +951,13 @@ def build_hypercube(
     norm_mode: str = "data",
     amp_mode: str = "sum",
     cp_flux_ref_mode: str = "median",
-    floor: float = 1e-12,
     S_chunk: int = 128,
     C_chunk: int = 1,
     P_chunk: int = 360,
     compression: str | None = None,
     vel_bias_kms: float = 0.0,
     processes: int | None = None,
+    blas_threads: int | None = None,
 ) -> None:
     """
     Build /HyperCube/models with LOSVD convolution on the template grid,
@@ -958,6 +977,9 @@ def build_hypercube(
     if processes is None:
         processes = int(os.environ.get("CUBEFIT_GEN_PROCESSES", "1"))
     processes = max(1, int(processes))
+    if blas_threads is None:
+        blas_threads = int(os.environ.get("CUBEFIT_GEN_BLAS_THREADS", "1"))
+    blas_threads = max(1, int(blas_threads))
 
     # -------- Fast preflight: exit early if fully complete (reader-only)
     with open_h5(base_h5, "reader") as f_rd:
@@ -1212,52 +1234,57 @@ def build_hypercube(
 
         with ProcessPoolExecutor(max_workers=processes, mp_context=ctx,
             initializer=_init_hypercube_worker,
-            initargs=(T_fft, R_T, km, n_fft, T, phase_shift)) as executor:
+            initargs=(T_fft, R_T, km, n_fft, T, phase_shift,
+                blas_threads)) as executor:
 
             for (p0, p1, s0, s1, c0, c1, idx3) in _iter_all_tiles():
                 if _done_get(done, idx3) != 0:
                     continue
 
                 jobs = []
-                for s_idx in range(s0, s1):
+
+                H_tile = np.empty((s1 - s0, c1 - c0), dtype=object)
+                scale_tile = np.zeros((s1 - s0, c1 - c0), dtype=np.float64)
+
+                for i, s_idx in enumerate(range(s0, s1)):
                     a_sum = float(A_sum[s_idx])
-                    for c_idx in range(c0, c1):
-                        H_native = np.asarray(losvd_ds[s_idx, :, c_idx],
+
+                    for j, c_idx in enumerate(range(c0, c1)):
+                        H_tile[i, j] = np.asarray(losvd_ds[s_idx, :, c_idx],
                             dtype=np.float64, order="C")
 
                         if norm_mode == "model":
-                            scale = float(A[s_idx, c_idx])
-                        elif a_sum <= 0.0 or L_vec[s_idx] <= 0.0:
-                            scale = 0.0
-                        else:
+                            scale_tile[i, j] = float(A[s_idx, c_idx])
+                        elif a_sum > 0.0 and L_vec[s_idx] > 0.0:
                             frac = float(A[s_idx, c_idx]) / \
                                 np.maximum(a_sum, eps)
-                            scale = float(L_vec[s_idx]) * frac
+                            scale_tile[i, j] = float(L_vec[s_idx]) * frac
 
-                        jobs.append(executor.submit(_hypercube_worker,
-                            (s_idx, c_idx, p0, p1, H_native, scale)))
+                jobs.append(executor.submit(_hypercube_worker,
+                    (s0, s1, c0, c1, p0, p1, H_tile, scale_tile)))
 
                 for future in as_completed(jobs):
-                    s_idx, c_idx, pp0, pp1, Ycp = future.result()
+                    results = future.result()
 
-                    if masked_flag:
-                        Yv = Ycp[:, keep_idx]
-                    else:
-                        Yv = Ycp
+                    for s_idx, c_idx, pp0, pp1, Ycp in results:
+                        if masked_flag:
+                            Yv = Ycp[:, keep_idx]
+                        else:
+                            Yv = Ycp
 
-                    if w_lam_sqrt is not None:
-                        e_local = np.sum(np.square(Yv, dtype=np.float64) *
-                            w_lam_sqrt[None, :], axis=1)
-                    else:
-                        e_local = np.sum(np.square(Yv, dtype=np.float64),
-                            axis=1)
+                        if w_lam_sqrt is not None:
+                            e_local = np.sum(np.square(Yv, dtype=np.float64) *
+                                w_lam_sqrt[None, :], axis=1)
+                        else:
+                            e_local = np.sum(np.square(Yv, dtype=np.float64),
+                                axis=1)
 
-                    E_acc[c_idx, pp0:pp1] += e_local
-                    tile_idx = s_idx // S_chunk
-                    E_tile_comp[tile_idx, c_idx] += float(
-                        np.sum(e_local))
+                        E_acc[c_idx, pp0:pp1] += e_local
 
-                    models[s_idx, c_idx, pp0:pp1, 0:L] = Ycp
+                        tile_idx = s_idx // S_chunk
+                        E_tile_comp[tile_idx, c_idx] += float(np.sum(e_local))
+
+                        models[s_idx, c_idx, pp0:pp1, 0:L] = Ycp
 
                 _done_set(done, idx3)
 

@@ -154,6 +154,9 @@ v1.16:  Reworked support exploration to screen candidates by constrained
             gradient, data-fit gradient, and rotating population coverage before
             joint constrained re-solving in `streamActiveSetNNLS`;
         Made exploration acceptance consistent with the scientific regularisation objective in `streamActiveSetNNLS`. 30 September 2026
+v1.17:  Changed `_canon_orbit_weights` to accept a `None` value for
+            `orbit_weights` and return `None` in that case, rather than
+            automatically reading the weights from the HDF5 file. 1 October 2026
 """
 
 from __future__ import annotations, print_function
@@ -479,13 +482,6 @@ def _pool_ok(pool, timeout: float = 5.0) -> bool:
     except Exception:
         return False
 
-def _worker_init(blas_threads: int) -> None:
-    os.environ["OMP_NUM_THREADS"] = str(blas_threads)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
-    os.environ["MKL_NUM_THREADS"] = str(blas_threads)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(np.max((1, blas_threads // 2)))
-    os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
-
 # ------------------------------------------------------------------------------
 
 def rmse_proxy_subset(
@@ -561,48 +557,60 @@ def rmse_proxy_subset(
 
 # ------------------------------------------------------------------------------
 
-def _canon_orbit_weights(h5_path: str,
-                         orbit_weights,
-                         C: int,
-                         P: int) -> np.ndarray | None:
+def _canon_orbit_weights(orbit_weights, C: int, P: int) -> np.ndarray | None:
     """
-    Return a unit-sum orbit-shape vector, or None if unavailable.
+    Return a unit-sum orbit-shape vector, or None if disabled.
 
-    Accepts:
-      - orbit_weights == None: try reading '/CompWeights' from HDF5.
-      - orbit_weights shape == (C,): use as the orbit-shape vector.
-      - orbit_weights shape == (C*P,): sum over populations -> (C,).
+    Parameters
+    ----------
+    orbit_weights : array-like or None
+        Orbit weights. If ``None``, no orbit constraint is used.
+        Accepted shapes are ``(C,)`` or ``(C * P,)``.
+    C : int
+        Number of components.
+    P : int
+        Number of population coefficients per component.
 
-    The result is normalised to sum to one.
+    Returns
+    -------
+    ndarray or None
+        Unit-sum component-weight vector with shape ``(C,)``, or ``None``
+        if ``orbit_weights`` is ``None``.
+
+    Raises
+    ------
+    ValueError
+        If the supplied weights have incompatible dimensions, contain
+        invalid values, or have zero total mass.
+
+    Examples
+    --------
+    >>> _canon_orbit_weights(None, C=20, P=360) is None
+    True
     """
-    w = None
-    if orbit_weights is not None:
-        w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
-    else:
-        with open_h5(h5_path, role="reader") as f:
-            if "/CompWeights" in f:
-                w = np.asarray(
-                    f["/CompWeights"][...],
-                    dtype=np.float64,
-                ).ravel(order="C")
-            else:
-                return None
+    if orbit_weights is None:
+        return None
+
+    w = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
 
     if w.size == C:
         pass
     elif w.size == C * P:
         w = w.reshape(C, P).sum(axis=1)
     else:
-        raise ValueError(
-            f"orbit_weights length {w.size} incompatible with C={C}, P={P}. "
-            f"Expected C or C*P."
-        )
+        raise ValueError(f"orbit_weights length {w.size} incompatible with "
+            f"C={C}, P={P}. Expected C or C*P.")
 
-    w = np.asarray(w, dtype=np.float64)
-    w = np.maximum(w, 0.0)
+    if not np.all(np.isfinite(w)):
+        raise ValueError("orbit_weights must contain only finite values.")
+
+    if np.any(w < 0.0):
+        raise ValueError("orbit_weights must be nonnegative.")
+
     w_sum = float(np.sum(w))
-    if (not np.isfinite(w_sum)) or (w_sum <= 0.0):
-        raise ValueError("orbit_weights must have positive total mass")
+
+    if w_sum <= 0.0:
+        raise ValueError("orbit_weights must have positive total mass.")
 
     return w / w_sum
 
@@ -1562,8 +1570,7 @@ def streamActiveSetNNLS(
             raise ValueError(
                 "known_zero_mask has wrong size in monolithic solver")
 
-    orbit_shape = (_canon_orbit_weights(h5_path, orbit_weights, C=C, P=P)
-        if orbit_weights is not None else None)
+    orbit_shape = _canon_orbit_weights(orbit_weights, C=C, P=P)
 
     S_flat = np.asarray(inv_sqrt_energy_flat, dtype=np.float64).ravel()
     ATy_scaled = S_flat * ATy_flat
@@ -2063,20 +2070,9 @@ def streamActiveSetNNLS(
                 regularisation_scale * np.diag(S_loc * S_loc) +
                 numerical_ridge_loc * np.eye(k_loc, dtype=np.float64))
 
-            try:
-                z_loc = np.linalg.solve(ATA_reg_loc, ATy_loc)
-            except np.linalg.LinAlgError:
-                U, svals, Vt = np.linalg.svd(ATA_reg_loc, full_matrices=False)
-
-                smax = svals[0] if svals.size else 1.0
-
-                s_thresh = max(1e-12, 1e-6 * smax)
-
-                s_inv = np.where(svals > s_thresh, 1.0 / svals, 0.0)
-
-                z_loc = Vt.T @ (s_inv * (U.T @ ATy_loc))
-
-            z_loc = np.maximum(z_loc, 0.0)
+            z_loc = _nnls_from_quadratic(ATA_reg_loc, ATy_loc,
+                x0=np.maximum(z[active_idx], 0.0),
+                max_iter=10000, tol=1e-11)
 
             alpha_loc = None
             lambda_loc = None
@@ -3033,12 +3029,17 @@ def streamActiveSetNNLS(
             "tol_here": float(tol_here),
         })
 
+        x_is_zero = np.all(x <= 0.0)
+
         if (
-            support_stationary
-            and explore_fail_count >= explore_fail_patience
+            explore_fail_count >= explore_fail_patience
+            and (support_stationary or x_is_zero)
         ):
+            stop_reason = ("zero_solution_exploration_exhausted" if x_is_zero
+                else "exploration_patience_reached")
+
             _set_stop(
-                "exploration_patience_reached",
+                stop_reason,
                 "converged",
                 it,
                 converged=True,
@@ -3348,8 +3349,7 @@ def monolithic_nnls_scipy(
     known_zero = _get_known_zero_mask(h5_path, C, P)
     known_zero_flat = known_zero.ravel(order="C")
 
-    orbit_shape = _canon_orbit_weights(
-        h5_path, orbit_weights, C=C, P=P)
+    orbit_shape = _canon_orbit_weights(orbit_weights, C=C, P=P)
     has_hard_orbit_shape = (
         orbit_shape is not None and np.any(orbit_shape > 0.0))
 
@@ -3838,9 +3838,7 @@ def monolithicSolver(
             "monolithicSolver requires orbit_weights for the constrained "
             "reference problem.")
 
-    orbit_shape = _canon_orbit_weights(
-        h5_path, orbit_weights, C=C, P=P)
-
+    orbit_shape = _canon_orbit_weights(orbit_weights, C=C, P=P)
     if orbit_shape is None:
         raise ValueError(
             "Could not construct a valid orbit shape.")
@@ -4144,13 +4142,7 @@ def solve_streaming_nnls(
 
     # ---------------------------- orbit prior --------------------------
     orbit_shape_outer = None
-    if orbit_weights is not None:
-        orbit_shape_outer = _canon_orbit_weights(
-            h5_path,
-            orbit_weights,
-            C=C,
-            P=P,
-        )
+    orbit_shape_outer = _canon_orbit_weights(orbit_weights, C=C, P=P)
 
     # ---------------------------- diagnostics --------------------------
     diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
