@@ -161,6 +161,20 @@ v1.17:  Changed `_canon_orbit_weights` to accept a `None` value for
             possible when `orbit_weights=None` --- to ensure termination
             proceeds, since there is no KKT support for all-zeros, in 
             `streamActiveSetNNLS`. 1 October 2026
+v1.18:  Added `orbit_weights` to the checkpoint state and made it authoritative
+            on resume, rather than reading the weights from the HDF5 file in
+            `streamActiveSetNNLS`;
+        Added a check to ensure that the resumed `orbit_weights` are consistent
+            with the current `C` and `P` values, and raise an error if not in
+            `streamActiveSetNNLS`;
+        Allow convergence when KKT are satisfied alone, if `orbit_weights` is
+            `None`, in `streamActiveSetNNLS`;
+        Corrected column exploration; previous implementation ordered by orbit
+            index, then truncated to `explore_batch_size` which arbitrarily
+            affected higher orbit indices in `streamActiveSetNNLS`;
+        Improved the rotation of the explored columns from sequential per orbit
+            to coarse-to-fine interleaved sequence in `streamActiveSetNNLS`. 2
+            October 2026
 """
 
 from __future__ import annotations, print_function
@@ -1584,12 +1598,11 @@ def streamActiveSetNNLS(
     data_scale_ref = _robust_scale_ref(ATy_scaled, fallback=grad_ref)
     tol_grad_rel = 1e-11
 
-    # Exploration first screens the full inactive population space cheaply, then
-    # spends expensive reduced solves only on compact, diverse candidate sets.
-    explore_batch_size = 24
-    explore_batches_per_iter = 3
+    # Keep joint trials broad enough to expose several alternatives per orbit.
     explore_top_per_orbit = 6
     explore_coverage_per_orbit = 3
+    explore_batch_size = max(48, min(256, 4 * C))
+    explore_batches_per_iter = 3
     # Number of consecutive unsuccessful coverage rounds required before
     # exploration is considered exhausted on a stationary support.
     explore_fail_patience = 12
@@ -1632,17 +1645,72 @@ def streamActiveSetNNLS(
 
     # Normalize and validate the resume metadata before it is used.
     resume_state = dict(resume_state or {})
+
     if resume_state:
         saved_regularisation_scale = float(
             resume_state.get("regularisation_scale", 1.0))
 
-        if not np.isclose(saved_regularisation_scale, regularisation_scale,
-            rtol=1e-12, atol=0.0):
+        if not np.isclose(
+            saved_regularisation_scale,
+            regularisation_scale,
+            rtol=1e-12,
+            atol=0.0,
+        ):
             raise ValueError(
                 "Cannot full-resume with a different regularisation_scale: "
                 f"checkpoint={saved_regularisation_scale:.6e}, "
                 f"requested={regularisation_scale:.6e}. "
                 "Use warm_start='saved_x' instead.")
+
+        # Historical checkpoints predate the unconstrained orbit_weights=None
+        # pathway, so a missing mode flag is interpreted as constrained.
+        saved_hard_orbit_shape = bool(
+            resume_state.get("hard_orbit_shape", True))
+
+        if saved_hard_orbit_shape != has_hard_orbit_shape:
+            raise ValueError(
+                "Cannot full-resume with a different orbit constraint mode: "
+                f"checkpoint hard_orbit_shape="
+                f"{saved_hard_orbit_shape}, "
+                f"requested={has_hard_orbit_shape}. "
+                "Use warm_start='saved_x' instead.")
+
+        # New constrained checkpoints store the canonical normalized orbit
+        # shape. Old constrained checkpoints may not have this field, in which
+        # case retain backward compatibility and accept the resume.
+        if (
+            has_hard_orbit_shape
+            and "orbit_shape" in resume_state
+            and resume_state["orbit_shape"] is not None
+        ):
+            saved_orbit_shape = np.asarray(
+                resume_state["orbit_shape"],
+                dtype=np.float64,
+            ).ravel(order="C")
+
+            if saved_orbit_shape.size != C:
+                raise ValueError(
+                    "Cannot full-resume with an incompatible orbit_shape: "
+                    f"checkpoint size={saved_orbit_shape.size}, "
+                    f"requested size={C}. "
+                    "Use warm_start='saved_x' instead.")
+
+            if not np.all(np.isfinite(saved_orbit_shape)):
+                raise ValueError(
+                    "Cannot full-resume from a checkpoint with non-finite "
+                    "orbit_shape values. "
+                    "Use warm_start='saved_x' instead.")
+
+            if not np.allclose(
+                saved_orbit_shape,
+                np.asarray(orbit_shape, dtype=np.float64),
+                rtol=1e-12,
+                atol=1e-15,
+            ):
+                raise ValueError(
+                    "Cannot full-resume with different orbit_weights. "
+                    "Use warm_start='saved_x' instead.")
+
     needs_kkt_initialise = bool(x0_flat is not None and not resume_state)
 
     start_iter = int(resume_state.get("iter", 0) or 0)
@@ -1877,6 +1945,10 @@ def streamActiveSetNNLS(
             "alpha_current": float(alpha_current),
             "ridge_current": float(ridge_current),
             "regularisation_scale": float(regularisation_scale),
+            "hard_orbit_shape": bool(has_hard_orbit_shape),
+            "orbit_shape": (
+                orbit_shape.astype(np.float64).tolist()
+                if orbit_shape is not None else None),
             "stop_reason": str(stop_reason),
             "stop_category": str(stop_category),
             "stop_converged": bool(stop_converged),
@@ -2301,12 +2373,22 @@ def streamActiveSetNNLS(
             "details": stop_details,
         })
 
-    def _build_exploration_batches(
-        not_active: np.ndarray,
-        grad_data: np.ndarray,
-        grad_total: np.ndarray,
-        it: int,
-    ) -> list[np.ndarray]:
+    def _dyadic_offset(round_idx: int, stride: int) -> int:
+        """Return a coarse-to-fine midpoint-subdivision offset."""
+        if stride <= 1:
+            return 0
+
+        round_idx = int(round_idx) % stride
+        if round_idx == 0:
+            return 0
+
+        level = int(np.floor(np.log2(round_idx))) + 1
+        first = 1 << (level - 1)
+        pos = round_idx - first
+        denom = 1 << level
+        return ((2 * pos + 1) * stride) // denom
+    def _build_exploration_batches(not_active: np.ndarray, grad_data: np.ndarray,
+        grad_total: np.ndarray, it: int) -> list[np.ndarray]:
         """
         Build diverse candidate batches for joint-support exploration.
 
@@ -2379,9 +2461,8 @@ def streamActiveSetNNLS(
             # Rank primarily by positive constrained gradient. Break near-ties 
             # using the raw data gradient. Negative constrained gradients are 
             # deliberately left to the rotating coverage part of the search.
-            order = np.lexsort((g_data, g_total))[::-1]
             n_top = min(int(explore_top_per_orbit), int(cols.size))
-            order_total = np.argsort(g_total)[::-1]
+            order_total = np.lexsort((g_data, g_total))[::-1]
             top_total = cols[order_total[:n_top]]
 
             # Strong data-fit candidates. These are intentionally retained 
@@ -2398,7 +2479,7 @@ def streamActiveSetNNLS(
 
             if n_cov > 0:
                 stride = max(1, int(np.ceil(cols.size / n_cov)))
-                offset = int(explore_round) % stride
+                offset = _dyadic_offset(explore_round, stride)
 
                 coverage_positions = np.arange(
                     offset, cols.size, stride, dtype=np.int64)[:n_cov]
@@ -2420,7 +2501,7 @@ def streamActiveSetNNLS(
         batches = []
 
         for key in ("total", "data", "coverage"):
-            pieces = []
+            per_orbit = []
 
             for cc in exploration_orbits:
                 cc = int(cc)
@@ -2431,31 +2512,37 @@ def streamActiveSetNNLS(
                 cols_cc = candidate_by_orbit[cc][key]
 
                 if cols_cc.size > 0:
-                    pieces.append(cols_cc)
+                    per_orbit.append(cols_cc)
 
-            if not pieces:
+            if not per_orbit:
                 continue
+            offset = _dyadic_offset(explore_round, len(per_orbit))
+            per_orbit = per_orbit[offset:] + per_orbit[:offset]
 
-            batch = np.unique(np.concatenate(pieces)).astype(np.int64,
-                copy=False)
+            # Allocate slots round-robin across orbits. This removes arbitrary
+            # dependence on orbit index when the joint trial reaches its cap.
+            selected = []
+            depth = 0
 
-            # Keep the expensive reduced solve bounded. Rank oversized gradient
-            # batches by the relevant screening score. Coverage is already 
-            # sparse and normally remains below this limit.
-            if batch.size > int(explore_batch_size):
-                if key == "total":
-                    score = grad_total[batch]
-                elif key == "data":
-                    score = grad_data[batch]
-                else:
-                    score = np.zeros(batch.size, dtype=np.float64)
+            while len(selected) < int(explore_batch_size):
+                added = False
 
-                if key != "coverage":
-                    order = np.argsort(score)[::-1]
-                    batch = batch[order[:int(explore_batch_size)]]
-                else:
-                    batch = batch[:int(explore_batch_size)]
+                for cols_cc in per_orbit:
+                    if depth >= cols_cc.size:
+                        continue
 
+                    selected.append(int(cols_cc[depth]))
+                    added = True
+
+                    if len(selected) >= int(explore_batch_size):
+                        break
+
+                if not added:
+                    break
+
+                depth += 1
+
+            batch = np.asarray(selected, dtype=np.int64)
             batches.append(batch)
 
         return batches[:int(explore_batches_per_iter)]
@@ -2888,6 +2975,26 @@ def streamActiveSetNNLS(
                 f"working={np.count_nonzero(active)} "
                 f"positive={np.count_nonzero(positive_mask)}", flush=True)
         
+        if support_stationary and not has_hard_orbit_shape:
+            # Without hard orbit constraints, the NNLS KKT conditions alone are
+            # sufficient to declare convergence.
+            _set_stop(
+                "kkt_stationary",
+                "converged",
+                it,
+                converged=True,
+                n_active=int(np.count_nonzero(active)),
+                max_grad_active=float(max_grad_active),
+                max_grad_dual=float(max_grad_dual),
+                tol_here=float(tol_here),
+            )
+
+            _emit_checkpoint(
+                it,
+                final=True,
+                phase="kkt_stationary",
+            )
+            break
         # ------------------------------------------------------------
         # Joint-support exploration
         # ------------------------------------------------------------

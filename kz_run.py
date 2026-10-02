@@ -32,7 +32,6 @@ v1.5:   Provide `sspIdx` for large `nCuts` runs to thin the SSP grid. 21 August
             2026
 """
 
-import numpy as np
 import os, re, sys
 import pathlib as plp
 import argparse
@@ -41,7 +40,6 @@ from datetime import datetime
 curdir = plp.Path(__file__).parent
 
 from CubeFit.kz_init import props
-from CubeFit.kz_fitSpec import genCubeFit
 
 def _configure_solver_environment(args, propDict):
     """Set the solver-related environment variables used by the current wrapper."""
@@ -66,6 +64,8 @@ def _configure_solver_environment(args, propDict):
     os.environ["CUBEFIT_DIAG_STRIDE"] = str(1)
     os.environ["CUBEFIT_DIAG_TOPK"] = str(12)
     os.environ["CUBEFIT_SOLVER_CHECKPOINT_EVERY"] = "1"
+
+
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.environ["CUBEFIT_DIAG_JSONL"] = str(
@@ -127,9 +127,10 @@ def main():
     _configure_solver_environment(args, propDict)
 
     try:
+        from CubeFit.kz_fitSpec import genCubeFit
         genCubeFit(**propDict)
     except SystemExit:
-        # Let explicit sys.exit()s behave normally
+        # Let explicit sys.exit() behave normally
         raise
     except BaseException as e:
         # Log + print the traceback explicitly
