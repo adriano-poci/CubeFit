@@ -93,6 +93,12 @@ def main():
             [-0.2, 0.0, 0.2, 0.4, 0.6])
     propDict['cpu_processes'] = 4
     propDict['blas_threads'] = 2
+    if propDict['nCuts'] == 3:
+        propDict['regularisation_scale'] = 1e-4
+        propDict['lOrder'] = 1
+    elif propDict['nCuts'] == 20:
+        propDict['regularisation_scale'] = 0.0
+        propDict['lOrder'] = 1
     print(propDict)
 
     try:

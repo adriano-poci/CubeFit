@@ -34,8 +34,7 @@ import h5py
 import numpy as np
 
 
-def makeValidationCube(source_path, output_path, *,
-    rebuild_hypercube=False):
+def makeValidationCube(source_path, output_path, *, rebuild_hypercube=False):
     """
     Create a CubeFit validation input from an existing model cube.
 
@@ -75,9 +74,7 @@ def makeValidationCube(source_path, output_path, *,
     output_path = os.path.abspath(str(output_path))
 
     if source_path == output_path:
-        raise ValueError(
-            "source_path and output_path must be different."
-        )
+        raise ValueError("source_path and output_path must be different.")
 
     if not os.path.isfile(source_path):
         raise FileNotFoundError(source_path)
@@ -185,8 +182,7 @@ def makeValidationCube(source_path, output_path, *,
     print()
     print("Validation input created.")
     print(f"DataCube shape: {model.shape}")
-    print("DataCube range: "
-        f"{np.min(model):.6e} .. {np.max(model):.6e}")
+    print(f"DataCube range: {np.min(model):.6e} .. {np.max(model):.6e}")
 
     return output_path
 

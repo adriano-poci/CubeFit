@@ -43,6 +43,8 @@ v1.8:   Updated `plot_diagnostic_jsonl_dashboard` to latest diagnostic outputs.
 v1.9:   Reworked `plot_diagnostic_jsonl_dashboard` for joint-support
             exploration, replacing obsolete promotion and stall diagnostics. 30
             September 2026
+v2.0:   Updated `plot_diagnostic_jsonl_dashboard` to reflect the new definition
+            of orbital weights. 3 October 2026
 """
 
 from __future__ import annotations
@@ -519,7 +521,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     show: bool = False, figsize: tuple[float, float] = (24.0, 13.0),
 ) -> list[dict]:
     """
-    Plot diagnostics for the flexible-amplitude hard-prior solver.
+    Plot diagnostics for the equal-component-mass constrained solver.
 
     The dashboard combines ``iter_pre``, ``iter_post``, setup, and final
     records emitted by the constrained streaming active-set solver. Records
@@ -537,8 +539,8 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     6. Exploration rounds and consecutive failures.
     7. Proposed, retained, and discarded trial columns.
     8. Remaining candidate search space.
-    9. Fitted hard-orbit amplitude and numerical ridge.
-    10. Orbit-amplitude stationarity.
+    9. Fitted common component mass and numerical ridge.
+    10. Common-amplitude KKT stationarity.
     11. Cumulative and per-iteration runtime.
     12. Current-support stationarity versus exploration acceptance.
 
@@ -984,17 +986,10 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     trial_accepted = _series(merged, "exploration_trial_accepted",
         default=np.nan)
 
-    shape_dot_lambda = _series(merged, "shape_dot_lambda",)
+    constraint_dot_lambda = _series(merged, "constraint_dot_lambda",
+        "shape_dot_lambda")
 
-    elapsed_time = _series(merged, "t_sec",)
-
-    constraint_l1 = _series(merged, "orbit_constraint_l1",
-        "orbit_resid_l1")
-    constraint_l2 = _series(merged, "orbit_constraint_l2",
-        "orbit_resid_l2")
-    constraint_linf = _series(merged, "orbit_constraint_linf",
-        "orbit_resid_linf")
-    alpha_stationarity = _series(merged, "alpha_stationarity")
+    elapsed_time = _series(merged, "t_sec")
 
     def _trial_gradient_max(record: dict, scalar_key: str, vector_key: str,
         ) -> float:
@@ -1316,7 +1311,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 9: hard-orbit amplitude and numerical stabilisation
+    # Panel 9: common component mass and numerical stabilisation
     # ------------------------------------------------------------------
     axis = axes["amplitude"]
 
@@ -1324,12 +1319,12 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         axis,
         iterations,
         alpha,
-        r"Fitted $\alpha$",
+        r"Common coefficient mass $\alpha$",
         lw=1.5,
         color="tab:blue",
     )
 
-    axis.set_title("Orbit amplitude & numerical stability")
+    axis.set_title("Common coefficient mass & numerical stability")
     axis.set_xlabel("Iteration")
     axis.set_ylabel(r"$\alpha$")
     _homogenise_ticks(axis)
@@ -1361,23 +1356,23 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     )
 
     # ------------------------------------------------------------------
-    # Panel 10: orbit-level population structure
+    # Panel 10: common-amplitude KKT stationarity
     # ------------------------------------------------------------------
     axis = axes["stationarity"]
 
     _plot_finite(
         axis,
         iterations,
-        np.abs(shape_dot_lambda),
-        r"$|w^T\lambda|$",
+        np.abs(constraint_dot_lambda),
+        r"$|\mathbf{1}_{+}^{T}\lambda|$",
         positive_log=True,
         lw=1.4,
         color="tab:blue",
     )
 
-    axis.set_title("Orbit-amplitude stationarity")
+    axis.set_title("Common-amplitude stationarity")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel(r"$|w^T\lambda|$")
+    axis.set_ylabel(r"$|\mathbf{1}_{+}^{T}\lambda|$")
     _homogenise_ticks(axis)
     axis.legend(fontsize=8, loc="best")
 

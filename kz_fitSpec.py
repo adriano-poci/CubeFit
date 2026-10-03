@@ -103,6 +103,9 @@ v1.30:  Added `orbitWeights` kwarg to toggle whether the orbit weights are used
         Pass parallelism to `pipeline_runner.PipelineRunner.build_hypercube`;
         Changed residual panel to `scatter` in `parallel_spectrum_plots` and 
             `plot_best_worst_spectrum_fits_stacked`. 1 October 2026
+v2.0:   Updated `compare_orbit_vs_solution_absolute` to use new definition of
+            orbital weights;
+        Updated `loadCubeFit` to parse `validation*` kwargs. 3 October 2026
 """
 
 # need to set up the logger before any other imports
@@ -266,12 +269,10 @@ def loadValidationCube(validationPath, spLL, nSpat, *, dataset="/ModelCube"):
     with open_h5(str(validationPath), role="reader") as f:
         if dataset not in f:
             raise RuntimeError(f"{validationPath} does not contain {dataset}.")
-
         if "/ObsPix" not in f:
             raise RuntimeError(f"{validationPath} does not contain /ObsPix.")
 
         cube = np.asarray(f[dataset][...], dtype=np.float64, order="C")
-
         obs_pix = np.asarray(f["/ObsPix"][...], dtype=np.float64).ravel(
             order="C")
 
@@ -285,32 +286,25 @@ def loadValidationCube(validationPath, spLL, nSpat, *, dataset="/ModelCube"):
         raise ValueError("Validation cube shape mismatch: "
             f"{dataset} has {cube.shape}, but the current run "
             f"expects {expected_shape} = (nSpat, nLSpec).")
-
     if obs_pix.shape != spLL.shape:
         raise ValueError("Validation wavelength-grid length mismatch: "
             f"{obs_pix.size} != {spLL.size}.")
-
     if not np.allclose(obs_pix, spLL, rtol=1e-12, atol=1e-12,):
         max_diff = float(np.max(np.abs(obs_pix - spLL)))
-
         raise ValueError("Validation /ObsPix does not match the current "
             "_oneTimeSpec wavelength grid. "
             f"Maximum absolute difference = {max_diff:.6e}.")
-
     if not np.all(np.isfinite(cube)):
         n_bad = int(np.count_nonzero(~np.isfinite(cube)))
-
         raise RuntimeError(f"{dataset} contains {n_bad} non-finite values.")
 
     # HDF5 CubeFit convention: (nSpat, nLSpec)
     # kz_fitSpec convention:    (nLSpec, nSpat)
-    validationCube = np.ascontiguousarray(cube.T, dtype=np.float64,)
+    validationCube = np.ascontiguousarray(cube.T, dtype=np.float64)
 
     logger.log("[CubeFit][validation] Loaded synthetic data from "
-        f"{validationPath}:{dataset}; "
-        f"shape={validationCube.shape}, "
-        f"min={np.min(validationCube):.6e}, "
-        f"max={np.max(validationCube):.6e}")
+        f"{validationPath}:{dataset}; shape={validationCube.shape}, "
+        f"min={np.min(validationCube):.6e}, max={np.max(validationCube):.6e}")
 
     return validationCube
 
@@ -456,6 +450,11 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     validationPath = kwargs.pop('validationPath', None)
     validationDataset = kwargs.pop('validationDataset', '/ModelCube')
     validationTag = kwargs.pop('validationTag', None)
+    if validationPath is not None:
+        if validationTag is None:
+            raise ValueError("validationTag is required for validation runs.")
+        figDir = curdir/galaxy/'validation'/str(validationTag)
+        figDir.mkdir(parents=True, exist_ok=True)
 
     with logger.capture_all_output():
         decDir, cDirs, cKeys, nComp, teLL, lnGrid, histBinSize, dataVelScale,\
@@ -2003,10 +2002,20 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     """
     Load the CubeFit data for a given galaxy and model path.
     """
+    validationPath = kwargs.pop('validationPath', None)
+    validationDataset = kwargs.pop('validationDataset', '/ModelCube')
+    validationTag = kwargs.pop('validationTag', None)
+    is_validation = validationPath is not None or validationTag is not None
+
     # Directories
     bDir = mDir/'tri_models'/mPath
     pDir = curdir.parent/'pxf'
-    figDir = curdir/galaxy/'figures'
+    if is_validation:
+        if validationTag is None:
+            raise ValueError("validationTag is required for validation output.")
+        figDir = curdir/galaxy/'validation'/str(validationTag)
+    else:
+        figDir = curdir/galaxy/'figures'
     MKDIRS = [bDir, pDir, figDir]
     [plp.Path(DIR).mkdir(parents=True, exist_ok=True) for DIR in MKDIRS]
     if isinstance(decDir, type(None)):
@@ -2269,8 +2278,10 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
-    hdf5Path = (hdf5Dir/
-        f"hypercube_{nComp:{pred}d}_{lOrder:02d}").with_suffix('.h5')
+    hdf5Name = f"hypercube_{nComp:{pred}d}_{lOrder:02d}"
+    if validationTag is not None:
+        hdf5Name += f"_{validationTag}"
+    hdf5Path = (hdf5Dir/hdf5Name).with_suffix('.h5')
     
     # Read dims & X_global using robust reader
     with open_h5(hdf5Path, role="reader") as f:
@@ -2363,80 +2374,46 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         nSpat, nLam = D.shape
     
     # ------------------------------------------------------------
-    # Reconstruct the hard-prior target used by the constrained fit
+    # Reconstruct the equal-component-mass constraint used by the fit.
+    # The dynamical weights remain encoded in the HyperCube itself; here
+    # they only identify which components participate in the constraint.
     # ------------------------------------------------------------
-    orbit_shape = np.asarray(
-        cWeights,
-        dtype=np.float64,
+    orbit_weights = np.asarray(cWeights, dtype=np.float64,
     ).ravel(order="C")
 
-    if orbit_shape.size != nComp:
+    if orbit_weights.size != nComp:
+        raise ValueError("cWeights must contain one value per orbit component.")
+    if not np.all(np.isfinite(orbit_weights)):
+        raise ValueError("cWeights must contain only finite values.")
+    if np.any(orbit_weights < 0.0):
+        raise ValueError("cWeights must be nonnegative.")
+
+    positive_orbits = orbit_weights > 0.0
+    if not np.any(positive_orbits):
         raise ValueError(
-            "cWeights must contain one value per orbit component."
-        )
+            "cWeights must contain at least one positive component.")
 
-    orbit_shape = np.maximum(
-        orbit_shape,
-        0.0,
-    )
-
-    orbit_shape_sum = float(
-        np.sum(orbit_shape)
-    )
-
-    if (
-        not np.isfinite(orbit_shape_sum)
-        or orbit_shape_sum <= 0.0
-    ):
-        raise ValueError(
-            "cWeights must have positive finite total weight."
-        )
-
-    # This is the exact shape passed to the constrained solver.
-    orbit_shape /= orbit_shape_sum
-
-    x_global_cp = np.asarray(
-        x_global,
-        dtype=np.float64,
-    )
+    orbit_shape = orbit_weights / np.sum(orbit_weights)
+    x_global_cp = np.asarray(x_global, dtype=np.float64,)
 
     if x_global_cp.ndim == 1:
         if x_global_cp.size != nComp * nPop:
-            raise ValueError(
-                "x_global has the wrong number of coefficients."
-            )
-        x_global_cp = x_global_cp.reshape(
-            nComp,
-            nPop,
-            order="C",
-        )
+            raise ValueError("x_global has the wrong number of coefficients.")
+        x_global_cp = x_global_cp.reshape(nComp, nPop, order="C")
     elif x_global_cp.shape != (nComp, nPop):
-        raise ValueError(
-            "x_global must have shape "
-            f"({nComp}, {nPop})."
-        )
+        raise ValueError(f"x_global must have shape ({nComp}, {nPop}).")
 
-    # Because orbit_shape has unit sum, the fitted global amplitude is the
-    # total physical coefficient mass.
-    alpha_fit = float(
-        np.sum(
-            x_global_cp,
-            dtype=np.float64,
-        )
-    )
+    solution_orbit_mass = np.sum(x_global_cp, axis=1)
 
-    if (
-        not np.isfinite(alpha_fit)
-        or alpha_fit < 0.0
-    ):
+    # Alpha is now the common coefficient mass of each positive-weight
+    # component, not the total coefficient mass over all components.
+    alpha_fit = float(np.mean(solution_orbit_mass[positive_orbits]))
+
+    if (not np.isfinite(alpha_fit) or alpha_fit < 0.0):
         raise RuntimeError(
-            "The fitted global orbit amplitude is invalid."
-        )
+            "The fitted common component amplitude is invalid.")
 
-    orbit_target_mass = (
-        alpha_fit
-        * orbit_shape
-    )
+    orbit_target_mass = alpha_fit * positive_orbits.astype(np.float64)
     
     arSOL = x_global.reshape(nComp, nMetals, nAges, nAlphas, order='C')
     M = np.zeros((NOrbs, nComp), dtype=np.float64)
@@ -2463,65 +2440,31 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         compDisp[nc, :] = svR
         compVel[nc, :] = vMean[:, 2] # v_phi
 
-    solution_orbit_mass = np.sum(
-        x_global_cp,
-        axis=1,
-    )
+    orbit_resid = solution_orbit_mass - orbit_target_mass
+    relative_orbit_resid = np.divide(orbit_resid, alpha_fit,
+        out=np.zeros_like(orbit_resid), where=alpha_fit > 0.0)
 
-    orbit_resid = (
-        solution_orbit_mass
-        - orbit_target_mass
-    )
-
-    print(
-        "[Orbit-prior plot] "
-        f"alpha_fit={alpha_fit:.6e} "
-        f"shape_sum={np.sum(orbit_shape):.6e} "
-        f"solution_sum={np.sum(solution_orbit_mass):.6e} "
-        f"target_sum={np.sum(orbit_target_mass):.6e} "
+    print(f"[Orbit-constraint plot] alpha_fit={alpha_fit:.6e} "
+        f"n_constrained={np.count_nonzero(positive_orbits)} "
         f"L1={np.sum(np.abs(orbit_resid)):.6e} "
-        f"Linf={np.max(np.abs(orbit_resid)):.6e}",
-        flush=True,
-    )
+        f"Linf={np.max(np.abs(orbit_resid)):.6e} "
+        f"relative_Linf={np.max(np.abs(relative_orbit_resid)):.6e}", flush=True)
 
     # ---------------------------------------------
     # FIT RESIDUALS
     # ---------------------------------------------
-    data_fit = np.asarray(
-        data_cube[:, mask_arr],
-        dtype=np.float64,
-    )
-    model_fit = np.asarray(
-        model_cube[:, mask_arr],
-        dtype=np.float64,
-    )
-
+    data_fit = np.asarray(data_cube[:, mask_arr], dtype=np.float64)
+    model_fit = np.asarray(model_cube[:, mask_arr], dtype=np.float64)
     # Residual spectrum in the native flux units.
     resid_fit = data_fit - model_fit
 
     # ---------------------------------------------
     # RAW-FLUX SPACE (solver space)
     # ---------------------------------------------
-    data_raw = np.sum(
-        data_fit,
-        axis=1,
-    )
-    model_raw = np.sum(
-        model_fit,
-        axis=1,
-    )
-
-    rms_resid_raw = np.sqrt(
-        np.mean(
-            resid_fit**2,
-            axis=1,
-        )
-    )
-
-    mean_resid_raw = np.mean(
-        resid_fit,
-        axis=1,
-    )
+    data_raw = np.sum(data_fit, axis=1)
+    model_raw = np.sum(model_fit, axis=1)
+    rms_resid_raw = np.sqrt(np.mean(resid_fit**2, axis=1))
+    mean_resid_raw = np.mean(resid_fit, axis=1)
 
     # ---------------------------------------------
     # SURFACE-BRIGHTNESS SPACE (interpretation)
@@ -2529,32 +2472,13 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     data_sb = data_raw / binCounts
     model_sb = model_raw / binCounts
 
-    data_sb = np.ma.masked_invalid(
-        np.ma.masked_less_equal(
-            data_sb,
-            0.0,
-        )
-    )
-    model_sb = np.ma.masked_invalid(
-        np.ma.masked_less_equal(
-            model_sb,
-            0.0,
-        )
-    )
+    data_sb = np.ma.masked_invalid(np.ma.masked_less_equal(data_sb, 0.0))
+    model_sb = np.ma.masked_invalid(np.ma.masked_less_equal(model_sb, 0.0))
 
-    rms_resid_sb = (
-        rms_resid_raw / binCounts
-    )
-    mean_resid_sb = (
-        mean_resid_raw / binCounts
-    )
-
-    rms_resid_sb = np.ma.masked_invalid(
-        rms_resid_sb
-    )
-    mean_resid_sb = np.ma.masked_invalid(
-        mean_resid_sb
-    )
+    rms_resid_sb = rms_resid_raw / binCounts
+    mean_resid_sb = mean_resid_raw / binCounts
+    rms_resid_sb = np.ma.masked_invalid(rms_resid_sb)
+    mean_resid_sb = np.ma.masked_invalid(mean_resid_sb)
 
     # ---------------------------------------------
     # SYMMETRIC FRACTIONAL RESIDUAL
@@ -2587,57 +2511,26 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # ---------------------------------------------
     # FRACTIONAL RMS RESIDUAL
     # ---------------------------------------------
-    rms_resid_frac = 100.0 * np.sqrt(
-        np.nanmean(
-            frac_resid**2,
-            axis=1,
-        )
-    )
-    rms_resid_frac = np.ma.masked_invalid(
-        rms_resid_frac
-    )
+    rms_resid_frac = 100.0 * np.sqrt(np.nanmean(frac_resid**2, axis=1))
+    rms_resid_frac = np.ma.masked_invalid(rms_resid_frac)
 
     # ---------------------------------------------
     # ROBUST FRACTIONAL RESIDUAL: NMAD
     # ---------------------------------------------
-    frac_median = np.nanmedian(
-        frac_resid,
-        axis=1,
-    )
-    frac_abs_dev = np.abs(
-        frac_resid
-        - frac_median[:, None]
-    )
-    mad_frac = np.nanmedian(
-        frac_abs_dev,
-        axis=1,
-    )
+    frac_median = np.nanmedian(frac_resid, axis=1)
+    frac_abs_dev = np.abs(frac_resid - frac_median[:, None])
+    mad_frac = np.nanmedian(frac_abs_dev, axis=1,)
     # 1.4826 converts MAD to the Gaussian-equivalent sigma.
-    nmad_resid_frac = (
-        100.0
-        * 1.4826
-        * mad_frac
-    )
-    nmad_resid_frac = np.ma.masked_invalid(
-        nmad_resid_frac
-    )
-    median_frac_resid = (
-        100.0 * frac_median
-    )
-    median_frac_resid = np.ma.masked_invalid(
-        median_frac_resid
-    )
+    nmad_resid_frac = 100.0 * 1.4826 * mad_frac
+    nmad_resid_frac = np.ma.masked_invalid(nmad_resid_frac)
+    median_frac_resid = 100.0 * frac_median
+    median_frac_resid = np.ma.masked_invalid(median_frac_resid)
 
     # ---------------------------------------------
     # FIT-QUALITY METRIC
     # ---------------------------------------------
-    fit_metric = np.asarray(
-        median_abs_frac_resid,
-        dtype=np.float64,
-    )
-    finite_metric = np.isfinite(
-        fit_metric
-    )
+    fit_metric = np.asarray(median_abs_frac_resid, dtype=np.float64,)
+    finite_metric = np.isfinite(fit_metric)
     fitLabel = r'$Q_s\ [\%]$'
     metric_median = np.nan
     metric_std = np.nan
@@ -2654,34 +2547,17 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             f"std={metric_std:.3f}%",
             flush=True)
 
-        nmad_finite = np.asarray(
-            nmad_resid_frac,
-            dtype=np.float64,
-        )
-        nmad_finite = nmad_finite[
-            np.isfinite(nmad_finite)
-        ]
+        nmad_finite = np.asarray(nmad_resid_frac, dtype=np.float64,)
+        nmad_finite = nmad_finite[np.isfinite(nmad_finite)]
 
         if nmad_finite.size > 0:
-            print(
-                "Fractional NMAD: "
-                f"mean={np.mean(nmad_finite):.3f}% "
-                f"median={np.median(nmad_finite):.3f}%",
-                flush=True,
-            )
-        print(
-            f"Worst fit: aperture {worst} "
-            f"(median |fractional residual|="
-            f"{fit_metric[worst]:.3f}%)",
-            flush=True,
-        )
+            print(f"Fractional NMAD: mean={np.mean(nmad_finite):.3f}% "
+                f"median={np.median(nmad_finite):.3f}%", flush=True)
+        print(f"Worst fit: aperture {worst} (median |fractional residual|="
+            f"{fit_metric[worst]:.3f}%)", flush=True)
 
-        print(
-            f"Best fit: aperture {best} "
-            f"(median |fractional residual|="
-            f"{fit_metric[best]:.3f}%)",
-            flush=True,
-        )
+        print(f"Best fit: aperture {best} (median |fractional residual|="
+            f"{fit_metric[best]:.3f}%)", flush=True)
 
     # ---------------------------------------------
     # PLOTTING LIMITS
@@ -2697,9 +2573,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     print(f"[CubeFit] All plots and maps saved in {str(figDir)}")
 
     compare_orbit_vs_solution_absolute(h5_path=str(hdf5Path),
-        orbit_target_mass=orbit_target_mass, x_global=x_global_cp,
-        save=figDir/f"compare_prior_abs_{nComp:{pred}d}_i{proj}_{lOrder:02d}.png"
-    )
+        orbit_weights=orbit_weights, x_global=x_global_cp, save=figDir/
+        f"orbit_constraint_{nComp:{pred}d}_i{proj}_{lOrder:02d}.png")
 
     plt.figure(figsize=(6, 4))
     plt.hist(fit_metric[finite_metric], bins=40)
@@ -3730,47 +3605,54 @@ def plot_sparse_spectra_from_x(
 def compare_orbit_vs_solution_absolute(
     h5_path: str,
     *,
-    orbit_target_mass: np.ndarray | None = None,
-    orbit_weights: np.ndarray | None = None,
+    orbit_weights: np.ndarray,
     x_global: np.ndarray | None = None,
     save: str | None = None,
 ):
     """
-    Compare the fitted per-orbit masses against the exact hard-prior target.
+    Diagnose the equal-component-mass orbit constraint.
 
-    For the flexible-amplitude constrained formulation, the target is
+    The HyperCube retains the relative dynamical amplitude of each component.
+    The hard coefficient constraint therefore requires
 
-        target[c] = alpha_fit * orbit_shape[c],
+        sum_p x[c, p] = alpha
 
-    where orbit_shape is fixed a priori and normalized to unit sum, while
-    alpha_fit is the fitted global coefficient mass.
+    for every positive-weight component. The numerical orbit weights select
+    constrained components but do not scale their coefficient-mass targets.
 
     Parameters
     ----------
     h5_path : str
         Path to the HDF5 file.
-    orbit_target_mass : ndarray, optional
-        Absolute orbit-mass target vector of shape (C,).
-        This is the preferred input for the augmented-row formulation.
-    orbit_weights : ndarray, optional
-        Backward-compatible alias. If provided and `orbit_target_mass` is None,
-        it is used directly as the absolute target vector.
+    orbit_weights : ndarray
+        Dynamical component weights with shape ``(C,)`` or ``(C * P,)``.
+        Positive values select components subject to the hard constraint.
     x_global : ndarray, optional
-        Solution vector of shape (C*P,) or (C, P). If omitted, read /X_global.
+        Solution with shape ``(C * P,)`` or ``(C, P)``. If omitted, read
+        ``/X_global`` from the HDF5 file.
     save : str, optional
-        If provided, save the plot to this path.
+        Output figure path.
 
     Returns
     -------
     dict
-        Diagnostic summary with absolute and relative residuals.
+        Component weights, coefficient masses, fitted common amplitude, and
+        absolute and relative constraint residuals.
 
     Raises
     ------
     RuntimeError
-        If the target vector or solution is unavailable.
+        If the solution is unavailable.
     ValueError
-        If array shapes are incompatible.
+        If the supplied arrays have incompatible dimensions or values.
+
+    Examples
+    --------
+    >>> out = compare_orbit_vs_solution_absolute(
+    ...     h5_path,
+    ...     orbit_weights=orbit_weights,
+    ...     x_global=x_global,
+    ... )
     """
     with open_h5(h5_path, role="reader") as f:
         M = f["/HyperCube/models"]
@@ -3779,115 +3661,145 @@ def compare_orbit_vs_solution_absolute(
         if x_global is None:
             if "/X_global" not in f:
                 raise RuntimeError(
-                    "No /X_global in HDF5 and x_global not provided."
-                )
-            x_global = np.asarray(f["/X_global"][...], dtype=np.float64)
+                    "No /X_global in HDF5 and x_global not provided.")
+            x_global = np.asarray(
+                f["/X_global"][...],
+                dtype=np.float64,
+            )
 
     x = np.asarray(x_global, dtype=np.float64)
+
     if x.ndim == 1:
         if x.size != C * P:
             raise ValueError(
-                f"x_global has length {x.size}, expected C*P={C*P}."
-            )
+                f"x_global has length {x.size}, expected C*P={C * P}.")
         x = x.reshape(C, P)
     elif x.ndim == 2:
         if x.shape != (C, P):
             raise ValueError(
-                f"x_global shape {x.shape}, expected (C,P)=({C},{P})."
-            )
+                f"x_global shape {x.shape}, expected (C,P)=({C},{P}).")
     else:
-        raise ValueError("x_global must be 1-D or 2-D")
-
-    if orbit_target_mass is None:
-        if orbit_weights is None:
-            raise RuntimeError(
-                "Provide orbit_target_mass for absolute comparison."
-            )
-        orbit_target_mass = np.asarray(orbit_weights, dtype=np.float64).ravel()
-    else:
-        orbit_target_mass = np.asarray(orbit_target_mass, dtype=np.float64).ravel()
-
-    if orbit_target_mass.size == C * P:
-        orbit_target_mass = orbit_target_mass.reshape(C, P).sum(axis=1)
-    elif orbit_target_mass.size != C:
         raise ValueError(
-            f"orbit_target_mass has size {orbit_target_mass.size}, "
-            f"expected C={C} or C*P={C*P}."
-        )
+            "x_global must be one- or two-dimensional.")
 
+    weights = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
+
+    if weights.size == C * P:
+        weights = weights.reshape(C, P).sum(axis=1)
+    elif weights.size != C:
+        raise ValueError(
+            f"orbit_weights has size {weights.size}, "
+            f"expected C={C} or C*P={C * P}.")
+    if not np.all(np.isfinite(weights)):
+        raise ValueError(
+            "orbit_weights must contain only finite values.")
+    if np.any(weights < 0.0):
+        raise ValueError(
+            "orbit_weights must be nonnegative.")
+
+    positive = weights > 0.0
+    if not np.any(positive):
+        raise ValueError(
+            "orbit_weights must contain at least one positive component.")
+
+    weight_sum = float(np.sum(weights))
+    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+        raise ValueError(
+            "orbit_weights must have positive finite total weight.")
+
+    orbit_shape = weights / weight_sum
     sol_mass = np.sum(x, axis=1)
-    resid = sol_mass - orbit_target_mass
 
-    abs_l1 = float(np.sum(np.abs(resid)))
-    abs_l2 = float(np.linalg.norm(resid))
-    abs_linf = float(np.max(np.abs(resid))) if resid.size else 0.0
+    # The fitted alpha is the common coefficient mass of constrained
+    # components. Averaging makes this diagnostic independent of tiny
+    # numerical constraint residuals.
+    alpha_fit = float(np.mean(sol_mass[positive]))
 
-    rel_l2 = float(abs_l2 / (np.linalg.norm(orbit_target_mass) + 1e-30))
-    rel_linf = float(
-        abs_linf / (np.max(np.abs(orbit_target_mass)) + 1e-30)
-    )
+    target_ratio = positive.astype(np.float64)
+    mass_ratio = np.divide(sol_mass, alpha_fit, out=np.zeros_like(sol_mass),
+        where=alpha_fit > 0.0)
 
-    eps = 1e-30
-    log_t = np.log10(np.maximum(orbit_target_mass, eps))
-    log_s = np.log10(np.maximum(sol_mass, eps))
+    relative_resid = mass_ratio - target_ratio
+    target_mass = alpha_fit * target_ratio
+    absolute_resid = sol_mass - target_mass
 
-    fig = plt.figure(figsize=(9.5, 4.2))
-    gs = gridspec.GridSpec(1, 2, width_ratios=[1.05, 1.0], wspace=0.32)
+    abs_l1 = float(np.sum(np.abs(absolute_resid)))
+    abs_l2 = float(np.linalg.norm(absolute_resid))
+    abs_linf = float(np.max(np.abs(absolute_resid)))
+    rel_linf = float(np.max(np.abs(relative_resid)))
 
-    # Left: absolute target vs solution
-    ax0 = fig.add_subplot(gs[0, 0])
-    ax0.plot(log_t, log_s, "o", alpha=0.75, ms=5)
-    lo = float(np.min([log_t.min(), log_s.min()])) if log_t.size else -1.0
-    hi = float(np.max([log_t.max(), log_s.max()])) if log_t.size else 1.0
-    ax0.plot([lo, hi], [lo, hi], "k--", lw=1.0)
-    ax0.set_xlabel(r"$\log_{10}(M_{\rm target})$")
-    ax0.set_ylabel(r"$\log_{10}(M_{\rm solution})$")
-    ax0.set_title("Absolute orbit mass comparison")
-
-    txt = (
-        rf"$||s-t||_1={abs_l1:.3e}$" "\n"
-        rf"$||s-t||_2={abs_l2:.3e}$" "\n"
-        rf"$||s-t||_\infty={abs_linf:.3e}$" "\n"
-        rf"rel$_2$={rel_l2:.3e}, rel$_\infty$={rel_linf:.3e}"
-    )
-    ax0.text(
-        1.0-0.03,
-        1.0-0.97,
-        txt,
-        transform=ax0.transAxes,
-        va='bottom',
-        ha='right',
-        fontsize=7,
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
-    )
-
-    # Right: residual vector
-    ax1 = fig.add_subplot(gs[0, 1])
     idx = np.arange(C, dtype=int)
-    ax1.axhline(0.0, color="k", lw=1.0)
-    ax1.bar(idx, resid, width=0.8)
-    ax1.set_xlabel("orbit index")
-    ax1.set_ylabel(r"$M_{\rm solution}-M_{\rm target}$")
-    ax1.set_title("Absolute residual per orbit")
 
-    if C <= 24:
-        ax1.set_xticks(idx)
+    fig = plt.figure(figsize=(13.5, 4.2))
+    gs = gridspec.GridSpec(1, 3, width_ratios=[1.0, 1.0, 1.0], wspace=0.32)
+
+    # The dynamical weights are context, not coefficient-mass targets.
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax0.plot(idx[positive], orbit_shape[positive], "o",
+        ms=5, alpha=0.8)
+    ax0.set_yscale("log")
+    ax0.set_xlabel("component index")
+    ax0.set_ylabel(r"normalized dynamical weight $w_c$")
+    ax0.set_title("Dynamical weights encoded in HyperCube")
+
+    # Positive-weight components should all have coefficient mass alpha.
+    ax1 = fig.add_subplot(gs[0, 1])
+    ax1.axhline(1.0, color="k", lw=1.0, linestyle="--",
+        label=r"target $m_c/\alpha=1$")
+    ax1.plot(idx[positive], mass_ratio[positive], "o",
+        ms=5, alpha=0.8, label="fitted")
+
+    if np.any(~positive):
+        ax1.plot(idx[~positive], mass_ratio[~positive], "x",
+            ms=6, label="zero-weight component")
+
+    ax1.set_xlabel("component index")
+    ax1.set_ylabel(r"$m_c/\alpha$")
+    ax1.set_title("Coefficient-mass constraint")
+    ax1.legend(fontsize=8, loc="best")
+
+    # This directly measures violation of the constraint actually imposed.
+    # Right: component-wise relative coefficient-mass residual.
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.bar(np.arange(C), relative_resid)
+    ax2.axhline(0.0, color="k", lw=0.8)
+    ax2.set_xlabel("component index")
+    ax2.set_ylabel(r"$(m_c-m_{c,\mathrm{target}})/\alpha$")
+    ax2.set_title("Relative constraint residual")
+    resid_l1 = float(np.linalg.norm(absolute_resid, ord=1))
+    resid_l2 = float(np.linalg.norm(absolute_resid))
+    resid_inf = float(np.linalg.norm(absolute_resid, ord=np.inf))
+    rel_inf = float(np.max(np.abs(relative_resid)))
+
+    text = (rf"$\alpha={alpha_fit:.3e}$" "\n"
+        rf"$||r||_1={resid_l1:.3e}$" "\n"
+        rf"$||r||_2={resid_l2:.3e}$" "\n"
+        rf"$||r||_\infty={resid_inf:.3e}$" "\n"
+        rf"$||r/\alpha||_\infty={rel_inf:.3e}$")
+    ax2.text(0.98, 0.98, text, transform=ax2.transAxes,
+        ha="right", va="top", fontsize=8,
+        bbox={"facecolor": "white", "alpha": 0.8})
 
     fig.tight_layout()
 
     if save:
         fig.savefig(save, dpi=140)
+
     plt.close(fig)
 
     return {
+        "orbit_weights": weights,
+        "orbit_shape": orbit_shape,
+        "positive_orbits": positive,
+        "alpha": alpha_fit,
+        "orbit_mass": sol_mass,
+        "orbit_target_mass": target_mass,
+        "orbit_resid": absolute_resid,
+        "relative_orbit_resid": relative_resid,
         "abs_l1": abs_l1,
         "abs_l2": abs_l2,
         "abs_linf": abs_linf,
-        "rel_l2": rel_l2,
         "rel_linf": rel_linf,
-        "orbit_target_mass": orbit_target_mass,
-        "orbit_mass": sol_mass,
-        "orbit_resid": resid,
     }
 
 # ------------------------------------------------------------------------------

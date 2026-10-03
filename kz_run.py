@@ -122,6 +122,12 @@ def main():
         propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26, 0.4],
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6])
+    if propDict['nCuts'] == 3:
+        propDict['regularisation_scale'] = 1e-4
+        propDict['lOrder'] = 1
+    elif propDict['nCuts'] == 20:
+        propDict['regularisation_scale'] = 0.0
+        propDict['lOrder'] = 1
     print(propDict)
 
     _configure_solver_environment(args, propDict)

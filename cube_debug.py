@@ -1184,3 +1184,143 @@ def test_solution_rmse(
     return rmse
 
 # ------------------------------------------------------------------------------
+
+def diagnose_orbit_weight_encoding(
+    hypercube_path: str,
+    solution_path: str,
+) -> dict:
+    """
+    Compare HyperCube component amplitudes, orbit weights, and a free solution.
+
+    Parameters
+    ----------
+    hypercube_path : str
+        HyperCube HDF5 containing the models and orbit weights.
+    solution_path : str
+        HDF5 containing the unconstrained solution.
+
+    Returns
+    -------
+    result : dict
+        Per-component amplitudes, weights, coefficient masses, and correlations.
+
+    Raises
+    ------
+    RuntimeError
+        If required HyperCube normalization data are unavailable.
+    ValueError
+        If the stored dimensions are inconsistent.
+
+    Examples
+    --------
+    >>> out = diagnose_orbit_weight_encoding(hypercube_path, solution_path)
+    """
+    with open_h5(hypercube_path, role="reader") as f:
+        C, P = _read_C_P(f)
+        w_raw = _read_orbit_weights(f)
+
+        if "/HyperCube/norm/losvd_amp" not in f:
+            raise RuntimeError(
+                "Missing /HyperCube/norm/losvd_amp.")
+
+        amp_sc = np.asarray(
+            f["/HyperCube/norm/losvd_amp"][...],
+            dtype=np.float64,
+        )
+        norm_mode = str(
+            f["/HyperCube"].attrs.get("norm.mode", "unknown")
+        ).lower()
+
+    w = np.asarray(w_raw, dtype=np.float64).ravel(order="C")
+    if w.size == C * P:
+        w = w.reshape(C, P, order="C").sum(axis=1)
+    elif w.size != C:
+        raise ValueError(
+            f"orbit_weights has size {w.size}; expected {C} or {C * P}.")
+
+    if amp_sc.ndim != 2 or amp_sc.shape[1] != C:
+        raise ValueError(
+            f"losvd_amp has shape {amp_sc.shape}; expected (S, {C}).")
+
+    x = _read_X(solution_path, x_dset=None, C=C, P=P)
+
+    if not np.all(np.isfinite(x)):
+        raise ValueError("Solution contains non-finite coefficients.")
+    if np.any(x < 0.0):
+        raise ValueError("Solution contains negative coefficients.")
+
+    amp = np.sum(amp_sc, axis=0, dtype=np.float64)
+    x_mass = np.sum(x, axis=1, dtype=np.float64)
+
+    def _normalize(v):
+        v = np.asarray(v, dtype=np.float64)
+        total = float(np.sum(v, dtype=np.float64))
+        if not np.isfinite(total) or total <= 0.0:
+            raise ValueError("Cannot normalize a non-positive vector.")
+        return v / total
+
+    def _logcorr(a, b):
+        good = (
+            np.isfinite(a) & np.isfinite(b)
+            & (a > 0.0) & (b > 0.0)
+        )
+        if np.count_nonzero(good) < 2:
+            return np.nan
+        return float(np.corrcoef(
+            np.log10(a[good]),
+            np.log10(b[good]),
+        )[0, 1])
+
+    w_norm = _normalize(w)
+    amp_norm = _normalize(amp)
+    x_mass_norm = _normalize(x_mass)
+    effective_norm = _normalize(amp * x_mass)
+
+    ratio = np.full(C, np.nan, dtype=np.float64)
+    good = w_norm > 0.0
+    ratio[good] = amp_norm[good] / w_norm[good]
+
+    inv_amp = np.zeros(C, dtype=np.float64)
+    good_amp = amp > 0.0
+    inv_amp[good_amp] = 1.0 / amp[good_amp]
+
+    corr_amp_weight = _logcorr(amp, w)
+    corr_x_weight = _logcorr(x_mass, w)
+    corr_x_amp = _logcorr(x_mass, amp)
+    corr_x_inv_amp = _logcorr(x_mass, inv_amp)
+
+    print(f"[orbit encoding] norm.mode={norm_mode}")
+    print(
+        " c       weight        LOSVD          x-sum"
+        "        A*x          A/w"
+    )
+    for cc in range(C):
+        print(
+            f"{cc:2d}  {w_norm[cc]:12.5e}  {amp_norm[cc]:12.5e}  "
+            f"{x_mass_norm[cc]:12.5e}  "
+            f"{effective_norm[cc]:12.5e}  {ratio[cc]:9.4f}"
+        )
+
+    print()
+    print(f"corr(log A, log weight) = {corr_amp_weight:+.6f}")
+    print(f"corr(log x, log weight) = {corr_x_weight:+.6f}")
+    print(f"corr(log x, log A)      = {corr_x_amp:+.6f}")
+    print(f"corr(log x, log 1/A)    = {corr_x_inv_amp:+.6f}")
+
+    return {
+        "norm_mode": norm_mode,
+        "orbit_weights": w,
+        "orbit_weights_norm": w_norm,
+        "losvd_amplitude": amp,
+        "losvd_amplitude_norm": amp_norm,
+        "x_orbit_mass": x_mass,
+        "x_orbit_mass_norm": x_mass_norm,
+        "effective_amplitude_norm": effective_norm,
+        "losvd_over_weight": ratio,
+        "corr_log_losvd_weight": corr_amp_weight,
+        "corr_log_x_weight": corr_x_weight,
+        "corr_log_x_losvd": corr_x_amp,
+        "corr_log_x_inverse_losvd": corr_x_inv_amp,
+    }
+
+# ------------------------------------------------------------------------------
