@@ -1,7 +1,19 @@
 site_name: CubeFit
+site_description: LOSVD-convolved stellar-population fitting for IFU data cubes
 theme:
   name: material
 nav:
   - Home: index.md
-  - CubeFit: CubeFit.md
-docs_dir: docs
+  - Architecture: architecture.md
+  - HDF5 data model: hdf5-schema.md
+  - HyperCube construction: hypercube.md
+  - Solver and restart model: solver.md
+  - Workflows: workflows.md
+  - Configuration: configuration.md
+  - API map: api-reference.md
+  - Troubleshooting: troubleshooting.md
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true

@@ -1,101 +1,210 @@
 # CubeFit
 
-CubeFit is a high-throughput pipeline for orbital spectral–fitting on IFU data cubes.  
-It builds a **HyperCube** of convolved template populations, then solves for global
-population weights with a parallel **Kaczmarz** solver, including sidecar tracking,
-a live dashboard, and memory-safe reconstruction/plotting utilities.
+CubeFit is an HDF5-backed pipeline for fitting stellar-population mixtures to
+spatially resolved IFU spectroscopy while retaining the spatial and kinematic
+structure supplied by a Schwarzschild/orbit decomposition.
 
-- Fast, chunk-aligned HDF5 I/O (SWMR-friendly)
-- On-the-fly or cached λ-weights and global column energy
-- Robust multi-process Kaczmarz with trust-region, backtracking, optional NNLS polish
-- Fit sidecar writer for live progress & EWMA metrics
-- Reconstruction of `ModelCube` without materializing the full basis
-- Lightweight plotting (best/worst residual spectra) and diagnostics
+> **Documentation status:** this README and `docs/CubeFit.md` describe the
+> repository snapshot packed on 3 October 2026. They replace the old
+> Kaczmarz-centric documentation. The production pathway in this snapshot is
+> `kz_fitSpec.genCubeFit()` -> `PipelineRunner.solve_all_mp_batched()` ->
+> `streaming_nnls_constrained.solve_streaming_nnls()` ->
+> `streamActiveSetNNLS()`.
 
-> **Full documentation** → [`docs/CubeFit.md`](docs/CubeFit.md)  
-> **Environment variables (all knobs)** → [`docs/CubeFit.md#environment-variables`](docs/CubeFit.md#environment-variables)
+## What CubeFit solves
 
----
+Let
 
-## Installation
+- `S` be the number of spatial bins;
+- `L` the number of fitted wavelength pixels;
+- `C` the number of dynamical components; and
+- `P` the number of flattened SSP populations.
 
-Requirements: Python ≥ 3.10, NumPy, SciPy, h5py, matplotlib, tqdm, threadpoolctl, (optional) Cython.
+The HyperCube stores
 
-```bash
-# (optional) create an environment
-python -m venv .venv && source .venv/bin/activate
-
-# install package & deps
-pip install -r requirements.txt  # if present
-pip install -e .
+```text
+A[s,c,p,l] = model spectrum for spatial bin s,
+             component c, population p, wavelength l
 ```
 
-If your build includes Cython extensions (e.g., continuum detrending), ensure a C compiler
-is available; `pip install -e .` will compile them in place.
+and CubeFit solves for a global non-negative coefficient matrix `X[c,p]`:
 
----
+```text
+Y_hat[s,l] = sum_c sum_p A[s,c,p,l] * X[c,p].
+```
 
-## Quickstart
+The production HyperCube is normally built with `norm_mode="model"`. In that
+mode the LOSVD amplitude of every `(s,c)` component is multiplied into the
+HyperCube exactly once. The relative Schwarzschild component strength is
+therefore already encoded in `A`.
 
-Below is a minimal end-to-end sketch. See the manual for full options and data prep.
+## Current orbit constraint
+
+When `orbitWeights=False`, the fit is unconstrained apart from `X >= 0`.
+
+When orbit weights are enabled, the current solver uses the v2.0
+`equal_component_mass` formulation. Positive dynamical weights select the
+components that participate in the constraint, but their magnitudes are not
+applied to `X` a second time. Instead,
+
+```text
+sum_p X[c,p] = alpha
+```
+
+for every positive-weight component, with a common fitted `alpha >= 0`.
+
+This is deliberate: under model normalization the relative dynamical masses
+are already present in the HyperCube. The constraint removes the otherwise
+arbitrary component-level rescaling available to NNLS without double-applying
+the Schwarzschild weights.
+
+## Main entry points
+
+The high-level science interface is:
+
+```python
+from CubeFit.kz_fitSpec import genCubeFit, loadCubeFit
+```
+
+`genCubeFit()` prepares the spectral/dynamical inputs, writes the HDF5
+backbone, preflights and builds the HyperCube, and optionally runs the global
+streaming active-set NNLS solver.
+
+`loadCubeFit()` loads a completed fit, reconstructs `/ModelCube` when needed,
+computes residual diagnostics, and writes the scientific plots.
+
+Lower-level entry points include:
 
 ```python
 from CubeFit.hypercube_builder import build_hypercube
 from CubeFit.pipeline_runner import PipelineRunner
-
-H5 = "CubeFit/NGC4365/NGC4365_04.h5"
-
-# 1) Build the HyperCube (choose normalization you’ll use in fitting)
-build_hypercube(
-    H5,
-    norm_mode="model",   # or "data" (see docs on normalization)
-    amp_mode="sum"       # or "trapz" (requires /VelPix)
-)
-
-# 2) Solve (multi-process Kaczmarz); see docs for all knobs/args
-pr = PipelineRunner(H5)
-x_global, stats = pr.solve_all_mp_batched(
-    epochs=3,
-    pixels_per_aperture=1247,
-    lr=0.9,
-    project_nonneg=True,
-    processes=8,
-    blas_threads=8,
-)
-
-# 3) Reconstruct the model cube for diagnostics/plots
-from CubeFit.kz_fitSpec import reconstruct_model_cube_single
-reconstruct_model_cube_single(h5_path=H5, x_global=x_global, array_name="ModelCube", blas_threads=8)
+from CubeFit.streaming_nnls_constrained import solve_streaming_nnls
 ```
 
-**Tips**
-- If your HyperCube was built in the other normalization, you can convert in-place
-  (streaming) without a full rebuild. See **Normalization utilities** in the manual.
-- λ-weights (feature emphasis) and global column energy are read/cached automatically if present.
+## High-level run controls
 
----
+`genCubeFit()` consumes the following important values from `**kwargs`:
 
-## Building the docs
+```text
+warm                  zeros | saved_x | resume | upscale...
+regularisation_scale  non-negative float; default 1.0
+cpu_processes          requested process count; default 12
+blas_threads           requested BLAS threads/process; default 4
+hdf5Dir                output directory
+orbitWeights           False by default
+validationPath         synthetic validation input HDF5
+validationDataset      validation spectra dataset; default /DataCube
+validationTag          required for validation runs
+```
 
-This repo ships a full manual at `docs/CubeFit.md`. You can build HTML/PDF with your Makefile:
+`runSwitch='gen'` builds the HyperCube and returns. `runSwitch='fit'` ensures
+the HyperCube exists and then fits it.
+
+## Parallelism
+
+`genCubeFit()` passes `cpu_processes` and `blas_threads` through
+`cube_utils.resolve_parallelism()`, which respects the process CPU affinity /
+Slurm cpuset and avoids a requested `processes * BLAS_threads` total above the
+available allocation.
+
+Set numerical-library thread variables before Python starts, especially on
+Slurm:
 
 ```bash
-make html
-make pdf
+export OMP_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
+export MKL_NUM_THREADS=2
+export BLIS_NUM_THREADS=2
+export NUMEXPR_NUM_THREADS=1
 ```
 
-MkDocs config (`mkdocs.yml`) already points navigation to `docs/CubeFit.md`.
+The worker initializers in this repository explicitly set OpenMP, OpenBLAS and
+MKL thread counts. They do **not** set `BLIS_NUM_THREADS`, so BLIS users should
+set it in the launch environment.
 
----
+## Validation / closure tests
 
-## Where to next?
+`validation.makeValidationCube()` creates a deliberately small validation
+input from a completed `/ModelCube`. It writes only:
 
-- **Full reference & walkthrough**: [`docs/CubeFit.md`](docs/CubeFit.md)  
-- **All environment variables** (solver, NNLS, tracking, mp, etc.):
-  [`docs/CubeFit.md#environment-variables`](docs/CubeFit.md#environment-variables)
+```text
+/DataCube   synthetic spectra, (S,L), float64, gzip
+/ObsPix     observed log-wavelength grid, (L,)
+```
 
----
+The full `/HyperCube/models` dataset is not copied.
 
-## License
+Example:
 
-See `LICENSE` (if present). If you plan to publish results, please cite the repository and any underlying data/model libraries you use (e.g., MILES/eMILES).
+```python
+from CubeFit.validation import makeValidationCube
+
+makeValidationCube(
+    'CubeFit/NGC4365/hypercube_3_01.h5',
+    'CubeFit/NGC4365/hypercube_3_01_mock-data.h5',
+)
+```
+
+Then fit it with a distinct output tag:
+
+```python
+genCubeFit(
+    ...,
+    runSwitch='fit',
+    validationPath='CubeFit/NGC4365/hypercube_3_01_mock-data.h5',
+    validationDataset='/DataCube',
+    validationTag='closure-01',
+)
+```
+
+The new fit is written to a tagged HyperCube such as
+`hypercube_3_01_closure-01.h5`; validation figures are written under
+`<galaxy>/validation/closure-01/`.
+
+Coefficient recovery can then be audited with
+`validation.compare_validation_solution()`.
+
+## Diagnostics
+
+The active solver emits JSONL diagnostics when configured with:
+
+```bash
+export CUBEFIT_DIAG_LEVEL=2
+export CUBEFIT_DIAG_STRIDE=1
+export CUBEFIT_DIAG_TOPK=12
+export CUBEFIT_DIAG_JSONL=/path/to/diagnostics.jsonl
+export CUBEFIT_SOLVER_CHECKPOINT_EVERY=1
+```
+
+The most useful records are `setup`, `mono_setup`, `kkt`,
+`exploration_trial`, `exploration_accept`, `exploration`, and the final stop
+summary.
+
+## Important current implementation notes
+
+The source snapshot contains several historical APIs and environment knobs.
+The production constrained solver does **not** use the old Kaczmarz trust
+region, tile-local NNLS polish, orbit softbox, or the old proportional
+orbit-weight penalty described by the previous documentation.
+
+Likewise, several `CUBEFIT_*` variables still set by `kz_run.py` belong to
+older solver paths and are not read by `streaming_nnls_constrained.py`. The
+current constrained solver directly reads the diagnostic and checkpoint
+variables listed above.
+
+The current `build_hypercube()` creates a spawned process pool, but this
+snapshot submits one `(s-tile,c-tile,p-block)` future and waits for it before
+submitting the next tile. Consequently, `processes>1` does not create multiple
+simultaneous tile jobs in this exact implementation. See the manual's
+performance section before interpreting process-count benchmarks.
+
+## Documentation
+
+- Full manual: [`docs/CubeFit.md`](docs/CubeFit.md)
+- Standalone HTML: [`docs/CubeFit.html`](docs/CubeFit.html)
+- PDF manual: [`docs/CubeFit.pdf`](docs/CubeFit.pdf)
+
+The manual includes the HDF5 schema, normalization semantics, v2.0 orbit
+constraint, active-set search, dyadic exploration, regularization, resume
+compatibility, validation workflow, plotting, storage management, diagnostics,
+HPC operation, and a source-derived API index.

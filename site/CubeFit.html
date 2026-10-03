@@ -1,0 +1,1020 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>CubeFit</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    html { -webkit-text-size-adjust: 100%; }
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">CubeFit</h1>
+</header>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a
+href="#cubefit--losvd-convolved-stellar-population-fitting-for-ifu-cubes"
+id="toc-cubefit--losvd-convolved-stellar-population-fitting-for-ifu-cubes">CubeFit
+— LOSVD-convolved stellar population fitting for IFU cubes</a>
+<ul>
+<li><a href="#hdf5-layout-what-lives-where"
+id="toc-hdf5-layout-what-lives-where">HDF5 layout (what lives
+where)</a></li>
+<li><a href="#manager-creating-and-populating-the-hdf5-backbone"
+id="toc-manager-creating-and-populating-the-hdf5-backbone">Manager:
+creating and populating the HDF5 backbone</a></li>
+<li><a href="#hypercube-builder" id="toc-hypercube-builder">Hypercube
+builder</a></li>
+<li><a href="#normalization-conversion-post-hoc"
+id="toc-normalization-conversion-post-hoc">Normalization conversion
+(post-hoc)</a></li>
+<li><a href="#λ-feature-emphasis-line-weights"
+id="toc-λ-feature-emphasis-line-weights">λ-feature emphasis (line
+weights)</a></li>
+<li><a
+href="#solver-multiprocess-batched-kaczmarz--weighted-nnls-polish"
+id="toc-solver-multiprocess-batched-kaczmarz--weighted-nnls-polish">Solver:
+multiprocess batched Kaczmarz (+ weighted NNLS polish)</a></li>
+<li><a href="#reconstruction--plots-without-storing-a-full-modelcube"
+id="toc-reconstruction--plots-without-storing-a-full-modelcube">Reconstruction
+&amp; plots (without storing a full ModelCube)</a></li>
+<li><a href="#fit-tracking--snapshots"
+id="toc-fit-tracking--snapshots">Fit tracking &amp; snapshots</a></li>
+<li><a href="#utilities" id="toc-utilities">Utilities</a></li>
+<li><a href="#environment-variables-knobs"
+id="toc-environment-variables-knobs">Environment variables (knobs)</a>
+<ul>
+<li><a href="#hdf5--dataset-caching" id="toc-hdf5--dataset-caching">HDF5
+&amp; dataset caching</a></li>
+<li><a href="#multiprocessing--blasopenmp"
+id="toc-multiprocessing--blasopenmp">Multiprocessing &amp;
+BLAS/OpenMP</a></li>
+<li><a
+href="#solver-worker-level-stability--steps-in-kaczmarz_solver_cchunk_mppy"
+id="toc-solver-worker-level-stability--steps-in-kaczmarz_solver_cchunk_mppy">Solver:
+worker-level stability &amp; steps (in
+<code>kaczmarz_solver_cchunk_mp.py</code>)</a></li>
+<li><a
+href="#solver-aggregation--nnls-polish-in-kaczmarz_solver_cchunk_mppy"
+id="toc-solver-aggregation--nnls-polish-in-kaczmarz_solver_cchunk_mppy">Solver:
+aggregation &amp; NNLS polish (in
+<code>kaczmarz_solver_cchunk_mp.py</code>)</a></li>
+<li><a
+href="#solver-λ-weights-in-kaczmarz_solver_cchunk_mppy--cube_utilspy"
+id="toc-solver-λ-weights-in-kaczmarz_solver_cchunk_mppy--cube_utilspy">Solver:
+λ-weights (in <code>kaczmarz_solver_cchunk_mp.py</code> /
+<code>cube_utils.py</code>)</a></li>
+<li><a href="#fit-tracking-in-fit_trackerpy"
+id="toc-fit-tracking-in-fit_trackerpy">Fit tracking (in
+<code>fit_tracker.py</code>)</a></li>
+</ul></li>
+<li><a href="#typical-end-to-end-workflow"
+id="toc-typical-end-to-end-workflow">Typical end-to-end
+workflow</a></li>
+<li><a href="#notes-on-normalization--physics"
+id="toc-notes-on-normalization--physics">Notes on normalization &amp;
+physics</a></li>
+<li><a href="#troubleshooting--sanity-checks"
+id="toc-troubleshooting--sanity-checks">Troubleshooting &amp; sanity
+checks</a></li>
+<li><a href="#where-to-look-in-the-code"
+id="toc-where-to-look-in-the-code">Where to look in the code</a></li>
+<li><a href="#building-the-docs" id="toc-building-the-docs">Building the
+docs</a></li>
+</ul></li>
+</ul>
+</nav>
+<h1
+id="cubefit--losvd-convolved-stellar-population-fitting-for-ifu-cubes">CubeFit
+— LOSVD-convolved stellar population fitting for IFU cubes</h1>
+<p>CubeFit builds a <strong>hypercube of convolved template
+spectra</strong> for every
+<code>(spaxel S, component C, population P)</code> and solves for a
+global, non-negative mixture that best explains the observed IFU data
+cube. It is designed for large datasets (10^3–10^5 spaxels, 10^2–10^3
+populations), is robust to restarts, and uses HDF5 end-to-end with
+streaming, tile-aligned I/O.</p>
+<ul>
+<li><strong>Hypercube builder:</strong> FFT-based LOSVD convolution on
+the template grid, followed by flux-conserving rebin to the observed
+grid.</li>
+<li><strong>Normalization:</strong> choose “model” (LOSVD amplitude) or
+“data” (per-spaxel observed flux with LOSVD-proportional splits).
+Convert between modes later without a rebuild.</li>
+<li><strong>Line emphasis:</strong> optional λ-weights so absorption
+features drive the fit.</li>
+<li><strong>Solver:</strong> multiprocess Kaczmarz with diagonal
+preconditioning, trust region, backtracking, global step caps, near-zero
+column freezing, optional de-correlation nudge, and a tile-local
+<strong>weighted NNLS polish</strong>.</li>
+<li><strong>Tracking:</strong> streaming fit metrics and optional
+snapshots to a SWMR-friendly sidecar.</li>
+<li><strong>Utilities:</strong> chunk-aware normalization conversion;
+global column energy; reconstruction and plotting helpers that never
+touch the giant <code>/HyperCube/models</code> unless needed.</li>
+</ul>
+<hr />
+<h2 id="hdf5-layout-what-lives-where">HDF5 layout (what lives
+where)</h2>
+<p>Core inputs:</p>
+<ul>
+<li><code>/Templates</code> — <code>(P, T)</code> template spectra on
+the template grid (time domain).</li>
+<li><code>/TemPix</code> — <code>(T,)</code> template grid in log-λ
+(natural log).</li>
+<li><code>/ObsPix</code> — <code>(L,)</code> observed wavelength grid
+(log-λ).</li>
+<li><code>/R_T</code> — <code>(T, L)</code> (or <code>(L, T)</code>)
+<strong>flux-conserving</strong> linear rebin operator mapping the
+template grid to the observed grid.</li>
+<li><code>/LOSVD</code> — <code>(S, V, C)</code> LOSVD histograms (per
+spaxel and component).</li>
+<li><code>/VelPix</code> — <code>(V,)</code> velocity grid in km/s (for
+LOSVD).</li>
+</ul>
+<p>Optional inputs:</p>
+<ul>
+<li><code>/Mask</code> — <code>(L,)</code> boolean wavelength mask; used
+consistently by builder and solver.</li>
+<li><code>/HyperCube/data_flux</code> — <code>(S,)</code> masked mean
+data flux per spaxel (required for <code>norm="data"</code>).</li>
+</ul>
+<p>Built artifacts:</p>
+<ul>
+<li><code>/HyperCube/models</code> — <code>(S, C, P, L)</code> float32
+convolved+rebinned spectra, chunked for streaming and resumable via a
+<code>_done</code> bitmap.</li>
+<li><code>/HyperCube/col_energy</code> — <code>(C, P)</code> float64
+global column energy <code>E[c,p] = Σ_{s,λ in mask} A^2</code>, for
+step-size control.</li>
+<li><code>/HyperCube/norm/losvd_amp</code> — <code>(S, C)</code> LOSVD
+amplitude (sum or trapz).</li>
+<li><code>/HyperCube/norm/losvd_amp_sum</code> — <code>(S,)</code>
+per-spaxel sum of amplitudes.</li>
+<li><code>/HyperCube/lambda_weights</code> — <code>(L,)</code> optional
+λ-weights in <code>[floor, 1]</code> (generated by a median-DoG
+heuristic).</li>
+</ul>
+<p>Fit outputs:</p>
+<ul>
+<li><code>/X_global</code> — <code>(C*P,)</code> solution vector,
+row-major <code>(C, P)</code> flattened.</li>
+</ul>
+<hr />
+<h2 id="manager-creating-and-populating-the-hdf5-backbone">Manager:
+creating and populating the HDF5 backbone</h2>
+<p><code>hdf5_manager.py</code> provides:</p>
+<ul>
+<li><strong>Safe file open</strong> with retries, optional SWMR, and
+lock-handling (<code>open_h5</code>).</li>
+<li><strong>Dataset creation</strong> for the core arrays and dimensions
+(<code>H5Manager</code> + <code>H5Dims</code>).</li>
+<li><strong>Population</strong> from NumPy arrays
+(<code>populate_from_arrays</code>), including grid checks.</li>
+<li><strong>Flux-conserving rebin</strong> operator construction
+(<code>ensure_rebin_and_resample</code>).</li>
+</ul>
+<p>Typical setup:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.hdf5_manager <span class="im">import</span> H5Manager, H5Dims</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>mgr <span class="op">=</span> H5Manager(<span class="st">&quot;galaxy.h5&quot;</span>, tem_pix<span class="op">=</span>tem_loglam, obs_pix<span class="op">=</span>obs_loglam)</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>mgr.init_base(H5Dims(nSpat<span class="op">=</span>S, nLSpec<span class="op">=</span>L, nTSpec<span class="op">=</span>T, nVel<span class="op">=</span>V, nComp<span class="op">=</span>C, nPop<span class="op">=</span>P))</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>mgr.populate_from_arrays(losvd<span class="op">=</span>H_SVC, datacube<span class="op">=</span>Y_SL, templates<span class="op">=</span>T_PT)</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>mgr.ensure_rebin_and_resample()  <span class="co"># builds /R_T (and validates shapes)</span></span></code></pre></div>
+<p>Notes:</p>
+<ul>
+<li><code>/R_T</code> is built by exact bin overlap in log-λ, preserving
+flux.</li>
+<li><code>/Mask</code> (if present) is used later by both builder and
+solver.</li>
+<li>Manager helpers centralize chunk-cache setup so downstream is
+fast.</li>
+</ul>
+<hr />
+<h2 id="hypercube-builder">Hypercube builder</h2>
+<p><code>hypercube_builder.py</code> constructs
+<code>/HyperCube/models</code> in streaming, tile-aligned passes:</p>
+<ol type="1">
+<li><strong>Kernel from LOSVD:</strong> each <code>(s,c)</code> LOSVD
+row → <strong>unit-area</strong> kernel on the template grid (linear
+interpolation to integer pixel shifts). A separate scalar
+<strong>amplitude</strong> is computed per <code>(s,c)</code> (either
+sum or trapezoidal integral).</li>
+<li><strong>Convolution (per p):</strong> FFT-multiply template by
+kernel and crop the linear convolution back to the template length.</li>
+<li><strong>Rebin to observed grid:</strong> multiply by
+<code>/R_T</code> to get <code>(P, L)</code> for each
+<code>(s,c)</code>.</li>
+<li><strong>Normalization:</strong>
+<ul>
+<li><code>norm="model"</code>: multiply each <code>(s,c,p,:)</code> by
+its LOSVD amplitude.</li>
+<li><code>norm="data"</code>: compute per-spaxel mean observed flux
+(from <code>/HyperCube/data_flux</code>), then split across components
+in proportion to their LOSVD amplitudes, preserving the (c) ratios
+determined by LOSVD at that spaxel.</li>
+</ul></li>
+<li><strong>Global column energy:</strong> simultaneously accumulate
+<code>E[c,p]=Σ_{s,λ in mask} A²</code> into
+<code>/HyperCube/col_energy</code> for solver preconditioning.</li>
+</ol>
+<p><strong>Resumability &amp; chunking:</strong> the builder creates
+<code>/HyperCube/models</code> with chunks
+<code>(S_chunk, C_chunk, P_chunk, L)</code> and maintains a
+<code>_done</code> bitmap over the
+<code>(S_chunk, C_chunk, P_chunk)</code> tile grid; this lets you resume
+safely or inspect progress mid-build. Metadata is flushed regularly.</p>
+<hr />
+<h2 id="normalization-conversion-post-hoc">Normalization conversion
+(post-hoc)</h2>
+<p>Flip between <code>norm="data"</code> and <code>norm="model"</code>
+after the build:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.hypercube_builder <span class="im">import</span> convert_hypercube_norm</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>convert_hypercube_norm(<span class="st">&quot;galaxy.h5&quot;</span>, to_mode<span class="op">=</span><span class="st">&quot;model&quot;</span>, recompute_energy<span class="op">=</span><span class="va">True</span>)</span></code></pre></div>
+<p>This reads <code>/HyperCube/norm/losvd_amp_sum</code> (and
+<code>/HyperCube/data_flux</code> when needed), computes a
+<strong>per-spaxel scalar</strong> <code>F[s]</code>, and scales
+<code>/HyperCube/models[s,:,:,:] *= F[s]</code> in
+<strong>S-tiles</strong> (chunk-aligned). It updates
+<code>/HyperCube/col_energy</code> (optional) and flips the
+<code>/HyperCube</code> attribute <code>norm.mode</code>. It also
+respects <code>/Mask</code> when deriving or validating the spaxel flux
+vector.</p>
+<p>This is a safe, <strong>no-FFT</strong> operation. Use it to avoid
+rebuilding the hypercube when only a normalization flip is required.</p>
+<hr />
+<h2 id="λ-feature-emphasis-line-weights">λ-feature emphasis (line
+weights)</h2>
+<p>Absorption features can be down-weighted in plain least squares. To
+emphasize them, the solver supports <strong>λ-weights</strong>:</p>
+<ul>
+<li>Build weights once via a <strong>median spectrum</strong> and a
+two-scale smoothing <strong>difference-of-Gaussians</strong>
+(implemented with boxcars), then map to <code>[min_w, 1]</code>. Store
+at <code>/HyperCube/lambda_weights</code>.</li>
+<li>During solving, multiply both <strong>residuals</strong> and
+<strong>design matrix columns</strong> by <code>sqrt(w)</code> —
+equivalent to solving in a diagonal metric where line pixels matter
+more.</li>
+</ul>
+<p>Helpers in <code>cube_utils.py</code>:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.cube_utils <span class="im">import</span> ensure_lambda_weights, read_lambda_weights</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>w <span class="op">=</span> ensure_lambda_weights(<span class="st">&quot;galaxy.h5&quot;</span>)  <span class="co"># writes /HyperCube/lambda_weights</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>w2 <span class="op">=</span> read_lambda_weights(<span class="st">&quot;galaxy.h5&quot;</span>)   <span class="co"># reads, with floor &amp; mask handling</span></span></code></pre></div>
+<p>At solver startup you’ll see a banner printing
+<code>min/max/mean</code> of the λ-weights used (after masking).</p>
+<hr />
+<h2
+id="solver-multiprocess-batched-kaczmarz--weighted-nnls-polish">Solver:
+multiprocess batched Kaczmarz (+ weighted NNLS polish)</h2>
+<p>Entry point:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.pipeline_runner <span class="im">import</span> PipelineRunner</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>runner <span class="op">=</span> PipelineRunner(<span class="st">&quot;galaxy.h5&quot;</span>)</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>x_global, stats <span class="op">=</span> runner.solve_all_mp_batched(</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    epochs<span class="op">=</span>E,</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    pixels_per_aperture<span class="op">=</span>...,            <span class="co"># row batching (if used)</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    lr<span class="op">=</span>...,                             <span class="co"># base learning-rate</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    project_nonneg<span class="op">=</span><span class="va">True</span>,                <span class="co"># x &gt;= 0</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    processes<span class="op">=</span>..., blas_threads<span class="op">=</span>...,    <span class="co"># MP and BLAS knobs</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    orbit_weights<span class="op">=</span>...,                  <span class="co"># optional (C,) ratio guidance</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="co"># …other optional arguments…</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+<p>High-level flow (<code>pipeline_runner.py</code> →
+<code>kaczmarz_solver_cchunk_mp.py</code>):</p>
+<ol type="1">
+<li><strong>Tile scheduling:</strong> sort S-tiles by data norm (coarse
+“hardest first” ordering).</li>
+<li><strong>Workers:</strong> each process takes a contiguous
+<strong>c-band</strong> for the active S-tile.</li>
+<li><strong>Inside a worker (per band):</strong>
+<ul>
+<li><strong>Sanitize</strong> non-finite values in <code>A</code> and
+<code>R</code> to zeros.</li>
+<li><strong>Apply λ-weights</strong> by computing gradients and
+denominators on <code>√w · A</code> and <code>√w · R</code> (but updates
+and residuals are returned in the unweighted space).</li>
+<li><strong>Diagonal preconditioning:</strong> per-population step
+<code>dx_p ∝ g_p / Σ (A_w)^2</code>, blended with global column energy
+<code>E[c,p]</code> for stability.</li>
+<li><strong>Near-zero column freeze</strong> (relative &amp; absolute
+thresholds).</li>
+<li><strong>Trust region</strong> on ΔR in weighted space
+(<code>||ΔR_w|| ≤ τ ||R_w||</code>) + <strong>backtracking</strong> for
+monotone weighted RMSE drop.</li>
+<li><strong>Optional de-correlation nudge</strong> to avoid chasing flat
+null-space directions across <code>P</code>.</li>
+<li><strong>Candidate set</strong> for <strong>tile-local weighted NNLS
+polish</strong> (top-K by score).</li>
+</ul></li>
+<li><strong>Parent process:</strong>
+<ul>
+<li>Aggregates ΔR over bands and runs <strong>tile-level
+backtracking</strong>.</li>
+<li>Applies a <strong>global step cap</strong> using
+<code>Σ dx² · E[c,p]</code> vs. <code>||Y||</code>.</li>
+<li>Optionally runs <strong>NNLS polish</strong> on the proposed (c,p)
+set using a λ-subsample (rows) and accepts only if it reduces
+<strong>weighted RMSE</strong> enough.</li>
+<li>Commits the single global α for the tile: update <code>R</code> and
+<code>x</code>, enforce <code>x ≥ 0</code>.</li>
+<li>Optional <strong>ratio penalty</strong> step nudges the component
+totals toward <code>orbit_weights</code> (if provided).</li>
+<li>Streams metrics to <code>FitTracker</code> and snapshots
+(optional).</li>
+</ul></li>
+</ol>
+<p>The result is written to <code>/X_global</code> (flattened
+<code>(C*P,)</code>), along with run stats.</p>
+<hr />
+<h2
+id="reconstruction--plots-without-storing-a-full-modelcube">Reconstruction
+&amp; plots (without storing a full ModelCube)</h2>
+<p>You can reconstruct <code>Ŷ = A·x</code> for diagnostics without
+materializing a full <code>/ModelCube</code>:</p>
+<ul>
+<li><strong>Reconstruction utilities</strong> read <code>A</code> in the
+same chunk order and contract against <code>x</code> in λ-bands. They
+write a small target array you name (e.g., <code>/ReconTile</code>) or
+return the result.</li>
+<li><strong>Parallel spectral plots</strong> pull just the selected rows
+from <code>/DataCube</code> and the reconstructed array and produce
+side-by-side data/model spectral plots for worst/best spaxels.</li>
+</ul>
+<p>Both are tile-aligned and cache-aware; they never read
+<code>/HyperCube/models</code> beyond the needed slices.</p>
+<hr />
+<h2 id="fit-tracking--snapshots">Fit tracking &amp; snapshots</h2>
+<p><code>fit_tracker.py</code> provides a <strong>non-blocking</strong>
+sidecar writer process:</p>
+<ul>
+<li>Destination: a sidecar H5 next to the main file
+(<code>*.fit.&lt;pid&gt;.&lt;ts&gt;.h5</code>).</li>
+<li>Bounded <code>mp.Queue</code> so the solver never blocks on
+I/O.</li>
+<li>SWMR enabled for dashboards.</li>
+<li>Streams <strong>RMSE history</strong>, <strong>EWMA</strong>,
+<strong>progress</strong>, and optional <strong>x snapshots</strong>
+(best/last/history).</li>
+</ul>
+<p>Use <code>tracker=FitTracker(...)</code> in the solver; the runner
+wires this up for you.</p>
+<hr />
+<h2 id="utilities">Utilities</h2>
+<ul>
+<li><strong>Normalization conversion:</strong>
+<code>convert_hypercube_norm(h5, to_mode="model"|"data", recompute_energy=True)</code>
+— chunk-aligned, mask-aware.</li>
+<li><strong>Global column energy:</strong> created during build; can be
+recomputed later if you changed normalization.</li>
+<li><strong>Done-bitmap control:</strong> functions to inspect and
+invalidate <code>_done</code> to resume or redo specific tiles.</li>
+<li><strong>Recompression:</strong> rewrite
+<code>/HyperCube/models</code> with different compression/filter options
+(tile-wise copy).</li>
+</ul>
+<hr />
+<h2 id="environment-variables-knobs">Environment variables (knobs)</h2>
+<p>These can be exported to tune performance, stability, or behavior.
+Defaults shown are what the code uses if you don’t set them.</p>
+<h3 id="hdf5--dataset-caching">HDF5 &amp; dataset caching</h3>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th style="text-align: right;">Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>HDF5_USE_FILE_LOCKING</code></td>
+<td style="text-align: right;"><code>FALSE</code></td>
+<td>Avoid HDF5 file locking issues on shared filesystems.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_RDCC_NSLOTS</code></td>
+<td style="text-align: right;"><code>400003</code></td>
+<td>File-level raw chunk cache: number of slots.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_RDCC_NBYTES</code></td>
+<td style="text-align: right;"><code>4294967296</code> (4 GiB)</td>
+<td>File-level raw chunk cache size in bytes.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_RDCC_W0</code></td>
+<td style="text-align: right;"><code>0.9</code></td>
+<td>File-level raw chunk cache preemption policy.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_RDCC_SLOTS</code></td>
+<td style="text-align: right;"><code>1000003</code></td>
+<td>Per-dataset cache slots used by some readers.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_RDCC_BYTES</code></td>
+<td style="text-align: right;"><code>268435456</code> (256 MiB)</td>
+<td>Per-dataset cache size used by some readers.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="multiprocessing--blasopenmp">Multiprocessing &amp;
+BLAS/OpenMP</h3>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th style="text-align: right;">Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CUBEFIT_MP_CTX</code></td>
+<td style="text-align: right;"><code>forkserver</code> (fallback
+<code>spawn</code>)</td>
+<td>MP start method for the solver pool.</td>
+</tr>
+<tr>
+<td><code>OMP_NUM_THREADS</code></td>
+<td style="text-align: right;">set by code</td>
+<td>BLAS/OpenMP threads per worker (also
+<code>OPENBLAS_NUM_THREADS</code>, <code>MKL_NUM_THREADS</code>).</td>
+</tr>
+<tr>
+<td><code>KMP_INIT_AT_FORK</code></td>
+<td style="text-align: right;"><code>FALSE</code></td>
+<td>Avoid OpenMP deadlocks with <code>fork</code>.</td>
+</tr>
+<tr>
+<td><code>SLURM_CPUS_PER_TASK</code></td>
+<td style="text-align: right;">(if present)</td>
+<td>Used by reconstruction helpers to set BLAS threads.</td>
+</tr>
+<tr>
+<td><code>PYTHONUNBUFFERED</code></td>
+<td style="text-align: right;"><code>1</code> (recommended)</td>
+<td>Unbuffered stdout for real-time logs on HPC.</td>
+</tr>
+</tbody>
+</table>
+<h3
+id="solver-worker-level-stability--steps-in-kaczmarz_solver_cchunk_mppy">Solver:
+worker-level stability &amp; steps (in
+<code>kaczmarz_solver_cchunk_mp.py</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th style="text-align: right;">Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CUBEFIT_BT_STEPS</code></td>
+<td style="text-align: right;"><code>3</code></td>
+<td>Backtracking steps per band (worker) for monotone weighted
+RMSE.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_BT_FACTOR</code></td>
+<td style="text-align: right;"><code>0.5</code></td>
+<td>Multiplicative α shrink in backtracking.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_TRUST_TAU</code></td>
+<td style="text-align: right;"><code>0.7</code></td>
+<td>Trust-region cap: `</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_EPS</code></td>
+<td style="text-align: right;"><code>1e-12</code></td>
+<td>Numerical floor in denominators and divisions.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_ZERO_COL_REL</code></td>
+<td style="text-align: right;"><code>1e-12</code></td>
+<td>Relative threshold (vs median energy) to <strong>freeze</strong>
+near-zero columns.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_ZERO_COL_ABS</code></td>
+<td style="text-align: right;"><code>1e-24</code></td>
+<td>Absolute threshold to <strong>freeze</strong> columns.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_DEBUG_SAFE</code></td>
+<td style="text-align: right;"><code>0</code></td>
+<td>Print sanitization/freeze stats per tile if <code>1</code>.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_NNLS_PROP_PER_BAND</code></td>
+<td style="text-align: right;"><code>6</code></td>
+<td>How many (c,p) candidates to propose for NNLS polish per band.</td>
+</tr>
+</tbody>
+</table>
+<h3
+id="solver-aggregation--nnls-polish-in-kaczmarz_solver_cchunk_mppy">Solver:
+aggregation &amp; NNLS polish (in
+<code>kaczmarz_solver_cchunk_mp.py</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th style="text-align: right;">Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CUBEFIT_TILE_BT_STEPS</code></td>
+<td style="text-align: right;"><code>6</code></td>
+<td>Backtracking steps for the <strong>aggregated</strong> ΔR across
+bands.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_TILE_BT_FACTOR</code></td>
+<td style="text-align: right;"><code>0.5</code></td>
+<td>Aggregated α shrink factor.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_GLOBAL_TAU</code></td>
+<td style="text-align: right;"><code>0.5</code></td>
+<td>Global step cap using <code>Σ dx²·E[c,p]</code> vs `</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_GLOBAL_ENERGY_BLEND</code></td>
+<td style="text-align: right;"><code>1e-3</code></td>
+<td>Blend local <code>Σ(A_w)^2</code> with global column energy
+<code>E[c,p]</code> in denominators.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_NNLS_ENABLE</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td>Enable tile-local <strong>weighted</strong> NNLS polish.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_NNLS_EVERY</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td>Run NNLS polish every N tiles.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_NNLS_MAX_COLS</code></td>
+<td style="text-align: right;"><code>128</code></td>
+<td>Max columns K in the NNLS system.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_NNLS_MAX_BYTES</code></td>
+<td style="text-align: right;"><code>1000000000</code></td>
+<td>Approx memory cap for NNLS system (rows×8 per column).</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_NNLS_SUB_L</code></td>
+<td style="text-align: right;"><code>0</code></td>
+<td>λ-subsample size for NNLS (0 → use all).</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_NNLS_SOLVER</code></td>
+<td style="text-align: right;"><code>nnls</code></td>
+<td>One of <code>nnls</code>, <code>lsq</code>, <code>mu</code>,
+<code>fista</code> (FISTA recommended for speed/accuracy).</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_NNLS_MAX_ITER</code></td>
+<td style="text-align: right;"><code>50</code></td>
+<td>Iteration cap for iterative NNLS (<code>mu</code>,
+<code>fista</code>, <code>lsq</code>’s TRF).</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_NNLS_MIN_IMPROVE</code></td>
+<td style="text-align: right;"><code>0.999</code></td>
+<td>Required weighted-RMSE ratio to accept polish (&lt; this
+accepts).</td>
+</tr>
+</tbody>
+</table>
+<h3
+id="solver-λ-weights-in-kaczmarz_solver_cchunk_mppy--cube_utilspy">Solver:
+λ-weights (in <code>kaczmarz_solver_cchunk_mp.py</code> /
+<code>cube_utils.py</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th style="text-align: right;">Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CUBEFIT_LAMBDA_WEIGHTS_ENABLE</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td>Enable λ-weights for solver (<code>√w</code> weighting).</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_LAMBDA_WEIGHTS_DSET</code></td>
+<td
+style="text-align: right;"><code>/HyperCube/lambda_weights</code></td>
+<td>Dataset to read.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_LAMBDA_MIN_W</code></td>
+<td style="text-align: right;"><code>1e-6</code></td>
+<td>Floor on λ-weights; protects √w.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_LAMBDA_WEIGHTS_AUTO</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td>Auto-generate weights if missing.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="fit-tracking-in-fit_trackerpy">Fit tracking (in
+<code>fit_tracker.py</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th style="text-align: right;">Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>FITTRACKER_START</code></td>
+<td style="text-align: right;"><code>spawn</code> (or best
+available)</td>
+<td>Start method for the tracker process
+(<code>spawn</code>/<code>forkserver</code>/<code>fork</code>).</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_TRACKER_QSIZE</code></td>
+<td style="text-align: right;"><code>8192</code></td>
+<td>Max queue size; drops messages when full if non-blocking.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_TRACKER_FLUSH_EVERY</code></td>
+<td style="text-align: right;"><code>128</code></td>
+<td>Flush to disk after this many messages.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_TRACKER_FLUSH_SEC</code></td>
+<td style="text-align: right;"><code>5.0</code></td>
+<td>Or flush if this many seconds have passed.</td>
+</tr>
+<tr>
+<td><code>CUBEFIT_RMSE_STRIDE</code></td>
+<td style="text-align: right;"><code>16</code></td>
+<td>Only enqueue every Nth batch RMSE sample (sub-sampling).</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="typical-end-to-end-workflow">Typical end-to-end workflow</h2>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1) Build HDF5 backbone &amp; rebin operator</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>mgr <span class="op">=</span> H5Manager(<span class="st">&quot;galaxy.h5&quot;</span>, tem_pix<span class="op">=</span>tem_loglam, obs_pix<span class="op">=</span>obs_loglam)</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>mgr.init_base(H5Dims(nSpat<span class="op">=</span>S, nLSpec<span class="op">=</span>L, nTSpec<span class="op">=</span>T, nVel<span class="op">=</span>V, nComp<span class="op">=</span>C, nPop<span class="op">=</span>P))</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>mgr.populate_from_arrays(losvd<span class="op">=</span>H_SVC, datacube<span class="op">=</span>Y_SL, templates<span class="op">=</span>T_PT)</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>mgr.ensure_rebin_and_resample()</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 2) Build hypercube</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.hypercube_builder <span class="im">import</span> build_hypercube</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>build_hypercube(<span class="st">&quot;galaxy.h5&quot;</span>, norm_mode<span class="op">=</span><span class="st">&quot;data&quot;</span>)  <span class="co"># or &quot;model&quot;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="co"># (Optional) Flip normalization later without rebuild</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.hypercube_builder <span class="im">import</span> convert_hypercube_norm</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>convert_hypercube_norm(<span class="st">&quot;galaxy.h5&quot;</span>, to_mode<span class="op">=</span><span class="st">&quot;model&quot;</span>, recompute_energy<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 3) Create λ-weights</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.cube_utils <span class="im">import</span> ensure_lambda_weights</span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>ensure_lambda_weights(<span class="st">&quot;galaxy.h5&quot;</span>)</span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="co"># 4) Solve</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> CubeFit.pipeline_runner <span class="im">import</span> PipelineRunner</span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>runner <span class="op">=</span> PipelineRunner(<span class="st">&quot;galaxy.h5&quot;</span>)</span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>x, stats <span class="op">=</span> runner.solve_all_mp_batched(</span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>    epochs<span class="op">=</span><span class="dv">6</span>, lr<span class="op">=</span><span class="fl">0.6</span>, project_nonneg<span class="op">=</span><span class="va">True</span>, processes<span class="op">=</span><span class="dv">8</span>, blas_threads<span class="op">=</span><span class="dv">2</span>,</span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>    orbit_weights<span class="op">=</span>orbit_w  <span class="co"># optional (C,)</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+<hr />
+<h2 id="notes-on-normalization--physics">Notes on normalization &amp;
+physics</h2>
+<ul>
+<li><code>norm="model"</code> keeps each <code>(s,c)</code> model’s
+scale proportional to the LOSVD amplitude — closest to “physical
+mass/flux” carried by LOSVD at that spaxel.</li>
+<li><code>norm="data"</code> ties the per-spaxel model sum to the
+observed mean flux (masked), splitting across components in proportion
+to LOSVD amplitudes. This is convenient for direct data-scale
+comparisons but can blur absolute differences across datasets. You can
+switch modes post-hoc with <code>convert_hypercube_norm</code>.</li>
+</ul>
+<p>The solver respects <code>/Mask</code> and λ-weights uniformly, so
+<strong>absorption features</strong> can dominate the fit when λ-weights
+are present (verify the printed min/max/mean at startup to ensure they
+are not all ones).</p>
+<hr />
+<h2 id="troubleshooting--sanity-checks">Troubleshooting &amp; sanity
+checks</h2>
+<ul>
+<li><strong>Hypercube completeness:</strong> use the <code>_done</code>
+bitmap helpers to inspect or reset tiles if needed.</li>
+<li><strong>Normalization flips:</strong> use
+<code>convert_hypercube_norm</code> (streams in S-tiles and handles
+<code>/Mask</code>); do <strong>not</strong> read the entire dataset
+into RAM.</li>
+<li><strong>Line weights:</strong> ensure
+<code>/HyperCube/lambda_weights</code> exists and spans a range (e.g.,
+min ≪ 1, max ≈ 1); the solver prints min/max/mean.</li>
+<li><strong>Population mixture looks uniform across components:</strong>
+<ul>
+<li>Confirm λ-weights are applied (banner shows they’re not all 1).</li>
+<li>Increase epochs modestly; keep <code>GLOBAL_ENERGY_BLEND</code>
+small but nonzero.</li>
+<li>Enable NNLS polish with a moderate
+<code>CUBEFIT_NNLS_MAX_COLS</code>, a λ-subsample
+(<code>CUBEFIT_NNLS_SUB_L</code>), and
+<code>CUBEFIT_NNLS_SOLVER=fista</code> for sharper per-tile
+updates.</li>
+</ul></li>
+</ul>
+<hr />
+<h2 id="where-to-look-in-the-code">Where to look in the code</h2>
+<ul>
+<li><strong>HDF5 backbone:</strong> <code>hdf5_manager.py</code> (safe
+open, grids, rebin operator).</li>
+<li><strong>Builder:</strong> <code>hypercube_builder.py</code> (FFT
+conv, normalization, col_energy, chunking + resume).</li>
+<li><strong>Solver:</strong> <code>kaczmarz_solver_cchunk_mp.py</code>
+(MP loop, λ-weights, trust/backtracking, NNLS polish).</li>
+<li><strong>Runner:</strong> <code>pipeline_runner.py</code>
+(orchestration, tracking, <code>/X_global</code>).</li>
+<li><strong>Tracking:</strong> <code>fit_tracker.py</code> (sidecar
+writer, RMSE history, progress, snapshots).</li>
+<li><strong>Recon/plots:</strong> utilities in
+<code>kz_fitSpec.py</code> (tile-aligned recon) and safe plotting
+helpers.</li>
+</ul>
+<hr />
+<h2 id="building-the-docs">Building the docs</h2>
+<p>Place this file at <code>docs/CubeFit.md</code> and run:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span>            <span class="co"># builds docs/CubeFit.html and docs/CubeFit.pdf via pandoc</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkdocs</span> serve    <span class="co"># live preview with Material theme (served from docs/)</span></span></code></pre></div>
+<p>Pandoc targets (from your Makefile):</p>
+<ul>
+<li><code>docs/CubeFit.html</code> via:<br />
+<code>pandoc -s -f gfm -t html5 docs/CubeFit.md -o docs/CubeFit.html --metadata title="CubeFit" --toc</code></li>
+<li><code>docs/CubeFit.pdf</code> via XeLaTeX:<br />
+<code>pandoc -s -f gfm docs/CubeFit.md -o docs/CubeFit.pdf --pdf-engine=xelatex -V geometry:margin=1in -V mainfont="Latin Modern Roman" -V monofont="Latin Modern Mono" --toc</code></li>
+</ul>
+<p>MkDocs (from your <code>mkdocs.yml</code>):</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">site_name</span><span class="kw">:</span><span class="at"> CubeFit</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">theme</span><span class="kw">:</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> material</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="fu">nav</span><span class="kw">:</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">Home</span><span class="kw">:</span><span class="at"> index.md</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">CubeFit</span><span class="kw">:</span><span class="at"> CubeFit.md</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="fu">docs_dir</span><span class="kw">:</span><span class="at"> docs</span></span></code></pre></div>
+</body>
+</html>

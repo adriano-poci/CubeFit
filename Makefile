@@ -1,13 +1,24 @@
 DOC=docs/CubeFit.md
 HTML=docs/CubeFit.html
 PDF=docs/CubeFit.pdf
+REFERENCE=docs/CubeFit.reference.pdf
+PYTHON?=python
 
-all: html pdf
+.PHONY: all docs html pdf verify clean
+
+all: docs
+
+docs: html pdf
 
 html:
-	pandoc -s -f gfm -t html5 $(DOC) -o $(HTML) --metadata title="CubeFit" --toc
+	$(PYTHON) docs/build_docs.py --source $(DOC) --html $(HTML) --html-only
 
 pdf:
-	pandoc -s -f gfm $(DOC) -o $(PDF) --pdf-engine=xelatex \
-	  -V geometry:margin=1in -V mainfont="Open Sans" \
-	  -V monofont="IntoneMono Nerd Font Mono" --toc
+	$(PYTHON) docs/build_docs.py --source $(DOC) --pdf $(PDF) --pdf-only
+
+verify: pdf
+	$(PYTHON) docs/verify_pdf_style.py $(PDF) --reference $(REFERENCE)
+
+clean:
+	rm -f $(HTML) $(PDF)
+	rm -rf docs/_pdf_style_diff

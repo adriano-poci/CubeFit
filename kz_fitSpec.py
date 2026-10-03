@@ -140,6 +140,7 @@ from CubeFit.hypercube_builder import build_hypercube, assert_preflight_ok,\
     estimate_global_velocity_bias_prebuild
 from CubeFit.pipeline_runner   import PipelineRunner
 from CubeFit import cube_utils as cu
+from CubeFit import validation as cfv
 from dynamics.IFU.Constants import Constants, Units, UnitStr
 from dynamics.IFU.Functions import Plot, Geometric
 from cythonModules import C_utils as Cu
@@ -203,110 +204,6 @@ def _MWProp(prop, aperMass):
     mwP = np.ma.sum((aperMass/np.ma.sum(aperMass, axis=1)[:, np.newaxis])*\
         prop[np.newaxis, :], axis=1)
     return mwP
-
-# ------------------------------------------------------------------------------
-
-def loadValidationCube(validationPath, spLL, nSpat, *, dataset="/ModelCube"):
-    """
-    Load a CubeFit model cube for use as synthetic validation data.
-
-    The returned array follows the orientation expected internally by
-    ``genCubeFit``: ``(nLSpec, nSpat)``. CubeFit HDF5 datasets use the
-    opposite orientation, ``(nSpat, nLSpec)``, so the selected dataset
-    is transposed before returning.
-
-    The wavelength grid stored in the validation file is required to
-    agree with the wavelength grid produced by ``_oneTimeSpec``. This
-    prevents a model cube generated on one spectral grid from being
-    silently fitted on another.
-
-    Parameters
-    ----------
-    validationPath : str or pathlib.Path
-        CubeFit HDF5 file containing the synthetic validation cube.
-    spLL : ndarray
-        Current observed log-wavelength grid from ``_oneTimeSpec``, with
-        shape ``(nLSpec,)``.
-    nSpat : int
-        Number of spatial bins expected by the current CubeFit run.
-    dataset : str, optional
-        HDF5 dataset containing the validation spectra. Default is
-        ``"/ModelCube"``.
-
-    Returns
-    -------
-    validationCube : ndarray
-        Synthetic spectral cube with shape ``(nLSpec, nSpat)`` and
-        dtype ``float64``.
-
-    Raises
-    ------
-    FileNotFoundError
-        If ``validationPath`` does not exist.
-    RuntimeError
-        If the requested dataset or wavelength grid is missing, or if
-        the validation cube contains non-finite values.
-    ValueError
-        If the validation cube dimensions or wavelength grid do not
-        match the current CubeFit configuration.
-
-    Examples
-    --------
-    >>> laGrid = loadValidationCube(
-    ...     "NGC4365/hypercube_003_00.h5",
-    ...     spLL,
-    ...     nSpat,
-    ... )
-    """
-    validationPath = plp.Path(validationPath)
-
-    if not validationPath.is_file():
-        raise FileNotFoundError(
-            f"Validation HDF5 file not found: {validationPath}")
-
-    spLL = np.asarray(spLL, dtype=np.float64).ravel(order="C")
-
-    with open_h5(str(validationPath), role="reader") as f:
-        if dataset not in f:
-            raise RuntimeError(f"{validationPath} does not contain {dataset}.")
-        if "/ObsPix" not in f:
-            raise RuntimeError(f"{validationPath} does not contain /ObsPix.")
-
-        cube = np.asarray(f[dataset][...], dtype=np.float64, order="C")
-        obs_pix = np.asarray(f["/ObsPix"][...], dtype=np.float64).ravel(
-            order="C")
-
-    if cube.ndim != 2:
-        raise ValueError(f"{dataset} must be two-dimensional; "
-            f"got shape {cube.shape}.")
-
-    expected_shape = (int(nSpat), int(spLL.size),)
-
-    if cube.shape != expected_shape:
-        raise ValueError("Validation cube shape mismatch: "
-            f"{dataset} has {cube.shape}, but the current run "
-            f"expects {expected_shape} = (nSpat, nLSpec).")
-    if obs_pix.shape != spLL.shape:
-        raise ValueError("Validation wavelength-grid length mismatch: "
-            f"{obs_pix.size} != {spLL.size}.")
-    if not np.allclose(obs_pix, spLL, rtol=1e-12, atol=1e-12,):
-        max_diff = float(np.max(np.abs(obs_pix - spLL)))
-        raise ValueError("Validation /ObsPix does not match the current "
-            "_oneTimeSpec wavelength grid. "
-            f"Maximum absolute difference = {max_diff:.6e}.")
-    if not np.all(np.isfinite(cube)):
-        n_bad = int(np.count_nonzero(~np.isfinite(cube)))
-        raise RuntimeError(f"{dataset} contains {n_bad} non-finite values.")
-
-    # HDF5 CubeFit convention: (nSpat, nLSpec)
-    # kz_fitSpec convention:    (nLSpec, nSpat)
-    validationCube = np.ascontiguousarray(cube.T, dtype=np.float64)
-
-    logger.log("[CubeFit][validation] Loaded synthetic data from "
-        f"{validationPath}:{dataset}; shape={validationCube.shape}, "
-        f"min={np.min(validationCube):.6e}, max={np.max(validationCube):.6e}")
-
-    return validationCube
 
 # ------------------------------------------------------------------------------
 
@@ -448,7 +345,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         raise ValueError("regularisation_scale must be nonnegative and finite.")
 
     validationPath = kwargs.pop('validationPath', None)
-    validationDataset = kwargs.pop('validationDataset', '/ModelCube')
+    validationDataset = kwargs.pop('validationDataset', '/DataCube')
     validationTag = kwargs.pop('validationTag', None)
     if validationPath is not None:
         if validationTag is None:
@@ -471,7 +368,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     nComp = int(nComp)
 
     if validationPath is not None:
-        laGrid = loadValidationCube(validationPath, spLL, nSpat,
+        laGrid = cfv.loadValidationCube(validationPath, spLL, nSpat,
             dataset=validationDataset)
 
         if laGrid.shape != (nLSpec, nSpat):
@@ -629,9 +526,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         (f"_{validationTag}" if validationTag is not None else ""))
         ).with_suffix('.h5')
     
-    # Control runner
-    runner = PipelineRunner(hdf5Path)
-    
     if not kwargs.pop('orbitWeights', False):
         cWeights = None
 
@@ -649,6 +543,9 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     )
     mgr.ensure_rebin_and_resample()
 
+    # The HDF5 file must exist before PipelineRunner opens it as a reader.
+    runner = PipelineRunner(hdf5Path)
+
     # --- 2. Precompute HyperCube ---
     if redraw and ('gen' in runSwitch):
         logger.log('[CubeFit] Calling `invalidate_done` to regenerate '\
@@ -665,13 +562,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             c_list=list(range(int(np.minimum(2, nC)))),
             p_list=list(range(int(np.minimum(6, nP)))),
             # keep tolerances in sync with preflight defaults
-            tol_rel=2e-3,
-            tol_shift_px=0.5,
-            tol_flat_valid=3e-8,
-            require_rt_flat=True,
-            rt_flat_tol=3e-8,
-            verbose=True,
-        )
+            tol_rel=2e-3, tol_shift_px=0.5, tol_flat_valid=3e-8,
+            require_rt_flat=True, rt_flat_tol=3e-8, verbose=True)
         if bias:
             est = estimate_global_velocity_bias_prebuild(hdf5Path,
                 n_spax=128, n_features=24, window_len=31, lag_px=12)

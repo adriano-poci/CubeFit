@@ -65,8 +65,6 @@ def _configure_solver_environment(args, propDict):
     os.environ["CUBEFIT_DIAG_TOPK"] = str(12)
     os.environ["CUBEFIT_SOLVER_CHECKPOINT_EVERY"] = "1"
 
-
-
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.environ["CUBEFIT_DIAG_JSONL"] = str(
         curdir/args.galaxy/
@@ -97,7 +95,6 @@ def main():
     if slurm_cpu is not None:
         nCPU = int(slurm_cpu)
     else:
-        curdir = plp.Path(__file__).parent
         try:
             with open(curdir/'kz_addqueue.sh') as f:
                 content = f.read()
@@ -123,11 +120,14 @@ def main():
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6])
     if propDict['nCuts'] == 3:
-        propDict['regularisation_scale'] = 1e-4
-        propDict['lOrder'] = 1
-    elif propDict['nCuts'] == 20:
         propDict['regularisation_scale'] = 0.0
         propDict['lOrder'] = 1
+        propDict['validationPath'] = str(curdir/args.galaxy/
+            'hypercube_3_01_mock-data.h5')
+        propDict['validationTag'] = 'lambda_1e-4'
+    elif propDict['nCuts'] == 20:
+        propDict['regularisation_scale'] = 3e-5
+        propDict['lOrder'] = 0
     print(propDict)
 
     _configure_solver_environment(args, propDict)

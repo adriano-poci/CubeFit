@@ -1,0 +1,3 @@
+reportlab>=4.1
+markdown-it-py>=4.0
+Pillow>=10.0
