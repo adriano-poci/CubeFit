@@ -181,6 +181,8 @@ v2.0:   Fixed orbit-mass constraint implementation. The orbital weights are
             to a global amplitude. `alpha` is already fit for by the solver and
             is now understood as the global amplitude between the parent
             Schwarzschild model and the observed spectral data. 3 October 2026
+v2.1:   Added `_exploration_cycle_rounds` to terminate exploration cycles when
+            the full candidate list has been cycled over. 4 October 2026
 """
 
 from __future__ import annotations, print_function
@@ -1610,9 +1612,6 @@ def streamActiveSetNNLS(
     explore_coverage_per_orbit = 3
     explore_batch_size = max(48, min(256, 4 * C))
     explore_batches_per_iter = 3
-    # Number of consecutive unsuccessful coverage rounds required before
-    # exploration is considered exhausted on a stationary support.
-    explore_fail_patience = 12
     explore_fail_count = 0
     explore_round = 0
 
@@ -1765,21 +1764,10 @@ def streamActiveSetNNLS(
         "max_iter": int(max_iter),
         "start_iter": int(start_iter),
         "max_active": int(max_active),
-        "explore_batch_size": int(
-            explore_batch_size
-        ),
-        "explore_batches_per_iter": int(
-            explore_batches_per_iter
-        ),
-        "explore_top_per_orbit": int(
-            explore_top_per_orbit
-        ),
-        "explore_coverage_per_orbit": int(
-            explore_coverage_per_orbit
-        ),
-        "explore_fail_patience": int(
-            explore_fail_patience
-        ),
+        "explore_batch_size": int(explore_batch_size),
+        "explore_batches_per_iter": int(explore_batches_per_iter),
+        "explore_top_per_orbit": int(explore_top_per_orbit),
+        "explore_coverage_per_orbit": int(explore_coverage_per_orbit),
     })
 
     if x0_flat is None:
@@ -2384,19 +2372,55 @@ def streamActiveSetNNLS(
         })
 
     def _dyadic_offset(round_idx: int, stride: int) -> int:
-        """Return a coarse-to-fine midpoint-subdivision offset."""
+        """Return a unique coarse-to-fine offset over one complete cycle."""
+        stride = int(stride)
+
         if stride <= 1:
             return 0
 
-        round_idx = int(round_idx) % stride
-        if round_idx == 0:
+        offsets = [0]
+        seen = {0}
+        denom = 2
+
+        while len(offsets) < stride:
+            for numerator in range(1, denom, 2):
+                offset = (numerator * stride) // denom
+
+                if offset not in seen:
+                    seen.add(offset)
+                    offsets.append(offset)
+
+                    if len(offsets) >= stride:
+                        break
+
+            denom *= 2
+
+        return offsets[int(round_idx) % stride]
+    def _exploration_cycle_rounds(not_active: np.ndarray) -> int:
+        """Return rounds needed for one complete rotating coverage sweep."""
+        not_active = np.asarray(not_active, dtype=np.int64).ravel(order="C")
+
+        if not_active.size == 0:
             return 0
 
-        level = int(np.floor(np.log2(round_idx))) + 1
-        first = 1 << (level - 1)
-        pos = round_idx - first
-        denom = 1 << level
-        return ((2 * pos + 1) * stride) // denom
+        if has_hard_orbit_shape:
+            search_orbits = positive_shape_orbits
+        else:
+            search_orbits = np.arange(C, dtype=np.int64)
+
+        cycle_rounds = 1
+
+        for cc in search_orbits:
+            n_cols = int(np.count_nonzero((not_active // P) == int(cc)))
+
+            if n_cols == 0:
+                continue
+
+            n_cov = min(int(explore_coverage_per_orbit), n_cols)
+            stride = max(1, int(np.ceil(n_cols / n_cov)))
+            cycle_rounds = max(cycle_rounds, stride)
+
+        return cycle_rounds
     def _build_exploration_batches(not_active: np.ndarray, grad_data: np.ndarray,
         grad_total: np.ndarray, grad_x: np.ndarray, it: int) -> list[np.ndarray]:
         """
@@ -3152,19 +3176,31 @@ def streamActiveSetNNLS(
 
         x_is_zero = np.all(z <= positive_tol)
 
-        if (
-            explore_fail_count >= explore_fail_patience
-            and (support_stationary or x_is_zero)
-        ):
-            stop_reason = ("zero_solution_exploration_exhausted" if x_is_zero
-                else "exploration_patience_reached")
+        coverage_rounds = _exploration_cycle_rounds(not_active)
+        coverage_exhausted = (explore_fail_count >= coverage_rounds
+            and coverage_rounds > 0)
+
+        if x_is_zero or support_stationary or (active_ok and coverage_exhausted):
+            if x_is_zero:
+                stop_reason = "zero_solution_exploration_exhausted"
+                stop_category = "converged"
+                stop_converged = True
+            elif support_stationary:
+                stop_reason = "kkt_stationary"
+                stop_category = "converged"
+                stop_converged = True
+            else:
+                stop_reason = "joint_search_exhausted"
+                stop_category = "search"
+                stop_converged = False
 
             _set_stop(
                 stop_reason,
-                "converged",
+                stop_category,
                 it,
-                converged=True,
+                converged=stop_converged,
                 explore_fail_count=int(explore_fail_count),
+                coverage_rounds=int(coverage_rounds),
                 n_active=int(np.count_nonzero(active)),
                 max_grad_active=float(max_grad_active),
                 max_grad_dual=float(max_grad_dual),
@@ -3174,7 +3210,7 @@ def streamActiveSetNNLS(
             _emit_checkpoint(
                 it,
                 final=True,
-                phase="exploration_exhausted",
+                phase=stop_reason,
             )
             break
 

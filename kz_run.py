@@ -121,13 +121,15 @@ def main():
             [-0.2, 0.0, 0.2, 0.4, 0.6])
     if propDict['nCuts'] == 3:
         propDict['regularisation_scale'] = 0.0
-        propDict['lOrder'] = 1
-        propDict['validationPath'] = str(curdir/args.galaxy/
-            'hypercube_3_01_mock-data.h5')
-        propDict['validationTag'] = 'lambda_1e-4'
+        propDict['lOrder'] = 0
+        # propDict['validationPath'] = str(curdir/args.galaxy/
+        #     'hypercube_3_01_mock-data.h5')
+        # propDict['validationTag'] = 'lambda_1e-4'
+        # propDict['warm'] = 'resume'
     elif propDict['nCuts'] == 20:
         propDict['regularisation_scale'] = 3e-5
         propDict['lOrder'] = 0
+        propDict['warm'] = 'resume'
     print(propDict)
 
     _configure_solver_environment(args, propDict)

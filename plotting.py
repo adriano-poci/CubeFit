@@ -1169,20 +1169,21 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     # ------------------------------------------------------------------
     axis = axes["dual"]
 
-    _plot_finite(axis, trial_iterations, trial_grad_data_max,
-        "Data term", positive_log=True, lw=1.2, color="tab:blue", alpha=0.8)
+    trial_kkt_ratio = np.divide(trial_grad_total_max,
+        np.interp(trial_iterations, iterations, kkt_tol),
+        out=np.full_like(trial_grad_total_max, np.nan),
+        where=np.interp(trial_iterations, iterations, kkt_tol) > 0.0)
 
-    _plot_finite(axis, trial_iterations, trial_grad_constraint_max,
-        "Orbit-constraint term", positive_log=True,lw=1.2, color="tab:orange",
-        alpha=0.8)
+    _plot_finite(axis, trial_iterations, trial_kkt_ratio,
+        "Proposal constrained gradient / tolerance",
+        positive_log=True, lw=1.5, color="tab:green")
 
-    _plot_finite(axis, trial_iterations, trial_grad_total_max,
-        "Combined screening gradient", positive_log=True, lw=1.5,
-        color="tab:green")
+    axis.axhline(1.0, lw=1.0, color="black", linestyle="--",
+        label="KKT boundary")
 
-    axis.set_title("Candidate screening")
+    axis.set_title("Candidate constrained KKT")
+    axis.set_ylabel("Violation / tolerance")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel(r"Maximum $|g|$ in proposal")
     _homogenise_ticks(axis)
     axis.legend(fontsize=8, loc="best")
 
@@ -1294,21 +1295,20 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     # ------------------------------------------------------------------
     axis = axes["candidate_space"]
 
-    _plot_finite(axis, iterations, n_candidates, "Remaining candidates",
-        lw=1.4, color="tab:blue")
+    tested_fraction = np.divide(
+        proposal_n_all,
+        np.interp(trial_iterations, iterations, n_zero_free),
+        out=np.full_like(proposal_n_all, np.nan),
+        where=np.interp(trial_iterations, iterations, n_zero_free) > 0.0,
+    )
 
-    coverage_axis = axis.twinx()
-    tested_fraction = np.divide(proposal_n, n_candidates,
-        out=np.full_like(proposal_n, np.nan), where=n_candidates > 0.0,)
-    _plot_finite(coverage_axis, iterations, 100.0 * tested_fraction,
-        "Batch fraction", lw=1.2, color="tab:orange")
+    axis.scatter(trial_iterations, 100.0 * tested_fraction,
+        s=18, alpha=0.7, color="tab:blue")
 
-    axis.set_title("Candidate search effort")
-    axis.set_ylabel("Remaining columns")
-    coverage_axis.set_ylabel("Batch [% of candidates]", color="tab:orange")
+    axis.set_title("Candidate search coverage")
+    axis.set_ylabel("Proposal [% of inactive columns]")
     axis.set_xlabel("Iteration")
     _homogenise_ticks(axis)
-    axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
     # Panel 9: common component mass and numerical stabilisation
@@ -1324,7 +1324,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         color="tab:blue",
     )
 
-    axis.set_title("Common coefficient mass & numerical stability")
+    axis.set_title("Common coefficient mass")
     axis.set_xlabel("Iteration")
     axis.set_ylabel(r"$\alpha$")
     _homogenise_ticks(axis)
@@ -1370,7 +1370,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         color="tab:blue",
     )
 
-    axis.set_title("Common-amplitude stationarity")
+    axis.set_title(r"Global $\alpha$ stationarity")
     axis.set_xlabel("Iteration")
     axis.set_ylabel(r"$|\mathbf{1}_{+}^{T}\lambda|$")
     _homogenise_ticks(axis)

@@ -30,6 +30,8 @@ v1.11:  Reworked `resolve_parallelism` to roughly retain the hybrid parallelism
 v1.12:  Added `upscaledSolution` and `constrainUpscaledSolution` to upward
             propagate a solution from a small run to seed a production run. 25
             September 2026 
+v1.13:  Return `statGrid` from `_oneTimeSpec` to provide the errors of the
+            rebinned spectra. 4 October 2026 
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -2613,6 +2615,11 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     VB = Load.lzma(vbSpec)
     binSpec = VB['binSpec']
+    binStat = VB['binStat']
+
+    if binStat.shape != binSpec.shape:
+        raise RuntimeError(f"`binStat` shape {binStat.shape} != `binSpec` "
+            f"shape {binSpec.shape}.")
     try:
         dPix = VB['linLam']/(RZ.zShift+1)
         lDel = VB['lDel']
@@ -2636,6 +2643,7 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         dlMask = np.where((dPix >= (lmin-lDel*0.1)) &\
             (dPix <= (lmax+lDel*0.1)))[0]
         binSpec = np.take(binSpec, dlMask, axis=0)
+        binStat = np.take(binStat, dlMask, axis=0)
         dPix = dPix[dlMask]
     nSpec, nSpat = binSpec.shape
 
@@ -2686,10 +2694,14 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         lims = spLR/dL + [-0.5, 0.5]
         vScale = float(np.squeeze(np.diff(np.log(lims))/nSpec*CTS.c))
         laGrid = np.ma.ones((nSpec, nSpat), dtype=np.float64)*np.nan
+        statGrid = np.ma.ones((nSpec, nSpat), dtype=np.float64)*np.nan
         for qk in tqdm(range(nSpat), desc='Data Spectra', total=nSpat):
             laSpec, spLL, _vs = pxu.log_rebin(spLR, binSpec[:, qk],
                 velscale=vScale)
+            laVar, _spLL, _vs = pxu.log_rebin(spLR, binStat[:, qk]**2,
+                velscale=vScale)
             laGrid[:, qk] = laSpec
+            statGrid[:, qk] = np.sqrt(np.maximum(laVar, 0.0))
         print('\n')
         # outs = dict(data=laGrid, spec=spLL, vscale=vScale)
         # Write.lzma(lrb, outs)
@@ -2697,6 +2709,7 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     else:
         raise RuntimeError('No binned spectra.')
     laGrid = np.ma.masked_invalid(laGrid)
+    statGrid = np.ma.masked_invalid(statGrid)
     # pixOff = int(laGrid.shape[0]*0.01)
     pixOff = 5
 
@@ -2869,7 +2882,8 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     #     f"{lnGrid.shape[0]}"
 
     return [decDir, cDirs, cKeys, nComp, teLL, cLnGrid, histBinSize,
-        vScale, RZ, spLL, cLaGrid, lmin, lmax, umetals, uages, ualphas, pixOff]
+        vScale, RZ, spLL, cLaGrid, statGrid, lmin, lmax, umetals, uages,
+        ualphas, pixOff]
 
 # ------------------------------------------------------------------------------
 

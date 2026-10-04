@@ -106,6 +106,8 @@ v1.30:  Added `orbitWeights` kwarg to toggle whether the orbit weights are used
 v2.0:   Updated `compare_orbit_vs_solution_absolute` to use new definition of
             orbital weights;
         Updated `loadCubeFit` to parse `validation*` kwargs. 3 October 2026
+v2.1:   Generate validation cube on the fly in order to account for noise
+            properties in `genCubeFit`. 4 October 2026
 """
 
 # need to set up the logger before any other imports
@@ -344,18 +346,10 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     if (not np.isfinite(regularisation_scale)) or (regularisation_scale < 0.0):
         raise ValueError("regularisation_scale must be nonnegative and finite.")
 
-    validationPath = kwargs.pop('validationPath', None)
-    validationDataset = kwargs.pop('validationDataset', '/DataCube')
-    validationTag = kwargs.pop('validationTag', None)
-    if validationPath is not None:
-        if validationTag is None:
-            raise ValueError("validationTag is required for validation runs.")
-        figDir = curdir/galaxy/'validation'/str(validationTag)
-        figDir.mkdir(parents=True, exist_ok=True)
 
     with logger.capture_all_output():
-        decDir, cDirs, cKeys, nComp, teLL, lnGrid, histBinSize, dataVelScale,\
-            RZ, spLL, laGrid, lmin, lmax, umetals, uages, ualphas, pixOff = \
+        decDir, cDirs, _, nComp, teLL, lnGrid, histBinSize, _,\
+            _, spLL, laGrid, statGrid, _, _, _, _, _, _ = \
             cu._oneTimeSpec(galaxy=galaxy, mPath=mPath, decDir=decDir,
             nCuts=nCuts, proj=proj, SN=SN, full=full, slope=slope, IMF=IMF,
             iso=iso, weighting=weighting, lOrder=lOrder, rescale=rescale,
@@ -366,14 +360,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     nSSP = int(np.prod((nMetals, nAges, nAlphas), dtype=int))
     pred = f"0{len(repr(nComp)):d}"
     nComp = int(nComp)
-
-    if validationPath is not None:
-        laGrid = cfv.loadValidationCube(validationPath, spLL, nSpat,
-            dataset=validationDataset)
-
-        if laGrid.shape != (nLSpec, nSpat):
-            raise RuntimeError("Internal validation-cube shape error: "
-                f"{laGrid.shape} != {(nLSpec, nSpat)}.")
 
     oDict = cu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
     binFN = oDict['binFN']
@@ -518,6 +504,16 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         kwargs.pop('blas_threads', BLAS_THREADS)
     best_processes, best_blas = cu.resolve_parallelism(Ncpu, Nblas)
 
+    # Check if this is a validation run and load the validation cube if so
+    validationPath = kwargs.pop('validationPath', None)
+    validationDataset = kwargs.pop('validationDataset', '/DataCube')
+    validationTag = kwargs.pop('validationTag', None)
+    validationError = kwargs.pop('validationError', 'none')
+    # validationError can be 'none', 'stat', or 'residual'
+    # for none, the stat from the real data-cube, or the residual from the
+    # previous hypercube fit
+    validationNoiseScale = float(kwargs.pop('validationNoiseScale', 1.0))
+    validationSeed = int(kwargs.pop('validationSeed', 42))
 
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
@@ -525,7 +521,20 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     hdf5Path = (hdf5Dir/(f"hypercube_{nComp:{pred}d}_{lOrder:02d}" + 
         (f"_{validationTag}" if validationTag is not None else ""))
         ).with_suffix('.h5')
-    
+    if validationPath is not None:
+        mockPath = hdf5Dir/f"validation_{validationTag}.h5"
+        statCube = statGrid.T if validationError == 'stat' else None
+        cfv.makeValidationCube(validationPath, mockPath,
+            noise=validationError, noise_scale=validationNoiseScale,
+            stat_cube=statCube, seed=validationSeed)
+
+        laGrid = cfv.loadValidationCube(mockPath, spLL, nSpat,
+            dataset=validationDataset)
+        if laGrid.shape != (nLSpec, nSpat):
+            raise RuntimeError("Internal validation-cube shape error: "
+                f"{laGrid.shape} != {(nLSpec, nSpat)}.")
+
+
     if not kwargs.pop('orbitWeights', False):
         cWeights = None
 
@@ -1969,8 +1978,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     xbin, ybin = GEO.rotate2D(xbin, ybin, PA)
 
     with logger.capture_all_output():
-        decDir, cDirs, cKeys, nComp, teLL, lnGrid, histBinSize, dataVelScale,\
-            RZ, spLL, laGrid, lmin, lmax, umetals, uages, ualphas, pixOff = \
+        decDir, cDirs, _, nComp, teLL, lnGrid, histBinSize, _,\
+            RZ, spLL, laGrid, statGrid, _, _, _, _, _, _ = \
             cu._oneTimeSpec(galaxy=galaxy, mPath=mPath, decDir=decDir,
             nCuts=nCuts, proj=proj, SN=SN, full=full, slope=slope, IMF=IMF,
             iso=iso, weighting=weighting, lOrder=lOrder, rescale=rescale,
@@ -2207,7 +2216,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     nProcs = builtins.min(best_processes, nTiles, 12) 
     # don’t spawn more processes than tiles
 
-    ok, why = modelcube_status(str(hdf5Path), x_global=x_global, require_float64=True, redraw=redraw)
+    ok, why = modelcube_status(str(hdf5Path), x_global=x_global,
+        require_float64=True, redraw=redraw)
     logger.log(f"[ModelCube] status: {why}")
     if ok:
         logger.log("[ModelCube] Skipping reconstruction.")
@@ -2216,27 +2226,17 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         # reconstruct_model_cube_single(  # or your parallel version
         try:
             if best_processes <= 1:
-                reconstruct_modelcube_fast(
-                    h5_path=str(hdf5Path),
-                    x_cp=x_global,
-                    s_chunk=spat_tile,
-                    out_dtype="float64",
-                )
+                reconstruct_modelcube_fast(h5_path=str(hdf5Path),
+                    x_cp=x_global, s_chunk=spat_tile, out_dtype="float64")
             else:
-                reconstruct_modelcube_fast_parallel(
-                    h5_path=str(hdf5Path),
-                    x_cp=x_global,
-                    s_chunk=None,
-                    out_dtype="float64",
-                    rdcc_slots=1_000_003,
-                    rdcc_bytes=8 * 1024**2,
+                reconstruct_modelcube_fast_parallel(h5_path=str(hdf5Path),
+                    x_cp=x_global, s_chunk=None, out_dtype="float64",
+                    rdcc_slots=1_000_003, rdcc_bytes=8 * 1024**2,
                     rdcc_w0=0.90,
                     n_workers=builtins.min(best_processes, nTiles),
-                    blas_threads_per_worker=best_blas,
-                )
+                    blas_threads_per_worker=best_blas)
         except Exception as e:
-            logger.log(
-                f"[ModelCube] Error: Could not reconstruct ModelCube")
+            logger.log(f"[ModelCube] Error: Could not reconstruct ModelCube")
             raise e
         # Stamp digest so future runs can skip confidently
         try:
@@ -2270,8 +2270,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # The dynamical weights remain encoded in the HyperCube itself; here
     # they only identify which components participate in the constraint.
     # ------------------------------------------------------------
-    orbit_weights = np.asarray(cWeights, dtype=np.float64,
-    ).ravel(order="C")
+    orbit_weights = np.asarray(cWeights, dtype=np.float64).ravel(order="C")
 
     if orbit_weights.size != nComp:
         raise ValueError("cWeights must contain one value per orbit component.")
@@ -2325,9 +2324,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         cnData = np.take(intData, nc, axis=1).reshape(18, -1)
         print(orbSOL.shape)
         print(cnData.shape)
-        drad, svR, svRe, dweights, dcirc = Cgh.broadBetaCompsCyl(cnData,
+        _, svR, _, _, _ = Cgh.broadBetaCompsCyl(cnData,
             np.append(cRadius, 1e15), 'z', -np.inf, 0.0)
-        _drad, vMean, vErr, _dweights, _dcirc = Cgh.broadVelCompsSph(cnData,
+        _, vMean, _, _, _ = Cgh.broadVelCompsSph(cnData,
             np.append(sRadius, 1e15), -np.inf, 0.0)
         compDisp[nc, :] = svR
         compVel[nc, :] = vMean[:, 2] # v_phi
@@ -2447,7 +2446,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 f"median={np.median(nmad_finite):.3f}%", flush=True)
         print(f"Worst fit: aperture {worst} (median |fractional residual|="
             f"{fit_metric[worst]:.3f}%)", flush=True)
-
         print(f"Best fit: aperture {best} (median |fractional residual|="
             f"{fit_metric[best]:.3f}%)", flush=True)
 

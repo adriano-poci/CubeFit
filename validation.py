@@ -27,6 +27,9 @@ v1.0:   29 September 2026
 v1.1:   Generalised to include all validation tests;
         Produce a minimal mock dataset, which does not need `/HyperCube` and
             other model products in `makeValidationCube`. 3 October 2026
+v1.2:   Updated `makeValidationCube` to allow for noise in the mock data, either
+            drawn from the data STAT cube, or from a previous fit's residuals. 4
+            October 2026
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -46,9 +49,15 @@ from CubeFit.hdf5_manager import open_h5
 
 # ------------------------------------------------------------------------------
 
-def makeValidationCube(source_path, output_path):
+def makeValidationCube(source_path, output_path, noise="none",
+    noise_scale=1.0, stat_cube=None, seed=42):
     """
     Create a minimal CubeFit validation input from an existing model cube.
+
+    Synthetic spectra are generated from ``/ModelCube`` with optional noise.
+    The source file is never modified. Noise may be omitted, drawn from a
+    supplied observational 1-sigma error cube, or generated from the empirical
+    residuals of the original CubeFit solution.
 
     Parameters
     ----------
@@ -56,6 +65,19 @@ def makeValidationCube(source_path, output_path):
         Completed CubeFit HDF5 file containing /ModelCube and /ObsPix.
     output_path : str
         Output validation HDF5 path.
+    noise : {'none', 'stat', 'residual'}, optional
+        Noise model. ``'none'`` gives exact model closure. ``'stat'`` draws
+        independent Gaussian noise using ``stat_cube`` as the per-pixel
+        1-sigma uncertainty. ``'residual'`` randomly permutes the original
+        DataCube-ModelCube residuals independently within each spectrum.
+        Default is ``'none'``.
+    noise_scale : float, optional
+        Multiplicative scale applied to the generated noise. Default is 1.0.
+    stat_cube : ndarray, optional
+        Per-pixel 1-sigma observational uncertainties with shape (S, L).
+        Required when ``noise='stat'``.
+    seed : int, optional
+        Random seed used to generate reproducible noise. Default is 42.
 
     Returns
     -------
@@ -69,14 +91,18 @@ def makeValidationCube(source_path, output_path):
     RuntimeError
         If required source datasets are missing or invalid.
     ValueError
-        If source_path and output_path refer to the same file.
+        If the paths, noise mode, noise scale, or supplied error cube are
+        invalid.
 
     Examples
     --------
     >>> makeValidationCube(
-    ...     "hypercube_3_01.h5",
-    ...     "hypercube_3_01_mock-data.h5")
+    ...     "hypercube_3_01.h5", "hypercube_3_01_mock-data.h5")
     'hypercube_3_01_mock-data.h5'
+    >>> makeValidationCube(
+    ...     "hypercube_3_01.h5", "hypercube_3_01_mock-stat.h5",
+    ...     noise="stat", stat_cube=statGrid.T, seed=42)
+    'hypercube_3_01_mock-stat.h5'
     """
     source_path = os.path.abspath(str(source_path))
     output_path = os.path.abspath(str(output_path))
@@ -108,14 +134,70 @@ def makeValidationCube(source_path, output_path):
         if not np.all(np.isfinite(obs_pix)):
             raise RuntimeError("ObsPix contains non-finite values.")
 
+    noise = str(noise).lower()
+    noise_scale = float(noise_scale)
+    rng = np.random.default_rng(seed)
+
+    if noise_scale < 0.0 or not np.isfinite(noise_scale):
+        raise ValueError("noise_scale must be finite and non-negative.")
+
+    if noise == "none":
+        noise_cube = np.zeros_like(model)
+        validation_kind = "exact_model_closure"
+
+    elif noise == "stat":
+        if stat_cube is None:
+            raise ValueError("stat_cube is required for noise='stat'.")
+
+        stat = np.asarray(stat_cube, dtype=np.float64)
+        if stat.shape != model.shape:
+            raise ValueError(
+                f"stat_cube shape {stat.shape} != model shape {model.shape}.")
+
+        if np.any(~np.isfinite(stat)) or np.any(stat < 0.0):
+            raise ValueError("stat_cube contains invalid 1-sigma errors.")
+
+        noise_cube = rng.normal(0.0, stat)
+        validation_kind = "gaussian_observational_noise"
+
+    elif noise == "residual":
+        with h5py.File(source_path, "r") as f:
+            if "/DataCube" not in f:
+                raise RuntimeError(
+                    "noise='residual' requires source /DataCube.")
+
+            data = np.asarray(f["/DataCube"][...], dtype=np.float64)
+
+        if data.shape != model.shape:
+            raise RuntimeError(
+                f"DataCube shape {data.shape} != ModelCube {model.shape}.")
+
+        residual = data-model
+        noise_cube = np.empty_like(residual)
+
+        # Preserve each spaxel's empirical residual distribution while
+        # destroying wavelength-coherent correspondence with the original fit.
+        for ss in range(model.shape[0]):
+            noise_cube[ss] = rng.permutation(residual[ss])
+
+        validation_kind = "permuted_empirical_residual_noise"
+
+    else:
+        raise ValueError("noise must be one of 'none', 'stat', or 'residual'.")
+
+    mock = model + noise_scale*noise_cube
+
     with h5py.File(output_path, "w") as f:
-        ds = f.create_dataset("/DataCube", data=model, dtype=np.float64,
+        ds = f.create_dataset("/DataCube", data=mock, dtype=np.float64,
             compression="gzip", shuffle=True)
         f.create_dataset("/ObsPix", data=obs_pix, dtype=np.float64)
 
         ds.attrs["validation_source"] = "/ModelCube"
         ds.attrs["validation_source_file"] = source_path
-        ds.attrs["validation_kind"] = "exact_model_closure"
+        ds.attrs["validation_kind"] = validation_kind
+        ds.attrs["noise_mode"] = noise
+        ds.attrs["noise_scale"] = noise_scale
+        ds.attrs["noise_seed"] = int(seed)
 
     print()
     print("Validation input created.")

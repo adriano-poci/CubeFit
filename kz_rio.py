@@ -36,14 +36,16 @@ import argparse
 from CubeFit.kz_init import props
 from CubeFit.kz_fitSpec import loadCubeFit
 
+curdir = plp.Path(__file__).parent
+
 def _configure_solver_environment():
     """Set the solver-related environment variables used by the current wrapper."""
-    t = os.environ.get("SLURM_CPUS_PER_TASK", "12")
-    os.environ["OMP_NUM_THREADS"]      = t
-    os.environ["MKL_NUM_THREADS"]      = t
-    os.environ["OPENBLAS_NUM_THREADS"] = t
-    os.environ["OMP_DYNAMIC"]          = "FALSE"
-    os.environ["MKL_DYNAMIC"]          = "FALSE"
+    # t = os.environ.get("SLURM_CPUS_PER_TASK", "12")
+    # os.environ["OMP_NUM_THREADS"] = t
+    # os.environ["MKL_NUM_THREADS"] = t
+    # os.environ["OPENBLAS_NUM_THREADS"] = t
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    os.environ["MKL_DYNAMIC"] = "FALSE"
 
 def main():
     ap = argparse.ArgumentParser(description="Thin wrapper around genCubeFit")
@@ -67,7 +69,6 @@ def main():
     if slurm_cpu is not None:
         nCPU = int(slurm_cpu)
     else:
-        curdir = plp.Path(__file__).parent
         try:
             with open(curdir/'kz_addqueue.sh') as f:
                 content = f.read()
@@ -94,11 +95,16 @@ def main():
     propDict['cpu_processes'] = 4
     propDict['blas_threads'] = 2
     if propDict['nCuts'] == 3:
-        propDict['regularisation_scale'] = 1e-4
-        propDict['lOrder'] = 1
-    elif propDict['nCuts'] == 20:
         propDict['regularisation_scale'] = 0.0
-        propDict['lOrder'] = 1
+        propDict['lOrder'] = 0
+        # propDict['validationPath'] = str(curdir/args.galaxy/
+        #     'hypercube_3_01_mock-data.h5')
+        # propDict['validationTag'] = 'lambda_1e-4'
+        # propDict['warm'] = 'resume'
+    elif propDict['nCuts'] == 20:
+        propDict['regularisation_scale'] = 3e-5
+        propDict['lOrder'] = 0
+        propDict['warm'] = 'resume'
     print(propDict)
 
     try:
