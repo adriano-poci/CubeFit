@@ -33,6 +33,8 @@ v1.5:   Added archive/restore wrappers for `/HyperCube/models` that rewrite the
             August 2026
 v1.6:   Added extensive safe-guards to archive/restore to avoid accidental data
             loss. 11 August 2026
+v1.7:   Added `ssp_*` properties to persist SSP library metadata in the HDF5
+            file in `populate_from_arrays`. 5 October 2026
 
 
 HDF5 manager for CubeFit.
@@ -521,14 +523,10 @@ class H5Manager:
     After this, the builder and solver read everything they need from disk.
     """
 
-    def __init__(self,
-                 base_path: str | Path,
-                 *,
-                 compression: str = "gzip",
-                 clevel: int = 4,
-                 shuffle: bool = True,
-                 tem_pix: Optional[np.ndarray] = None,
-                 obs_pix: Optional[np.ndarray] = None) -> None:
+    def __init__(self, base_path: str | Path, *,
+        compression: str = "gzip", clevel: int = 4, shuffle: bool = True,
+        tem_pix: Optional[np.ndarray] = None,
+        obs_pix: Optional[np.ndarray] = None) -> None:
         self.base_path = Path(base_path)
         self.compression = compression
         self.clevel = int(clevel)
@@ -679,7 +677,7 @@ class H5Manager:
             "shape": tuple(map(int, shape)),
             "chunks": tuple(map(int, chunks)),
             "dtype_models": dtype_models,
-            "models_path": str(self.base_path),   # << required by HyperCubeReader
+            "models_path": str(self.base_path), # << required by HyperCubeReader
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         if extra:
@@ -922,6 +920,10 @@ class H5Manager:
         binnum: np.ndarray | None = None,   # length nPix, int in [0, S)
         bincounts: np.ndarray | None = None,  # length S, int
         orbit_weights: np.ndarray | None = None, 
+        ssp_metals: np.ndarray | None = None,
+        ssp_ages: np.ndarray | None = None,
+        ssp_alphas: np.ndarray | None = None,
+        ssp_library: str | None = None,
     ) -> dict:
         """
         Expected input shapes (strict):
@@ -933,7 +935,11 @@ class H5Manager:
         Stores:
         /DataCube   -> (S, L_obs) float64
         /LOSVD      -> (S, V, C)  float64
-        /Templates  -> (P, T_c)   float64 (flattened populations, cropped spectral)
+        /Templates  -> (P, T_c)   float64 (flattened populations, cropped
+            spectral range)
+        /SSPMetals  -> (nMetals,) float64
+        /SSPAges    -> (nAges,)   float64
+        /SSPAlphas  -> (nAlphas,) float64
         /TemPix     -> (T_c,)     float64
         /ObsPix     -> (L_obs,)   float64
         /VelPix     -> (V,)       float64
@@ -1053,25 +1059,21 @@ class H5Manager:
         i_lo = max(0, i_lo)
         i_hi = min(T, i_hi)
         if i_hi - i_lo < 2:
-            raise ValueError(
-                "Templates do not span the required guard. "
+            raise ValueError("Templates do not span the required guard. "
                 f"Need [{lam_lo:.6f}, {lam_hi:.6f}] in log-λ, but tem_pix runs "
-                f"{tem_pix[0]:.6f}..{tem_pix[-1]:.6f}. Provide a wider template "
-                "grid."
-            )
+                f"{tem_pix[0]:.6f}..{tem_pix[-1]:.6f}. "
+                "Provide a wider template grid.")
 
         clipped_left  = (i_lo == 0) and (tem_pix[0] > lam_lo)
         clipped_right = (i_hi == T) and (tem_pix[-1] < lam_hi)
         if clipped_left or clipped_right:
             eff_lo_px = int(round(max(0.0,
-                            (obs_pix.min() - tem_pix[0]) / dlog_tem)))
+                (obs_pix.min() - tem_pix[0]) / dlog_tem)))
             eff_hi_px = int(round(max(0.0,
-                            (tem_pix[-1] - obs_pix.max()) / dlog_tem)))
-            raise ValueError(
-                "Template guard insufficient after cropping: "
+                (tem_pix[-1] - obs_pix.max()) / dlog_tem)))
+            raise ValueError("Template guard insufficient after cropping: "
                 f"effective guard (px) left={eff_lo_px}, right={eff_hi_px}, "
-                f"required={Kguard}."
-            )
+                f"required={Kguard}.")
 
         tem_pix_c   = tem_pix[i_lo:i_hi].copy()
         templates_c = templates_PT[:, i_lo:i_hi].copy()
@@ -1094,23 +1096,23 @@ class H5Manager:
                 nPix = nPix_y
             elif nPix_y != nPix:
                 raise RuntimeError(f"/XPix length ({nPix}) and /YPix length "
-                                f"({nPix_y}) mismatch.")
+                    f"({nPix_y}) mismatch.")
         if binnum is not None:
             bn = np.asarray(binnum).ravel()
             nPix_b = int(bn.size)
             if nPix is None:
                 nPix = nPix_b
             elif nPix_b != nPix:
-                raise RuntimeError(f"/BinNum length ({nPix_b}) and /XPix length "
-                                f"({nPix}) mismatch.")
+                raise RuntimeError(f"/BinNum length ({nPix_b}) and /XPix length"
+                    f" ({nPix}) mismatch.")
             if not np.issubdtype(bn.dtype, np.integer):
-                raise ValueError("binnum must be integer indices mapping pixels "
-                                "to spatial bins [0..S-1].")
+                raise ValueError("binnum must be integer indices mapping pixels"
+                    " to spatial bins [0..S-1].")
             if bn.size == 0:
                 raise ValueError("binnum must be non-empty if provided.")
             if (bn.min() < 0) or (bn.max() >= S):
-                raise ValueError("binnum contains out-of-range indices; expected "
-                                f"in [0, {S-1}].")
+                raise ValueError("binnum contains out-of-range indices; "
+                    f"expected in [0, {S-1}].")
 
         # ---------- write everything ----------
         with self._open_rw() as f:
@@ -1130,15 +1132,26 @@ class H5Manager:
                 dtype=np.float64)  # (S,L)
 
             # Write normalized LOSVDs
-            _write(
-                "/LOSVD",
+            _write("/LOSVD",
                 losvd_in.astype(np.float64, copy=False),
-                dtype=np.float64,
-            )  # (S,V,C)
+                dtype=np.float64)  # (S,V,C)
 
             Tds = _write("/Templates",
-                        templates_c.astype(np.float64, copy=False),
-                        dtype=np.float64)  # (P, T_c)
+                templates_c.astype(np.float64, copy=False),
+                dtype=np.float64)  # (P, T_c)
+
+            # Persist physical SSP coordinates and library provenance.
+            if ssp_metals is not None:
+                _write("/SSPMetals",
+                    np.asarray(ssp_metals, dtype=np.float64))
+            if ssp_ages is not None:
+                _write("/SSPAges",
+                    np.asarray(ssp_ages, dtype=np.float64))
+            if ssp_alphas is not None:
+                _write("/SSPAlphas",
+                    np.asarray(ssp_alphas, dtype=np.float64))
+            if ssp_library is not None:
+                Tds.attrs["ssp_library"] = str(ssp_library)
 
             if mask is not None:
                 mask = np.asarray(mask, dtype=bool).ravel()
@@ -1151,7 +1164,8 @@ class H5Manager:
             if x_init is not None:
                 x_init = np.asarray(x_init, dtype=np.float64)
                 if x_init.size != C * P:
-                    raise ValueError(f"x_init length {x_init.size} != C*P={C*P}.")
+                    raise ValueError(f"x_init length {x_init.size} != C*P = "
+                        f"{C*P}.")
                 _write("/X_global", x_init, dtype=np.float64)
 
             # operators
@@ -1159,12 +1173,12 @@ class H5Manager:
 
             # dims (post-crop)
             dims = dict(nSpat=S, nLSpec=L_obs, nTSpec=T_c, nVel=V, nComp=C,
-                        nPop=P)
+                nPop=P)
             self._write_dims_attrs(f, dims)
 
             # template metadata (reconstruction + crop)
             Tds.attrs["orig_shape"]  = np.asarray(templates_in_shape,
-                                                dtype=np.int64)
+                dtype=np.int64)
             Tds.attrs["orig_t_axis"] = np.int64(orig_t_axis)
             Tds.attrs["pop_shape"]   = np.asarray(pop_shape, dtype=np.int64)
             Tds.attrs["crop_i_lo"]   = np.int64(i_lo)
@@ -1173,15 +1187,13 @@ class H5Manager:
             Tds.attrs["T_len_out"]   = np.int64(T_c)
 
             # guard metadata
-            guard_info = dict(
-                Kguard_px=int(Kguard),
+            guard_info = dict(Kguard_px=int(Kguard),
                 dlog_tem=float(dlog_tem),
                 obs_lo=float(obs_pix.min()),
                 obs_hi=float(obs_pix.max()),
                 tem_lo=float(tem_pix_c.min()),
                 tem_hi=float(tem_pix_c.max()),
-                safety_pad_px=int(safety_pad_px),
-            )
+                safety_pad_px=int(safety_pad_px))
             self._write_guard_attrs(f, guard_info)
 
             # ---------- write per-pixel metadata (only if provided) ----------

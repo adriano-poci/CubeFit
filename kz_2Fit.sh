@@ -13,7 +13,7 @@
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
 #SBATCH -p medium
-# SBATCH --qos=priority
+#SBATCH --qos=priority
 
 #SBATCH --job-name="CubeFit_2Fit"
 #SBATCH --time=0-48:00
@@ -31,9 +31,9 @@ module load foss/2023a
 module load Python/3.11.3-GCCcore-12.3.0
 
 # --- BLAS / OpenMP threading (per worker) ---
-export OMP_NUM_THREADS=8
-export OPENBLAS_NUM_THREADS=8
-export MKL_NUM_THREADS=8
+# export OMP_NUM_THREADS=8
+# export OPENBLAS_NUM_THREADS=8
+# export MKL_NUM_THREADS=8
 export NUMEXPR_NUM_THREADS=1
 export OMP_PROC_BIND=TRUE
 export OMP_PLACES=cores

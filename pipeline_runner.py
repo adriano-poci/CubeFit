@@ -80,6 +80,8 @@ v1.25:  Added adjustable `regularisation_scale` throughout the solver pathway.
             10 September 2026
 v1.26:  Cleaned `build_hypercube` for use by passing through all `kwargs`. 1
             October 2026
+v1.27:  Added `streaming` keyword to `PipelineRunner.solve_all_mp_batched` to
+            toggle between streaming or monolithic NNLS solvers. 5 October 2026 
 """
 
 from __future__ import annotations
@@ -92,15 +94,8 @@ from dataclasses import dataclass
 from CubeFit.hdf5_manager import H5Manager, H5Dims, open_h5
 from CubeFit.hypercube_builder import build_hypercube
 from CubeFit.hypercube_reader import HyperCubeReader, ReaderCfg
-# from CubeFit.streaming_nnls import (
-    # MPConfig, solve_streaming_nnls)
 from CubeFit.streaming_nnls_constrained import (
-    MPConfig, solve_streaming_nnls, monolithicNNLS, monolithic_nnls_scipy)
-# from CubeFit.streaming_nnls_augmented_rows import (
-#     MPConfig, solve_streaming_nnls)
-from CubeFit.live_fit_dashboard import (
-    render_aperture_fits_with_x, render_sfh_from_x, alpha_star_stats
-)
+    MPConfig, solve_streaming_nnls, monolithicNNLS)
 from CubeFit.fit_tracker import FitTracker, NullTracker, load_checkpoint
 import CubeFit.cube_utils as cu
 from CubeFit.cube_utils import RatioCfg
@@ -369,6 +364,7 @@ class PipelineRunner:
         warm_start="zeros",  # zeros, saved_x, or resume
         regularisation_scale=1.0,
         tracker_mode="on",
+        streaming=True,
     ):
 
         # ---------------- Warm-start ----------------
@@ -479,28 +475,16 @@ class PipelineRunner:
 
         try:
             with logger.capture_all_output():
-
-                x_solver, stats = solve_streaming_nnls(self.h5_path, cfg,
-                    orbit_weights=orbit_weights, x0=x0_effective,
-                    resume_state=resume_state_effective, tracker=tracker,
-                    monolithic_max_active=2000,
-                    regularisation_scale=regularisation_scale)
-                # x_solver, stats = solve_monolithic_nnls(self.h5_path,
-                    # orbit_weights=orbit_weights, 
-                    # hard_project=True)
-                # cfg = MPConfig(epochs=1, processes=1, blas_threads=1, apply_mask=True)
-                # x_solver, stats = monolithicSolver(
-                #     self.h5_path,
-                #     cfg,
-                #     orbit_weights=orbit_weights,
-                #     x0=x0_effective,
-                #     regularisation_scale=0.0,
-                # )
-                # x_solver, stats = monolithicNNLS(
-                #     self.h5_path,
-                #     cfg,
-                #     regularisation_scale=0.0,
-                # )
+                if streaming:
+                    x_solver, stats = solve_streaming_nnls(self.h5_path, cfg,
+                        orbit_weights=orbit_weights, x0=x0_effective,
+                        resume_state=resume_state_effective, tracker=tracker,
+                        monolithic_max_active=2000,
+                        regularisation_scale=regularisation_scale)
+                else:
+                    x_solver, stats = monolithicNNLS(self.h5_path, cfg,
+                        orbit_weights=orbit_weights, x0=x0_effective,
+                        regularisation_scale=regularisation_scale)
 
         finally:
             try:

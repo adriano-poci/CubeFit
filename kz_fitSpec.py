@@ -108,6 +108,11 @@ v2.0:   Updated `compare_orbit_vs_solution_absolute` to use new definition of
         Updated `loadCubeFit` to parse `validation*` kwargs. 3 October 2026
 v2.1:   Generate validation cube on the fly in order to account for noise
             properties in `genCubeFit`. 4 October 2026
+v2.2:   Correctly disambiguated the mock data *generation* from the subsequent
+            *fit* to such data in `genCubeFit`;
+        Updated `genCubeFit` to modify `figDir` if `is_validation`;
+        Pass SSP library providence to `populate_from_arrays` in `genCubeFit`. 5
+            October 2026
 """
 
 # need to set up the logger before any other imports
@@ -308,7 +313,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     PA = INF['angle'][0]
 
     xpix, ypix, sele, pixs = cu.Load.lzma(pfs)
-    # saur,goods = cu.Load.lzma(sfs)
+    # saur, goods = cu.Load.lzma(sfs)
     # del saur
     xbix, ybix = GEO.rotate2D(xpix, ypix, PA)
     pfn = dDir.parent/'muse'/'obsData'/f"{galaxy}-poly-rot.xz"
@@ -349,7 +354,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     with logger.capture_all_output():
         decDir, cDirs, _, nComp, teLL, lnGrid, histBinSize, _,\
-            _, spLL, laGrid, statGrid, _, _, _, _, _, _ = \
+            _, spLL, laGrid, statGrid, lmin, lmax, umetals, uages, ualphas, _=\
             cu._oneTimeSpec(galaxy=galaxy, mPath=mPath, decDir=decDir,
             nCuts=nCuts, proj=proj, SN=SN, full=full, slope=slope, IMF=IMF,
             iso=iso, weighting=weighting, lOrder=lOrder, rescale=rescale,
@@ -514,15 +519,23 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # previous hypercube fit
     validationNoiseScale = float(kwargs.pop('validationNoiseScale', 1.0))
     validationSeed = int(kwargs.pop('validationSeed', 42))
+    is_validation = validationPath is not None and validationTag is not None
 
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
-    hdf5Path = (hdf5Dir/(f"hypercube_{nComp:{pred}d}_{lOrder:02d}" + 
-        (f"_{validationTag}" if validationTag is not None else ""))
+    hdf5Path = (hdf5Dir/((f"hypercube_{nComp:{pred}d}_{lOrder:02d}" + 
+        (f"_{validationTag}" if validationTag is not None else "")) + '.h5')
         ).with_suffix('.h5')
-    if validationPath is not None:
-        mockPath = hdf5Dir/f"validation_{validationTag}.h5"
+    if is_validation:
+        if validationTag is None:
+            raise ValueError("validationTag is required for validation runs.")
+        if validationPath is None:
+            raise ValueError("validationPath is required for validation runs.")
+        figDir = curdir/galaxy/'validation'/str(validationTag)
+        figDir.mkdir(parents=True, exist_ok=True)
+        mockPath = hdf5Dir/\
+            f"{plp.Path(validationPath).stem}_mock_{validationTag}.h5"
         statCube = statGrid.T if validationError == 'stat' else None
         cfv.makeValidationCube(validationPath, mockPath,
             noise=validationError, noise_scale=validationNoiseScale,
@@ -534,22 +547,18 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             raise RuntimeError("Internal validation-cube shape error: "
                 f"{laGrid.shape} != {(nLSpec, nSpat)}.")
 
-
     if not kwargs.pop('orbitWeights', False):
         cWeights = None
+    sspLibrary = f"{kwargs.get('kind', 'EMILES')}:{iso}:{IMF}:{slope:.2f}"
 
     # --- Initialize and load data ---
     mgr = H5Manager(hdf5Path)
-    arDims = mgr.populate_from_arrays(
-        losvd=nApHists,
-        datacube=laGrid, templates=lnGrid,
-        mask=spmask,
+    arDims = mgr.populate_from_arrays(losvd=nApHists, datacube=laGrid, templates=lnGrid, mask=spmask,
         tem_pix=copy(teLL), obs_pix=copy(spLL), vel_pix=copy(vbins),
-        xpix=xpix, ypix=ypix,
-        binnum=binNum,
-        bincounts=binCounts,
+        xpix=xpix, ypix=ypix, binnum=binNum, bincounts=binCounts,
         orbit_weights=cWeights,
-    )
+        ssp_metals=umetals, ssp_ages=uages, ssp_alphas=ualphas,
+        ssp_library=sspLibrary)
     mgr.ensure_rebin_and_resample()
 
     # The HDF5 file must exist before PipelineRunner opens it as a reader.
@@ -666,15 +675,13 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     ###########################################
     # Multi-processing Batched Streaming NNLS #
     ###########################################
-    x_global, stats = runner.solve_all_mp_batched(
-        x0=x0,
+    x_global, stats = runner.solve_all_mp_batched(x0=x0,
         # orbit_weights=None, # or None for “free” fit
         orbit_weights=cWeights,
-        processes=best_processes,
-        blas_threads=best_blas,
+        processes=best_processes, blas_threads=best_blas,
         reader_s_tile=128, # match /HyperCube/models chunking on S
-        warm_start=warm_start,
-        regularisation_scale=regularisation_scale)
+        warm_start=warm_start, regularisation_scale=regularisation_scale,
+        streaming=kwargs.pop('streaming', True))
 
     xPath = hdf5Dir/hdf5Path.name.replace('hypercube', 'x')
     logger.log("[Pipeline] Writing final /X_global to ...")
@@ -1903,20 +1910,11 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     """
     Load the CubeFit data for a given galaxy and model path.
     """
-    validationPath = kwargs.pop('validationPath', None)
-    validationDataset = kwargs.pop('validationDataset', '/ModelCube')
-    validationTag = kwargs.pop('validationTag', None)
-    is_validation = validationPath is not None or validationTag is not None
 
     # Directories
     bDir = mDir/'tri_models'/mPath
     pDir = curdir.parent/'pxf'
-    if is_validation:
-        if validationTag is None:
-            raise ValueError("validationTag is required for validation output.")
-        figDir = curdir/galaxy/'validation'/str(validationTag)
-    else:
-        figDir = curdir/galaxy/'figures'
+    figDir = curdir/galaxy/'figures'
     MKDIRS = [bDir, pDir, figDir]
     [plp.Path(DIR).mkdir(parents=True, exist_ok=True) for DIR in MKDIRS]
     if isinstance(decDir, type(None)):
@@ -1979,7 +1977,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     with logger.capture_all_output():
         decDir, cDirs, _, nComp, teLL, lnGrid, histBinSize, _,\
-            RZ, spLL, laGrid, statGrid, _, _, _, _, _, _ = \
+            RZ, spLL, laGrid, statGrid, lmin, lmax, umetals, uages, ualphas, _=\
             cu._oneTimeSpec(galaxy=galaxy, mPath=mPath, decDir=decDir,
             nCuts=nCuts, proj=proj, SN=SN, full=full, slope=slope, IMF=IMF,
             iso=iso, weighting=weighting, lOrder=lOrder, rescale=rescale,
@@ -2176,13 +2174,31 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         intData[1, :, :], 0.0))[np.newaxis, :, :], intData.shape)
     intData = np.ma.masked_array(intData, mask=ftmMask)
 
+    # Check if this is a validation run and load the validation cube if so
+    validationPath = kwargs.pop('validationPath', None)
+    validationDataset = kwargs.pop('validationDataset', '/DataCube')
+    validationTag = kwargs.pop('validationTag', None)
+    validationError = kwargs.pop('validationError', 'none')
+    # validationError can be 'none', 'stat', or 'residual'
+    # for none, the stat from the real data-cube, or the residual from the
+    # previous hypercube fit
+    validationNoiseScale = float(kwargs.pop('validationNoiseScale', 1.0))
+    validationSeed = int(kwargs.pop('validationSeed', 42))
+    is_validation = validationPath is not None and validationTag is not None
+
     # --- Setup HDF5 directory ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
-    hdf5Name = f"hypercube_{nComp:{pred}d}_{lOrder:02d}"
-    if validationTag is not None:
-        hdf5Name += f"_{validationTag}"
-    hdf5Path = (hdf5Dir/hdf5Name).with_suffix('.h5')
+    hdf5Path = (hdf5Dir/((f"hypercube_{nComp:{pred}d}_{lOrder:02d}" + 
+        (f"_{validationTag}" if validationTag is not None else "")) + '.h5')
+        ).with_suffix('.h5')
+    if is_validation:
+        if validationTag is None:
+            raise ValueError("validationTag is required for validation runs.")
+        if validationPath is None:
+            raise ValueError("validationPath is required for validation runs.")
+        figDir = curdir/galaxy/'validation'/str(validationTag)
+        figDir.mkdir(parents=True, exist_ok=True)
     
     # Read dims & X_global using robust reader
     with open_h5(hdf5Path, role="reader") as f:
@@ -3278,17 +3294,17 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     orbKeys])
                 mmax = np.max([np.nanmax(maps['metal'][otype]) for otype in
                     orbKeys])
-                lmin = np.min([np.nanmin(maps['alpha'][otype]) for otype in
+                hmin = np.min([np.nanmin(maps['alpha'][otype]) for otype in
                     orbKeys])
-                lmax = np.max([np.nanmax(maps['alpha'][otype]) for otype in
+                hmax = np.max([np.nanmax(maps['alpha'][otype]) for otype in
                     orbKeys])
                 print(f"Age map limits: {amin:.2f} to {amax:.2f}")
                 print(f"Metal map limits: {mmin:.2f} to {mmax:.2f}")
-                print(f"Alpha map limits: {lmin:.2f} to {lmax:.2f}")
+                print(f"Alpha map limits: {hmin:.2f} to {hmax:.2f}")
                 propSpecs = [
                     ('metal', r"$[Fe/H]$", mmin, mmax),
                     ('age', rf"$t\ [{UTS.gyr}]$", amin, amax),
-                    ('alpha', r"$[\alpha/Fe]$", lmin, lmax),
+                    ('alpha', r"$[\alpha/Fe]$", hmin, hmax),
                 ]
 
 

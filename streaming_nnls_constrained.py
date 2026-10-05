@@ -183,6 +183,10 @@ v2.0:   Fixed orbit-mass constraint implementation. The orbital weights are
             Schwarzschild model and the observed spectral data. 3 October 2026
 v2.1:   Added `_exploration_cycle_rounds` to terminate exploration cycles when
             the full candidate list has been cycled over. 4 October 2026
+v2.2:   Changed blind cycling of candidates to tracking cached sets of active
+            columns; don't retry non-improving successfully-resolved sets;
+        Updated `monolithicNNLS` to solve the new mathematical formulation of the
+            solver. 5 October 2026
 """
 
 from __future__ import annotations, print_function
@@ -1614,6 +1618,12 @@ def streamActiveSetNNLS(
     explore_batches_per_iter = 3
     explore_fail_count = 0
     explore_round = 0
+    # Explicit coverage
+    explore_coverage_target = 0.5
+    coverage_tested = np.zeros(CP, dtype=bool)
+    coverage_restore_pending = False
+    # Cache valid but non-improving proposals for the current committed state.
+    failed_proposals = set()
 
     # Orbit weights select constrained components. Their relative amplitudes
     # are already encoded in the HyperCube; coefficient masses are equal.
@@ -1810,10 +1820,8 @@ def streamActiveSetNNLS(
 
                 current_mass = float(np.sum(x_seed[cc, :]))
 
-                if (
-                    np.isfinite(current_mass)
-                    and current_mass > 0.0
-                ):
+                if (np.isfinite(current_mass)
+                    and current_mass > 0.0):
                     # Preserve the warm-start population mixture.
                     x_seed[cc, :] *= (target_cc / current_mass)
                 else:
@@ -1893,6 +1901,12 @@ def streamActiveSetNNLS(
         if "explore_round" in resume_state:
             explore_round = int(
                 resume_state["explore_round"])
+        if "coverage_tested" in resume_state:
+            saved = np.asarray(resume_state["coverage_tested"], dtype=bool)
+            if saved.size == CP:
+                coverage_tested[:] = saved.ravel(order="C")
+        elif explore_fail_count > 0:
+            coverage_restore_pending = True
 
         if has_hard_orbit_shape and zero_shape_orbits.size > 0:
             for cc in zero_shape_orbits:
@@ -1963,6 +1977,7 @@ def streamActiveSetNNLS(
             "stop_details": dict(stop_details),
             "explore_fail_count": int(explore_fail_count),
             "explore_round": int(explore_round),
+            "coverage_tested": coverage_tested.astype(bool).tolist(),
         }
     
     def _emit_checkpoint(
@@ -2396,31 +2411,89 @@ def streamActiveSetNNLS(
             denom *= 2
 
         return offsets[int(round_idx) % stride]
-    def _exploration_cycle_rounds(not_active: np.ndarray) -> int:
-        """Return rounds needed for one complete rotating coverage sweep."""
+    def _build_coverage_batch(not_active: np.ndarray,
+        round_idx: int) -> np.ndarray:
+        """Build the exact rotating coverage batch for one exploration round."""
         not_active = np.asarray(not_active, dtype=np.int64).ravel(order="C")
-
-        if not_active.size == 0:
-            return 0
 
         if has_hard_orbit_shape:
             search_orbits = positive_shape_orbits
         else:
             search_orbits = np.arange(C, dtype=np.int64)
 
-        cycle_rounds = 1
+        per_orbit = []
 
         for cc in search_orbits:
-            n_cols = int(np.count_nonzero((not_active // P) == int(cc)))
+            cols = not_active[(not_active // P) == int(cc)]
 
-            if n_cols == 0:
+            if cols.size == 0:
                 continue
 
-            n_cov = min(int(explore_coverage_per_orbit), n_cols)
-            stride = max(1, int(np.ceil(n_cols / n_cov)))
-            cycle_rounds = max(cycle_rounds, stride)
+            n_cov = min(int(explore_coverage_per_orbit), int(cols.size))
+            stride = max(1, int(np.ceil(cols.size / n_cov)))
+            offset = _dyadic_offset(round_idx, stride)
+            positions = np.arange(offset, cols.size, stride,
+                dtype=np.int64)[:n_cov]
+            coverage_cols = cols[positions]
 
-        return cycle_rounds
+            if coverage_cols.size:
+                per_orbit.append(coverage_cols)
+
+        if not per_orbit:
+            return np.zeros((0,), dtype=np.int64)
+
+        offset = _dyadic_offset(round_idx, len(per_orbit))
+        per_orbit = per_orbit[offset:] + per_orbit[:offset]
+
+        selected = []
+        depth = 0
+
+        while len(selected) < int(explore_batch_size):
+            added = False
+
+            for cols_cc in per_orbit:
+                if depth >= cols_cc.size:
+                    continue
+
+                selected.append(int(cols_cc[depth]))
+                added = True
+
+                if len(selected) >= int(explore_batch_size):
+                    break
+
+            if not added:
+                break
+
+            depth += 1
+
+        return np.asarray(selected, dtype=np.int64)
+
+    def _coverage_summary(not_active: np.ndarray) -> tuple[float, float]:
+        """Return minimum per-orbit and total unique coverage fractions."""
+        if has_hard_orbit_shape:
+            search_orbits = positive_shape_orbits
+        else:
+            search_orbits = np.arange(C, dtype=np.int64)
+
+        fractions = []
+        n_tested = 0
+        n_total = 0
+
+        for cc in search_orbits:
+            cols = not_active[(not_active // P) == int(cc)]
+
+            if cols.size == 0:
+                continue
+
+            tested = int(np.count_nonzero(coverage_tested[cols]))
+            fractions.append(tested / float(cols.size))
+            n_tested += tested
+            n_total += int(cols.size)
+
+        coverage_min = min(fractions) if fractions else 1.0
+        coverage_total = n_tested / float(max(1, n_total))
+
+        return float(coverage_min), float(coverage_total)
     def _build_exploration_batches(not_active: np.ndarray, grad_data: np.ndarray,
         grad_total: np.ndarray, grad_x: np.ndarray, it: int) -> list[np.ndarray]:
         """
@@ -2508,26 +2581,9 @@ def streamActiveSetNNLS(
             order_data = np.argsort(g_data)[::-1]
             top_data = cols[order_data[:n_top]]
 
-            # Rotating coverage prevents the screening gradients from 
-            # permanently excluding populations that are useful only through 
-            # joint redistribution.
-            n_cov = min(int(explore_coverage_per_orbit), int(cols.size))
-
-            if n_cov > 0:
-                stride = max(1, int(np.ceil(cols.size / n_cov)))
-                offset = _dyadic_offset(explore_round, stride)
-
-                coverage_positions = np.arange(
-                    offset, cols.size, stride, dtype=np.int64)[:n_cov]
-
-                coverage_cols = cols[coverage_positions]
-            else:
-                coverage_cols = np.zeros((0,), dtype=np.int64)
-
             candidate_by_orbit[cc] = {
                 "exchange": top_total,
                 "data": top_data,
-                "coverage": coverage_cols,
             }
 
         # Build compact joint trials with distinct purposes. Every trial spans
@@ -2536,7 +2592,7 @@ def streamActiveSetNNLS(
         # a time.
         batches = []
 
-        for key in ("exchange", "data", "coverage"):
+        for key in ("exchange", "data"):
             per_orbit = []
 
             for cc in exploration_orbits:
@@ -2579,7 +2635,12 @@ def streamActiveSetNNLS(
                 depth += 1
 
             batch = np.asarray(selected, dtype=np.int64)
-            batches.append(batch)
+            batches.append((key, batch))
+
+        coverage = _build_coverage_batch(not_active, explore_round)
+
+        if coverage.size:
+            batches.append(("coverage", coverage))
 
         return batches[:int(explore_batches_per_iter)]
 
@@ -2668,7 +2729,7 @@ def streamActiveSetNNLS(
         explore_obj_tol = (64.0 * np.finfo(np.float64).eps
             * max(1.0, abs(float(current_total_obj))))
 
-        for trial_number, proposal in enumerate(batches):
+        for trial_number, (trial_kind, proposal) in enumerate(batches):
 
             trial_active = np.unique(np.concatenate((current_active, proposal))
                 ).astype(np.int64, copy=False)
@@ -2695,6 +2756,7 @@ def streamActiveSetNNLS(
                         "best_regularisation_obj": float(best_reg_obj),
                         "best_total_obj": float(best_total_obj),
                         "proposal": proposal.tolist(),
+                        "trial_kind": trial_kind,
                     })
                     continue
 
@@ -2703,18 +2765,31 @@ def streamActiveSetNNLS(
                 trial_active = np.unique(np.concatenate((current_active,
                     proposal))).astype(np.int64, copy=False)
 
-            (
-                trial_active,
-                z_trial,
-                info_trial,
-                alpha_trial,
-                lambda_trial,
-                ATA_trial,
-                ATy_trial,
-                S_trial,
-                ridge_trial,
-                cond_trial,
-            ) = _solve_reduced_active(trial_active)
+            proposal_key = tuple(sorted(proposal.tolist()))
+
+            if proposal_key in failed_proposals:
+                # This exact joint support has already been validly solved
+                # against the unchanged committed solution.
+                if trial_kind == "coverage":
+                    coverage_tested[proposal] = True
+
+                _emit_diag({
+                    "kind": "exploration_trial",
+                    "source": "streamActiveSetNNLS",
+                    "iter": int(it + 1),
+                    "explore_round": int(explore_round),
+                    "trial": int(trial_number),
+                    "trial_kind": str(trial_kind),
+                    "accepted": False,
+                    "solve_accepted": True,
+                    "reason": "duplicate_nonimproving_proposal",
+                    "proposal_n": int(proposal.size),
+                    "proposal": proposal.tolist(),
+                })
+                continue
+            trial_active, z_trial, info_trial, alpha_trial, lambda_trial,\
+                ATA_trial, ATy_trial, S_trial, ridge_trial, cond_trial = \
+                _solve_reduced_active(trial_active)
 
             del alpha_trial
             del lambda_trial
@@ -2746,9 +2821,12 @@ def streamActiveSetNNLS(
                     "proposal_grad_constraint": (
                         constraint_gradient[proposal].tolist()),
                     "proposal_grad_total": grad_total[proposal].tolist(),
+                    "trial_kind": trial_kind,
                 })
                 continue
 
+            if trial_kind == "coverage":
+                coverage_tested[proposal] = True
             trial_data_obj = _data_quad_obj(ATA_trial, ATy_trial, z_trial)
             trial_reg_obj = (0.5 * float(regularisation_scale)
                 * float(np.sum((S_trial * z_trial) ** 2)))
@@ -2772,6 +2850,8 @@ def streamActiveSetNNLS(
 
             accepted_trial = (trial_total_obj
                 < best_total_obj - explore_obj_tol)
+            if not accepted_trial:
+                failed_proposals.add(proposal_key)
 
             _emit_diag({
                 "kind": "exploration_trial",
@@ -2779,6 +2859,7 @@ def streamActiveSetNNLS(
                 "iter": int(it + 1),
                 "explore_round": int(explore_round),
                 "trial": int(trial_number),
+                "trial_kind": str(trial_kind),
 
                 # Trial outcome.
                 "accepted": bool(accepted_trial),
@@ -2855,15 +2936,8 @@ def streamActiveSetNNLS(
         improved = bool(best_total_obj
             < float(current_total_obj) - explore_obj_tol)
 
-        return (
-            improved,
-            best_active,
-            best_z,
-            best_info,
-            best_ATA,
-            best_ATy,
-            best_data_obj,
-        )
+        return improved, best_active, best_z, best_info, best_ATA, best_ATy,\
+            best_data_obj
 
     # ------------------------------------------------------------
     # Active-set outer loop
@@ -3091,15 +3165,18 @@ def streamActiveSetNNLS(
                 )
             break
 
-        (
-            improved,
-            best_active,
-            best_z,
-            best_info,
-            best_ATA,
-            best_ATy,
-            best_data_obj,
-        ) = _explore_support(it=it, current_active=current_active,
+
+        if coverage_restore_pending:
+            first_round = max(0, explore_round - explore_fail_count)
+            available = max(0, int(max_active) - current_active.size)
+            for rr in range(first_round, explore_round):
+                old_coverage = _build_coverage_batch(not_active, rr)
+                coverage_tested[old_coverage[:available]] = True
+            coverage_restore_pending = False
+        
+        improved, best_active, best_z, best_info, best_ATA, best_ATy,\
+            best_data_obj = _explore_support(it=it,
+            current_active=current_active,
             current_data_obj=data_objective_current, not_active=not_active,
             grad_data=grad_data, constraint_gradient=constraint_gradient,
             grad_total=grad_total, grad_x=grad_x)
@@ -3115,6 +3192,8 @@ def streamActiveSetNNLS(
 
             active[:] = False
             active[best_active] = True
+            coverage_tested[:] = False
+            failed_proposals.clear()
 
             z[:] = 0.0
             z[best_active] = best_z
@@ -3176,9 +3255,8 @@ def streamActiveSetNNLS(
 
         x_is_zero = np.all(z <= positive_tol)
 
-        coverage_rounds = _exploration_cycle_rounds(not_active)
-        coverage_exhausted = (explore_fail_count >= coverage_rounds
-            and coverage_rounds > 0)
+        coverage_min, coverage_total = _coverage_summary(not_active)
+        coverage_exhausted = coverage_min >= explore_coverage_target
 
         if x_is_zero or support_stationary or (active_ok and coverage_exhausted):
             if x_is_zero:
@@ -3200,7 +3278,9 @@ def streamActiveSetNNLS(
                 it,
                 converged=stop_converged,
                 explore_fail_count=int(explore_fail_count),
-                coverage_rounds=int(coverage_rounds),
+                coverage_min=float(coverage_min),
+                coverage_total=float(coverage_total),
+                coverage_target=float(explore_coverage_target),
                 n_active=int(np.count_nonzero(active)),
                 max_grad_active=float(max_grad_active),
                 max_grad_dual=float(max_grad_dual),
@@ -3325,7 +3405,41 @@ def streamActiveSetNNLS(
 # ------------------------------------------------------------------------------
 
 def _build_literal_Ab(h5_path: str, cfg: MPConfig):
-    """Build the literal physical-space design matrix and data vector."""
+    """
+    Build the literal physical-space CubeFit design matrix and data vector.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the CubeFit HDF5 file.
+    cfg : MPConfig
+        Solver configuration controlling masking and spatial tile size.
+
+    Returns
+    -------
+    A : ndarray
+        Physical-space design matrix with shape (N, K), where K contains all
+        columns not excluded by ``known_zero_mask``.
+    y : ndarray
+        Flattened observed spectra with shape (N,).
+    free_idx : ndarray
+        Full ``C*P`` indices represented by the columns of ``A``.
+    known_zero : ndarray
+        Persistent structural exclusion mask with shape (C, P).
+    dims : tuple
+        ``(S, L, C, P)`` dimensions of the original problem.
+
+    Raises
+    ------
+    RuntimeError
+        If the HDF5 dimensions are inconsistent or no columns remain.
+    ValueError
+        If the assembled matrix or data contain non-finite values.
+
+    Examples
+    --------
+    >>> A, y, free_idx, known_zero, dims = _build_literal_Ab(h5_path, cfg)
+    """
     with open_h5(h5_path, role="reader") as f:
         DC = f["/DataCube"]
         M = f["/HyperCube/models"]
@@ -3336,432 +3450,63 @@ def _build_literal_Ab(h5_path: str, cfg: MPConfig):
             raise RuntimeError(
                 "Expected /DataCube (S,L) and /HyperCube/models (S,C,P,L).")
         if Sm != S or Lm != L:
-            raise RuntimeError(
-                "Model and data dimensions are inconsistent.")
+            raise RuntimeError("Model and data dimensions are inconsistent.")
 
         mask = cu._get_mask(f) if cfg.apply_mask else None
         keep_idx = np.flatnonzero(mask) if mask is not None else None
         chunks = M.chunks
 
-    CP = int(C * P)
+    CP = int(C*P)
     known_zero = _get_known_zero_mask(h5_path, C, P)
-    known_zero_flat = known_zero.ravel(order="C")
-    allowed = ~known_zero_flat
-    free_idx = np.flatnonzero(allowed).astype(np.int64)
+    free_idx = np.flatnonzero(~known_zero.ravel(order="C")).astype(np.int64)
 
     if free_idx.size == 0:
         raise RuntimeError("No allowed columns remain for monolithic solve.")
 
     Lk = int(keep_idx.size) if keep_idx is not None else L
-    n_rows = int(S * Lk)
-    n_free = int(free_idx.size)
-    s_tile = int(
-        cfg.s_tile_override
-        or (chunks[0] if chunks and chunks[0] else 128))
+    n_rows = int(S*Lk)
+    s_tile = int(cfg.s_tile_override or
+        (chunks[0] if chunks and chunks[0] else 128))
 
-    A = np.empty(
-        (n_rows, n_free), dtype=np.float64, order="F")
-    b = np.empty(n_rows, dtype=np.float64)
+    # A is intentionally materialized: this is the monolithic reference.
+    A = np.empty((n_rows, free_idx.size), dtype=np.float64, order="F")
+    y = np.empty(n_rows, dtype=np.float64)
 
-    free_c = free_idx // P
-    free_p = free_idx % P
     row0 = 0
-
     with open_h5(h5_path, role="reader") as f:
         DC = f["/DataCube"]
         M = f["/HyperCube/models"]
 
-        for s0 in tqdm(
-            range(0, S, s_tile),
-            desc="[MONOLITHIC] building A",
-            disable=not getattr(cfg, "verbose", True),
-        ):
-            s1 = min(S, s0 + s_tile)
-            Y = np.asarray(
-                DC[s0:s1, :], dtype=np.float64, order="C")
+        iterator = range(0, S, s_tile)
+        iterator = tqdm(iterator, desc="[MONOLITHIC] building A",
+            disable=not getattr(cfg, "verbose", True))
+
+        for s0 in iterator:
+            s1 = min(S, s0+s_tile)
+            Y = np.asarray(DC[s0:s1, :], dtype=np.float64)
 
             if keep_idx is not None:
                 Y = Y[:, keep_idx]
 
-            rows = int(Y.size)
-            row1 = row0 + rows
-            b[row0:row1] = Y.ravel(order="C")
+            rows = Y.size
+            row1 = row0+rows
+            y[row0:row1] = Y.ravel(order="C")
 
-            for j, (cc, pp) in enumerate(zip(free_c, free_p)):
-                col = np.asarray(
-                    M[s0:s1, cc, pp, :],
-                    dtype=np.float64,
-                    order="C")
+            # Form the literal rows (s,l) x columns (c,p).
+            slab = np.asarray(M[s0:s1, :, :, :], dtype=np.float64)
+            if keep_idx is not None:
+                slab = slab[:, :, :, keep_idx]
 
-                if keep_idx is not None:
-                    col = col[:, keep_idx]
-
-                A[row0:row1, j] = col.ravel(order="C")
-
+            A_tile = slab.transpose(0, 3, 1, 2).reshape(rows, CP)
+            A[row0:row1, :] = A_tile[:, free_idx]
             row0 = row1
 
     if not np.all(np.isfinite(A)):
-        raise RuntimeError("Literal A contains non-finite values.")
-    if not np.all(np.isfinite(b)):
-        raise RuntimeError("Literal b contains non-finite values.")
+        raise ValueError("Literal A contains non-finite values.")
+    if not np.all(np.isfinite(y)):
+        raise ValueError("Literal y contains non-finite values.")
 
-    return A, b, free_idx, known_zero, (S, L, C, P)
-
-# ------------------------------------------------------------------------------
-
-def monolithic_nnls_scipy(
-    h5_path: str,
-    cfg: MPConfig,
-    *,
-    orbit_weights: Optional[np.ndarray] = None,
-    x0: Optional[np.ndarray] = None,
-    resume_state: Optional[dict] = None,
-    tracker=None,
-    monolithic_max_active: int = 2000,
-    regularisation_scale: float = 1.0,
-    max_iter: int = 2000,
-    tol: float = 1e-9,
-):
-    """
-    Solve the full CubeFit problem as a dense constrained NNLS reference.
-
-    This solver assembles the complete scaled normal equations and solves the
-    same nonnegative problem as ``streamActiveSetNNLS``, including equal
-    coefficient mass across positive-weight components, fitted global
-    amplitude, known-zero exclusions, and numerical ridge.
-
-    Parameters
-    ----------
-    h5_path : str
-        Path to the CubeFit HDF5 file.
-    cfg : MPConfig
-        Parallelism and HDF5 configuration.
-    orbit_weights : ndarray, optional
-        Orbit weights defining the fixed orbit shape.
-    x0 : ndarray, optional
-        Physical-space starting solution with shape ``(C, P)``. The dense
-        reference solve does not depend on this starting point.
-    resume_state : dict, optional
-        Streaming-solver resume state. Full-state resume is not supported.
-    tracker : optional
-        Accepted for API compatibility with ``solve_streaming_nnls``.
-    monolithic_max_active : int, optional
-        Accepted for API compatibility. The dense reference uses all allowed
-        columns and therefore has no outer active-set size limit.
-    regularisation_scale : float, optional
-        Multiplicative scale applied to the numerical ridge. Zero disables
-        the ridge.
-    max_iter : int, optional
-        Maximum iterations for the unconstrained fallback NNLS solve.
-    tol : float, optional
-        Convergence tolerance for the unconstrained fallback NNLS solve.
-
-    Returns
-    -------
-    x : ndarray
-        Physical-space solution with shape ``(C, P)``.
-    stats : dict
-        Reference-solver diagnostics.
-
-    Raises
-    ------
-    RuntimeError
-        If the dense constrained solve fails.
-    ValueError
-        If the inputs or hard orbit constraints are inconsistent.
-
-    Examples
-    --------
-    >>> x, stats = monolithic_nnls_scipy(
-    ...     h5_path, cfg, orbit_weights=orbit_weights,
-    ...     regularisation_scale=0.0)
-    """
-    if resume_state:
-        raise ValueError(
-            "monolithic_nnls_scipy does not support full-state resume; "
-            "use zeros or saved_x.")
-
-    del tracker, monolithic_max_active, x0
-
-    regularisation_scale = float(regularisation_scale)
-    if (not np.isfinite(regularisation_scale)
-            or regularisation_scale < 0.0):
-        raise ValueError(
-            "regularisation_scale must be nonnegative and finite.")
-
-    t0 = time.perf_counter()
-
-    with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
-        M = f["/HyperCube/models"]
-        S, L = map(int, DC.shape)
-        _, C, P, Lm = map(int, M.shape)
-
-        if Lm != L:
-            raise RuntimeError("Model / data wavelength mismatch.")
-
-        mask = cu._get_mask(f) if cfg.apply_mask else None
-        keep_idx = np.flatnonzero(mask) if mask is not None else None
-        model_chunks = M.chunks
-
-    CP = int(C * P)
-    known_zero = _get_known_zero_mask(h5_path, C, P)
-    known_zero_flat = known_zero.ravel(order="C")
-
-    orbit_shape = _canon_orbit_weights(orbit_weights, C=C, P=P)
-    has_hard_orbit_shape = (
-        orbit_shape is not None and np.any(orbit_shape > 0.0))
-
-    if has_hard_orbit_shape:
-        orbit_shape = np.asarray(orbit_shape, dtype=np.float64)
-        blocked = np.flatnonzero(
-            np.all(known_zero, axis=1) & (orbit_shape > 0.0))
-
-        if blocked.size:
-            raise ValueError(
-                "known_zero_mask makes the hard orbit constraint "
-                f"infeasible for positive-weight orbits {blocked.tolist()}.")
-
-    Lk = int(keep_idx.size) if keep_idx is not None else L
-    s_tile = int(
-        cfg.s_tile_override
-        or (model_chunks[0] if model_chunks and model_chunks[0] else 128))
-    s_ranges = [
-        (s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
-
-    # Match the streaming solver's per-column energy normalization.
-    D_tot = np.zeros((C, P), dtype=np.float64)
-
-    with open_h5(h5_path, role="reader") as f:
-        M = f["/HyperCube/models"]
-
-        for s0, s1 in tqdm(
-                s_ranges, desc="[REF-NNLS] scaling",
-                disable=not getattr(cfg, "verbose", True)):
-            M_tile = np.asarray(
-                M[s0:s1, :, :, :], dtype=np.float64, order="C")
-
-            if keep_idx is not None:
-                M_tile = M_tile[:, :, :, keep_idx]
-
-            D_tot += np.sum(M_tile * M_tile, axis=(0, 3))
-
-    n_tiles = max(1, len(s_ranges))
-    col_energy = D_tot / float(n_tiles)
-    positive = col_energy > 0.0
-
-    energy_med = (
-        float(np.median(col_energy[positive])) if np.any(positive) else 1.0)
-    energy_floor = max(1e-30, energy_med * 1e-2)
-    col_energy = np.maximum(col_energy, energy_floor)
-
-    S_temp = 1.0 / np.sqrt(col_energy)
-    S_median = float(np.median(S_temp))
-    S_cap = 8.0 * max(1.0, S_median)
-    S_temp = np.minimum(S_temp, S_cap)
-    S_flat = S_temp.ravel(order="C")
-
-    if has_hard_orbit_shape:
-        orbit_of_col = np.arange(CP, dtype=np.int64) // P
-        allowed = ~known_zero_flat
-        allowed &= orbit_shape[orbit_of_col] > 0.0
-    else:
-        allowed = ~known_zero_flat
-
-    free_idx = np.flatnonzero(allowed).astype(np.int64)
-
-    if free_idx.size == 0:
-        raise RuntimeError(
-            "Dense reference solve has no free coefficients.")
-
-    n_free = int(free_idx.size)
-    S_active = S_flat[free_idx]
-
-    # Assemble the complete scaled normal equations using the same worker as
-    # the streaming solver.
-    ATA = np.zeros((n_free, n_free), dtype=np.float64)
-    ATy = np.zeros((n_free,), dtype=np.float64)
-
-    n_workers = max(1, int(cfg.processes))
-    batches = [[] for _ in range(n_workers)]
-    for i, tile in enumerate(s_ranges):
-        batches[i % n_workers].append(tile)
-
-    ctx = mp.get_context("spawn")
-
-    with ProcessPoolExecutor(
-            max_workers=n_workers, mp_context=ctx,
-            initializer=_init_worker,
-            initargs=(cfg.blas_threads,)) as executor:
-        futures = [
-            executor.submit(
-                _worker_reduced, h5_path, batch, keep_idx, free_idx,
-                S_active, CP, P)
-            for batch in batches if batch]
-
-        for future in tqdm(
-                as_completed(futures), total=len(futures),
-                desc="[REF-NNLS] normal equations",
-                disable=not getattr(cfg, "verbose", True)):
-            ATA_loc, ATy_loc = future.result()
-            ATA += ATA_loc
-            ATy += ATy_loc
-
-    diag = np.diag(ATA)
-    diag_med = float(np.median(diag)) if diag.size else 0.0
-
-    try:
-        eigs = np.linalg.eigvalsh(ATA)
-        emin = float(np.min(eigs))
-        emax = float(np.max(eigs))
-    except Exception:
-        emin = 0.0
-        emax = float(np.max(diag)) if diag.size else 1.0
-
-    cond_bad = emin <= 1e-10 * max(emax, 1.0)
-    ridge_rel = regularisation_scale * 1e-3
-    ridge = (0.0 if regularisation_scale == 0.0 else
-        max(1e-10, ridge_rel * max(1.0, diag_med)))
-
-    H = ATA + ridge * np.eye(n_free, dtype=np.float64)
-
-    if has_hard_orbit_shape:
-        z_free, ref_info = _orbit_hard_constraint_solve(
-            ATA_sub_reg=H,
-            ATy_sub=ATy,
-            active_idx=free_idx,
-            S_active=S_active,
-            orbit_shape=np.asarray(orbit_shape, dtype=np.float64),
-            C=C, P=P,
-            scientific_regularisation=regularisation_scale)
-
-        if not ref_info["accepted"]:
-            raise RuntimeError(
-                "Dense reference constrained NNLS failed: "
-                f"{ref_info['reason']}")
-
-        z_free = np.asarray(z_free, dtype=np.float64)
-        alpha = float(ref_info["alpha"])
-        mu = float(ref_info.get("mu", 0.0))
-        ridge_total = float(ridge + mu)
-
-        orbit_mass = np.bincount(
-            free_idx // P, weights=S_active * z_free,
-            minlength=C).astype(np.float64)
-        orbit_target = alpha * (orbit_shape > 0.0)
-        orbit_resid = orbit_mass - orbit_target
-        orbit_l1 = float(np.sum(np.abs(orbit_resid)))
-        orbit_linf = float(np.max(np.abs(orbit_resid)))
-        constraint_violation = float(ref_info["resid_linf"])
-        solve_message = "dense constrained active-set KKT solve converged"
-        solve_iterations = int(ref_info.get("n_free", n_free))
-    else:
-        mu = 0.0
-        ridge_total = float(ridge)
-        z_free = _nnls_from_quadratic(
-            H, ATy, max_iter=max_iter, tol=tol)
-        z_free = np.asarray(z_free, dtype=np.float64)
-
-        alpha = None
-        orbit_mass = np.bincount(
-            free_idx // P, weights=S_active * z_free,
-            minlength=C).astype(np.float64)
-        orbit_target = None
-        orbit_resid = None
-        orbit_l1 = None
-        orbit_linf = None
-        constraint_violation = 0.0
-        solve_message = "dense projected-gradient NNLS solve completed"
-        solve_iterations = None
-
-    np.maximum(z_free, 0.0, out=z_free)
-
-    z_full = np.zeros((CP,), dtype=np.float64)
-    z_full[free_idx] = z_free
-
-    x_flat = S_flat * z_full
-    x_flat[known_zero_flat] = 0.0
-    x = x_flat.reshape(C, P)
-
-    data_objective = (
-        0.5 * float(z_free @ (ATA @ z_free))
-        - float(ATy @ z_free))
-    total_objective = (
-        data_objective
-        + 0.5 * ridge_total * float(np.dot(z_free, z_free)))
-
-    z_scale = max(1.0, float(np.max(np.abs(z_free))))
-    positive_tol = 1e-12 * z_scale
-    positive = z_free > positive_tol
-
-    if has_hard_orbit_shape:
-        lambda_orbit = np.asarray(
-            ref_info["lambda_orbit"], dtype=np.float64)
-        grad = (
-            ATy - ATA @ z_free - ridge_total * z_free
-            - S_active * lambda_orbit[free_idx // P])
-        max_grad_active = (
-            float(np.max(np.abs(grad[positive])))
-            if np.any(positive) else 0.0)
-        max_grad_inactive = (
-            float(np.max(grad[~positive]))
-            if np.any(~positive) else -np.inf)
-        max_grad_dual = max(max_grad_inactive, 0.0)
-    else:
-        grad = ATy - ATA @ z_free - ridge_total * z_free
-        max_grad_active = (
-            float(np.max(np.abs(grad[positive])))
-            if np.any(positive) else 0.0)
-        max_grad_inactive = (
-            float(np.max(grad[~positive]))
-            if np.any(~positive) else -np.inf)
-        max_grad_dual = max(max_grad_inactive, 0.0)
-
-    elapsed = float(time.perf_counter() - t0)
-
-    stats = {
-        "elapsed_sec": elapsed,
-        "rows": int(S * Lk),
-        "cols": int(CP),
-        "n_free": int(n_free),
-        "n_active": int(np.count_nonzero(positive)),
-        "x_nnz": int(np.count_nonzero(x > 0.0)),
-        "x_sum": float(np.sum(x)),
-        "x_norm": float(np.linalg.norm(x)),
-        "x_max": float(np.max(x)),
-        "data_objective": float(data_objective),
-        "total_objective": float(total_objective),
-        "ridge": float(ridge),
-        "mu": float(mu),
-        "ridge_total": float(ridge_total),
-        "regularisation_scale": float(regularisation_scale),
-        "alpha": alpha,
-        "orbit_mass": orbit_mass,
-        "orbit_target": orbit_target,
-        "orbit_resid": orbit_resid,
-        "orbit_resid_l1": orbit_l1,
-        "orbit_resid_linf": orbit_linf,
-        "constraint_violation": float(constraint_violation),
-        "max_grad_active": float(max_grad_active),
-        "max_grad_inactive": float(max_grad_inactive),
-        "max_grad_dual": float(max_grad_dual),
-        "success": True,
-        "status": 0,
-        "message": solve_message,
-        "iterations": solve_iterations,
-        "known_zero_mask": known_zero.copy(),
-    }
-
-    print(
-        f"[REF-NNLS] done in {elapsed:.1f}s "
-        f"active={stats['n_active']}/{CP} "
-        f"x_sum={stats['x_sum']:.6e} "
-        f"data_obj={data_objective:.6e} "
-        f"ridge={ridge_total:.6e} "
-        f"dual={max_grad_dual:.3e}",
-        flush=True)
-
-    return x, stats
+    return A, y, free_idx, known_zero, (S, L, C, P)
 
 # ------------------------------------------------------------------------------
 
@@ -3780,418 +3525,272 @@ def monolithicNNLS(
     reuse_cache: bool = True,
 ):
     """
-    Solve the literal unconstrained physical-space NNLS problem.
+    Solve the complete CubeFit problem using the literal full A and y.
 
-    The problem solved is exactly ``min ||A x - b||_2`` subject only to
-    non-negativity. Persistent ``known_zero_mask`` columns are excluded.
-    ``orbit_weights`` and ``regularisation_scale`` are not applied because
-    this function is the independent unconstrained NNLS reference.
+    The complete masked physical-space design matrix and data vector are
+    materialized. No streamed normal equations, column scaling, support
+    exploration, or reduced active-set machinery are used.
 
-    Parameters
-    ----------
-    h5_path : str
-        Path to the CubeFit HDF5 file.
-    cfg : MPConfig
-        HDF5, masking, and memory configuration.
-    orbit_weights : ndarray, optional
-        Accepted for API compatibility; ignored.
-    x0 : ndarray, optional
-        Accepted for API compatibility; ignored.
-    resume_state : dict, optional
-        Full-state resume is unsupported.
-    tracker : object, optional
-        Accepted for API compatibility; ignored.
-    block_size : int, optional
-        Accepted for API compatibility; ignored.
-    monolithic_max_active : int, optional
-        Accepted for API compatibility; ignored.
-    regularisation_scale : float, optional
-        Must be zero because this is the literal unregularized NNLS problem.
-    cache_path : str, optional
-        Accepted for API compatibility; ignored.
-    reuse_cache : bool, optional
-        Accepted for API compatibility; ignored.
-
-    Returns
-    -------
-    x : ndarray
-        Physical-space NNLS solution with shape ``(C, P)``.
-    stats : dict
-        NNLS diagnostics.
-
-    Raises
-    ------
-    RuntimeError
-        If SciPy NNLS fails.
-    ValueError
-        If a nonzero regularisation scale or full resume is requested.
-    """
-    del orbit_weights, x0, tracker, block_size
-    del monolithic_max_active, cache_path, reuse_cache
-
-    if resume_state:
-        raise ValueError(
-            "monolithicNNLS does not support full-state resume.")
-
-    if float(regularisation_scale) != 0.0:
-        raise ValueError(
-            "monolithicNNLS is the unregularized NNLS reference; "
-            "set regularisation_scale=0.0.")
-
-    t0 = time.perf_counter()
-    A, b, free_idx, known_zero, dims = _build_literal_Ab(
-        h5_path, cfg)
-    S, L, C, P = dims
-
-    print(
-        f"[MONOLITHIC-NNLS] A={A.shape[0]}x{A.shape[1]}",
-        flush=True)
-
-    result = lsq_linear(
-        A, b, bounds=(0.0, np.inf), method="trf",
-        lsq_solver="lsmr", lsmr_tol="auto", lsmr_maxiter=10000,
-        max_iter=20000, tol=1e-8,
-        verbose=1 if getattr(cfg, "verbose", True) else 0)
-
-    if not result.success:
-        raise RuntimeError(
-            f"Literal monolithic NNLS failed: {result.message}")
-
-    x_free = np.asarray(result.x, dtype=np.float64)
-    rnorm = float(np.linalg.norm(A @ x_free - b))
-
-    CP = C * P
-    x_flat = np.zeros(CP, dtype=np.float64)
-    x_flat[free_idx] = x_free
-    x_flat[known_zero.ravel(order="C")] = 0.0
-    x = x_flat.reshape(C, P)
-
-    residual = A @ x_free - b
-    residual_ss = float(np.dot(residual, residual))
-    elapsed = float(time.perf_counter() - t0)
-
-    stats = {
-        "solver": "scipy.optimize.lsq_linear",
-        "success": True,
-        "elapsed_sec": elapsed,
-        "rows": int(A.shape[0]),
-        "cols": int(CP),
-        "n_free": int(free_idx.size),
-        "n_active": int(np.count_nonzero(x_free > 0.0)),
-        "x_nnz": int(np.count_nonzero(x > 0.0)),
-        "x_sum": float(np.sum(x)),
-        "x_norm": float(np.linalg.norm(x)),
-        "x_max": float(np.max(x)),
-        "rnorm": float(rnorm),
-        "residual_ss": residual_ss,
-        "rmse": float(np.sqrt(residual_ss / max(1, A.shape[0]))),
-        "known_zero_mask": known_zero.copy(),
-    }
-
-    print(
-        f"[MONOLITHIC-NNLS] done in {elapsed:.1f}s "
-        f"active={stats['n_active']}/{CP} "
-        f"rnorm={rnorm:.6e}",
-        flush=True)
-
-    return x, stats
-
-# ------------------------------------------------------------------------------
-
-def monolithicSolver(
-    h5_path: str,
-    cfg: MPConfig,
-    *,
-    orbit_weights: Optional[np.ndarray] = None,
-    x0: Optional[np.ndarray] = None,
-    resume_state: Optional[dict] = None,
-    tracker: Optional[object] = None,
-    block_size: Optional[int] = None,
-    monolithic_max_active: int = 1000,
-    regularisation_scale: float = 0.0,
-    cache_path: str | None = None,
-    reuse_cache: bool = True,
-):
-    """
-    Solve the literal physical-space constrained least-squares problem.
-
-    The problem solved is
-
-        min 0.5 * ||A x - b||_2^2
-
-    subject to
-
-        x >= 0
-
-    and, when ``orbit_weights`` are supplied,
-
-        sum_p x[c, p] = alpha,
-        alpha >= 0,
-
-    for every positive-weight component.
-
-    The literal design matrix ``A`` and data vector ``b`` are fully formed in
-    memory. No streaming normal equations, scaled solver coordinates,
-    promotion logic, or custom constrained KKT solver are used.
-
-    ``regularisation_scale`` must be zero for a mathematically identical
-    comparison with the zero-ridge streaming problem.
+    Without orbit constraints, the problem is solved directly using classical
+    SciPy NNLS. With orbit constraints, SLSQP solves the same literal
+    least-squares objective subject to non-negativity and equal total
+    coefficient mass in every positive-weight component.
 
     Parameters
     ----------
     h5_path : str
         Path to the CubeFit HDF5 file.
     cfg : MPConfig
-        HDF5, masking, and memory configuration.
+        HDF5 and masking configuration.
     orbit_weights : ndarray, optional
-        Orbit weights defining the fixed unit-sum orbit shape.
+        Orbit weights. Positive entries select components participating in the
+        equal-component-mass constraint. If None, conventional NNLS is used.
     x0 : ndarray, optional
-        Physical-space warm start with shape ``(C, P)``.
+        Physical-space initial solution with shape (C, P).
     resume_state : dict, optional
-        Full-state resume is unsupported.
+        Unsupported; accepted for API compatibility.
     tracker : object, optional
-        Accepted for API compatibility; ignored.
+        Accepted for API compatibility and ignored.
     block_size : int, optional
-        Accepted for API compatibility; ignored.
+        Accepted for API compatibility and ignored.
     monolithic_max_active : int, optional
-        Accepted for API compatibility; ignored.
+        Accepted for API compatibility and ignored.
     regularisation_scale : float, optional
-        Must be zero for the literal constrained reference problem.
+        Physical-space L2 regularisation strength. Default is 1.0.
     cache_path : str, optional
-        Accepted for API compatibility; ignored.
+        Accepted for API compatibility and ignored.
     reuse_cache : bool, optional
-        Accepted for API compatibility; ignored.
+        Accepted for API compatibility and ignored.
 
     Returns
     -------
     x : ndarray
-        Physical-space constrained solution with shape ``(C, P)``.
+        Physical-space solution with shape (C, P).
     stats : dict
-        Constrained reference diagnostics.
+        Monolithic solver diagnostics.
 
     Raises
     ------
     RuntimeError
-        If the constrained optimizer fails.
+        If the monolithic optimizer fails.
     ValueError
-        If the inputs or orbital constraints are inconsistent.
+        If the inputs or orbit constraints are invalid.
+
+    Examples
+    --------
+    >>> x, stats = monolithicNNLS(h5_path, cfg, orbit_weights=None)
+    >>> x, stats = monolithicNNLS(
+    ...     h5_path, cfg, orbit_weights=weights)
     """
     del tracker, block_size, monolithic_max_active
     del cache_path, reuse_cache
 
     if resume_state:
-        raise ValueError(
-            "monolithicSolver does not support full-state resume.")
+        raise ValueError("monolithicNNLS does not support full-state resume.")
 
-    if float(regularisation_scale) != 0.0:
+    regularisation_scale = float(regularisation_scale)
+    if (not np.isfinite(regularisation_scale)
+        or regularisation_scale < 0.0):
         raise ValueError(
-            "monolithicSolver is an unregularized reference; "
-            "set regularisation_scale=0.0.")
+            "regularisation_scale must be nonnegative and finite.")
+
+    if not _HAS_SCIPY_OPTIMIZE:
+        raise RuntimeError("SciPy optimize is required for monolithicNNLS.")
 
     t0 = time.perf_counter()
-    A, b, free_idx, known_zero, dims = _build_literal_Ab(
-        h5_path, cfg)
+    A, y, free_idx, known_zero, dims = _build_literal_Ab(h5_path, cfg)
     S, L, C, P = dims
-    CP = C * P
-
-    if orbit_weights is None:
-        raise ValueError(
-            "monolithicSolver requires orbit_weights for the constrained "
-            "reference problem.")
+    CP = int(C*P)
 
     orbit_shape = _canon_orbit_weights(orbit_weights, C=C, P=P)
-    if orbit_shape is None:
-        raise ValueError(
-            "Could not construct a valid orbit shape.")
+    constrained = orbit_shape is not None
 
-    orbit_shape = np.asarray(
-        orbit_shape, dtype=np.float64).ravel(order="C")
-    positive_orbits = np.flatnonzero(orbit_shape > 0.0)
+    if constrained:
+        positive_orbits = np.flatnonzero(orbit_shape > 0.0)
 
-    known_zero_cp = known_zero.reshape(C, P)
-    blocked = np.flatnonzero(
-        np.all(known_zero_cp, axis=1) & (orbit_shape > 0.0))
+        blocked = np.flatnonzero(
+            np.all(known_zero, axis=1) & (orbit_shape > 0.0))
+        if blocked.size:
+            raise ValueError(
+                "known_zero_mask makes the orbit constraint infeasible for "
+                f"components {blocked.tolist()}.")
 
-    if blocked.size:
-        raise ValueError(
-            "known_zero_mask blocks positive-weight orbits "
-            f"{blocked.tolist()}.")
-    free_idx = free_idx[orbit_shape[free_idx // P] > 0.0]
+        # Zero-weight components do not participate in the fitted model.
+        use = orbit_shape[free_idx//P] > 0.0
+        A = A[:, use]
+        free_idx = free_idx[use]
+    else:
+        positive_orbits = np.zeros(0, dtype=np.int64)
 
     n_free = int(free_idx.size)
-    free_c = free_idx // P
-    n_var = n_free + 1
+    if n_free == 0:
+        raise RuntimeError("No free columns remain for monolithic solve.")
 
-    # Build the exact convex least-squares Hessian. A remains the defining
-    # model matrix; this is only the analytical Hessian for trust-constr.
-    Hx = np.asarray(
-        A.T @ A, dtype=np.float64, order="C")
-    gx = np.asarray(
-        A.T @ b, dtype=np.float64)
+    print(f"[MONOLITHIC] A={A.shape[0]}x{A.shape[1]} "
+        f"constrained={constrained}", flush=True)
 
-    # Numerical normalization only; the physical solution is transformed back
-    # exactly before returning.
-    diag = np.diag(Hx)
-    valid = np.isfinite(diag) & (diag > 0.0)
-
-    if np.any(valid):
-        x_scale = float(np.median(
-            np.abs(gx[valid]) / diag[valid]))
-    else:
-        x_scale = 1.0
-
-    x_scale = max(1.0, x_scale)
-
-    alpha_scale = max(x_scale, float(P) * x_scale)
-
-    b_scale = max(1.0, float(np.linalg.norm(b)))
-
-    # u = x / x_scale, beta = alpha / alpha_scale.
-    H = np.zeros((n_var, n_var), dtype=np.float64)
-    H[:n_free, :n_free] = (
-        x_scale * x_scale / (b_scale * b_scale) * Hx)
-
-    def _objective(u):
-        x_free = x_scale * u[:n_free]
-        r = A @ x_free - b
-        return 0.5 * float(np.dot(r, r)) / (b_scale * b_scale)
-
-    def _gradient(u):
-        x_free = x_scale * u[:n_free]
-        r = A @ x_free - b
-        grad = np.zeros(
-            n_var, dtype=np.float64)
-        grad[:n_free] = (
-            x_scale * (A.T @ r) / (b_scale * b_scale))
-        return grad
-
-    def _hessian(u):
-        return H
-
-    B = np.zeros(
-        (positive_orbits.size, n_var),
-        dtype=np.float64)
-
-    orbit_to_row = {
-        int(cc): row
-        for row, cc in enumerate(positive_orbits)}
-
-    for j, cc in enumerate(free_c):
-        B[orbit_to_row[int(cc)], j] = x_scale
-
-    B[:, n_free] = -alpha_scale
-
-    constraints = LinearConstraint(B,
-        np.zeros(positive_orbits.size, dtype=np.float64),
-        np.zeros(positive_orbits.size, dtype=np.float64))
-
-    bounds = Bounds(np.zeros(n_var, dtype=np.float64),
-        np.full(n_var, np.inf, dtype=np.float64))
-
-    # Construct a feasible starting state. Prefer the supplied x0; otherwise
-    # use the literal unconstrained NNLS solution only as a numerical seed.
-    if x0 is not None:
-        x0_flat = np.asarray(
-            x0, dtype=np.float64).ravel(order="C")
-
-        if x0_flat.size != CP:
-            raise ValueError(
-                f"x0 has size {x0_flat.size}; expected {CP}.")
-
-        x0_flat = np.maximum(x0_flat, 0.0)
-        x0_flat[known_zero.ravel(order="C")] = 0.0
-        x_seed = x0_flat[free_idx].copy()
-    else:
-        x_seed, _ = nnls(A, b)
-
-    seed_mass = np.bincount(
-        free_c, weights=x_seed, minlength=C).astype(np.float64)
-    alpha0 = float(np.mean(seed_mass[positive_orbits]))
-
-    if not np.isfinite(alpha0) or alpha0 <= 0.0:
-        alpha0 = 1.0
-
-    x_seed = np.asarray(
-        x_seed,
-        dtype=np.float64).copy()
-
-    for cc in positive_orbits:
-        cc = int(cc)
-        local = np.flatnonzero(
-            free_c == cc)
-
-        if local.size == 0:
-            raise ValueError(
-                f"Orbit {cc} has no allowed population columns.")
-
-        target = alpha0
-        mass = float(np.sum(x_seed[local]))
-
-        if mass > 0.0:
-            x_seed[local] *= target / mass
+    # ------------------------------------------------------------------
+    # Classical unconstrained-orbit NNLS: literal A and y.
+    # ------------------------------------------------------------------
+    if not constrained:
+        if regularisation_scale > 0.0:
+            sqrt_reg = np.sqrt(regularisation_scale)
+            A_fit = np.vstack((A,
+                sqrt_reg*np.eye(n_free, dtype=np.float64)))
+            y_fit = np.concatenate((y,
+                np.zeros(n_free, dtype=np.float64)))
         else:
-            corr = A[:, local].T @ b
-            best = int(
-                local[int(np.argmax(corr))])
-            x_seed[local] = 0.0
-            x_seed[best] = target
+            A_fit = A
+            y_fit = y
 
-    u0 = np.empty(
-        n_var, dtype=np.float64)
-    u0[:n_free] = x_seed / x_scale
-    u0[n_free] = alpha0 / alpha_scale
+        print("[MONOLITHIC] solving with scipy.optimize.nnls", flush=True)
 
-    print(
-        f"[MONOLITHIC] solving constrained least squares: "
-        f"rows={A.shape[0]} free={n_free}",
-        flush=True)
+        x_free, rnorm = nnls(A_fit, y_fit, maxiter=max(3*n_free, 10000))
+        x_free = np.asarray(x_free, dtype=np.float64)
 
-    result = minimize(
-        _objective,
-        u0,
-        jac=_gradient,
-        hess=_hessian,
-        method="trust-constr",
-        bounds=bounds,
-        constraints=constraints,
-        options={
-            "maxiter": 20000,
-            "gtol": 1e-8,
-            "xtol": 1e-8,
-            "barrier_tol": 1e-8,
-            "verbose": 3 if getattr(cfg, "verbose", True) else 0,
-        })
+        solver_name = "scipy.optimize.nnls"
+        iterations = None
+        optimality = None
 
-    if result.x is None:
-        raise RuntimeError(
-            "Literal constrained solver returned no solution.")
+        del A_fit, y_fit
 
-    x_free = x_scale * np.maximum(
-        np.asarray(result.x[:n_free], dtype=np.float64),
-        0.0)
+    # ------------------------------------------------------------------
+    # Constrained literal least squares.
+    #
+    # Equal component masses are imposed without introducing alpha:
+    #
+    #   sum_p x[c,p] - sum_p x[c0,p] = 0
+    #
+    # for every positive orbit c != c0.
+    # ------------------------------------------------------------------
+    else:
+        free_c = free_idx//P
+        n_constraints = max(0, int(positive_orbits.size)-1)
+        E = np.zeros((n_constraints, n_free), dtype=np.float64)
 
-    alpha = alpha_scale * max(0.0, float(result.x[n_free]))
+        if n_constraints:
+            reference = int(positive_orbits[0])
 
+            for rr, cc in enumerate(positive_orbits[1:]):
+                E[rr, free_c == int(cc)] = 1.0
+                E[rr, free_c == reference] = -1.0
+
+            constraint = LinearConstraint(E,
+                np.zeros(n_constraints), np.zeros(n_constraints))
+            constraints = [constraint]
+        else:
+            constraints = []
+
+        # Normalize by the characteristic per-pixel data scale, not y.T@y.
+        # Dividing by y.T@y suppresses the gradient by O(N) and can make the
+        # feasible zero solution appear stationary to SLSQP.
+        data_scale = max(1.0, float(np.sqrt(np.mean(y*y))))
+        objective_scale = data_scale*data_scale
+
+        def _objective(x_vec):
+            residual = A @ x_vec-y
+            value = np.dot(residual, residual)
+            value += regularisation_scale*np.dot(x_vec, x_vec)
+            return 0.5*float(value)/objective_scale
+
+        def _gradient(x_vec):
+            residual = A @ x_vec-y
+            grad = A.T @ residual
+            grad += regularisation_scale*x_vec
+            return np.asarray(grad/objective_scale, dtype=np.float64)
+
+        if x0 is None:
+            # Start inside the feasible cone. Equal uniform mass across all
+            # participating components satisfies the hard constraint exactly.
+            x_seed = np.zeros(n_free, dtype=np.float64)
+            alpha0 = 1.0
+
+            for cc in positive_orbits:
+                local = np.flatnonzero(free_c == int(cc))
+                x_seed[local] = alpha0/float(local.size)
+        else:
+            x0_flat = np.asarray(
+                x0, dtype=np.float64).ravel(order="C")
+
+            if x0_flat.size != CP:
+                raise ValueError(
+                    f"x0 has size {x0_flat.size}; expected {CP}.")
+
+            x_seed = np.maximum(x0_flat[free_idx], 0.0)
+
+            # Make the supplied seed exactly equal-mass feasible.
+            masses = np.bincount(free_c, weights=x_seed,
+                minlength=C).astype(np.float64)
+            alpha0 = float(np.mean(masses[positive_orbits]))
+
+            for cc in positive_orbits:
+                local = np.flatnonzero(free_c == int(cc))
+                mass = float(np.sum(x_seed[local]))
+
+                if mass > 0.0:
+                    x_seed[local] *= alpha0/mass
+                elif alpha0 > 0.0:
+                    x_seed[local] = alpha0/float(local.size)
+
+        bounds = Bounds(np.zeros(n_free, dtype=np.float64),
+            np.full(n_free, np.inf, dtype=np.float64))
+
+        print("[MONOLITHIC] solving with scipy.optimize.SLSQP", flush=True)
+        g0 = _gradient(x_seed)
+        print(f"[MONOLITHIC] initial objective={_objective(x_seed):.6e} "
+            f"|g|inf={np.max(np.abs(g0)):.6e}", flush=True)
+
+        result = minimize(_objective, x_seed, jac=_gradient,
+            method="SLSQP", bounds=bounds, constraints=constraints,
+            options={"maxiter": 2000, "ftol": 1e-10,
+                "disp": bool(getattr(cfg, "verbose", True))})
+
+        if result.x is None or not result.success:
+            message = "no solution" if result.x is None else result.message
+            raise RuntimeError(
+                f"Monolithic constrained NNLS failed: {message}")
+
+        x_free = np.maximum(
+            np.asarray(result.x, dtype=np.float64), 0.0)
+
+        solver_name = "scipy.optimize.SLSQP"
+        iterations = int(result.nit)
+        optimality = None
+
+    # ------------------------------------------------------------------
+    # Restore full physical coefficient vector and calculate diagnostics.
+    # ------------------------------------------------------------------
     x_flat = np.zeros(CP, dtype=np.float64)
     x_flat[free_idx] = x_free
     x_flat[known_zero.ravel(order="C")] = 0.0
     x = x_flat.reshape(C, P)
 
-    residual = A @ x_free - b
+    residual = A @ x_free-y
     residual_ss = float(np.dot(residual, residual))
-    rmse = float(np.sqrt(residual_ss / max(1, A.shape[0])))
+    data_objective = 0.5*residual_ss
+    reg_objective = (0.5*regularisation_scale
+        * float(np.dot(x_free, x_free)))
+    total_objective = data_objective+reg_objective
 
     orbit_mass = np.sum(x, axis=1)
-    orbit_target = alpha * (orbit_shape > 0.0)
-    orbit_resid = orbit_mass - orbit_target
-    orbit_l1 = float(np.sum(np.abs(orbit_resid)))
-    orbit_linf = float(np.max(np.abs(orbit_resid)))
 
-    elapsed = float(time.perf_counter() - t0)
+    if constrained:
+        alpha = float(np.mean(orbit_mass[positive_orbits]))
+        orbit_target = alpha*(orbit_shape > 0.0)
+        orbit_resid = orbit_mass-orbit_target
+        orbit_linf = float(
+            np.max(np.abs(orbit_resid[positive_orbits])))
+    else:
+        alpha = None
+        orbit_target = None
+        orbit_resid = None
+        orbit_linf = None
+
+    elapsed = float(time.perf_counter()-t0)
 
     stats = {
-        "solver": "scipy.optimize.trust-constr",
-        "success": bool(result.success),
+        "solver": solver_name,
+        "success": True,
         "elapsed_sec": elapsed,
         "rows": int(A.shape[0]),
         "cols": int(CP),
@@ -4201,36 +3800,25 @@ def monolithicSolver(
         "x_sum": float(np.sum(x)),
         "x_norm": float(np.linalg.norm(x)),
         "x_max": float(np.max(x)),
-        "rmse": rmse,
         "residual_ss": residual_ss,
-        "data_objective": 0.5 * residual_ss,
-        "alpha": float(alpha),
+        "rmse": float(np.sqrt(residual_ss/max(1, A.shape[0]))),
+        "data_objective": data_objective,
+        "scientific_regularisation_objective": reg_objective,
+        "total_objective": total_objective,
+        "regularisation_scale": regularisation_scale,
+        "alpha": alpha,
         "orbit_mass": orbit_mass,
         "orbit_target": orbit_target,
         "orbit_resid": orbit_resid,
-        "orbit_resid_l1": orbit_l1,
         "orbit_resid_linf": orbit_linf,
-        "constraint_violation": orbit_linf,
-        "optimality": float(result.optimality),
-        "constr_violation": float(result.constr_violation),
-        "message": str(result.message),
-        "status": int(result.status),
-        "iterations": int(result.nit),
-        "x_scale": float(x_scale),
-        "alpha_scale": float(alpha_scale),
+        "iterations": iterations,
+        "optimality": optimality,
         "known_zero_mask": known_zero.copy(),
     }
 
-    print(
-        f"[MONOLITHIC] done in {elapsed:.1f}s "
-        f"success={result.success} "
-        f"active={stats['n_active']}/{CP} "
-        f"rmse={rmse:.6e} "
-        f"orbit_Linf={orbit_linf:.3e}",
-        flush=True)
-
-    if not result.success:
-        raise RuntimeError(f"Constrained solver failed: {result.message}")
+    print(f"[MONOLITHIC] done in {elapsed:.1f}s "
+        f"solver={solver_name} active={stats['n_active']}/{CP} "
+        f"rmse={stats['rmse']:.6e} orbit_Linf={orbit_linf}", flush=True)
 
     return x, stats
 

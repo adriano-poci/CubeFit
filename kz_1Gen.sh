@@ -13,6 +13,7 @@
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_1Gen.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_1Gen.log" --open-mode=append
 #SBATCH -p short
+# #SBATCH --qos=priority
 
 #SBATCH --job-name="CubeFit_1Gen"
 #SBATCH --time=0-12:00

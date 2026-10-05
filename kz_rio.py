@@ -89,22 +89,43 @@ def main():
     if args.ncomp is not None:
         propDict['nCuts'] = args.ncomp
     if propDict['nCuts'] > 50:
-        propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26, 0.4],
+        propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6])
-    propDict['cpu_processes'] = 4
-    propDict['blas_threads'] = 2
     if propDict['nCuts'] == 3:
         propDict['regularisation_scale'] = 0.0
         propDict['lOrder'] = 0
-        # propDict['validationPath'] = str(curdir/args.galaxy/
-        #     'hypercube_3_01_mock-data.h5')
-        # propDict['validationTag'] = 'lambda_1e-4'
-        # propDict['warm'] = 'resume'
+        propDict['validationPath'] = str(curdir/args.galaxy/
+            'hypercube_3_00.h5')
+        propDict['validationTag'] = 'datafit.w.lambda2e-5_stat_SSPoffset'
+        propDict['validationError'] = 'stat'
+        # propDict['streaming'] = False
+        ############################ Real run
+        propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
+            [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
+            [-0.2, 0.0, 0.2, 0.4, 0.6])
+        ############################ Run to generate mock data
+        # propDict['sspIdx'] = ([-1.79, -1.26, -0.6, -0.25, 0.0, 0.15, 0.26],
+        #     [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
+        #     [-0.2, 0.0, 0.2, 0.4, 0.6])
+        # propDict['warm'] = 'saved_x'
     elif propDict['nCuts'] == 20:
-        propDict['regularisation_scale'] = 3e-5
+        propDict['regularisation_scale'] = 1e-5
         propDict['lOrder'] = 0
-        propDict['warm'] = 'resume'
+        # propDict['validationPath'] = str(curdir/args.galaxy/
+        #     'hypercube_3_00.h5')
+        # propDict['validationTag'] = 'datafit.w.lambda2e-5_stat_SSPoffset'
+        # propDict['validationError'] = 'stat'
+        # propDict['streaming'] = False
+        ############################ SSP library to emulate real fit
+        # propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
+        #     [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
+        #     [-0.2, 0.0, 0.2, 0.4, 0.6])
+        ############################ SSP library to generate mock-data fit
+        propDict['sspIdx'] = ([-1.79, -1.26, -0.6, -0.25, 0.0, 0.15, 0.26],
+            [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
+            [-0.2, 0.0, 0.2, 0.4, 0.6])
+        # propDict['warm'] = 'saved_x'
     print(propDict)
 
     try:

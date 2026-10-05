@@ -30,6 +30,9 @@ v1.1:   Generalised to include all validation tests;
 v1.2:   Updated `makeValidationCube` to allow for noise in the mock data, either
             drawn from the data STAT cube, or from a previous fit's residuals. 4
             October 2026
+v1.3:   Confirm if validation run used the same SSP library, and produce
+            valid comparisons regardless, in `compare_validation_solution`. 5
+            October 2026
 """
 # need to set up the logger before any other imports
 import pathlib as plp
@@ -339,34 +342,39 @@ def loadValidationCube(validationPath, spLL, nSpat, *, dataset="/DataCube"):
 
 def compare_validation_solution(input_path, validation_path, save_path=None):
     """
-    Compare a validation solution directly with its generating solution.
+    Compare a validation fit with its generating CubeFit solution.
 
-    The input and validation paths are the corresponding HyperCube HDF5
-    files. Their sibling ``x_*.h5`` files are located automatically and
-    ``/X_global`` is compared coefficient by coefficient.
+    SSP identity requires the same declared SSP library, physical SSP axes,
+    template wavelength grid, and template spectra. If the SSP models are
+    identical, coefficients are compared directly. Otherwise, the comparison
+    is performed in physical stellar-population space using marginalized age,
+    metallicity, and alpha distributions and component-weighted mean
+    properties.
 
     Parameters
     ----------
     input_path : str or pathlib.Path
         HyperCube whose ``/ModelCube`` supplied the validation data.
     validation_path : str or pathlib.Path
-        HyperCube produced by fitting those validation data.
+        HyperCube produced by fitting the validation data.
     save_path : str or pathlib.Path, optional
         Output figure path. If None, the figure is not written.
 
     Returns
     -------
     out : dict
-        Input and recovered coefficients, residuals, and summary metrics.
+        SSP identity tests, fitted coefficients, physical summaries, direct
+        coefficient metrics when applicable, and the comparison figure.
 
     Raises
     ------
     FileNotFoundError
         If either HyperCube or corresponding solution file is absent.
     RuntimeError
-        If ``/X_global`` is absent from either solution file.
+        If required solution or SSP metadata are absent.
     ValueError
-        If the input and recovered coefficient shapes differ.
+        If coefficient arrays are invalid, component counts differ, or the SSP
+        coordinate arrays are inconsistent with their coefficient arrays.
 
     Examples
     --------
@@ -378,8 +386,76 @@ def compare_validation_solution(input_path, validation_path, save_path=None):
     validation_path = plp.Path(validation_path)
 
     def _x_path(path):
+        """Return the sibling solution-file path."""
         name = path.name.replace("hypercube", "x", 1)
         return path.with_name(name)
+
+    def _load_ssp(path):
+        """Load templates, physical SSP axes, and library provenance."""
+        with h5py.File(path, "r") as f:
+            if "/Templates" not in f or "/TemPix" not in f:
+                raise RuntimeError(f"{path} has incomplete SSP information.")
+
+            templates = np.asarray(
+                f["/Templates"][...], dtype=np.float64)
+            tem_pix = np.asarray(f["/TemPix"][...], dtype=np.float64)
+
+            required = ("/SSPMetals", "/SSPAges", "/SSPAlphas")
+            if all(name in f for name in required):
+                axes = tuple(np.asarray(f[name][...], dtype=np.float64)
+                    for name in required)
+            else:
+                axes = None
+
+            library = f["/Templates"].attrs.get("ssp_library", None)
+            if isinstance(library, bytes):
+                library = library.decode("utf-8")
+            if library is not None:
+                library = str(library)
+
+        return templates, tem_pix, axes, library
+
+    def _physical_summary(x, axes):
+        """Calculate marginalized SSP distributions and mean properties."""
+        metals, ages, alphas = axes
+        C, P = x.shape
+        expected = metals.size*ages.size*alphas.size
+
+        if P != expected:
+            raise ValueError(
+                f"X has P={P}, while SSP axes imply P={expected}.")
+
+        sfh = x.reshape(C, metals.size, ages.size, alphas.size)
+        mass = sfh.sum(axis=(1, 2, 3))
+
+        z_grid = metals[:, None, None]
+        age_grid = ages[None, :, None]
+        alpha_grid = alphas[None, None, :]
+
+        def _mean(grid):
+            """Return component-wise coefficient-weighted mean."""
+            num = np.sum(sfh*grid[None, ...], axis=(1, 2, 3))
+            return np.divide(num, mass, out=np.full(C, np.nan),
+                where=mass > 0.0)
+
+        return {
+            "sfh": sfh,
+            "mass": mass,
+            "age_distribution": sfh.sum(axis=(0, 1, 3)),
+            "metal_distribution": sfh.sum(axis=(0, 2, 3)),
+            "alpha_distribution": sfh.sum(axis=(0, 1, 2)),
+            "mean_age": _mean(age_grid),
+            "mean_metal": _mean(z_grid),
+            "mean_alpha": _mean(alpha_grid),
+        }
+
+    def _normalise(values):
+        """Return a unit-sum copy of a marginalized distribution."""
+        values = np.asarray(values, dtype=np.float64)
+        total = float(np.sum(values))
+        if total <= 0.0:
+            return np.zeros_like(values)
+        return values/total
 
     input_x_path = _x_path(input_path)
     validation_x_path = _x_path(validation_path)
@@ -393,99 +469,327 @@ def compare_validation_solution(input_path, validation_path, save_path=None):
         if "/X_global" not in f:
             raise RuntimeError(f"{input_x_path} has no /X_global.")
         x_input = np.asarray(f["/X_global"][...], dtype=np.float64)
+
     with h5py.File(validation_x_path, "r") as f:
         if "/X_global" not in f:
             raise RuntimeError(f"{validation_x_path} has no /X_global.")
         x_fit = np.asarray(f["/X_global"][...], dtype=np.float64)
-    if x_input.shape != x_fit.shape:
+
+    if x_input.ndim != 2 or x_fit.ndim != 2:
+        raise ValueError("X_global must have shape (C, P).")
+    if x_input.shape[0] != x_fit.shape[0]:
         raise ValueError(
-            f"X_global shapes differ: {x_input.shape} != {x_fit.shape}.")
-    if x_input.ndim != 2:
-        raise ValueError(
-            f"X_global must have shape (C, P); got {x_input.shape}.")
+            f"Component counts differ: {x_input.shape[0]} != "
+            f"{x_fit.shape[0]}.")
 
-    C, P = x_input.shape
-    resid = x_fit - x_input
+    C = int(x_input.shape[0])
 
-    input_flat = x_input.ravel(order="C")
-    fit_flat = x_fit.ravel(order="C")
-    resid_flat = resid.ravel(order="C")
+    t_input, l_input, axes_input, lib_input = _load_ssp(input_path)
+    t_fit, l_fit, axes_fit, lib_fit = _load_ssp(validation_path)
 
-    l1 = float(np.sum(np.abs(resid_flat)))
-    l2 = float(np.linalg.norm(resid_flat))
-    linf = float(np.max(np.abs(resid_flat)))
-    input_l1 = float(np.sum(np.abs(input_flat)))
-    input_l2 = float(np.linalg.norm(input_flat))
-    input_linf = float(np.max(np.abs(input_flat)))
+    physical_available = axes_input is not None and axes_fit is not None
 
-    rel_l1 = l1 / input_l1 if input_l1 > 0.0 else np.nan
-    rel_l2 = l2 / input_l2 if input_l2 > 0.0 else np.nan
-    rel_linf = linf / input_linf if input_linf > 0.0 else np.nan
-
-    denom = float(np.linalg.norm(input_flat) * np.linalg.norm(fit_flat))
-    cosine = float(np.dot(input_flat, fit_flat) / denom
-        ) if denom > 0.0 else np.nan
-
-    if np.std(input_flat) > 0.0 and np.std(fit_flat) > 0.0:
-        corr = float(np.corrcoef(input_flat, fit_flat)[0, 1])
+    if physical_available:
+        phys_input = _physical_summary(x_input, axes_input)
+        phys_fit = _physical_summary(x_fit, axes_fit)
     else:
-        corr = np.nan
+        phys_input = None
+        phys_fit = None
 
-    input_pop = np.sum(x_input, axis=0)
-    fit_pop = np.sum(x_fit, axis=0)
-    input_comp = np.sum(x_input, axis=1)
-    fit_comp = np.sum(x_fit, axis=1)
+    global_input = None
+    global_fit = None
+    def _global_properties(summary):
+        """Return coefficient-weighted global stellar-population means."""
+        mass = summary["mass"]
+        total = float(np.sum(mass))
 
-    vmax = float(max(np.max(input_flat), np.max(fit_flat), 0.0))
-    pad = 0.025 * vmax if vmax > 0.0 else 1.0
-    lim = (-pad, vmax + pad)
+        if total <= 0.0:
+            return {"age": np.nan, "metal": np.nan, "alpha": np.nan}
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+        return {
+            "age": float(np.sum(mass*summary["mean_age"])/total),
+            "metal": float(np.sum(mass*summary["mean_metal"])/total),
+            "alpha": float(np.sum(mass*summary["mean_alpha"])/total),
+        }
+    if physical_available:
 
-    ax = axes[0]
-    ax.scatter(input_flat, fit_flat, s=8, alpha=0.5)
-    ax.plot(lim, lim, "k--", lw=1.0)
-    ax.set_xlim(lim)
-    ax.set_ylim(lim)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel(r"input $x_{c,p}$")
-    ax.set_ylabel(r"recovered $x_{c,p}$")
-    ax.set_title("Coefficient recovery")
+        global_input = _global_properties(phys_input)
+        global_fit = _global_properties(phys_fit)
 
-    text = (rf"$C={C},\ P={P}$" "\n"
-        rf"$||\Delta x||_1/||x||_1={rel_l1:.3e}$" "\n"
-        rf"$||\Delta x||_2/||x||_2={rel_l2:.3e}$" "\n"
-        rf"$||\Delta x||_\infty/||x||_\infty={rel_linf:.3e}$" "\n"
-        rf"$\rho={corr:.5f}$" "\n"
-        rf"$\cos\theta={cosine:.5f}$")
-    ax.text(0.03, 0.97, text, va="top", ha="left", transform=ax.transAxes,
-        bbox=dict(boxstyle="round", fc="white", alpha=0.85))
+    same_library = (lib_input is not None and lib_fit is not None
+        and lib_input == lib_fit)
 
-    ax = axes[1]
-    pop_max = float(max(np.max(input_pop), np.max(fit_pop), 0.0))
-    pop_pad = 0.025 * pop_max if pop_max > 0.0 else 1.0
-    pop_lim = (-pop_pad, pop_max + pop_pad)
-    ax.scatter(input_pop, fit_pop, s=12, alpha=0.6)
-    ax.plot(pop_lim, pop_lim, "k--", lw=1.0)
-    ax.set_xlim(pop_lim)
-    ax.set_ylim(pop_lim)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel(r"input $\sum_c x_{c,p}$")
-    ax.set_ylabel(r"recovered $\sum_c x_{c,p}$")
-    ax.set_title("Population recovery")
+    same_axes = (physical_available
+        and all(a.shape == b.shape
+            and np.allclose(a, b, rtol=1e-12, atol=1e-14)
+            for a, b in zip(axes_input, axes_fit)))
 
-    ax = axes[2]
-    comp_max = float(max(np.max(input_comp), np.max(fit_comp), 0.0))
-    comp_pad = 0.025 * comp_max if comp_max > 0.0 else 1.0
-    comp_lim = (-comp_pad, comp_max + comp_pad)
-    ax.scatter(input_comp, fit_comp, s=20)
-    ax.plot(comp_lim, comp_lim, "k--", lw=1.0)
-    ax.set_xlim(comp_lim)
-    ax.set_ylim(comp_lim)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel(r"input $\sum_p x_{c,p}$")
-    ax.set_ylabel(r"recovered $\sum_p x_{c,p}$")
-    ax.set_title("Component coefficient mass")
+    same_templates = (t_input.shape == t_fit.shape
+        and l_input.shape == l_fit.shape
+        and np.allclose(l_input, l_fit, rtol=1e-12, atol=1e-14)
+        and np.allclose(t_input, t_fit, rtol=1e-10, atol=1e-12))
+
+    same_ssp = same_library and same_axes and same_templates
+
+    print("[validation] SSP comparison")
+    print(f"  generating library     = {lib_input}")
+    print(f"  fitted library         = {lib_fit}")
+    print(f"  same library           = {same_library}")
+    print(f"  same physical grid     = {same_axes}")
+    print(f"  same template spectra  = {same_templates}")
+    print(f"  coefficient comparable = {same_ssp}")
+
+    # Defaults for metrics that have no meaning across different SSP models.
+    resid = None
+    rel_l1 = rel_l2 = rel_linf = np.nan
+    corr = cosine = np.nan
+
+    if same_ssp:
+        if x_input.shape != x_fit.shape:
+            raise ValueError(
+                "Identical SSP models require identical X_global shapes: "
+                f"{x_input.shape} != {x_fit.shape}.")
+
+        resid = x_fit-x_input
+        input_flat = x_input.ravel(order="C")
+        fit_flat = x_fit.ravel(order="C")
+        resid_flat = resid.ravel(order="C")
+
+        l1 = float(np.sum(np.abs(resid_flat)))
+        l2 = float(np.linalg.norm(resid_flat))
+        linf = float(np.max(np.abs(resid_flat)))
+
+        input_l1 = float(np.sum(np.abs(input_flat)))
+        input_l2 = float(np.linalg.norm(input_flat))
+        input_linf = float(np.max(np.abs(input_flat)))
+
+        rel_l1 = l1/input_l1 if input_l1 > 0.0 else np.nan
+        rel_l2 = l2/input_l2 if input_l2 > 0.0 else np.nan
+        rel_linf = linf/input_linf if input_linf > 0.0 else np.nan
+
+        denom = float(np.linalg.norm(input_flat)*np.linalg.norm(fit_flat))
+        if denom > 0.0:
+            cosine = float(np.dot(input_flat, fit_flat)/denom)
+
+        if np.std(input_flat) > 0.0 and np.std(fit_flat) > 0.0:
+            corr = float(np.corrcoef(input_flat, fit_flat)[0, 1])
+
+        input_pop = np.sum(x_input, axis=0)
+        fit_pop = np.sum(x_fit, axis=0)
+        input_comp = np.sum(x_input, axis=1)
+        fit_comp = np.sum(x_fit, axis=1)
+
+        # Direct coefficient comparison is meaningful for identical SSPs.
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+
+        ax = axes[0]
+        vmax = float(max(np.max(input_flat), np.max(fit_flat), 0.0))
+        pad = 0.025*vmax if vmax > 0.0 else 1.0
+        lim = (-pad, vmax+pad)
+
+        ax.scatter(input_flat, fit_flat, s=8, alpha=0.5)
+        ax.plot(lim, lim, "k--", lw=1.0)
+        ax.set_xlim(lim)
+        ax.set_ylim(lim)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(r"input $x_{c,p}$")
+        ax.set_ylabel(r"recovered $x_{c,p}$")
+        ax.set_title("Coefficient recovery")
+
+        text = (rf"$C={C},\ P={x_input.shape[1]}$" "\n"
+            rf"$||\Delta x||_1/||x||_1={rel_l1:.3e}$" "\n"
+            rf"$||\Delta x||_2/||x||_2={rel_l2:.3e}$" "\n"
+            rf"$||\Delta x||_\infty/||x||_\infty={rel_linf:.3e}$" "\n"
+            rf"$\rho={corr:.5f}$" "\n"
+            rf"$\cos\theta={cosine:.5f}$")
+
+        ax.text(0.03, 0.97, text, va="top", ha="left",
+            transform=ax.transAxes,
+            bbox=dict(boxstyle="round", fc="white", alpha=0.85))
+
+        ax = axes[1]
+        vmax = float(max(np.max(input_pop), np.max(fit_pop), 0.0))
+        pad = 0.025*vmax if vmax > 0.0 else 1.0
+        lim = (-pad, vmax+pad)
+
+        ax.scatter(input_pop, fit_pop, s=12, alpha=0.6)
+        ax.plot(lim, lim, "k--", lw=1.0)
+        ax.set_xlim(lim)
+        ax.set_ylim(lim)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(r"input $\sum_c x_{c,p}$")
+        ax.set_ylabel(r"recovered $\sum_c x_{c,p}$")
+        ax.set_title("Population recovery")
+
+        ax = axes[2]
+        vmax = float(max(np.max(input_comp), np.max(fit_comp), 0.0))
+        pad = 0.025*vmax if vmax > 0.0 else 1.0
+        lim = (-pad, vmax+pad)
+
+        ax.scatter(input_comp, fit_comp, s=20)
+        ax.plot(lim, lim, "k--", lw=1.0)
+        ax.set_xlim(lim)
+        ax.set_ylim(lim)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(r"input $\sum_p x_{c,p}$")
+        ax.set_ylabel(r"recovered $\sum_p x_{c,p}$")
+        ax.set_title("Component coefficient mass")
+
+        print("[validation] coefficient recovery")
+        print(f"  shape                 = {x_input.shape}")
+        print(f"  relative L1 error     = {rel_l1:.6e}")
+        print(f"  relative L2 error     = {rel_l2:.6e}")
+        print(f"  relative Linf error   = {rel_linf:.6e}")
+        print(f"  correlation           = {corr:.8f}")
+        print(f"  cosine similarity     = {cosine:.8f}")
+
+    elif physical_available:
+        # Population indices are not comparable across different SSP models.
+        # Compare marginalized physical distributions on each native SSP grid
+        # and component-wise coefficient-weighted physical properties instead.
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+
+        distributions = (
+            ("age_distribution", 1, "Age", "Age distribution"),
+            ("metal_distribution", 0, "[Z/H]", "Metallicity distribution"),
+            ("alpha_distribution", 2, r"[$\alpha$/Fe]",
+                "Alpha distribution"),
+        )
+
+        input_label = lib_input if lib_input is not None else "Generating SSP"
+        fit_label = lib_fit if lib_fit is not None else "Recovered SSP"
+
+        for ax, (key, idx, xlabel, title) in zip(
+            axes[0], distributions):
+            grid_input = axes_input[idx]
+            grid_fit = axes_fit[idx]
+            yi = _normalise(phys_input[key])
+            yf = _normalise(phys_fit[key])
+
+            ax.plot(grid_input, yi, "o-", label=input_label)
+            ax.plot(grid_fit, yf, "s--", label=fit_label)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel("Coefficient fraction")
+            ax.set_title(title)
+            ax.legend()
+
+        properties = (
+            ("mean_age", "Mean age"),
+            ("mean_metal", "Mean [Z/H]"),
+            ("mean_alpha", r"Mean [$\alpha$/Fe]"),
+        )
+
+        cc = np.arange(C)
+
+        for ax, (key, ylabel) in zip(axes[1], properties):
+            ax.plot(cc, phys_input[key], "o-", label=input_label)
+            ax.plot(cc, phys_fit[key], "s--", label=fit_label)
+            ax.set_xlabel("Component")
+            ax.set_ylabel(ylabel)
+            ax.legend()
+
+        print("[validation] physical SSP recovery")
+        print("  direct coefficient comparison is not applicable")
+        print(f"  input P                = {x_input.shape[1]}")
+        print(f"  recovered P            = {x_fit.shape[1]}")
+
+        for key, label in (
+            ("mean_age", "age"),
+            ("mean_metal", "[Z/H]"),
+            ("mean_alpha", "[alpha/Fe]"),
+        ):
+            delta = phys_fit[key]-phys_input[key]
+            print(f"  max component delta {label:10s} = "
+                f"{np.nanmax(np.abs(delta)):.6e}")
+
+    else:
+        # Historic files lack SSP-coordinate provenance. Coefficients and
+        # physical SSP properties cannot be compared safely, so compare the
+        # reconstructed spectra directly.
+        with h5py.File(input_path, "r") as f:
+            model_input = np.asarray(f["/ModelCube"][...], dtype=np.float64)
+            wave_input = np.asarray(f["/ObsPix"][...], dtype=np.float64)
+
+        with h5py.File(validation_path, "r") as f:
+            model_fit = np.asarray(f["/ModelCube"][...], dtype=np.float64)
+            wave_fit = np.asarray(f["/ObsPix"][...], dtype=np.float64)
+
+        if model_input.shape != model_fit.shape:
+            raise ValueError(
+                f"ModelCube shapes differ: {model_input.shape} != "
+                f"{model_fit.shape}.")
+        if not np.allclose(wave_input, wave_fit, rtol=1e-12, atol=1e-14):
+            raise ValueError("ModelCube wavelength grids differ.")
+
+        spectral_resid = model_fit-model_input
+        relative_l2_spectral = (
+            np.linalg.norm(spectral_resid)/np.linalg.norm(model_input))
+
+        scale = np.sqrt(np.mean(model_input*model_input, axis=1))
+        rms = np.sqrt(np.mean(spectral_resid*spectral_resid, axis=1))
+        fractional_rms = np.divide(rms, scale, out=np.full_like(rms, np.nan),
+            where=scale > 0.0)
+
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+        ax = axes[0]
+        ax.plot(wave_input, np.mean(model_input, axis=0),
+            label="Generating fit")
+        ax.plot(wave_fit, np.mean(model_fit, axis=0), "--",
+            label="Validation fit")
+        ax.set_xlabel(r"$\ln\lambda$")
+        ax.set_ylabel("Mean model flux")
+        ax.set_title("Mean reconstructed spectrum")
+        ax.legend()
+
+        ax = axes[1]
+        ax.hist(fractional_rms[np.isfinite(fractional_rms)], bins=40)
+        ax.set_xlabel("Fractional spectral RMS")
+        ax.set_ylabel("Spatial bins")
+        ax.set_title(
+            rf"Spectral recovery: $\Delta_2={relative_l2_spectral:.3e}$")
+
+        ax = axes[2]
+
+        properties = (("mean_age", "Age", axes_input[1], axes_fit[1]),
+            ("mean_metal", "[Z/H]", axes_input[0], axes_fit[0]),
+            ("mean_alpha", r"[$\alpha$/Fe]", axes_input[2], axes_fit[2]))
+
+        markers = ("o", "s", "^")
+
+        for (key, label, grid_i, grid_f), marker in zip(
+            properties, markers):
+            lo = float(min(np.min(grid_i), np.min(grid_f)))
+            hi = float(max(np.max(grid_i), np.max(grid_f)))
+            scale = max(hi-lo, np.finfo(np.float64).eps)
+
+            xi = (phys_input[key]-lo)/scale
+            yf = (phys_fit[key]-lo)/scale
+            ax.scatter(xi, yf, marker=marker, label=label)
+
+        ax.plot((0.0, 1.0), (0.0, 1.0), "k--", lw=1.0)
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("Generating physical property")
+        ax.set_ylabel("Recovered physical property")
+        ax.set_title("Component population recovery")
+        ax.legend()
+
+        global_input = _global_properties(phys_input)
+        global_fit = _global_properties(phys_fit)
+
+        print("[validation] global stellar populations")
+        for key in ("age", "metal", "alpha"):
+            delta = global_fit[key]-global_input[key]
+            print(f"  {key:8s}: {global_input[key]:.6g} -> "
+                f"{global_fit[key]:.6g}  delta={delta:+.6g}")
+
+        print("[validation] historic SSP provenance")
+        print("  assuming different SSP models")
+        print("  coefficient comparison is not applicable")
+        print("  physical SSP comparison is not available")
+        print(f"  spectral relative L2 = {relative_l2_spectral:.6e}")
 
     fig.tight_layout()
 
@@ -494,29 +798,41 @@ def compare_validation_solution(input_path, validation_path, save_path=None):
         save_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=200, bbox_inches="tight")
 
+    if physical_available:
+        print("[validation] global stellar populations")
+        for key in ("age", "metal", "alpha"):
+            delta = global_fit[key]-global_input[key]
+            print(f"  {key:8s}: {global_input[key]:.6g} -> "
+                f"{global_fit[key]:.6g}  delta={delta:+.6g}")
+
     out = {
         "x_input": x_input,
         "x_fit": x_fit,
+        "same_ssp": same_ssp,
+        "same_library": same_library,
+        "same_axes": same_axes,
+        "same_templates": same_templates,
+        "input_ssp_library": lib_input,
+        "fit_ssp_library": lib_fit,
+        "input_ssp_axes": axes_input,
+        "fit_ssp_axes": axes_fit,
+        "input_physical": phys_input,
+        "fit_physical": phys_fit,
         "residual": resid,
-        "input_population": input_pop,
-        "fit_population": fit_pop,
-        "input_component": input_comp,
-        "fit_component": fit_comp,
         "relative_l1": rel_l1,
         "relative_l2": rel_l2,
         "relative_linf": rel_linf,
         "correlation": corr,
         "cosine_similarity": cosine,
         "figure": fig,
+        "physical_comparison_available": physical_available,
+        "spectral_resid": spectral_resid if not physical_available else None,
+        "relative_l2_spectral": relative_l2_spectral if not physical_available \
+            else None,
+        "fractional_rms": fractional_rms if not physical_available else None,
+        "global_physical_input": global_input,
+        "global_physical_fit": global_fit,
     }
-
-    print("[validation] coefficient recovery")
-    print(f"  shape                 = {x_input.shape}")
-    print(f"  relative L1 error     = {rel_l1:.6e}")
-    print(f"  relative L2 error     = {rel_l2:.6e}")
-    print(f"  relative Linf error   = {rel_linf:.6e}")
-    print(f"  correlation           = {corr:.8f}")
-    print(f"  cosine similarity     = {cosine:.8f}")
 
     return out
 

@@ -33,7 +33,7 @@ def props(galaxy, **kwargs):
             smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],
             warm='resume', cpu_processes=12, blas_threads=4,
             orbitWeights=True, regularisation_scale=0.0, 
-            sspIdx=([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26, 0.4],
+            sspIdx=([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6]), **kwargs)
     elif 'FCC170' in galaxy:
@@ -43,7 +43,7 @@ def props(galaxy, **kwargs):
             smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],
             warm='zeros', cpu_processes=12, blas_threads=4,
             orbitWeights=True, regularisation_scale=0.0,
-            sspIdx=([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26, 0.4],
+            sspIdx=([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6]), **kwargs)
     else:
