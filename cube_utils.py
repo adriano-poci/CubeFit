@@ -1427,7 +1427,7 @@ def apply_component_softbox_energy(
         raise ValueError(f"w_c length {w.size} incompatible with C={C}, P={P}.")
 
     # energy-weighted usage per component (proportional to flux)
-    # avoids materializing x*E as a (C,P) temp
+    # avoids materialising x*E as a (C,P) temp
     s = np.einsum("cp,cp->c", x, E, dtype=np.float64)      # (C,)
 
     # normalize target & usage

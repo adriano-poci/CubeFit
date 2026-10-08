@@ -35,6 +35,8 @@ v1.6:   Added extensive safe-guards to archive/restore to avoid accidental data
             loss. 11 August 2026
 v1.7:   Added `ssp_*` properties to persist SSP library metadata in the HDF5
             file in `populate_from_arrays`. 5 October 2026
+v1.8:   Added defensive removal of stale `/HyperCube` data on detection of
+            incompatible array dimensions. 6 October 2026 
 
 
 HDF5 manager for CubeFit.
@@ -54,7 +56,7 @@ needs optional overrides in memory.
 
 from __future__ import annotations
 import numpy as np
-import json
+import json, hashlib
 from tqdm import tqdm
 from dataclasses import dataclass
 from pathlib import Path
@@ -506,6 +508,39 @@ def _normalize_losvd_and_persist(h5f, losvd, losvd_path, norm_path):
         norm_ds[...] = s.astype(np.float64)
 
     return losvd_normed
+
+def _cube_basis_digest(*arrays) -> str:
+    """
+    Return a deterministic SHA256 digest for HyperCube basis arrays.
+
+    Parameters
+    ----------
+    *arrays : array-like
+        Numerical arrays defining the HyperCube basis.
+
+    Returns
+    -------
+    str
+        SHA256 hexadecimal digest.
+
+    Raises
+    ------
+    ValueError
+        If an input cannot be converted to a NumPy array.
+
+    Examples
+    --------
+    >>> digest = _cube_basis_digest(templates, tem_pix, losvd)
+    """
+    digest = hashlib.sha256()
+
+    for array in arrays:
+        arr = np.asarray(array)
+        digest.update(str(arr.dtype).encode("utf-8"))
+        digest.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+        digest.update(np.ascontiguousarray(arr).view(np.uint8))
+
+    return digest.hexdigest()
 
 # --------------------------------------------------------------------------- #
 # Manager
@@ -970,16 +1005,16 @@ class H5Manager:
             with self._open_ro() as f_ro:
                 if tem_pix is None:
                     if "/TemPix" not in f_ro:
-                        raise RuntimeError("Missing /TemPix; pass tem_pix or call "
-                                        "set_spectral_grids(...).")
+                        raise RuntimeError("Missing /TemPix; pass tem_pix or "
+                            "call set_spectral_grids(...).")
                     tem_pix = np.asarray(f_ro["/TemPix"][...], dtype=np.float64)
                 else:
                     tem_pix = np.asarray(tem_pix, dtype=np.float64)
 
                 if obs_pix is None:
                     if "/ObsPix" not in f_ro:
-                        raise RuntimeError("Missing /ObsPix; pass obs_pix or call "
-                                        "set_spectral_grids(...).")
+                        raise RuntimeError("Missing /ObsPix; pass obs_pix or "
+                            "call set_spectral_grids(...).")
                     obs_pix = np.asarray(f_ro["/ObsPix"][...], dtype=np.float64)
                 else:
                     obs_pix = np.asarray(obs_pix, dtype=np.float64)
@@ -991,9 +1026,8 @@ class H5Manager:
             if tem_pix is None or obs_pix is None:
                 raise RuntimeError(
                     "Base HDF5 does not exist yet and spectral grids were not "
-                    "provided. Pass tem_pix and obs_pix (and optionally vel_pix) "
-                    "on the first run."
-                )
+                    "provided. Pass tem_pix and obs_pix (and optionally vel_pix)"
+                    " on the first run.")
             tem_pix = np.asarray(tem_pix, dtype=np.float64)
             obs_pix = np.asarray(obs_pix, dtype=np.float64)
             if vel_pix is not None:
@@ -1034,8 +1068,7 @@ class H5Manager:
         if templates_in.shape[0] != T_len:
             raise ValueError(
                 f"templates spectral axis (axis 0) length "
-                f"{templates_in.shape[0]} != len(tem_pix) {T_len}."
-            )
+                f"{templates_in.shape[0]} != len(tem_pix) {T_len}.")
 
         templates_in_shape = tuple(templates_in.shape)          # (T, *pop_axes)
         orig_t_axis = 0
@@ -1047,9 +1080,8 @@ class H5Manager:
         P, T = map(int, templates_PT.shape)
 
         # ---------- compute guard (template pixels) & crop spectral axis ----------
-        Kguard = self._compute_template_guard_pixels(
-            tem_pix, vel_pix, safety_pad_px=safety_pad_px
-        )
+        Kguard = self._compute_template_guard_pixels(tem_pix, vel_pix,
+            safety_pad_px=safety_pad_px)
         dlog_tem = float(np.median(np.diff(tem_pix)))
         lam_lo   = float(obs_pix.min()) - Kguard * dlog_tem
         lam_hi   = float(obs_pix.max()) + Kguard * dlog_tem
@@ -1114,8 +1146,36 @@ class H5Manager:
                 raise ValueError("binnum contains out-of-range indices; "
                     f"expected in [0, {S-1}].")
 
+        # Numerical inputs that completely define the unscaled HyperCube basis.
+        basis_digest = _cube_basis_digest(
+            templates_c, tem_pix_c, obs_pix, vel_pix, R_T, losvd_in)
+
         # ---------- write everything ----------
         with self._open_rw() as f:
+
+            old_digest = f.attrs.get("cube_basis_digest", None)
+
+            # Historic files have no digest. Reconstruct it from the old
+            # backbone before those datasets are overwritten below.
+            if old_digest is None and all(name in f for name in (
+                "/Templates", "/TemPix", "/ObsPix", "/VelPix",
+                "/R_T", "/LOSVD")):
+                old_digest = _cube_basis_digest(
+                    f["/Templates"][...], f["/TemPix"][...],
+                    f["/ObsPix"][...], f["/VelPix"][...],
+                    f["/R_T"][...], f["/LOSVD"][...])
+
+            if isinstance(old_digest, bytes):
+                old_digest = old_digest.decode("utf-8")
+
+            if (old_digest is not None
+                and str(old_digest) != basis_digest
+                and "/HyperCube" in f):
+                logger.log(
+                    "[HDF5] HyperCube basis changed; removing stale "
+                    "/HyperCube.")
+                del f["/HyperCube"]
+
             def _write(name, data, **create_kw):
                 if name in f:
                     del f[name]
@@ -1198,29 +1258,21 @@ class H5Manager:
 
             # ---------- write per-pixel metadata (only if provided) ----------
             if xpix is not None:
-                self._write_1d(
-                    f, "/XPix", xpix, np.float64,
+                self._write_1d(f, "/XPix", xpix, np.float64,
                     units="pixel or arcsec (user-supplied)",
-                    semantic="image-plane X coordinate per detector pixel",
-                )
+                    semantic="image-plane X coordinate per detector pixel")
             if ypix is not None:
-                self._write_1d(
-                    f, "/YPix", ypix, np.float64,
+                self._write_1d(f, "/YPix", ypix, np.float64,
                     units="pixel or arcsec (user-supplied)",
-                    semantic="image-plane Y coordinate per detector pixel",
-                )
+                    semantic="image-plane Y coordinate per detector pixel")
             if binnum is not None:
-                self._write_1d(
-                    f, "/BinNum", binnum, np.int32,
+                self._write_1d(f, "/BinNum", binnum, np.int32,
                     units="index",
-                    semantic="pixel→spatial-bin mapping [0..S-1]",
-                )
+                    semantic="pixel→spatial-bin mapping [0..S-1]")
             if bincounts is not None:
-                self._write_1d(
-                    f, "/BinCounts", bincounts, np.int32,
+                self._write_1d(f, "/BinCounts", bincounts, np.int32,
                     units="count",
-                    semantic="number of pixels per spatial bin [0..S-1]",
-                )
+                    semantic="number of pixels per spatial bin [0..S-1]")
 
             # ---------- compute & store /HyperCube/data_flux (S,) -----------
             # Per-spaxel mean over unmasked wavelengths (λ). Masked λ are ignored.
@@ -1268,6 +1320,8 @@ class H5Manager:
                 ds_w = f.create_dataset("/CompWeights", data=w, dtype=np.float64)
                 ds_w.attrs["semantic"] = "prior component weights w_c (unit-sum)"
                 ds_w.attrs["normalized"] = bool(np.isclose(np.sum(w), 1.0))
+            
+            f.attrs["cube_basis_digest"] = basis_digest
 
         return dict(nSpat=S, nLSpec=L_obs, nTSpec=T_c, nVel=V, nComp=C, nPop=P)
 

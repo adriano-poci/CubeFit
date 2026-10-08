@@ -1218,7 +1218,7 @@ reconstruct_modelcube_fast_parallel
 based on resolved parallelism.
 
 The reconstruction contracts the stored `(C,P)` coefficient matrix against
-HyperCube spatial slabs without materializing a separate global two-dimensional
+HyperCube spatial slabs without materialising a separate global two-dimensional
 design matrix.
 
 After reconstruction, `loadCubeFit()` stamps `/ModelCube` with metadata

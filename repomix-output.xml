@@ -5373,7 +5373,7 @@ reconstruct_modelcube_fast_parallel
 </code></pre>
 <p>based on resolved parallelism.</p>
 <p>The reconstruction contracts the stored <code>(C,P)</code> coefficient matrix against
-HyperCube spatial slabs without materializing a separate global two-dimensional
+HyperCube spatial slabs without materialising a separate global two-dimensional
 design matrix.</p>
 <p>After reconstruction, <code>loadCubeFit()</code> stamps <code>/ModelCube</code> with metadata
 including the coefficient digest, shape, arithmetic dtype, and generator.</p>
@@ -7029,7 +7029,7 @@ reconstruct_modelcube_fast_parallel
 based on resolved parallelism.
 
 The reconstruction contracts the stored `(C,P)` coefficient matrix against
-HyperCube spatial slabs without materializing a separate global two-dimensional
+HyperCube spatial slabs without materialising a separate global two-dimensional
 design matrix.
 
 After reconstruction, `loadCubeFit()` stamps `/ModelCube` with metadata
@@ -8986,7 +8986,7 @@ v1.1:   Generalised to include all validation tests;
 # need to set up the logger before any other imports
 import pathlib as plp
 from CubeFit.logger import get_logger
-print("[CubeFit] Initializing CubeFit logger...")
+print("[CubeFit] Initialising CubeFit logger...")
 curdir = plp.Path(__file__).parent
 lfn = curdir/'kz_run.log'
 logger = get_logger(lfn, mode='w')
@@ -20200,7 +20200,7 @@ def apply_component_softbox_energy(
         raise ValueError(f"w_c length {w.size} incompatible with C={C}, P={P}.")
 
     # energy-weighted usage per component (proportional to flux)
-    # avoids materializing x*E as a (C,P) temp
+    # avoids materialising x*E as a (C,P) temp
     s = np.einsum("cp,cp->c", x, E, dtype=np.float64)      # (C,)
 
     # normalize target & usage
@@ -35075,7 +35075,7 @@ v2.0:   Updated `compare_orbit_vs_solution_absolute` to use new definition of
 # need to set up the logger before any other imports
 import pathlib as plp
 from CubeFit.logger import get_logger
-print("[CubeFit] Initializing CubeFit logger...")
+print("[CubeFit] Initialising CubeFit logger...")
 curdir = plp.Path(__file__).parent
 lfn = curdir/'kz_run.log'
 logger = get_logger(lfn, mode='w')

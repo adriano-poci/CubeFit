@@ -32,16 +32,18 @@ IFS=$'\n\t'
 
 usage() {
     cat <<EOF
-Usage: $0 --cluster CLUSTER GALAXY [-n N] [--ncomp=N] [--ncomp N]
+Usage: $0 --cluster CLUSTER GALAXY [-n N] [--ncomp=N] [--ncomp N] [--redraw]
   --cluster CLUSTER   Slurm cluster to submit to, e.g. arc or htc
   GALAXY              galaxy name (string, required)
   -n N                number of components
   --ncomp=N           same as -n
+  --redraw             force redraw in generation and Rio stages
 EOF
 }
 
 CLUSTER=""
 NCOMP=""
+REDRAW=0
 
 # Parse long options first.
 new_argv=()
@@ -72,6 +74,10 @@ while [ "$#" -gt 0 ]; do
             fi
             NCOMP="$2"
             shift 2
+            ;;
+        --redraw)
+            REDRAW=1
+            shift
             ;;
         --)
             shift
@@ -132,9 +138,17 @@ if [ -n "${NCOMP:-}" ]; then
     common_args+=("--ncomp=$NCOMP")
 fi
 
+gen_args=("${common_args[@]}")
+rio_args=("${common_args[@]}")
+
+if [ "$REDRAW" -eq 1 ]; then
+    gen_args+=("--redraw")
+    rio_args+=("--redraw")
+fi
+
 fSGA_raw=$(sbatch --parsable -M "$CLUSTER" \
     --export=ALL,CF_CLUSTER="$CLUSTER" \
-    kz_1Gen.sh "${common_args[@]}")
+    kz_1Gen.sh "${gen_args[@]}")
 fSGA=${fSGA_raw%%;*}
 
 fSF_raw=$(sbatch --parsable -M "$CLUSTER" \
@@ -146,4 +160,4 @@ fSF=${fSF_raw%%;*}
 sbatch -M "$CLUSTER" \
     --export=ALL,CF_CLUSTER="$CLUSTER" \
     --dependency=afterok:"$fSF" \
-    kz_3Rio.sh "${common_args[@]}"
+    kz_3Rio.sh "${rio_args[@]}"

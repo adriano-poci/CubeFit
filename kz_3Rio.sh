@@ -79,15 +79,17 @@ IFS=$'\n\t'
 
 usage() {
     cat <<EOF
-Usage: $0 GALAXY [-n N] [--ncomp=N] [--ncomp N] [positional...]
+Usage: $0 GALAXY [-n N] [--ncomp=N] [--ncomp N] [--redraw]
   GALAXY         galaxy name (string, required)
   -n N           short form
   --ncomp=N      long form (either form optional)
+  --redraw       force regeneration of Rio outputs
 If provided, N must be a positive integer.
 EOF
 }
 
 NCOMP=""
+REDRAW=0
 # Build a new argv array excluding any long-form --ncomp tokens
 new_argv=()
 while [ "$#" -gt 0 ]; do
@@ -103,6 +105,10 @@ while [ "$#" -gt 0 ]; do
             fi
             NCOMP="$2"
             shift 2
+            ;;
+        --redraw)
+            REDRAW=1
+            shift
             ;;
         --)
             shift
@@ -157,11 +163,35 @@ if [ -n "${NCOMP:-}" ]; then
         echo "Error: ncomp must be > 0, got '$NCOMP'." >&2
         exit 2
     fi
-    echo "GALAXY = $GALAXY"
+fi
+
+if [ "$REDRAW" -ne 0 ] && [ "$REDRAW" -ne 1 ]; then
+    echo "Error: internal REDRAW value must be 0 or 1, got '$REDRAW'." >&2
+    exit 2
+fi
+
+echo "GALAXY = $GALAXY"
+
+if [ -n "${NCOMP:-}" ]; then
     echo "NCOMP  = $NCOMP"
 else
-    echo "GALAXY = $GALAXY"
     echo "NCOMP not provided; running with defaults"
+fi
+
+if [ "$REDRAW" -eq 1 ]; then
+    echo "REDRAW = yes"
+else
+    echo "REDRAW = no"
+fi
+
+run_args=(--galaxy "$GALAXY")
+
+if [ -n "${NCOMP:-}" ]; then
+    run_args+=(--ncomp "$NCOMP")
+fi
+
+if [ "$REDRAW" -eq 1 ]; then
+    run_args+=(--redraw)
 fi
 # ------------------------------------------------------------------------------
 # /Argument parsing
@@ -174,5 +204,4 @@ echo "Submitted cluster: ${CF_CLUSTER:-unknown}"
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-unknown}"
 echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-unknown}"
 
-python -m IPython --colors=NoColor kz_rio.py -- --galaxy "$GALAXY" --redraw \
-    ${NCOMP:+--ncomp="$NCOMP"}
+python -m IPython --colors=NoColor kz_rio.py -- "${run_args[@]}"

@@ -13,12 +13,12 @@
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_1Gen.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_1Gen.log" --open-mode=append
 #SBATCH -p short
-# #SBATCH --qos=priority
+#SBATCH --qos=priority
 
 #SBATCH --job-name="CubeFit_1Gen"
 #SBATCH --time=0-12:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=150G
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=adriano.poci@physics.ox.ac.uk
@@ -32,7 +32,7 @@ module load Python/3.11.3-GCCcore-12.3.0
 export MALLOC_ARENA_MAX=2
 
 # HyperCube multiprocessing + BLAS threading
-export CUBEFIT_GEN_BLAS_THREADS=2
+export CUBEFIT_GEN_BLAS_THREADS=4
 export CUBEFIT_GEN_PROCESSES=$((
     ${SLURM_CPUS_PER_TASK:-12} / CUBEFIT_GEN_BLAS_THREADS
 ))
@@ -63,15 +63,17 @@ IFS=$'\n\t'
 
 usage() {
     cat <<EOF
-Usage: $0 GALAXY [-n N] [--ncomp=N] [--ncomp N] [positional...]
+Usage: $0 GALAXY [-n N] [--ncomp=N] [--ncomp N] [--redraw] [positional...]
   GALAXY         galaxy name (string, required)
   -n N           short form
   --ncomp=N      long form (either form optional)
+  --redraw       invalidate/rebuild the HyperCube rather than resume it
 If provided, N must be a positive integer.
 EOF
 }
 
 NCOMP=""
+REDRAW=0
 # Build a new argv array excluding any long-form --ncomp tokens
 new_argv=()
 while [ "$#" -gt 0 ]; do
@@ -88,6 +90,10 @@ while [ "$#" -gt 0 ]; do
             NCOMP="$2"
             shift 2
             ;;
+        --redraw)
+            REDRAW=1
+            shift
+            ;;    
         --)
             shift
             while [ "$#" -gt 0 ]; do
@@ -141,11 +147,35 @@ if [ -n "${NCOMP:-}" ]; then
         echo "Error: ncomp must be > 0, got '$NCOMP'." >&2
         exit 2
     fi
-    echo "GALAXY = $GALAXY"
+fi
+
+if [ "$REDRAW" -ne 0 ] && [ "$REDRAW" -ne 1 ]; then
+    echo "Error: internal REDRAW value must be 0 or 1, got '$REDRAW'." >&2
+    exit 2
+fi
+
+echo "GALAXY = $GALAXY"
+
+if [ -n "${NCOMP:-}" ]; then
     echo "NCOMP  = $NCOMP"
 else
-    echo "GALAXY = $GALAXY"
     echo "NCOMP not provided; running with defaults"
+fi
+
+if [ "$REDRAW" -eq 1 ]; then
+    echo "REDRAW = yes (HyperCube will be rebuilt)"
+else
+    echo "REDRAW = no (existing HyperCube will be resumed/reused)"
+fi
+
+run_args=(--galaxy "$GALAXY" --run-switch gen)
+
+if [ -n "${NCOMP:-}" ]; then
+    run_args+=(--ncomp "$NCOMP")
+fi
+
+if [ "$REDRAW" -eq 1 ]; then
+    run_args+=(--redraw)
 fi
 # ------------------------------------------------------------------------------
 # /Argument parsing
@@ -160,5 +190,4 @@ echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-unknown}"
 echo "CUBEFIT_GEN_PROCESSES=$CUBEFIT_GEN_PROCESSES"
 echo "CUBEFIT_GEN_BLAS_THREADS=$CUBEFIT_GEN_BLAS_THREADS"
 
-python -m IPython --colors=NoColor kz_run.py -- --galaxy "$GALAXY" \
-    --run-switch 'gen' --redraw ${NCOMP:+--ncomp="$NCOMP"}
+python -m IPython --colors=NoColor kz_run.py -- "${run_args[@]}"

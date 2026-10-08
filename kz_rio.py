@@ -95,37 +95,39 @@ def main():
     if propDict['nCuts'] == 3:
         propDict['regularisation_scale'] = 0.0
         propDict['lOrder'] = 0
-        propDict['validationPath'] = str(curdir/args.galaxy/
-            'hypercube_3_00.h5')
-        propDict['validationTag'] = 'datafit.w.lambda2e-5_stat_SSPoffset'
-        propDict['validationError'] = 'stat'
+        # propDict['validationPath'] = str(curdir/args.galaxy/
+        #     'hypercube_3_00.h5')
+        # propDict['runTag'] = 'datafit.w.lambda2e-5_stat_SSPoffset'
+        # propDict['validationError'] = 'stat'
         # propDict['streaming'] = False
-        ############################ Real run
+        ############################ SSP library to emulate real fit
         propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6])
-        ############################ Run to generate mock data
+        ############################ SSP library to generate mock-data fit
         # propDict['sspIdx'] = ([-1.79, -1.26, -0.6, -0.25, 0.0, 0.15, 0.26],
         #     [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
         #     [-0.2, 0.0, 0.2, 0.4, 0.6])
         # propDict['warm'] = 'saved_x'
     elif propDict['nCuts'] == 20:
-        propDict['regularisation_scale'] = 1e-5
         propDict['lOrder'] = 0
         # propDict['validationPath'] = str(curdir/args.galaxy/
-        #     'hypercube_3_00.h5')
-        # propDict['validationTag'] = 'datafit.w.lambda2e-5_stat_SSPoffset'
+        #     'hypercube_20_00.h5')
+        # propDict['runTag'] = 'stat_SSPoffset'
         # propDict['validationError'] = 'stat'
         # propDict['streaming'] = False
         ############################ SSP library to emulate real fit
-        # propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
-        #     [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
-        #     [-0.2, 0.0, 0.2, 0.4, 0.6])
-        ############################ SSP library to generate mock-data fit
-        propDict['sspIdx'] = ([-1.79, -1.26, -0.6, -0.25, 0.0, 0.15, 0.26],
-            [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
+        propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
+            [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6])
-        # propDict['warm'] = 'saved_x'
+        # propDict['regularisation_scale'] = 1e-5
+        # propDict['runTag'] = 'lambda1e-5'
+        ############################ SSP library to generate mock-data fit
+        # propDict['sspIdx'] = ([-1.79, -1.26, -0.6, -0.25, 0.0, 0.15, 0.26],
+        #     [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
+        #     [0.0, 0.4])
+        propDict['regularisation_scale'] = 0.0
+        propDict['warm'] = 'zeros'
     print(propDict)
 
     try:
@@ -136,7 +138,7 @@ def main():
     except BaseException as e:
         # Log + print the traceback explicitly
         import traceback
-        print("[kz_rio] FATAL: unhandled exception in genCubeFit", file=sys.__stderr__, flush=True)
+        print("[kz_rio] FATAL: unhandled exception in loadCubeFit", file=sys.__stderr__, flush=True)
         traceback.print_exc()
         # This *forces* the interpreter to exit, even under IPython
         sys.exit(1)

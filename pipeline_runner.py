@@ -81,7 +81,10 @@ v1.25:  Added adjustable `regularisation_scale` throughout the solver pathway.
 v1.26:  Cleaned `build_hypercube` for use by passing through all `kwargs`. 1
             October 2026
 v1.27:  Added `streaming` keyword to `PipelineRunner.solve_all_mp_batched` to
-            toggle between streaming or monolithic NNLS solvers. 5 October 2026 
+            toggle between streaming or monolithic NNLS solvers. 5 October 2026
+v1.28:  Stop persisting `known_zero_mask` in
+            `PipelineRunner.solve_all_mp_batched` as it is now derived directly.
+            6 October 2026 
 """
 
 from __future__ import annotations
@@ -510,15 +513,6 @@ class PipelineRunner:
 
             f_wr["/X_global"].attrs["layout"] = "C_P"
             f_wr["/X_global"].attrs["P"] = x_solver.shape[1]
-
-            if "known_zero_mask" in stats:
-                print("[pipeline] writing KNOWN_ZERO mask to /HyperCube/known_zero_mask",
-                    flush=True)
-                grp = f_wr.require_group("/HyperCube")
-                if "known_zero_mask" in grp:
-                    del grp["known_zero_mask"]
-                grp.create_dataset("known_zero_mask",
-                    data=stats["known_zero_mask"].astype(bool), dtype="bool")
         
         logger.log(
             "[Pipeline] ===================================================")

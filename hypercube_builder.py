@@ -30,6 +30,9 @@ v1.4:   Compute and apply a global scale to the Hypercube model to improve
             numerical stability during fitting. 8 January 2026
 v1.5:   Universally removed all ad-hoc scalings. 26 January 2026
 v1.7:   Added parallelism to `build_hypercube`. 1 October 2026
+v1.8:   Re-worked parallelisation scheme to be more efficient;
+        Persist energy in-place during the work to make the entire build
+            resumable. 8 October 2026
 
 
 Hypercube builder (LOSVD convolution in log-λ, then rebin to observed grid)
@@ -47,7 +50,7 @@ Requires the HDF5 to already contain:
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional, Dict, Any, List, Tuple
-import os, math, builtins
+import os, math, builtins, hashlib
 import multiprocessing as mp
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -883,6 +886,27 @@ def _frac_shift_last_axis(X: np.ndarray, shift: float) -> np.ndarray:
     Y = np.fft.irfft(F * phase[(...,) + (None,)* (F.ndim-1 - 1)], n=T, axis=-1)
     return Y
 
+def _build_digest(basis_digest: str, norm_mode: str, amp_mode: str,
+    cp_flux_ref_mode: str, vel_bias_kms: float, mask=None,
+    data_flux=None) -> str:
+    """Return a deterministic digest for a numerical HyperCube build."""
+    digest = hashlib.sha256()
+    digest.update(str(basis_digest).encode("utf-8"))
+    digest.update(str(norm_mode).encode("utf-8"))
+    digest.update(str(amp_mode).encode("utf-8"))
+    digest.update(str(cp_flux_ref_mode).encode("utf-8"))
+    digest.update(np.float64(vel_bias_kms).tobytes())
+
+    if mask is not None:
+        arr = np.asarray(mask, dtype=bool)
+        digest.update(np.ascontiguousarray(arr).view(np.uint8))
+
+    if data_flux is not None:
+        arr = np.asarray(data_flux, dtype=np.float64)
+        digest.update(np.ascontiguousarray(arr).view(np.uint8))
+
+    return digest.hexdigest()
+
 # ------------------------- parallel builder workers ---------------------------
 
 _HC_T_fft = None
@@ -948,6 +972,7 @@ def build_hypercube(
     vel_bias_kms: float = 0.0,
     processes: int | None = None,
     blas_threads: int | None = None,
+    worker_S: int = 8,
 ) -> None:
     """
     Build /HyperCube/models with LOSVD convolution on the template grid,
@@ -970,6 +995,7 @@ def build_hypercube(
     if blas_threads is None:
         blas_threads = int(os.environ.get("CUBEFIT_GEN_BLAS_THREADS", "1"))
     blas_threads = max(1, int(blas_threads))
+    worker_S = max(1, int(worker_S))
 
     # -------- Fast preflight: exit early if fully complete (reader-only)
     with open_h5(base_h5, "reader") as f_rd:
@@ -977,15 +1003,39 @@ def build_hypercube(
         S, V, C = map(int, f_rd["/LOSVD"].shape)
         L = int(f_rd["/DataCube"].shape[1])
 
+        basis_digest = f_rd.attrs.get("cube_basis_digest", None)
+
+        if basis_digest is None:
+            raise RuntimeError(
+                "Missing cube_basis_digest; repopulate the HDF5 backbone.")
+        if isinstance(basis_digest, bytes):
+            basis_digest = basis_digest.decode("utf-8")
+        mask_sig = (np.asarray(f_rd["/Mask"][...], dtype=bool)
+            if "/Mask" in f_rd else None)
+
+        data_flux_sig = None
+        if norm_mode == "data":
+            if "/HyperCube/data_flux" not in f_rd:
+                raise RuntimeError(
+                    "norm_mode='data' requires /HyperCube/data_flux.")
+            data_flux_sig = np.asarray(
+                f_rd["/HyperCube/data_flux"][...], dtype=np.float64)
+
+        requested_digest = _build_digest(
+            str(basis_digest), norm_mode, amp_mode, cp_flux_ref_mode,
+            vel_bias_kms, mask=mask_sig, data_flux=data_flux_sig)
+
         g = f_rd.get("/HyperCube", None)
         if g is not None and "models" in g and "_done" in g:
             done = np.asarray(g["_done"][...], dtype=np.uint8)
             all_done = (done.size > 0 and int(done.sum()) == int(done.size))
             models_ds = g["models"]
-            shape_matches = (
-                models_ds.shape == (S, C, P, L)
-            )
-            if bool(g.attrs.get("complete", False)) and all_done and shape_matches:
+            shape_matches = (models_ds.shape == (S, C, P, L))
+            build_matches = (
+                str(g.attrs.get("build_digest", "")) == requested_digest)
+
+            if (bool(g.attrs.get("complete", False)) and all_done
+                and shape_matches and build_matches):
                 print("[HyperCube] already complete; skip build (no writer).")
                 return
 
@@ -1022,6 +1072,8 @@ def build_hypercube(
                     _w = _w[keep_idx]
                 w_lam_sqrt = np.sqrt(_w).astype(np.float64, copy=False)  # (Lk,) or (L,)
 
+        rebuild_required = (g is not None and "models" in g
+            and str(g.attrs.get("build_digest", "")) != requested_digest)
     
     # Precompute velocity→pixel mapping (shared for all (s,c))
     km = _kernel_map_from_grids(tem_loglam, vel_pix)
@@ -1043,6 +1095,17 @@ def build_hypercube(
     # -------- Prepare destination dataset, normalization, and resume bitmap
     with open_h5(base_h5, "writer") as f:
         g = f.require_group("/HyperCube")
+
+        if rebuild_required:
+            logger.log(
+                "[HyperCube] Build provenance changed; rebuilding models.")
+
+            for name in list(g.keys()):
+                if name != "data_flux":
+                    del g[name]
+
+            for name in list(g.attrs.keys()):
+                del g.attrs[name]
         # create models if absent, or recreate if shape no longer matches
         if "models" not in g:
             chunks = (min(S_chunk, S), min(C_chunk, C), min(P_chunk, P), L)
@@ -1092,19 +1155,13 @@ def build_hypercube(
         if "/HyperCube/component_support" in f:
             del f["/HyperCube/component_support"]
 
-        support_ds = g.create_dataset(
-            "component_support",
-            shape=(n_tiles, C),
-            dtype="u1",
-            chunks=(1, min(C, 256)),
-            compression="gzip",
-            compression_opts=1,
-        )
+        support_ds = g.create_dataset("component_support",
+            shape=(n_tiles, C), dtype="u1",
+            chunks=(1, min(C, 256)), compression="gzip", compression_opts=1)
 
         support_ds.attrs["definition"] = (
             "component_support[t,c]=1 if any spaxel s in tile t has "
-            "losvd_amp[s,c] > eps_support; else 0"
-        )
+            "losvd_amp[s,c] > eps_support; else 0")
         support_ds.attrs["source"] = "losvd_amp"
         support_ds.attrs["S_chunk"] = int(S_chunk)
         support_ds.attrs["eps_mode"] = "relative_to_component_max"
@@ -1145,26 +1202,38 @@ def build_hypercube(
 
         # How many tiles remain BEFORE enabling SWMR
         rem = int(np.asarray(done[...], np.uint8).size
-                  - np.asarray(done[...], np.uint8).sum())
-        if rem <= 0:
-            g.attrs["complete"] = True
-            g.attrs["shape"] = (S, C, P, L)
-            g.attrs["chunks"] = models.chunks
-            try:
-                f.flush()
-            except Exception:
-                pass
-            print("[HyperCube] already complete; nothing to write.")
-            return
+            - np.asarray(done[...], np.uint8).sum())
+        all_tiles_done = (rem <= 0)
 
         losvd_ds = f["/LOSVD"]
 
         masked_flag = bool(keep_idx is not None)
-        # create dataset & attrs up front (metadata writes pre-SWMR)
-        if "/HyperCube/col_energy" in f:
-            del f["/HyperCube/col_energy"]
-        E_ds = g.create_dataset("col_energy", shape=(C, P), dtype="f8",
-            chunks=(min(C,256), min(P,1024)), compression="gzip")
+
+        if "col_energy" not in g:
+            E_ds = g.create_dataset("col_energy", shape=(C, P), dtype="f8",
+                chunks=(min(C, 256), min(P, 1024)), compression="gzip")
+        else:
+            E_ds = g["col_energy"]
+            if E_ds.shape != (C, P):
+                del g["col_energy"]
+                E_ds = g.create_dataset("col_energy", shape=(C, P), dtype="f8",
+                    chunks=(min(C, 256), min(P, 1024)), compression="gzip")
+
+        n_tiles = math.ceil(S / S_chunk)
+
+        if "_energy_tiles" not in g:
+            E_tile_ds = g.create_dataset("_energy_tiles",
+                shape=(n_tiles, C, P), dtype="f8",
+                chunks=(1, min(C_chunk, C), min(P_chunk, P)),
+                compression="gzip", compression_opts=1)
+        else:
+            E_tile_ds = g["_energy_tiles"]
+            if E_tile_ds.shape != (n_tiles, C, P):
+                del g["_energy_tiles"]
+                E_tile_ds = g.create_dataset("_energy_tiles",
+                    shape=(n_tiles, C, P), dtype="f8",
+                    chunks=(1, min(C_chunk, C), min(P_chunk, P)),
+                    compression="gzip", compression_opts=1)
         # set attrs before swmr_mode
         E_ds.attrs["masked"] = bool(masked_flag)
         E_ds.attrs["lambda_weights"] = bool(w_lam_sqrt is not None)
@@ -1179,6 +1248,11 @@ def build_hypercube(
             E_ds.attrs["provenance"] = "sum_{s,λ} (√w·models)^2 over all λ"
         else:
             E_ds.attrs["provenance"] = "sum_{s,λ} models^2 over all λ"
+        E_tile_ds.attrs["S_chunk"] = int(S_chunk)
+        E_tile_ds.attrs["C_chunk"] = int(C_chunk)
+        E_tile_ds.attrs["P_chunk"] = int(P_chunk)
+        E_tile_ds.attrs["definition"] = \
+            "energy contribution per spatial storage tile"
 
 
         # --- SWMR writer mode
@@ -1188,17 +1262,6 @@ def build_hypercube(
             print("[SWMR] writer mode enabled for HyperCube build.")
         except Exception as e:
             print(f"[SWMR] could not enable writer mode: {e}")
-
-        # Initialize global column energy accumulator E[c,p] float64
-        E_acc = np.zeros((C, P), dtype=np.float64)
-        # ------------------------------------------------------------
-        # Tile-wise component energy for spatial support (ENERGY-based)
-        # ------------------------------------------------------------
-        n_tiles = math.ceil(S / S_chunk)
-
-        # Accumulate energy per (tile, component)
-        # float64 but very small: (n_tiles, C)
-        E_tile_comp = np.zeros((n_tiles, C), dtype=np.float64)
 
         # --- iterate tiles; skip ones marked done
         def _iter_all_tiles():
@@ -1215,13 +1278,26 @@ def build_hypercube(
 
         total_tiles = rem
 
-        pbar = tqdm(total=total_tiles, desc="[HyperCube] tiles",
-            mininterval=2.0)
+        if all_tiles_done:
+            E_acc = np.zeros((C, P), dtype=np.float64)
+            for tile_idx in range(n_tiles):
+                E_acc += np.asarray(
+                    E_tile_ds[tile_idx, :, :], dtype=np.float64)
+
+            E_ds[...] = E_acc
+            g.attrs["complete"] = True
+            g.attrs["shape"] = (S, C, P, L)
+            g.attrs["chunks"] = models.chunks
+            f.flush()
+
+            print("[HyperCube] finalized completed build from energy tiles.")
+            return
 
         eps = 1e-30  # avoids 0/0 in data mode
         ctx = mp.get_context("spawn")
         print(f"[HyperCube] parallel build: {processes} processes", flush=True)
-
+        pbar = tqdm(total=total_tiles, desc="[HyperCube] tiles",
+            mininterval=2.0)
         with ProcessPoolExecutor(max_workers=processes, mp_context=ctx,
             initializer=_init_hypercube_worker,
             initargs=(T_fft, R_T, km, n_fft, T, phase_shift,
@@ -1230,29 +1306,37 @@ def build_hypercube(
             for (p0, p1, s0, s1, c0, c1, idx3) in _iter_all_tiles():
                 if _done_get(done, idx3) != 0:
                     continue
+                tile_energy = np.zeros((c1 - c0, p1 - p0), dtype=np.float64)
 
                 jobs = []
 
-                H_tile = np.empty((s1 - s0, c1 - c0), dtype=object)
-                scale_tile = np.zeros((s1 - s0, c1 - c0), dtype=np.float64)
+                # Split the storage S-tile into smaller independent compute
+                # subtiles so the process pool is actually occupied.
+                for ws0 in range(s0, s1, worker_S):
+                    ws1 = min(ws0 + worker_S, s1)
 
-                for i, s_idx in enumerate(range(s0, s1)):
-                    a_sum = float(A_sum[s_idx])
+                    # Dense contiguous (dS,dC,V), rather than an object array.
+                    H_tile = np.asarray(losvd_ds[ws0:ws1, :, c0:c1],
+                        dtype=np.float64, order="C").transpose(0, 2, 1)
 
-                    for j, c_idx in enumerate(range(c0, c1)):
-                        H_tile[i, j] = np.asarray(losvd_ds[s_idx, :, c_idx],
-                            dtype=np.float64, order="C")
+                    scale_tile = np.zeros((ws1 - ws0, c1 - c0), dtype=np.float64)
 
-                        if norm_mode == "model":
-                            scale_tile[i, j] = float(A[s_idx, c_idx])
-                        elif a_sum > 0.0 and L_vec[s_idx] > 0.0:
-                            frac = float(A[s_idx, c_idx]) / \
-                                np.maximum(a_sum, eps)
-                            scale_tile[i, j] = float(L_vec[s_idx]) * frac
+                    for i, s_idx in enumerate(range(ws0, ws1)):
+                        a_sum = float(A_sum[s_idx])
 
-                jobs.append(executor.submit(_hypercube_worker,
-                    (s0, s1, c0, c1, p0, p1, H_tile, scale_tile)))
+                        for j, c_idx in enumerate(range(c0, c1)):
+                            if norm_mode == "model":
+                                scale_tile[i, j] = float(A[s_idx, c_idx])
+                            elif a_sum > 0.0 and L_vec[s_idx] > 0.0:
+                                frac = float(A[s_idx, c_idx]) / \
+                                    np.maximum(a_sum, eps)
+                                scale_tile[i, j] = float(L_vec[s_idx]) * frac
 
+                    jobs.append(executor.submit(_hypercube_worker,
+                        (ws0, ws1, c0, c1, p0, p1, H_tile, scale_tile)))
+
+                # All compute subtiles belonging to this storage tile run
+                # concurrently. The parent remains the sole HDF5 writer.
                 for future in as_completed(jobs):
                     results = future.result()
 
@@ -1266,15 +1350,23 @@ def build_hypercube(
                             e_local = np.sum(np.square(Yv, dtype=np.float64) *
                                 w_lam_sqrt[None, :], axis=1)
                         else:
-                            e_local = np.sum(np.square(Yv, dtype=np.float64),
-                                axis=1)
+                            e_local = np.sum(
+                                np.square(Yv, dtype=np.float64), axis=1)
 
-                        E_acc[c_idx, pp0:pp1] += e_local
-
-                        tile_idx = s_idx // S_chunk
-                        E_tile_comp[tile_idx, c_idx] += float(np.sum(e_local))
-
+                        tile_energy[c_idx - c0, pp0 - p0:pp1 - p0] += e_local
                         models[s_idx, c_idx, pp0:pp1, 0:L] = Ycp
+
+                # Only mark the storage tile complete after every compute
+                # subtile has returned successfully and been written.
+                tile_idx = s0 // S_chunk
+                E_tile_ds[tile_idx, c0:c1, p0:p1] = tile_energy
+
+                try:
+                    models.id.flush()
+                    E_tile_ds.id.flush()
+                    f.flush()
+                except Exception:
+                    pass
 
                 _done_set(done, idx3)
 
@@ -1295,17 +1387,31 @@ def build_hypercube(
 
         pbar.close()
 
+        E_acc = np.zeros((C, P), dtype=np.float64)
+        for tile_idx in range(n_tiles):
+            E_acc += np.asarray(
+                E_tile_ds[tile_idx, :, :], dtype=np.float64)
+
         E_ds[...] = E_acc
-        
+        E_ds.id.flush()
+
         g.attrs["complete"] = True
+        g.attrs["basis_digest"] = str(basis_digest)
+        g.attrs["build_digest"] = str(requested_digest)
+        g.attrs["norm_mode"] = str(norm_mode)
+        g.attrs["amp_mode"] = str(amp_mode)
+        g.attrs["cp_flux_ref_mode"] = str(cp_flux_ref_mode)
         if vel_bias_kms is not None:
             g.attrs["vel_bias_kms"] = float(vel_bias_kms)
             g.attrs["vel_bias_note"] = "global LOSVD shift applied at build"
         g.attrs["shape"] = (S, C, P, L)
         g.attrs["chunks"] = models.chunks
+        g.attrs["S_chunk"] = int(S_chunk)
+        g.attrs["C_chunk"] = int(C_chunk)
+        g.attrs["P_chunk"] = int(P_chunk)
 
         # help h5py close cleanly
-        del models, losvd_ds, done, g, # E_ds
+        del models, losvd_ds, done, E_ds, E_tile_ds, g
         try: f.flush()
         except: pass
 

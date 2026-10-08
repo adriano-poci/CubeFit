@@ -400,17 +400,11 @@ def _worker_ATAz(
     S_flat = np.asarray(S_flat, dtype=np.float64).ravel(order="C")
 
     if z.size != CP:
-        raise ValueError(
-            f"z has size {z.size}, expected CP={CP}."
-        )
+        raise ValueError(f"z has size {z.size}, expected CP={CP}.")
     if S_flat.size != CP:
-        raise ValueError(
-            f"S_flat has size {S_flat.size}, expected CP={CP}."
-        )
+        raise ValueError(f"S_flat has size {S_flat.size}, expected CP={CP}.")
     if CP != C * P:
-        raise ValueError(
-            f"CP={CP} is inconsistent with C*P={C * P}."
-        )
+        raise ValueError(f"CP={CP} is inconsistent with C*P={C * P}.")
 
     # Same scaling as the original code.
     z_cp = (S_flat * z).reshape(C, P)
@@ -648,7 +642,10 @@ def _canon_orbit_weights(orbit_weights, C: int, P: int) -> np.ndarray | None:
 
 def _get_known_zero_mask(h5_path: str, C: int, P: int) -> np.ndarray:
     """
-    Return the persistent hard-exclusion mask for the solver.
+    Return the structural zero-energy exclusion mask for the solver.
+
+    The mask is derived directly from ``/HyperCube/col_energy``. A coefficient
+    is excluded only when its global model-column energy is exactly zero.
 
     Parameters
     ----------
@@ -657,35 +654,41 @@ def _get_known_zero_mask(h5_path: str, C: int, P: int) -> np.ndarray:
     C : int
         Number of orbit components.
     P : int
-        Number of population columns per orbit.
+        Number of population columns per component.
 
     Returns
     -------
     known_zero : ndarray, shape (C, P)
-        Boolean mask. True entries are fixed to zero by the solver.
+        Boolean structural exclusion mask.
 
     Raises
     ------
     RuntimeError
-        If a stored mask has a shape inconsistent with ``(C, P)``.
+        If column energy is absent, invalid, or dimensionally inconsistent.
 
     Examples
     --------
-    >>> known_zero = _get_known_zero_mask(h5_path, C=3, P=360)
+    >>> known_zero = _get_known_zero_mask(h5_path, C=20, P=245)
     """
     with open_h5(h5_path, role="reader") as f:
-        if "/HyperCube/known_zero_mask" not in f:
-            return np.zeros((C, P), dtype=bool)
+        if "/HyperCube/col_energy" not in f:
+            raise RuntimeError(
+                "Missing /HyperCube/col_energy; cannot determine structural "
+                "known-zero columns.")
 
-        known_zero = np.asarray(
-            f["/HyperCube/known_zero_mask"][...], dtype=bool)
+        energy = np.asarray(
+            f["/HyperCube/col_energy"][...], dtype=np.float64)
 
-    if known_zero.shape != (C, P):
+    if energy.shape != (C, P):
         raise RuntimeError(
-            f"known_zero_mask has shape {known_zero.shape}; "
-            f"expected {(C, P)}.")
+            f"col_energy has shape {energy.shape}; expected {(C, P)}.")
 
-    return known_zero
+    if np.any(~np.isfinite(energy)):
+        raise RuntimeError("col_energy contains non-finite values.")
+    if np.any(energy < 0.0):
+        raise RuntimeError("col_energy contains negative values.")
+
+    return energy <= 0.0
 
 # ------------------------------------------------------------------------------
 
@@ -1488,7 +1491,7 @@ def streamActiveSetNNLS(
     known_zero_mask: Optional[np.ndarray] = None,
     x0_flat: Optional[np.ndarray] = None,
     resume_state: Optional[dict] = None,
-    max_active: int = 1000,
+    max_active: int = 2000,
     tol_grad: float = 1e-8,
     max_iter: int = 5000,
     regularisation_scale: float = 1.0,
@@ -1613,12 +1616,15 @@ def streamActiveSetNNLS(
 
     # Keep joint trials broad enough to expose several alternatives per orbit.
     explore_top_per_orbit = 6
-    explore_coverage_per_orbit = 3
-    explore_batch_size = max(48, min(256, 4 * C))
+    explore_coverage_per_orbit = 6
+
+    explore_batch_size = max(96, min(768, 8 * C))
+
     explore_batches_per_iter = 3
     explore_fail_count = 0
     explore_round = 0
-    # Explicit coverage
+
+    # Explicit coverage.
     explore_coverage_target = 0.5
     coverage_tested = np.zeros(CP, dtype=bool)
     coverage_restore_pending = False

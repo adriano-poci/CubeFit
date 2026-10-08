@@ -113,12 +113,14 @@ v2.2:   Correctly disambiguated the mock data *generation* from the subsequent
         Updated `genCubeFit` to modify `figDir` if `is_validation`;
         Pass SSP library providence to `populate_from_arrays` in `genCubeFit`. 5
             October 2026
+v2.3:   Changed `validationTag` to `runTag` to tag general runs in `genCubeFit`.
+            6 October 2026
 """
 
 # need to set up the logger before any other imports
 import pathlib as plp
 from CubeFit.logger import get_logger
-print("[CubeFit] Initializing CubeFit logger...")
+print("[CubeFit] Initialising CubeFit logger...")
 curdir = plp.Path(__file__).parent
 lfn = curdir/'kz_run.log'
 logger = get_logger(lfn, mode='w')
@@ -494,6 +496,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # (nSpat, nVel, nComp)
 
     logger.log('Generating spectral mask...', flush=True)
+    if isinstance(smask, type(None)):
+        smask = []
     spmask = np.ones(nLSpec, dtype=bool)
     with open(dDir/'emissionLines.txt', 'r+') as emlf:
         emMask = np.genfromtxt(emlf, usecols=(0, 1))
@@ -509,40 +513,49 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         kwargs.pop('blas_threads', BLAS_THREADS)
     best_processes, best_blas = cu.resolve_parallelism(Ncpu, Nblas)
 
-    # Check if this is a validation run and load the validation cube if so
+    # Run identity and optional validation-data configuration.
+    runTag = kwargs.pop('runTag', None)
     validationPath = kwargs.pop('validationPath', None)
     validationDataset = kwargs.pop('validationDataset', '/DataCube')
-    validationTag = kwargs.pop('validationTag', None)
     validationError = kwargs.pop('validationError', 'none')
-    # validationError can be 'none', 'stat', or 'residual'
-    # for none, the stat from the real data-cube, or the residual from the
-    # previous hypercube fit
     validationNoiseScale = float(kwargs.pop('validationNoiseScale', 1.0))
     validationSeed = int(kwargs.pop('validationSeed', 42))
-    is_validation = validationPath is not None and validationTag is not None
+    is_validation = validationPath is not None
 
-    # --- Setup HDF5 directory ---
+    if runTag is not None:
+        runTag = str(runTag).strip()
+        if not runTag:
+            runTag = None
+
+    # --- Setup HDF5 and figure directories ---
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
-    hdf5Path = (hdf5Dir/((f"hypercube_{nComp:{pred}d}_{lOrder:02d}" + 
-        (f"_{validationTag}" if validationTag is not None else "")) + '.h5')
-        ).with_suffix('.h5')
+
+    suffix = f"_{runTag}" if runTag is not None else ""
+    hdf5Path = hdf5Dir/f"hypercube_{nComp:{pred}d}_{lOrder:02d}{suffix}.h5"
+
     if is_validation:
-        if validationTag is None:
-            raise ValueError("validationTag is required for validation runs.")
-        if validationPath is None:
-            raise ValueError("validationPath is required for validation runs.")
-        figDir = curdir/galaxy/'validation'/str(validationTag)
-        figDir.mkdir(parents=True, exist_ok=True)
-        mockPath = hdf5Dir/\
-            f"{plp.Path(validationPath).stem}_mock_{validationTag}.h5"
+        if runTag is None:
+            raise ValueError("runTag is required for validation runs.")
+        figDir = curdir/galaxy/'validation'/runTag
+    elif runTag is not None:
+        figDir = curdir/galaxy/'figures'/runTag
+    else:
+        figDir = curdir/galaxy/'figures'
+
+    figDir.mkdir(parents=True, exist_ok=True)
+
+    if is_validation:
+        mockPath = hdf5Dir/f"{plp.Path(validationPath).stem}_mock_{runTag}.h5"
         statCube = statGrid.T if validationError == 'stat' else None
+
         cfv.makeValidationCube(validationPath, mockPath,
             noise=validationError, noise_scale=validationNoiseScale,
             stat_cube=statCube, seed=validationSeed)
 
         laGrid = cfv.loadValidationCube(mockPath, spLL, nSpat,
             dataset=validationDataset)
+
         if laGrid.shape != (nLSpec, nSpat):
             raise RuntimeError("Internal validation-cube shape error: "
                 f"{laGrid.shape} != {(nLSpec, nSpat)}.")
@@ -592,16 +605,13 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     logger.log(f"[CubeFit] Building /HyperCube in {hdf5Path}...")
     with logger.capture_all_output():
         runner.build_hypercube(vel_bias_kms=biasVel, norm_mode="model",
-            # choose "model" or "data"
-            # "model" preserves relative contribution to both spaxel and
-            # components
             amp_mode="sum", S_chunk=nS, C_chunk=nC, P_chunk=nP,
-            processes=best_processes, blas_threads=best_blas)
+            processes=best_processes, blas_threads=best_blas, worker_S=8)
     # even if runSwitch is fit only, we want to ensure the HyperCube
     # is built, so we don't return early here.
     # Should be zero-cost if already built
 
-    prefit_png = figDir / f"prefit_overlay_from_models_{nComp:{pred}d}.png"
+    prefit_png = figDir/f"prefit_overlay_from_models_{nComp:{pred}d}.png"
     with logger.capture_all_output():
         live_prefit_snapshot_from_models(h5_path=str(hdf5Path),
             max_components=4, templates_per_pair=4,
@@ -1537,15 +1547,10 @@ def parallel_spectrum_plots(
 
 # ------------------------------------------------------------------------------
 
-def plot_best_worst_spectrum_fits_stacked(
-    h5_or_path: str,
-    fit_metric: np.ndarray,
-    n_each: int = 3,
-    plot_path: plp.Path | str | None = None,
-    mask: np.ndarray | None = None,
-    title: str | None = None,
-    tag: str = "best_worst",
-) -> plp.Path:
+def plot_best_worst_spectrum_fits_stacked(h5_or_path: str,
+    fit_metric: np.ndarray, n_each: int = 3,
+    plot_path: plp.Path | str | None = None, mask: np.ndarray | None = None,
+    title: str | None = None, tag: str = "best_worst") -> plp.Path:
     """
     Make a publication-quality stacked comparison of best and worst spectral
     fits on one figure.
@@ -1724,7 +1729,6 @@ def plot_best_worst_spectrum_fits_stacked(
             spread = np.abs(vals - center)
 
             scale = float(np.nanpercentile(spread, 99.0,))
-
             scale = max(scale, 1e-30,)
 
         data_plot[j, :] = plot_amp * (dat - center) / scale
@@ -1741,13 +1745,8 @@ def plot_best_worst_spectrum_fits_stacked(
         # --------------------------------------------------------
         denom = 0.5 * (dat + mod)
 
-        valid = (
-            mask
-            & np.isfinite(dat)
-            & np.isfinite(mod)
-            & np.isfinite(denom)
-            & (denom > 0.0)
-        )
+        valid = (mask & np.isfinite(dat) & np.isfinite(mod)
+            & np.isfinite(denom) & (denom > 0.0))
 
         if np.any(valid):
             positive = denom[valid]
@@ -1774,7 +1773,7 @@ def plot_best_worst_spectrum_fits_stacked(
     # ------------------------------------------------------------
     # Plot
     # ------------------------------------------------------------
-    fig, ax = plt.subplots(figsize=plt.figaspect(3.0 / n_picks))
+    fig, ax = plt.subplots(figsize=plt.figaspect(5.0 / n_picks))
 
     data_c = 'k'
     model_c = 'tab:red'
@@ -2174,31 +2173,32 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         intData[1, :, :], 0.0))[np.newaxis, :, :], intData.shape)
     intData = np.ma.masked_array(intData, mask=ftmMask)
 
-    # Check if this is a validation run and load the validation cube if so
+    # Run identity and validation status.
+    runTag = kwargs.pop('runTag', None)
     validationPath = kwargs.pop('validationPath', None)
-    validationDataset = kwargs.pop('validationDataset', '/DataCube')
-    validationTag = kwargs.pop('validationTag', None)
-    validationError = kwargs.pop('validationError', 'none')
-    # validationError can be 'none', 'stat', or 'residual'
-    # for none, the stat from the real data-cube, or the residual from the
-    # previous hypercube fit
-    validationNoiseScale = float(kwargs.pop('validationNoiseScale', 1.0))
-    validationSeed = int(kwargs.pop('validationSeed', 42))
-    is_validation = validationPath is not None and validationTag is not None
+    is_validation = validationPath is not None
 
-    # --- Setup HDF5 directory ---
+    if runTag is not None:
+        runTag = str(runTag).strip()
+        if not runTag:
+            runTag = None
+
     hdf5Dir = plp.Path(kwargs.pop('hdf5Dir', curdir/galaxy))
     hdf5Dir.mkdir(parents=True, exist_ok=True)
-    hdf5Path = (hdf5Dir/((f"hypercube_{nComp:{pred}d}_{lOrder:02d}" + 
-        (f"_{validationTag}" if validationTag is not None else "")) + '.h5')
-        ).with_suffix('.h5')
+
+    suffix = f"_{runTag}" if runTag is not None else ""
+    hdf5Path = hdf5Dir/f"hypercube_{nComp:{pred}d}_{lOrder:02d}{suffix}.h5"
+
     if is_validation:
-        if validationTag is None:
-            raise ValueError("validationTag is required for validation runs.")
-        if validationPath is None:
-            raise ValueError("validationPath is required for validation runs.")
-        figDir = curdir/galaxy/'validation'/str(validationTag)
-        figDir.mkdir(parents=True, exist_ok=True)
+        if runTag is None:
+            raise ValueError("runTag is required for validation runs.")
+        figDir = curdir/galaxy/'validation'/runTag
+    elif runTag is not None:
+        figDir = curdir/galaxy/'figures'/runTag
+    else:
+        figDir = curdir/galaxy/'figures'
+
+    figDir.mkdir(parents=True, exist_ok=True)
     
     # Read dims & X_global using robust reader
     with open_h5(hdf5Path, role="reader") as f:
@@ -2521,8 +2521,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     ax.set_xlabel(r"$x\ [{\rm arcsec}]$")
     ax.set_ylabel(r"$y\ [{\rm arcsec}]$")
     plt.savefig(figDir/\
-        f"signed_residual_SB_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png"
-    )
+        f"signed_residual_SB_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
     plt.close(fig)
 
     if 'mw' in pplots:
@@ -2748,12 +2747,12 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 fit_metric=fit_metric, n=50, plot_dir=str(figDir),
                 n_workers=best_processes, tag=f"{nComp:{pred}d}", mask=mask_arr)
             _ = plot_best_worst_spectrum_fits_stacked(h5_or_path=str(hdf5Path),
-                fit_metric=p999_abs_frac_resid, n_each=2,
+                fit_metric=p999_abs_frac_resid, n_each=3,
                 plot_path=(figDir/\
                     f"outlier_spectrum_fits_stacked_{nComp:{pred}d}.png"),
                 mask=mask_arr)
             picks = plot_best_worst_spectrum_fits_stacked(
-                h5_or_path=str(hdf5Path), fit_metric=fit_metric, n_each=2,
+                h5_or_path=str(hdf5Path), fit_metric=fit_metric, n_each=3,
                 plot_path=(figDir/f"spectrum_fits_stacked_{nComp:{pred}d}.png"),
                 mask=mask_arr)
 
@@ -2776,8 +2775,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             [oDict['cuts'][f"{component:{pred}d}"] for component in nzComp],
             dtype=np.float64)
 
-        diskComps = np.flatnonzero(
-            (otypes == 0) & (allCuts[:, 2] > 0.5))
+        diskComps = np.flatnonzero((otypes == 0) & (allCuts[:, 2] > 0.5))
         bulgeComps = np.setdiff1d(np.arange(nComp), diskComps)
     elif oDict['cuts'] and len(oDict['cuts']) > 0:
         componentTypes = np.full(nzComp.size, -1, dtype=np.int64)
@@ -2812,8 +2810,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             [oDict['cuts'][f"{component:{pred}d}"] for component in nzComp],
             dtype=np.float64)
 
-        diskComps = np.flatnonzero(
-            (otypes == 0) & (allCuts[:, 2] > 0.5))
+        diskComps = np.flatnonzero((otypes == 0) & (allCuts[:, 2] > 0.5))
         bulgeComps = np.setdiff1d(np.arange(nComp), diskComps)
     else:
         otypes = copy(nzComp) - 1
@@ -2944,7 +2941,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             plt.savefig(figDir/\
                 f"orbitSFH_full_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
 
-
             if (np.ma.any(diskSFH>0) or np.ma.any(bulgeSFH>0)):
                 dbmax = np.log10(np.max((
                     np.ma.max(diskSFH[diskSFH>0]) if np.ma.any(diskSFH>0) else 1e-5,
@@ -2996,9 +2992,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     if not ax.get_subplotspec().is_first_col():
                         ax.set_yticklabels([])
                     if ax.get_subplotspec().is_first_col():
-                        lT = ax.text(1e-2, 1.0-1e-2, r'Bulge', va='top', ha='left',
-                            color=POT.pgreen, transform=ax.transAxes)
-                        lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
+                        lT = ax.text(1e-2, 1.0-1e-2, r'Bulge', va='top',
+                            ha='left', color=POT.pgreen, transform=ax.transAxes,
+                            path_effects=[PathEffects.withStroke(linewidth=1.5,
                             foreground='k')])
 
                 BIG = fig.add_subplot(gs[:])
@@ -3023,8 +3019,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     color='w', transform=cax.transAxes, rotation=270)
                 cb.set_ticks([])
 
-                plt.savefig(figDir/\
-                    f"orbitSFH_diskbulge_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+                plt.savefig(figDir/f"orbitSFH_diskbulge_{nComp:{pred}d}_i{proj}"
+                    f"{tag}_{lOrder:02d}.png")
                 
         except AssertionError as e:
             print(f"Could not make orbital SFH plot: {e}")
@@ -3039,10 +3035,12 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
             # compute log limits across panels, ignore zeros
             vals = np.hstack([
-                coZalpha[coZalpha>0].ravel() if np.ma.any(coZalpha>0) else np.array([]),
-                laZalpha[laZalpha>0].ravel() if np.ma.any(laZalpha>0) else np.array([]),
-                boZalpha[boZalpha>0].ravel() if np.ma.any(boZalpha>0) else np.array([]),
-            ])
+                coZalpha[coZalpha>0].ravel() if np.ma.any(coZalpha>0)
+                    else np.array([]),
+                laZalpha[laZalpha>0].ravel() if np.ma.any(laZalpha>0)
+                    else np.array([]),
+                boZalpha[boZalpha>0].ravel() if np.ma.any(boZalpha>0)
+                    else np.array([])])
             if vals.size > 0:
                 vmin2 = float(np.log10(np.max((np.min(vals), -12.0))))
                 vmax2 = float(np.log10(np.max(vals)))
@@ -3053,7 +3051,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
             fig2 = plt.figure(figsize=plt.figaspect(1./3.)*0.75)
             gs2 = gridspec.GridSpec(1, 3, wspace=0.0, hspace=0.0)
-            panels = [(coZalpha, 'Short-axis Tubes'), (laZalpha, 'Long-axis Tubes'), (boZalpha, 'Boxes')]
+            panels = [(coZalpha, 'Short-axis Tubes'),
+                (laZalpha, 'Long-axis Tubes'), (boZalpha, 'Boxes')]
             for pi, (arr, title) in enumerate(panels):
                 ax = fig2.add_subplot(gs2[0, pi])
                 # arr shape (nMetals, nAlphas) -> transpose for imshow so
@@ -3091,8 +3090,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 color='w', transform=cax2.transAxes, rotation=270)
             cb2.set_ticks([])
 
-            fig2.savefig(figDir/\
-                f"orbitSFH_alphaMetal_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+            fig2.savefig(figDir/f"orbitSFH_alphaMetal_{nComp:{pred}d}_i{proj}"
+                f"{tag}_{lOrder:02d}.png")
         
         except Exception as e:
             print(f"Could not make Z-α plot: {e}")
@@ -3149,9 +3148,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 color='w', transform=cax3.transAxes, rotation=270)
             cb3.set_ticks([])
 
-            fig3.savefig(figDir/\
-                f"orbitSFH_alphaMetalAge_{nComp:{pred}d}_i{proj}"
-                f"{tag}_{lOrder:02d}.png")
+            fig3.savefig(figDir/f"orbitSFH_alphaMetalAge_{nComp:{pred}d}_"
+                f"i{proj}{tag}_{lOrder:02d}.png")
         except Exception as e:
             print(f"Could not make Z-t-α plot: {e}")
             pass
@@ -3216,8 +3214,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 color='w', transform=cax4.transAxes)
             cb4.set_ticks([])
 
-            fig4.savefig(figDir/\
-                f"orbitSFH_corner_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
+            fig4.savefig(figDir/f"orbitSFH_corner_{nComp:{pred}d}_i{proj}"
+                f"{tag}_{lOrder:02d}.png")
         except Exception as e:
             print(f"Could not make corner plot: {e}")
             pass
@@ -3280,9 +3278,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                         la=_MWProp(laAlpha, np.compress(latube, aperMass,
                             axis=1)),
                         bo=_MWProp(boAlpha, np.compress(boxess, aperMass,
-                        axis=1))
-                    )
-                )
+                        axis=1))))
                 
                 orbKeys = ['sa', 'la']
                 orbSpecs = [r'$z$ Tubes', r'$x$ Tubes']
@@ -3380,20 +3376,15 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
 # ------------------------------------------------------------------------------
 
-def plot_sparse_spectra_from_x(
-    h5_or_path: str,
-    x_global: np.ndarray | None = None,
-    *,
-    picks: np.ndarray | list[int] | None = None,
-    chi2: np.ndarray | None = None,
-    n: int = 6,
-    plot_dir: str = ".",
-    tag: str = "",
-    mask: np.ndarray | None = None,
-):
+def plot_sparse_spectra_from_x(h5_or_path: str,
+    x_global: np.ndarray | None = None, *,
+    picks: np.ndarray | list[int] | None = None, chi2: np.ndarray | None = None,
+    n: int = 6, plot_dir: str | plp.Path = ".", tag: str = "",
+    mask: np.ndarray | None = None):
     """
     Plot a few diagnostic spectra without building /ModelCube.
-    Computes y_hat for selected spaxels directly from /HyperCube/models and x_global.
+    Computes y_hat for selected spaxels directly from /HyperCube/models and
+        x_global.
 
     Args
     ----
@@ -3414,11 +3405,12 @@ def plot_sparse_spectra_from_x(
     mask : 1-D bool array, optional
         Wavelength mask to apply to both data & model for plotting.
     """
+    plot_dir = plp.Path(plot_dir)
     os.makedirs(plot_dir, exist_ok=True)
 
     with open_h5(h5_or_path, role="reader") as f:
-        M = f["/HyperCube/models"]      # (S, C, P, L) float32
-        DC = f["/DataCube"]             # (S, L)
+        M = f["/HyperCube/models"] # (S, C, P, L) float32
+        DC = f["/DataCube"] # (S, L)
         S, C, P, L = map(int, M.shape)
         obs = f["/ObsPix"][...] if "/ObsPix" in f else np.arange(L, dtype=int)
 
@@ -3464,7 +3456,8 @@ def plot_sparse_spectra_from_x(
         S_chunk, C_chunk, P_chunk, L_chunk = map(int, chunks)
 
         print(f"[DiagSparse] S={S} C={C} P={P} L={L} | chunks={chunks}")
-        print(f"[DiagSparse] picks={picks.size} → reads per pick ≈ C·ceil(P/P_chunk)={C*math.ceil(P/max(1,P_chunk))}")
+        print(f"[DiagSparse] picks={picks.size} → reads per pick ≈ "
+            f"C·ceil(P/P_chunk)={C*math.ceil(P/max(1, P_chunk))}")
 
         def _predict_row(s_idx: int) -> np.ndarray:
             # produce y = sum_{c,p} x[c,p] * A[s_idx, c, p, :]
@@ -3481,8 +3474,8 @@ def plot_sparse_spectra_from_x(
                     c_index = c0 + ci
                     # choose p blocks to respect P_chunk if necessary
                     # but simple dot over full P is easiest and often fastest
-                    A_cp = slab[0, ci, :, :]    # (P, L) float32
-                    w = x32[c_index, :]         # (P,)
+                    A_cp = slab[0, ci, :, :] # (P, L) float32
+                    w = x32[c_index, :] # (P,)
                     # accumulate: (A_cp.T @ w) => (L,)
                     y += (A_cp.T @ w).astype(np.float64, copy=False)
             return y
@@ -3500,21 +3493,17 @@ def plot_sparse_spectra_from_x(
             ax.set_xlabel("λ (log space)")
             ax.set_ylabel("flux")
             ax.legend(loc="best", fontsize=8)
-            fn = os.path.join(plot_dir, f"diag_sparse_{tag}_spax{int(s):05d}.png")
-            fig.savefig(fn, dpi=120)
+            fig.savefig(plot_dir/f"diag_sparse_{tag}_spax{int(s):05d}.png",
+                dpi=120)
             plt.close(fig)
 
-        print(f"[DiagSparse] wrote {picks.size} plots to {plot_dir}")
+        print(f"[DiagSparse] wrote {picks.size} plots to {str(plot_dir)}")
 
 # ------------------------------------------------------------------------------
 
-def compare_orbit_vs_solution_absolute(
-    h5_path: str,
-    *,
-    orbit_weights: np.ndarray,
-    x_global: np.ndarray | None = None,
-    save: str | None = None,
-):
+def compare_orbit_vs_solution_absolute(h5_path: str, *,
+    orbit_weights: np.ndarray, x_global: np.ndarray | None = None,
+    save: str | None = None):
     """
     Diagnose the equal-component-mass orbit constraint.
 
@@ -3568,10 +3557,7 @@ def compare_orbit_vs_solution_absolute(
             if "/X_global" not in f:
                 raise RuntimeError(
                     "No /X_global in HDF5 and x_global not provided.")
-            x_global = np.asarray(
-                f["/X_global"][...],
-                dtype=np.float64,
-            )
+            x_global = np.asarray(f["/X_global"][...], dtype=np.float64)
 
     x = np.asarray(x_global, dtype=np.float64)
 
@@ -3585,8 +3571,7 @@ def compare_orbit_vs_solution_absolute(
             raise ValueError(
                 f"x_global shape {x.shape}, expected (C,P)=({C},{P}).")
     else:
-        raise ValueError(
-            "x_global must be one- or two-dimensional.")
+        raise ValueError("x_global must be one- or two-dimensional.")
 
     weights = np.asarray(orbit_weights, dtype=np.float64).ravel(order="C")
 
@@ -3597,11 +3582,9 @@ def compare_orbit_vs_solution_absolute(
             f"orbit_weights has size {weights.size}, "
             f"expected C={C} or C*P={C * P}.")
     if not np.all(np.isfinite(weights)):
-        raise ValueError(
-            "orbit_weights must contain only finite values.")
+        raise ValueError("orbit_weights must contain only finite values.")
     if np.any(weights < 0.0):
-        raise ValueError(
-            "orbit_weights must be nonnegative.")
+        raise ValueError("orbit_weights must be nonnegative.")
 
     positive = weights > 0.0
     if not np.any(positive):
