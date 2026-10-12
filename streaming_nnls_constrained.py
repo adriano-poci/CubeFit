@@ -2944,6 +2944,31 @@ def streamActiveSetNNLS(
 
         return improved, best_active, best_z, best_info, best_ATA, best_ATy,\
             best_data_obj
+    def _estimate_coverage_rounds_remaining(not_active, start_round):
+        tested = coverage_tested.copy()
+
+        for nr in range(10000):
+            batch = _build_coverage_batch(
+                not_active, int(start_round + nr))
+
+            tested[batch] = True
+
+            fractions = []
+            search_orbits = (positive_shape_orbits if has_hard_orbit_shape
+                else np.arange(C, dtype=np.int64))
+
+            for cc in search_orbits:
+                cols = not_active[(not_active // P) == int(cc)]
+                if cols.size:
+                    fractions.append(
+                        np.count_nonzero(tested[cols]) / float(cols.size))
+
+            coverage_min_future = min(fractions) if fractions else 1.0
+
+            if coverage_min_future >= explore_coverage_target:
+                return nr + 1
+
+        return -1
 
     # ------------------------------------------------------------
     # Active-set outer loop
@@ -3228,6 +3253,11 @@ def streamActiveSetNNLS(
                     current_active).tolist(),
                 "n_zero_dropped": int(dropped_zero.size),
                 "zero_dropped": (dropped_zero.tolist()),
+                "coverage_min": 0.0,
+                "coverage_total": 0.0,
+                "coverage_target": float(explore_coverage_target),
+                "coverage_exhausted": False,
+                "coverage_rounds_remaining": None,
             })
 
             _emit_checkpoint(
@@ -3243,6 +3273,14 @@ def streamActiveSetNNLS(
         explore_fail_count += 1
         explore_round += 1
 
+        x_is_zero = np.all(z <= positive_tol)
+
+        coverage_min, coverage_total = _coverage_summary(not_active)
+        coverage_exhausted = coverage_min >= explore_coverage_target
+
+        coverage_rounds_remaining = (0 if coverage_exhausted else
+            _estimate_coverage_rounds_remaining(not_active, explore_round))
+
         _emit_diag({
             "kind": "exploration",
             "source": "streamActiveSetNNLS",
@@ -3257,20 +3295,33 @@ def streamActiveSetNNLS(
             "max_grad_active": float(max_grad_active),
             "max_grad_dual": float(max_grad_dual),
             "tol_here": float(tol_here),
+            "coverage_min": float(coverage_min),
+            "coverage_total": float(coverage_total),
+            "coverage_target": float(explore_coverage_target),
+            "coverage_exhausted": bool(coverage_exhausted),
+            "coverage_rounds_remaining": int(coverage_rounds_remaining),
         })
+        print(
+            f"[MONO][coverage] min={coverage_min:.3f} "
+            f"total={coverage_total:.3f} "
+            f"target={explore_coverage_target:.3f} "
+            f"rounds_remaining={coverage_rounds_remaining}",
+            flush=True)
 
-        x_is_zero = np.all(z <= positive_tol)
+        if has_hard_orbit_shape:
+            can_stop = coverage_exhausted and (
+                x_is_zero or support_stationary or active_ok)
+        else:
+            can_stop = x_is_zero or support_stationary or (
+                active_ok and coverage_exhausted)
 
-        coverage_min, coverage_total = _coverage_summary(not_active)
-        coverage_exhausted = coverage_min >= explore_coverage_target
-
-        if x_is_zero or support_stationary or (active_ok and coverage_exhausted):
+        if can_stop:
             if x_is_zero:
                 stop_reason = "zero_solution_exploration_exhausted"
                 stop_category = "converged"
                 stop_converged = True
             elif support_stationary:
-                stop_reason = "kkt_stationary"
+                stop_reason = "kkt_stationary_search_exhausted"
                 stop_category = "converged"
                 stop_converged = True
             else:

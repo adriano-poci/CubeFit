@@ -115,6 +115,9 @@ v2.2:   Correctly disambiguated the mock data *generation* from the subsequent
             October 2026
 v2.3:   Changed `validationTag` to `runTag` to tag general runs in `genCubeFit`.
             6 October 2026
+v2.4:   Added `apertures` to `plot_best_worst_spectrum_fits_stacked` and
+            `spectraPicks` kwarg parsing in `loadCubeFit` to be able to override
+            the best/worst spaxel selection for spectral plots. 9 October 2026
 """
 
 # need to set up the logger before any other imports
@@ -1550,7 +1553,8 @@ def parallel_spectrum_plots(
 def plot_best_worst_spectrum_fits_stacked(h5_or_path: str,
     fit_metric: np.ndarray, n_each: int = 3,
     plot_path: plp.Path | str | None = None, mask: np.ndarray | None = None,
-    title: str | None = None, tag: str = "best_worst") -> plp.Path:
+    title: str | None = None, tag: str = "best_worst",
+    apertures=None) -> plp.Path:
     """
     Make a publication-quality stacked comparison of best and worst spectral
     fits on one figure.
@@ -1576,6 +1580,9 @@ def plot_best_worst_spectrum_fits_stacked(h5_or_path: str,
         Optional figure title.
     tag : str, optional
         Name fragment used when plot_path is not supplied.
+    apertures : array-like of int, optional
+        Explicit aperture indices to plot, in the requested order. If supplied,
+        these replace the automatic best/worst selection.
 
     Returns
     -------
@@ -1587,20 +1594,32 @@ def plot_best_worst_spectrum_fits_stacked(h5_or_path: str,
     if fit_metric.size == 0:
         raise ValueError("fit_metric is empty.")
 
-    n_each = int(max(1, n_each))
-    n_each = min(n_each, int(fit_metric.size))
+    if apertures is None:
+        n_each = int(max(1, n_each))
+        n_each = min(n_each, int(fit_metric.size))
 
-    idx_best = np.argsort(fit_metric)[:n_each]
-    idx_worst = np.argsort(fit_metric)[::-1][:n_each]
+        idx_best = np.argsort(fit_metric)[:n_each]
+        idx_worst = np.argsort(fit_metric)[::-1][:n_each]
 
-    picks = []
-    seen = set()
-    for label, idxs in (("worst", idx_worst), ("best", idx_best)):
-        for s in idxs:
-            s = int(s)
-            if s not in seen:
-                picks.append((label, s))
-                seen.add(s)
+        picks = []
+        seen = set()
+        for label, idxs in (("worst", idx_worst), ("best", idx_best)):
+            for s in idxs:
+                s = int(s)
+                if s not in seen:
+                    picks.append((label, s))
+                    seen.add(s)
+    else:
+        apertures = np.asarray(apertures, dtype=int).ravel()
+        if apertures.size == 0:
+            raise ValueError("apertures must contain at least one aperture.")
+        if np.any((apertures < 0) | (apertures >= fit_metric.size)):
+            raise ValueError(
+                f"apertures must lie in [0, {fit_metric.size - 1}].")
+        if np.unique(apertures).size != apertures.size:
+            raise ValueError("apertures contains duplicate indices.")
+
+        picks = [("selected", int(s)) for s in apertures]
 
     with open_h5(h5_path, role="reader") as f:
         if "/DataCube" not in f or "/ModelCube" not in f:
@@ -1697,7 +1716,7 @@ def plot_best_worst_spectrum_fits_stacked(h5_or_path: str,
     # ------------------------------------------------------------
     n_picks = len(picks)
 
-    plot_amp = 0.34
+    plot_amp = 0.36
     residual_amp = 0.14
     residual_offset = 0.38
     band_step = 1.0
@@ -1786,12 +1805,12 @@ def plot_best_worst_spectrum_fits_stacked(h5_or_path: str,
         # --------------------------------------------------------
         # Data: D_{s,lambda}
         # --------------------------------------------------------
-        ax.plot(obs[mask], dat[mask], lw=1.0, color=data_c,
+        ax.plot(obs[mask], dat[mask], lw=0.8, color=data_c,
             solid_capstyle='round')
         # --------------------------------------------------------
         # Model: M_{s,lambda}
         # --------------------------------------------------------
-        ax.plot(obs[mask],mod[mask], lw=1.0, color=model_c,
+        ax.plot(obs[mask],mod[mask], lw=0.8, color=model_c,
             alpha=0.95, solid_capstyle='round')
         # --------------------------------------------------------
         # Fractional residual: 100 r_{s,lambda}
@@ -2439,6 +2458,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     fit_metric = np.asarray(median_abs_frac_resid, dtype=np.float64,)
     finite_metric = np.isfinite(fit_metric)
     fitLabel = r'$Q_s\ [\%]$'
+    metric_mean = np.nan
     metric_median = np.nan
     metric_std = np.nan
     if np.any(finite_metric):
@@ -2739,22 +2759,31 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     if 'spec' in pplots:
         logger.log("Generating spectrum plots...")
         with logger.capture_all_output():
+            spectraPicks = kwargs.pop('spectraPicks', None)
+            if spectraPicks is not None:
+                spectraPicks = np.asarray(spectraPicks, dtype=np.int64)
+                if spectraPicks.ndim != 1:
+                    raise ValueError("spectraPicks must be a 1D array.")
+                if np.any(spectraPicks < 0) or np.any(spectraPicks >= nSpat):
+                    raise ValueError(
+                        "spectraPicks contains invalid spaxel indices.")
+                print(f"[CubeFit] Generating spectrum plots for {spectraPicks.size} spaxels.")
             if figDir.exists():
                 for prefix in ("best", "worst"):
                     for f in figDir.glob(f"{prefix}_{nComp:{pred}d}_spax*.png"):
                         f.unlink()
             parallel_spectrum_plots(h5_or_path=str(hdf5Path),
-                fit_metric=fit_metric, n=50, plot_dir=str(figDir),
+                fit_metric=fit_metric, n=20, plot_dir=str(figDir),
                 n_workers=best_processes, tag=f"{nComp:{pred}d}", mask=mask_arr)
             _ = plot_best_worst_spectrum_fits_stacked(h5_or_path=str(hdf5Path),
-                fit_metric=p999_abs_frac_resid, n_each=3,
+                fit_metric=p999_abs_frac_resid, n_each=2,
                 plot_path=(figDir/\
                     f"outlier_spectrum_fits_stacked_{nComp:{pred}d}.png"),
                 mask=mask_arr)
             picks = plot_best_worst_spectrum_fits_stacked(
-                h5_or_path=str(hdf5Path), fit_metric=fit_metric, n_each=3,
+                h5_or_path=str(hdf5Path), fit_metric=fit_metric, n_each=2,
                 plot_path=(figDir/f"spectrum_fits_stacked_{nComp:{pred}d}.png"),
-                mask=mask_arr)
+                mask=mask_arr, apertures=spectraPicks)
 
     if 'otype' not in oDict['cutOn']:
         return
