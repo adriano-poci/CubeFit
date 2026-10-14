@@ -187,6 +187,9 @@ v2.2:   Changed blind cycling of candidates to tracking cached sets of active
             columns; don't retry non-improving successfully-resolved sets;
         Updated `monolithicNNLS` to solve the new mathematical formulation of the
             solver. 5 October 2026
+v2.3:   Made `_worker_reduced` and `_worker_ATAz` storage-chunk-aware, grouping
+            reads by the physical HDF5 C/P chunk to eliminate redundant
+            hypercube I/O. 13 October 2026
 """
 
 from __future__ import annotations, print_function
@@ -287,53 +290,101 @@ def _worker_reduced(
     P: int,
 ):
     """
-    Worker to compute partial ATA_sub and ATy_sub for a batch of tiles,
-    given the active indices and their scaling S_active.
+    Compute partial reduced normal equations using storage-chunk-aware reads.
 
-    Memory-efficient, exact-equivalence implementation that does NOT
-    form the large (Sblk*Lk, k) A2 matrix.  Uses tensor contractions to
-    compute the same sums:
+    Active columns are grouped by the physical HDF5 (C, P) chunk containing
+    them. Each intersected model chunk is read once per spatial tile, and all
+    requested columns are extracted from that in-memory slab.
 
-        ATA_loc[i,j] += sum_{s,lambda} (S_i * M_{s,ci,pi,lambda})
-                              * (S_j * M_{s,cj,pj,lambda})
+    Parameters
+    ----------
+    h5_path : str
+        HyperCube HDF5 path.
+    batch : list
+        Spatial ``(s0, s1)`` tile ranges assigned to this worker.
+    keep_idx : ndarray or None
+        Wavelength indices retained by the spectral mask.
+    active_idx : ndarray
+        Global active column indices in C-major, P-minor order.
+    S_active : ndarray
+        Column scalings corresponding to ``active_idx``.
+    CP : int
+        Total number of model columns.
+    P : int
+        Number of stellar-population columns per component.
 
-        ATy_loc[i] += sum_{s,lambda} (S_i * M_{s,ci,pi,lambda}) * Yt[s,lambda]
+    Returns
+    -------
+    ATA_loc : ndarray
+        Partial reduced Gram matrix.
+    ATy_loc : ndarray
+        Partial reduced data projection.
 
-    Inputs
+    Raises
     ------
-    - active_idx: 1D int array of global column indices (length k)
-    - S_active : 1D float array of length k (per-active-column scaling)
-    - P : number of populations per orbit (used for cc/p decode)
-    """
-    k = int(active_idx.size)
-    ATA_loc = np.zeros((k, k), dtype=np.float64)
-    ATy_loc = np.zeros((k,), dtype=np.float64)
+    RuntimeError
+        If the HyperCube dimensions or chunk layout are invalid.
 
-    cc_arr = (active_idx // P).astype(np.int64)
-    pp_arr = (active_idx % P).astype(np.int64)
+    Examples
+    --------
+    Called internally by ``streamActiveSetNNLS``.
+    """
+    active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
+    S_active = np.asarray(S_active, dtype=np.float64).ravel(order="C")
+    k = int(active_idx.size)
+
+    ATA_loc = np.zeros((k, k), dtype=np.float64)
+    ATy_loc = np.zeros(k, dtype=np.float64)
+
+    cc_arr = active_idx // P
+    pp_arr = active_idx % P
 
     with open_h5(h5_path, role="reader") as f:
         DC = f["/DataCube"]
         M = f["/HyperCube/models"]
 
-        for (s0, s1) in batch:
-            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
+        if M.chunks is None:
+            C_chunk, P_chunk = 1, P
+        else:
+            C_chunk = int(M.chunks[1])
+            P_chunk = int(M.chunks[2])
+
+        # Group requested columns by physical HDF5 C/P chunk.
+        groups = {}
+        for jj, (cc, pp) in enumerate(zip(cc_arr, pp_arr)):
+            key = (int(cc // C_chunk), int(pp // P_chunk))
+            groups.setdefault(key, []).append(jj)
+
+        for s0, s1 in batch:
+            Yt = np.asarray(
+                DC[s0:s1, :], dtype=np.float64, order="C")
             if keep_idx is not None:
                 Yt = Yt[:, keep_idx]
+
+            rows = (s1 - s0) * Yt.shape[1]
             y_flat = Yt.reshape(-1)
-
-            Sblk = s1 - s0
-            Lk = Yt.shape[1]
-            rows = Sblk * Lk
-
-            # Only store the active columns, not the full tile.
             A_act = np.empty((rows, k), dtype=np.float64)
 
-            for j, (cc, pp) in enumerate(zip(cc_arr, pp_arr)):
-                col = np.asarray(M[s0:s1, cc, pp, :], dtype=np.float64, order="C")
+            for (cblock, pblock), jj_list in groups.items():
+                c0 = cblock * C_chunk
+                c1 = min(c0 + C_chunk, M.shape[1])
+                p0 = pblock * P_chunk
+                p1 = min(p0 + P_chunk, M.shape[2])
+
+                slab = np.asarray(
+                    M[s0:s1, c0:c1, p0:p1, :],
+                    dtype=np.float32, order="C")
+
                 if keep_idx is not None:
-                    col = col[:, keep_idx]
-                A_act[:, j] = S_active[j] * col.reshape(-1)
+                    slab = slab[:, :, :, keep_idx]
+
+                for jj in jj_list:
+                    lc = int(cc_arr[jj] - c0)
+                    lp = int(pp_arr[jj] - p0)
+                    A_act[:, jj] = (S_active[jj] *
+                        slab[:, lc, lp, :].reshape(-1))
+
+                del slab
 
             ATA_loc += A_act.T @ A_act
             ATy_loc += A_act.T @ y_flat
@@ -418,52 +469,58 @@ def _worker_ATAz(
             raise RuntimeError(
                 f"Model population dimension {M.shape[2]} != expected P={P}.")
 
+        C_chunk = int(M.chunks[1]) if M.chunks else 1
+        P_chunk = int(M.chunks[2]) if M.chunks else P
         Lk = int(keep_idx.size) if keep_idx is not None else int(M.shape[3])
 
         for s0, s1 in batch:
             Sblk = s1 - s0
-
-            # First pass: exact v = A @ (S z), one orbit slice at a time.
             v = np.zeros((Sblk, Lk), dtype=np.float64)
 
-            for cc in range(C):
-                t0 = time.perf_counter()
-                M_cc = M[s0:s1, cc, :, :][...]
-                if keep_idx is not None:
-                    M_cc = M_cc[:, :, keep_idx]
-                M_cc = np.asarray(M_cc, dtype=np.float64, order="C")
-                t_read += time.perf_counter() - t0
+            # First pass: v = A @ (S z).
+            for c0 in range(0, C, C_chunk):
+                c1 = min(c0 + C_chunk, C)
 
-                # M_cc has shape (Sblk, P, Lk)
-                # z_cp[cc] has shape (P,)
-                # result has shape (Sblk, Lk)
-                t0 = time.perf_counter()
-                v += np.tensordot(z_cp[cc], M_cc, axes=(0, 1))
-                t_forward += time.perf_counter() - t0
-                del M_cc
+                for p0 in range(0, P, P_chunk):
+                    p1 = min(p0 + P_chunk, P)
 
-            # Second pass: exact g = A^T @ v, again orbit slice by orbit slice.
-            for cc in range(C):
-                t0 = time.perf_counter()
-                M_cc = M[s0:s1, cc, :, :][...]
-                if keep_idx is not None:
-                    M_cc = M_cc[:, :, keep_idx]
-                M_cc = np.asarray(M_cc, dtype=np.float64, order="C")
-                t_read += time.perf_counter() - t0
+                    t0 = time.perf_counter()
+                    slab = np.asarray(M[s0:s1, c0:c1, p0:p1, :],
+                        dtype=np.float32, order="C")
+                    if keep_idx is not None:
+                        slab = slab[:, :, :, keep_idx]
+                    t_read += time.perf_counter() - t0
 
-                # M_cc: (Sblk, P, Lk)
-                # v   : (Sblk, Lk)
-                # g_cc: (P,)
-                t0 = time.perf_counter()
-                g_cc = np.tensordot(M_cc, v, axes=([0, 2], [0, 1]))
-                t_transpose += time.perf_counter() - t0
-                del M_cc
+                    t0 = time.perf_counter()
+                    v += np.tensordot(slab, z_cp[c0:c1, p0:p1],
+                        axes=([1, 2], [0, 1]))
+                    t_forward += time.perf_counter() - t0
+                    del slab
 
-                base = cc * P
-                partial[base:base + P] += (S_flat[base:base + P] * g_cc)
+            # Second pass: g = A.T @ v.
+            for c0 in range(0, C, C_chunk):
+                c1 = min(c0 + C_chunk, C)
 
-    print(
-        f"[ATAz worker {os.getpid()}] read={t_read:.1f}s "
+                for p0 in range(0, P, P_chunk):
+                    p1 = min(p0 + P_chunk, P)
+
+                    t0 = time.perf_counter()
+                    slab = np.asarray(M[s0:s1, c0:c1, p0:p1, :],
+                        dtype=np.float32, order="C")
+                    if keep_idx is not None:
+                        slab = slab[:, :, :, keep_idx]
+                    t_read += time.perf_counter() - t0
+
+                    t0 = time.perf_counter()
+                    g_blk = np.tensordot(slab, v, axes=([0, 3], [0, 1]))
+                    t_transpose += time.perf_counter() - t0
+
+                    scale_blk = S_flat.reshape(C, P)[c0:c1, p0:p1]
+                    partial.reshape(C, P)[c0:c1, p0:p1] += scale_blk * g_blk
+
+                    del slab
+
+    print(f"[ATAz worker {os.getpid()}] read={t_read:.1f}s "
         f"forward={t_forward:.1f}s transpose={t_transpose:.1f}s",
         flush=True)
     return partial

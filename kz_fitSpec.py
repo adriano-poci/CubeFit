@@ -118,6 +118,8 @@ v2.3:   Changed `validationTag` to `runTag` to tag general runs in `genCubeFit`.
 v2.4:   Added `apertures` to `plot_best_worst_spectrum_fits_stacked` and
             `spectraPicks` kwarg parsing in `loadCubeFit` to be able to override
             the best/worst spaxel selection for spectral plots. 9 October 2026
+v2.5:   Improving hypercube chunking for more efficient reads, and let the
+            readers derive the chunks directly in `genCubeFit`. 13 October 2026
 """
 
 # need to set up the logger before any other imports
@@ -586,7 +588,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             '/HyperCube.')
         invalidate_done(hdf5Path)
 
-    nS, nC, nP = 128, 2, 360
+    nS, nC, nP = 128, 1, 360
     biasVel = 0.0
     # --- Optional hard gate before any heavy work
     # Use small prefix slices if nothing is specified.
@@ -692,7 +694,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         # orbit_weights=None, # or None for “free” fit
         orbit_weights=cWeights,
         processes=best_processes, blas_threads=best_blas,
-        reader_s_tile=128, # match /HyperCube/models chunking on S
         warm_start=warm_start, regularisation_scale=regularisation_scale,
         streaming=kwargs.pop('streaming', True))
 
@@ -705,8 +706,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         if "/X_global" in f_wr:
             del f_wr["/X_global"]
 
-        f_wr.create_dataset( "/X_global",
-            data=x_global.astype(np.float64),
+        f_wr.create_dataset( "/X_global", data=x_global.astype(np.float64),
             compression="gzip",
             compression_opts=4)
 
