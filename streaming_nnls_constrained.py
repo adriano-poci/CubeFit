@@ -190,6 +190,10 @@ v2.2:   Changed blind cycling of candidates to tracking cached sets of active
 v2.3:   Made `_worker_reduced` and `_worker_ATAz` storage-chunk-aware, grouping
             reads by the physical HDF5 C/P chunk to eliminate redundant
             hypercube I/O. 13 October 2026
+v2.4:   Assemble all exploration proposals from one union-support Gram matrix,
+            eliminating redundant HyperCube passes for exchange, data, and
+            coverage trials;
+        Removed redundant ATy computation from `_worker_reduced`. 15 October 2026
 """
 
 from __future__ import annotations, print_function
@@ -290,11 +294,11 @@ def _worker_reduced(
     P: int,
 ):
     """
-    Compute partial reduced normal equations using storage-chunk-aware reads.
+    Compute a partial reduced Gram matrix using storage-chunk-aware reads.
 
-    Active columns are grouped by the physical HDF5 (C, P) chunk containing
-    them. Each intersected model chunk is read once per spatial tile, and all
-    requested columns are extracted from that in-memory slab.
+    Requested columns are grouped by the physical HDF5 ``(C, P)`` chunk
+    containing them. Each intersected model chunk is read once per spatial
+    tile, and all requested columns are extracted from that in-memory slab.
 
     Parameters
     ----------
@@ -317,53 +321,60 @@ def _worker_reduced(
     -------
     ATA_loc : ndarray
         Partial reduced Gram matrix.
-    ATy_loc : ndarray
-        Partial reduced data projection.
+    ATy_loc : None
+        Retained for API compatibility. The canonical global ``ATy_scaled``
+        vector is used by the caller.
 
     Raises
     ------
-    RuntimeError
-        If the HyperCube dimensions or chunk layout are invalid.
+    ValueError
+        If the support indices or scalings are inconsistent.
 
     Examples
     --------
     Called internally by ``streamActiveSetNNLS``.
     """
+    del CP
+
     active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
     S_active = np.asarray(S_active, dtype=np.float64).ravel(order="C")
+
     k = int(active_idx.size)
 
+    if S_active.size != k:
+        raise ValueError(f"S_active has size {S_active.size}; expected {k}.")
+
     ATA_loc = np.zeros((k, k), dtype=np.float64)
-    ATy_loc = np.zeros(k, dtype=np.float64)
 
     cc_arr = active_idx // P
     pp_arr = active_idx % P
 
     with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
         M = f["/HyperCube/models"]
 
         if M.chunks is None:
-            C_chunk, P_chunk = 1, P
+            C_chunk = 1
+            P_chunk = P
         else:
             C_chunk = int(M.chunks[1])
             P_chunk = int(M.chunks[2])
 
-        # Group requested columns by physical HDF5 C/P chunk.
+        # Group requested columns by their physical HDF5 C/P chunk.
         groups = {}
+
         for jj, (cc, pp) in enumerate(zip(cc_arr, pp_arr)):
-            key = (int(cc // C_chunk), int(pp // P_chunk))
+            key = (
+                int(cc // C_chunk),
+                int(pp // P_chunk),
+            )
             groups.setdefault(key, []).append(jj)
 
         for s0, s1 in batch:
-            Yt = np.asarray(
-                DC[s0:s1, :], dtype=np.float64, order="C")
-            if keep_idx is not None:
-                Yt = Yt[:, keep_idx]
+            L_keep = (int(keep_idx.size) if keep_idx is not None
+                else int(M.shape[3]))
+            rows = int(s1 - s0) * L_keep
 
-            rows = (s1 - s0) * Yt.shape[1]
-            y_flat = Yt.reshape(-1)
-            A_act = np.empty((rows, k), dtype=np.float64)
+            A_act = np.empty((rows, k), dtype=np.float64, order="C")
 
             for (cblock, pblock), jj_list in groups.items():
                 c0 = cblock * C_chunk
@@ -371,9 +382,8 @@ def _worker_reduced(
                 p0 = pblock * P_chunk
                 p1 = min(p0 + P_chunk, M.shape[2])
 
-                slab = np.asarray(
-                    M[s0:s1, c0:c1, p0:p1, :],
-                    dtype=np.float32, order="C")
+                slab = np.asarray(M[s0:s1, c0:c1, p0:p1, :], dtype=np.float32,
+                    order="C")
 
                 if keep_idx is not None:
                     slab = slab[:, :, :, keep_idx]
@@ -381,15 +391,13 @@ def _worker_reduced(
                 for jj in jj_list:
                     lc = int(cc_arr[jj] - c0)
                     lp = int(pp_arr[jj] - p0)
-                    A_act[:, jj] = (S_active[jj] *
-                        slab[:, lc, lp, :].reshape(-1))
+
+                    A_act[:, jj] = S_active[jj] * slab[:, lc, lp, :].reshape(-1)
 
                 del slab
 
             ATA_loc += A_act.T @ A_act
-            ATy_loc += A_act.T @ y_flat
-
-    return ATA_loc, ATy_loc
+    return ATA_loc, None
 
 # ------------------------------------------------------------------------------
 
@@ -2186,8 +2194,13 @@ def streamActiveSetNNLS(
         ATy_sub = ATy_scaled[active_idx].copy()
 
         return ATA_sub, ATy_sub, S_active
-    def _solve_reduced_active(active_idx):
-        """Assemble and solve the constrained reduced problem."""
+    def _solve_reduced_active(active_idx, assembled=None):
+        """
+        Assemble and solve the constrained reduced problem.
+
+        If ``assembled`` is supplied, use the provided reduced normal equations
+        instead of rereading the HyperCube.
+        """
         active_idx = np.asarray(active_idx, dtype=np.int64)
         k_loc = int(active_idx.size)
 
@@ -2195,7 +2208,26 @@ def streamActiveSetNNLS(
             raise RuntimeError(
                 "Cannot solve reduced problem with empty active support.")
 
-        ATA_loc, ATy_loc, S_loc = _assemble_reduced(active_idx)
+        if assembled is None:
+            ATA_loc, ATy_loc, S_loc = _assemble_reduced(active_idx)
+        else:
+            ATA_loc, ATy_loc, S_loc = assembled
+
+            ATA_loc = np.asarray(ATA_loc, dtype=np.float64, order="C")
+            ATy_loc = np.asarray(ATy_loc, dtype=np.float64).ravel(order="C")
+            S_loc = np.asarray(S_loc, dtype=np.float64).ravel(order="C")
+
+            if ATA_loc.shape != (k_loc, k_loc):
+                raise ValueError("Preassembled ATA shape is inconsistent with "
+                    "active_idx.")
+
+            if ATy_loc.size != k_loc:
+                raise ValueError("Preassembled ATy size is inconsistent with "
+                    "active_idx.")
+
+            if S_loc.size != k_loc:
+                raise ValueError("Preassembled scaling size is inconsistent "
+                    "with active_idx.")
 
         # Scientific L2 regularisation is defined in physical x-space.
         # Since x = S * z, its Hessian contribution in z-space is
@@ -2263,6 +2295,95 @@ def streamActiveSetNNLS(
             numerical_ridge_loc,
             cond_loc,
         )
+    def _solve_reduced_from_assembled(
+        active_idx,
+        ATA_loc,
+        ATy_loc,
+        S_loc,
+    ):
+        """
+        Solve a constrained reduced problem from preassembled normal equations.
+
+        Parameters
+        ----------
+        active_idx : ndarray
+            Global column indices of the reduced support.
+        ATA_loc : ndarray
+            Reduced data Hessian on ``active_idx``.
+        ATy_loc : ndarray
+            Reduced data linear term on ``active_idx``.
+        S_loc : ndarray
+            Column scalings on ``active_idx``.
+
+        Returns
+        -------
+        result : tuple
+            Same result tuple as ``_solve_reduced_active``.
+
+        Raises
+        ------
+        ValueError
+            If the supplied reduced arrays have inconsistent dimensions.
+
+        Examples
+        --------
+        Used internally during joint-support exploration.
+        """
+        active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
+        ATA_loc = np.asarray(ATA_loc, dtype=np.float64, order="C")
+        ATy_loc = np.asarray(ATy_loc, dtype=np.float64).ravel(order="C")
+        S_loc = np.asarray(S_loc, dtype=np.float64).ravel(order="C")
+
+        k_loc = int(active_idx.size)
+
+        if ATA_loc.shape != (k_loc, k_loc):
+            raise ValueError(
+                "ATA_loc has a shape inconsistent with active_idx.")
+        if ATy_loc.size != k_loc or S_loc.size != k_loc:
+            raise ValueError(
+                "ATy_loc or S_loc has a size inconsistent with active_idx.")
+
+        scientific_diag_loc = (regularisation_scale * (S_loc * S_loc))
+        ATA_scientific_loc = (ATA_loc + np.diag(scientific_diag_loc))
+
+        numerical_ridge_loc, emin_loc, emax_loc, cond_loc = \
+            _adaptive_numerical_ridge(ATA_scientific_loc,
+                target_cond=numerical_target_cond,
+                min_ridge=numerical_ridge_floor)
+
+        if has_hard_orbit_shape:
+            z_raw_loc, info_loc = _orbit_hard_constraint_solve(
+                ATA_sub_reg=ATA_loc, ATy_sub=ATy_loc,
+                active_idx=active_idx, S_active=S_loc,
+                orbit_shape=np.asarray(orbit_shape, dtype=np.float64),
+                C=C, P=P, numerical_ridge=numerical_ridge_loc,
+                scientific_regularisation=regularisation_scale)
+
+            if not info_loc["accepted"]:
+                return (active_idx, None, None, None, None, None, None, None, None, None)
+
+            z_loc = np.asarray(z_raw_loc, dtype=np.float64).copy()
+            alpha_loc = float(info_loc["alpha"])
+            lambda_loc = np.asarray(info_loc["lambda_orbit"],
+                dtype=np.float64).ravel(order="C")
+
+        else:
+            ATA_reg_loc = (ATA_loc +
+                regularisation_scale * np.diag(S_loc * S_loc) +
+                numerical_ridge_loc * np.eye(k_loc, dtype=np.float64))
+
+            z_loc = _nnls_from_quadratic(ATA_reg_loc, ATy_loc,
+                x0=np.maximum(z[active_idx], 0.0),
+                max_iter=10000, tol=1e-11)
+
+            alpha_loc = None
+            lambda_loc = None
+
+            info_loc = {
+                "accepted": True,
+                "mu": 0.0,
+                "lambda_orbit": np.zeros((C,), dtype=np.float64),
+            }
 
     def _prune_zero_support(
         z_vec: np.ndarray,
@@ -2707,26 +2828,18 @@ def streamActiveSetNNLS(
 
         return batches[:int(explore_batches_per_iter)]
 
-    def _explore_support(
-        it: int,
-        current_active: np.ndarray,
-        current_data_obj: float,
-        not_active: np.ndarray,
-        grad_data: np.ndarray,
-        constraint_gradient: np.ndarray,
-        grad_total: np.ndarray,
-        grad_x: np.ndarray,
-    ) -> tuple[
-        bool,
-        np.ndarray,
-        np.ndarray,
-        dict,
-        np.ndarray,
-        np.ndarray,
-        float
-    ]:
+    def _explore_support(it: int, current_active: np.ndarray,
+        current_data_obj: float, not_active: np.ndarray, grad_data: np.ndarray,
+        constraint_gradient: np.ndarray, grad_total: np.ndarray,
+        grad_x: np.ndarray) -> tuple[bool, np.ndarray, np.ndarray, dict,
+        np.ndarray, np.ndarray, float]:
         """
-        Test candidate batches by jointly re-solving the complete support.
+        Test exploration proposals using one union-support Gram assembly.
+
+        The exchange, data-gradient, and coverage proposals are first combined
+        into a single union support. The reduced normal equations are assembled
+        once on that union. Each individual proposal is then solved using the
+        exact corresponding principal submatrix of the union Gram matrix.
 
         Parameters
         ----------
@@ -2738,67 +2851,82 @@ def streamActiveSetNNLS(
             Current unregularised data objective.
         not_active : ndarray
             Currently inactive candidate columns.
+        grad_data : ndarray
+            Current data-fit gradient.
+        constraint_gradient : ndarray
+            Current hard-constraint gradient contribution.
         grad_total : ndarray
             Current constrained reduced gradient.
+        grad_x : ndarray
+            Multiplier-free objective gradient in physical x-space.
 
         Returns
         -------
         improved : bool
-            True when a trial gives a strictly better data fit.
+            True when a trial gives a strictly better total objective.
         best_active : ndarray
             Best trial support found.
         best_z : ndarray
             Best trial reduced coefficients.
         best_info : dict
             Constrained-solve information for the best trial.
+        best_ATA : ndarray
+            Reduced Gram matrix for the best accepted trial.
+        best_ATy : ndarray
+            Reduced linear term for the best accepted trial.
+        best_data_obj : float
+            Data objective of the best accepted trial.
 
         Raises
         ------
-        None
+        RuntimeError
+            If the exploration union cannot be mapped consistently.
 
         Examples
         --------
-        >>> improved, active_new, z_new, info = _explore_support(
-        ...     0, active_idx, data_object, not_active, grad_total)
+        Called internally by ``streamActiveSetNNLS``.
         """
-        current_active = np.asarray(current_active, dtype=np.int64,).ravel(
-            order="C")
+        current_active = np.asarray(current_active, dtype=np.int64
+            ).ravel(order="C")
 
         batches = _build_exploration_batches(not_active, grad_data, grad_total,
             grad_x, it)
 
         if not batches:
-            return (
-                False,
-                current_active.copy(),
-                z[current_active].copy(),
-                {},
-                np.zeros((0, 0), dtype=np.float64),
-                np.zeros((0,), dtype=np.float64),
-                float(current_data_obj),
-            )
+            return (False, current_active.copy(), z[current_active].copy(),
+                {}, np.zeros((0, 0), dtype=np.float64),
+                np.zeros((0,), dtype=np.float64), float(current_data_obj))
 
         best_active = current_active.copy()
         best_z = z[current_active].copy()
         best_info = {}
         best_ATA = None
         best_ATy = None
-        current_reg_obj = (0.5 * float(regularisation_scale)
-            * float(np.sum((S_flat[current_active] * z[current_active]) ** 2)))
+
+        current_reg_obj = (0.5 * float(regularisation_scale) * float(np.sum(
+                (S_flat[current_active] * z[current_active]) ** 2)))
         current_total_obj = float(current_data_obj) + current_reg_obj
+
         best_data_obj = float(current_data_obj)
         best_reg_obj = float(current_reg_obj)
         best_total_obj = float(current_total_obj)
+
         explore_obj_tol = (64.0 * np.finfo(np.float64).eps
             * max(1.0, abs(float(current_total_obj))))
 
+        # --------------------------------------------------------------
+        # Prepare all genuinely new trials before touching the HyperCube.
+        # --------------------------------------------------------------
+        prepared_trials = []
+
         for trial_number, (trial_kind, proposal) in enumerate(batches):
+            proposal = np.asarray(proposal, dtype=np.int64).ravel(order="C")
 
             trial_active = np.unique(np.concatenate((current_active, proposal))
                 ).astype(np.int64, copy=False)
 
             if trial_active.size > int(max_active):
-                available = max(0, int(max_active) - current_active.size,)
+                available = max(0, int(max_active) - current_active.size)
 
                 if available <= 0:
                     _emit_diag({
@@ -2813,26 +2941,27 @@ def streamActiveSetNNLS(
                         "proposal_n": int(proposal.size),
                         "trial_n_active": int(current_active.size),
                         "current_data_obj": float(current_data_obj),
-                        "current_regularisation_obj": float(current_reg_obj),
-                        "current_total_obj": float(current_total_obj),
+                        "current_regularisation_obj":
+                            float(current_reg_obj),
+                        "current_total_obj":
+                            float(current_total_obj),
                         "best_data_obj": float(best_data_obj),
-                        "best_regularisation_obj": float(best_reg_obj),
+                        "best_regularisation_obj":
+                            float(best_reg_obj),
                         "best_total_obj": float(best_total_obj),
                         "proposal": proposal.tolist(),
-                        "trial_kind": trial_kind,
+                        "trial_kind": str(trial_kind),
                     })
                     continue
 
                 proposal = proposal[:available]
 
-                trial_active = np.unique(np.concatenate((current_active,
-                    proposal))).astype(np.int64, copy=False)
+                trial_active = np.unique(np.concatenate((
+                    current_active, proposal))).astype(np.int64, copy=False)
 
             proposal_key = tuple(sorted(proposal.tolist()))
 
             if proposal_key in failed_proposals:
-                # This exact joint support has already been validly solved
-                # against the unchanged committed solution.
                 if trial_kind == "coverage":
                     coverage_tested[proposal] = True
 
@@ -2850,9 +2979,65 @@ def streamActiveSetNNLS(
                     "proposal": proposal.tolist(),
                 })
                 continue
-            trial_active, z_trial, info_trial, alpha_trial, lambda_trial,\
-                ATA_trial, ATy_trial, S_trial, ridge_trial, cond_trial = \
-                _solve_reduced_active(trial_active)
+
+            prepared_trials.append({
+                "trial_number": int(trial_number),
+                "trial_kind": str(trial_kind),
+                "proposal": proposal,
+                "proposal_key": proposal_key,
+                "trial_active": trial_active,
+            })
+
+        if not prepared_trials:
+            return (False, best_active, best_z, best_info, best_ATA, best_ATy,
+                best_data_obj)
+
+        # --------------------------------------------------------------
+        # Construct the union of every support that will actually be
+        # tested and assemble its Gram matrix ONCE.
+        # --------------------------------------------------------------
+        exploration_union = np.unique(np.concatenate([current_active] + [
+                trial["proposal"] for trial in prepared_trials])
+            ).astype(np.int64, copy=False)
+
+        print(f"[MONO][explore {explore_round}] "
+            f"assembling union support: current={current_active.size} "
+            f"union={exploration_union.size} trials={len(prepared_trials)}",
+            flush=True,)
+
+        ATA_union, ATy_union, S_union = _assemble_reduced(exploration_union)
+
+        # exploration_union is sorted by np.unique, so searchsorted gives
+        # the exact local positions without a Python dictionary.
+        # Every trial support is a subset of exploration_union.
+        # --------------------------------------------------------------
+        # Solve each proposal using only in-memory submatrices.
+        # --------------------------------------------------------------
+        for trial in prepared_trials:
+            trial_number = trial["trial_number"]
+            trial_kind = trial["trial_kind"]
+            proposal = trial["proposal"]
+            proposal_key = trial["proposal_key"]
+            trial_active = trial["trial_active"]
+
+            loc = np.searchsorted(exploration_union, trial_active)
+
+            if (np.any(loc >= exploration_union.size) or not np.array_equal(
+                exploration_union[loc], trial_active)):
+                raise RuntimeError("Exploration trial is not a subset of the "
+                    "assembled union support.")
+
+            ATA_trial_pre = np.ascontiguousarray(ATA_union[np.ix_(loc, loc)],
+                dtype=np.float64)
+            ATy_trial_pre = np.asarray(ATy_union[loc], dtype=np.float64,
+                order="C")
+            S_trial_pre = np.asarray(S_union[loc], dtype=np.float64,
+                order="C")
+
+            trial_active, z_trial, info_trial, alpha_trial, \
+                lambda_trial, ATA_trial, ATy_trial, S_trial, \
+                ridge_trial, cond_trial = _solve_reduced_active(trial_active,
+                    assembled=(ATA_trial_pre, ATy_trial_pre, S_trial_pre))
 
             del alpha_trial
             del lambda_trial
@@ -2881,26 +3066,32 @@ def streamActiveSetNNLS(
                     "best_total_obj": float(best_total_obj),
                     "proposal": proposal.tolist(),
                     "proposal_grad_data": grad_data[proposal].tolist(),
-                    "proposal_grad_constraint": (
-                        constraint_gradient[proposal].tolist()),
+                    "proposal_grad_constraint":
+                        constraint_gradient[proposal].tolist(),
                     "proposal_grad_total": grad_total[proposal].tolist(),
-                    "trial_kind": trial_kind,
+                    "trial_kind": str(trial_kind),
                 })
                 continue
 
             if trial_kind == "coverage":
                 coverage_tested[proposal] = True
+
             trial_data_obj = _data_quad_obj(ATA_trial, ATy_trial, z_trial)
+
             trial_reg_obj = (0.5 * float(regularisation_scale)
                 * float(np.sum((S_trial * z_trial) ** 2)))
+
             trial_total_obj = float(trial_data_obj) + float(trial_reg_obj)
-            total_improvement = float(current_total_obj) - \
-                float(trial_total_obj)
-            data_improvement = float(current_data_obj) - float(trial_data_obj)
-            regularisation_change = float(current_reg_obj) - \
-                float(trial_reg_obj)
-            best_total_improvement = (
-                float(best_total_obj) - float(trial_total_obj))
+
+            total_improvement = (float(current_total_obj)
+                - float(trial_total_obj))
+            data_improvement = (float(current_data_obj)
+                - float(trial_data_obj))
+            regularisation_change = (float(current_reg_obj)
+                - float(trial_reg_obj))
+            best_total_improvement = (float(best_total_obj)
+                - float(trial_total_obj))
+
             rel_total_improvement = (total_improvement
                 / max(1.0, abs(float(current_total_obj))))
             rel_data_improvement = (data_improvement
@@ -2913,6 +3104,7 @@ def streamActiveSetNNLS(
 
             accepted_trial = (trial_total_obj
                 < best_total_obj - explore_obj_tol)
+
             if not accepted_trial:
                 failed_proposals.add(proposal_key)
 
@@ -2924,72 +3116,78 @@ def streamActiveSetNNLS(
                 "trial": int(trial_number),
                 "trial_kind": str(trial_kind),
 
-                # Trial outcome.
                 "accepted": bool(accepted_trial),
                 "solve_accepted": True,
                 "proposal_n": int(proposal.size),
                 "trial_n_active": int(trial_active.size),
 
-                # Objective of the committed state entering exploration.
                 "current_data_obj": float(current_data_obj),
-                "current_regularisation_obj": float(current_reg_obj),
-                "current_total_obj": float(current_total_obj),
+                "current_regularisation_obj":
+                    float(current_reg_obj),
+                "current_total_obj":
+                    float(current_total_obj),
 
-                # Best trial found before this trial.
                 "best_data_obj": float(best_data_obj),
-                "best_regularisation_obj": float(best_reg_obj),
+                "best_regularisation_obj":
+                    float(best_reg_obj),
                 "best_total_obj": float(best_total_obj),
 
-                # This trial.
                 "trial_data_obj": float(trial_data_obj),
-                "trial_regularisation_obj": float(trial_reg_obj),
-                "trial_total_obj": float(trial_total_obj),
+                "trial_regularisation_obj":
+                    float(trial_reg_obj),
+                "trial_total_obj":
+                    float(trial_total_obj),
 
-                # Improvement relative to the committed state.
                 "data_improvement": float(data_improvement),
-                "regularisation_change": float(regularisation_change),
-                "total_improvement": float(total_improvement),
-                "relative_data_improvement": float(rel_data_improvement),
-                "relative_total_improvement": float(rel_total_improvement),
+                "regularisation_change":
+                    float(regularisation_change),
+                "total_improvement":
+                    float(total_improvement),
+                "relative_data_improvement":
+                    float(rel_data_improvement),
+                "relative_total_improvement":
+                    float(rel_total_improvement),
 
-                # Improvement relative to the best trial already seen.
-                "best_total_improvement": float(best_total_improvement),
+                "best_total_improvement":
+                    float(best_total_improvement),
 
                 "improvement_tol": float(explore_obj_tol),
 
-                # Exact candidate identities.
                 "proposal": proposal.tolist(),
 
-                # What each proposed column looked like before the
-                # joint re-solve.
-                "proposal_grad_data": proposal_grad_data_values.tolist(),
-                "proposal_grad_constraint": (
-                    proposal_grad_constraint_values.tolist()),
-                "proposal_grad_total": proposal_grad_total_values.tolist(),
-                "proposal_grad_x": proposal_grad_x_values.tolist(),
+                "proposal_grad_data":
+                    proposal_grad_data_values.tolist(),
+                "proposal_grad_constraint":
+                    proposal_grad_constraint_values.tolist(),
+                "proposal_grad_total":
+                    proposal_grad_total_values.tolist(),
+                "proposal_grad_x":
+                    proposal_grad_x_values.tolist(),
 
-                # Compact screening summaries for plotting without
-                # needing to decode the full proposal vectors.
-                "proposal_grad_data_max": float(np.max(
-                    np.abs(proposal_grad_data_values))),
-                "proposal_grad_constraint_max": float(np.max(
-                    np.abs(proposal_grad_constraint_values))),
-                "proposal_grad_total_max": float(np.max(
-                    np.abs(proposal_grad_total_values))),
-                "proposal_grad_data_max_signed": float(np.max(
-                    proposal_grad_data_values)),
-                "proposal_grad_constraint_max_signed": float(np.max(
-                    proposal_grad_constraint_values)),
-                "proposal_grad_total_max_signed": float(np.max(
-                    proposal_grad_total_values)),
-                "proposal_grad_x_max_signed": float(np.max(
-                    proposal_grad_x_values)),
+                "proposal_grad_data_max": float(
+                    np.max(np.abs(
+                        proposal_grad_data_values))),
+                "proposal_grad_constraint_max": float(
+                    np.max(np.abs(
+                        proposal_grad_constraint_values))),
+                "proposal_grad_total_max": float(
+                    np.max(np.abs(
+                        proposal_grad_total_values))),
+                "proposal_grad_data_max_signed": float(
+                    np.max(proposal_grad_data_values)),
+                "proposal_grad_constraint_max_signed": float(
+                    np.max(proposal_grad_constraint_values)),
+                "proposal_grad_total_max_signed": float(
+                    np.max(proposal_grad_total_values)),
+                "proposal_grad_x_max_signed": float(
+                    np.max(proposal_grad_x_values)),
             })
 
             if accepted_trial:
                 best_total_obj = float(trial_total_obj)
                 best_data_obj = float(trial_data_obj)
                 best_reg_obj = float(trial_reg_obj)
+
                 best_active = trial_active.copy()
                 best_z = z_trial.copy()
                 best_info = dict(info_trial)
@@ -2999,8 +3197,8 @@ def streamActiveSetNNLS(
         improved = bool(best_total_obj
             < float(current_total_obj) - explore_obj_tol)
 
-        return improved, best_active, best_z, best_info, best_ATA, best_ATy,\
-            best_data_obj
+        return (improved, best_active, best_z, best_info, best_ATA, best_ATy,
+            best_data_obj)
     def _estimate_coverage_rounds_remaining(not_active, start_round):
         tested = coverage_tested.copy()
 

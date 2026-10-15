@@ -12,17 +12,16 @@
 #SBATCH -D "/data/phys-gal-dynamics/phys2603/muse"
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
-#SBATCH -p long
+#SBATCH -p medium
 # #SBATCH --qos=priority
 
 #SBATCH --job-name="CubeFit_2Fit"
-#SBATCH --time=6-00:00
-#SBATCH -N 1
-#SBATCH --ntasks=1
+#SBATCH --time=0-48:00
 #SBATCH --cpus-per-task=48
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --mem=300G
 #SBATCH --hint=nomultithread
-#SBATCH --exclusive
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=adriano.poci@physics.ox.ac.uk
 
@@ -43,9 +42,12 @@ export MKL_DYNAMIC=FALSE
 export OPENBLAS_VERBOSE=0
 
 # --- HDF5 raw-data chunk cache (reader side) ---
-export CUBEFIT_RDCC_NBYTES=$((16*1024*1024*1024))  # 16 GiB
-export CUBEFIT_RDCC_NSLOTS=400003                   # large-ish prime
-export CUBEFIT_RDCC_W0=0.9
+# Larger cache are good for intermediate-size cubes
+# For production-scale cubes, the cache will never be big enough to ever be
+# re-read from cache. So smaller is better.
+export CUBEFIT_RDCC_NBYTES=$((64*1024*1024))
+export CUBEFIT_RDCC_NSLOTS=521
+export CUBEFIT_RDCC_W0=0.0
 
 export HDF5_USE_FILE_LOCKING=FALSE
 
@@ -70,7 +72,6 @@ try:
 except Exception as exc:
     print("[sanity] threadpoolctl not available:", exc)
 PY
-
 
 
 # ------------------------------------------------------------------------------

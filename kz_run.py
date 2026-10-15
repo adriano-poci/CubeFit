@@ -156,7 +156,7 @@ def main():
         #     [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
         #     [0.0, 0.4])
         # propDict['regularisation_scale'] = 0.0
-        propDict['warm'] = 'zeros'
+        propDict['warm'] = 'resume'
     print(propDict)
 
     _configure_solver_environment(args, propDict)

@@ -17,11 +17,11 @@
 
 #SBATCH --job-name="CubeFit_3Rio"
 #SBATCH --time=0-12:00
-#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=350G
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --mem=300G
 #SBATCH --hint=nomultithread
-#SBATCH --exclusive
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=adriano.poci@physics.ox.ac.uk
 
