@@ -194,6 +194,14 @@ v2.4:   Assemble all exploration proposals from one union-support Gram matrix,
             eliminating redundant HyperCube passes for exchange, data, and
             coverage trials;
         Removed redundant ATy computation from `_worker_reduced`. 15 October 2026
+v2.5:   Replaced the fixed 50-percent exploration-coverage stopping criterion
+            with consecutive stationary joint-support challenges;
+        Made coverage proposals maximally separated from populations already
+            tested within each orbit, so each stationary challenge probes new
+            regions of SSP space;
+        Reset stationary-challenge evidence after every accepted support change
+            and recompute exact full-space KKT before counting further failures.
+            16 October 2026
 """
 
 from __future__ import annotations, print_function
@@ -1682,17 +1690,36 @@ def streamActiveSetNNLS(
     # Keep joint trials broad enough to expose several alternatives per orbit.
     explore_top_per_orbit = 6
     explore_coverage_per_orbit = 6
-
     explore_batch_size = max(96, min(768, 8 * C))
-
     explore_batches_per_iter = 3
     explore_fail_count = 0
     explore_round = 0
 
-    # Explicit coverage.
-    explore_coverage_target = 0.5
+    # ------------------------------------------------------------------
+    # Stationary joint-search convergence.
+    #
+    # Exact KKT stationarity at the current committed support is necessary but
+    # is not sufficient for the hard-orbit problem. An inactive population can
+    # become useful only after entering jointly with other populations and
+    # allowing the complete constrained support to re-adjust.
+    #
+    # Once exact KKT is stationary, therefore require several consecutive
+    # *joint* exploration failures. Every challenge still contains the
+    # gradient-driven exchange and data trials, plus a deliberately diverse
+    # coverage trial.
+    #
+    # Any accepted support change invalidates all such evidence: the active
+    # coefficients, orbit multipliers, and inactive gradients can all change.
+    # The counter and coverage history are consequently reset on acceptance.
+    # ------------------------------------------------------------------
+    stationary_explore_patience = 3
+    stationary_fail_count = 0
+
+    # Track populations used by coverage challenges for the current committed
+    # solution. This is no longer a fractional stopping criterion. It exists
+    # only to make successive challenges maximally different from one another.
     coverage_tested = np.zeros(CP, dtype=bool)
-    coverage_restore_pending = False
+
     # Cache valid but non-improving proposals for the current committed state.
     failed_proposals = set()
 
@@ -1849,6 +1876,7 @@ def streamActiveSetNNLS(
         "explore_batches_per_iter": int(explore_batches_per_iter),
         "explore_top_per_orbit": int(explore_top_per_orbit),
         "explore_coverage_per_orbit": int(explore_coverage_per_orbit),
+        "stationary_explore_patience": int(stationary_explore_patience),
     })
 
     if x0_flat is None:
@@ -1966,18 +1994,23 @@ def streamActiveSetNNLS(
                 lambda_orbit_current = lambda_saved.copy()
 
         if "explore_fail_count" in resume_state:
-            explore_fail_count = int(
-                resume_state["explore_fail_count"])
+            explore_fail_count = int(resume_state["explore_fail_count"])
 
         if "explore_round" in resume_state:
-            explore_round = int(
-                resume_state["explore_round"])
+            explore_round = int(resume_state["explore_round"])
+
+        # New checkpoints persist the number of consecutive failed joint
+        # challenges observed while exact KKT remained stationary. Historical
+        # checkpoints have no such certificate, so conservatively restart the
+        # stationary confirmation count from zero.
+        if "stationary_fail_count" in resume_state:
+            stationary_fail_count = int(
+                resume_state["stationary_fail_count"])
+
         if "coverage_tested" in resume_state:
             saved = np.asarray(resume_state["coverage_tested"], dtype=bool)
             if saved.size == CP:
                 coverage_tested[:] = saved.ravel(order="C")
-        elif explore_fail_count > 0:
-            coverage_restore_pending = True
 
         if has_hard_orbit_shape and zero_shape_orbits.size > 0:
             for cc in zero_shape_orbits:
@@ -2048,6 +2081,7 @@ def streamActiveSetNNLS(
             "stop_details": dict(stop_details),
             "explore_fail_count": int(explore_fail_count),
             "explore_round": int(explore_round),
+            "stationary_fail_count": int(stationary_fail_count),
             "coverage_tested": coverage_tested.astype(bool).tolist(),
         }
     
@@ -2597,7 +2631,41 @@ def streamActiveSetNNLS(
         return offsets[int(round_idx) % stride]
     def _build_coverage_batch(not_active: np.ndarray,
         round_idx: int) -> np.ndarray:
-        """Build the exact rotating coverage batch for one exploration round."""
+        """
+        Build a maximally separated coverage challenge.
+
+        Coverage is no longer used as a fractional convergence quota. Instead,
+        each orbit contributes inactive populations chosen to be as far as
+        possible from populations already tested at the current committed
+        solution.
+
+        The first population is selected using the coarse-to-fine dyadic
+        sequence so the initial challenge does not privilege one end of the
+        SSP ordering. Subsequent populations are selected greedily by
+        farthest-point sampling. Distance is measured in population-index
+        space within each orbit.
+
+        Parameters
+        ----------
+        not_active : ndarray
+            Global indices of currently inactive candidate columns.
+        round_idx : int
+            Exploration-round index used only to rotate the initial seed when
+            no previous coverage population exists for an orbit.
+
+        Returns
+        -------
+        selected : ndarray
+            Global column indices for the diverse coverage challenge.
+
+        Raises
+        ------
+        None
+
+        Examples
+        --------
+        >>> coverage = _build_coverage_batch(not_active, explore_round)
+        """
         not_active = np.asarray(not_active, dtype=np.int64).ravel(order="C")
 
         if has_hard_orbit_shape:
@@ -2608,24 +2676,83 @@ def streamActiveSetNNLS(
         per_orbit = []
 
         for cc in search_orbits:
-            cols = not_active[(not_active // P) == int(cc)]
+            cc = int(cc)
+            cols = not_active[(not_active // P) == cc]
 
             if cols.size == 0:
                 continue
 
-            n_cov = min(int(explore_coverage_per_orbit), int(cols.size))
-            stride = max(1, int(np.ceil(cols.size / n_cov)))
-            offset = _dyadic_offset(round_idx, stride)
-            positions = np.arange(offset, cols.size, stride,
-                dtype=np.int64)[:n_cov]
-            coverage_cols = cols[positions]
+            # Work in local population coordinates. The global column ordering
+            # is C-major/P-minor, so modulo P gives the SSP population index.
+            pops = cols % P
+            already_mask = coverage_tested[cols]
+            available_cols = cols[~already_mask]
+            available_pops = pops[~already_mask]
 
-            if coverage_cols.size:
-                per_orbit.append(coverage_cols)
+            if available_cols.size == 0:
+                continue
+
+            n_cov = min(int(explore_coverage_per_orbit),
+                int(available_cols.size))
+
+            tested_pops = pops[already_mask].astype(np.int64, copy=False)
+            chosen_cols = []
+            chosen_pops = []
+
+            for _ in range(n_cov):
+                if tested_pops.size or chosen_pops:
+                    # Measure each unselected population by its distance from
+                    # the nearest population already challenged at this
+                    # committed solution. Include choices made earlier in this
+                    # same batch so the batch itself is maximally dispersed.
+                    if chosen_pops:
+                        reference = np.concatenate((tested_pops,
+                            np.asarray(chosen_pops, dtype=np.int64)))
+                    else:
+                        reference = tested_pops
+
+                    distances = np.min(np.abs(available_pops[:, None]
+                            - reference[None, :]), axis=1)
+
+                    # Deterministic tie-break: prefer the population farther
+                    # from the centre of the SSP index range, then the lower
+                    # global column index. This prevents repeated arbitrary
+                    # choices while preserving reproducibility.
+                    centre = 0.5 * float(P - 1)
+                    centre_distance = np.abs(available_pops.astype(np.float64) -
+                        centre)
+
+                    order = np.lexsort((available_cols, -centre_distance,
+                        -distances))
+                    jj = int(order[0])
+
+                else:
+                    # No previous coverage information exists for this orbit.
+                    # Seed the farthest-point sequence at a coarse-to-fine
+                    # location that rotates with the exploration round.
+                    seed_pos = _dyadic_offset(round_idx,
+                        int(available_cols.size))
+                    jj = int(seed_pos)
+
+                chosen_cols.append(int(available_cols[jj]))
+                chosen_pops.append(int(available_pops[jj]))
+
+                keep = np.ones(available_cols.size, dtype=bool)
+                keep[jj] = False
+                available_cols = available_cols[keep]
+                available_pops = available_pops[keep]
+
+                if available_cols.size == 0:
+                    break
+
+            if chosen_cols:
+                per_orbit.append(np.asarray(chosen_cols, dtype=np.int64))
 
         if not per_orbit:
             return np.zeros((0,), dtype=np.int64)
 
+        # Round-robin across orbits so a global batch-size cap cannot
+        # systematically favour low-index orbits.
         offset = _dyadic_offset(round_idx, len(per_orbit))
         per_orbit = per_orbit[offset:] + per_orbit[:offset]
 
@@ -2653,7 +2780,12 @@ def streamActiveSetNNLS(
         return np.asarray(selected, dtype=np.int64)
 
     def _coverage_summary(not_active: np.ndarray) -> tuple[float, float]:
-        """Return minimum per-orbit and total unique coverage fractions."""
+        """
+        Return diagnostic coverage fractions for the current committed state.
+
+        Coverage is reported for run-health diagnostics only. It is not a
+        convergence requirement.
+        """
         if has_hard_orbit_shape:
             search_orbits = positive_shape_orbits
         else:
@@ -3199,31 +3331,6 @@ def streamActiveSetNNLS(
 
         return (improved, best_active, best_z, best_info, best_ATA, best_ATy,
             best_data_obj)
-    def _estimate_coverage_rounds_remaining(not_active, start_round):
-        tested = coverage_tested.copy()
-
-        for nr in range(10000):
-            batch = _build_coverage_batch(
-                not_active, int(start_round + nr))
-
-            tested[batch] = True
-
-            fractions = []
-            search_orbits = (positive_shape_orbits if has_hard_orbit_shape
-                else np.arange(C, dtype=np.int64))
-
-            for cc in search_orbits:
-                cols = not_active[(not_active // P) == int(cc)]
-                if cols.size:
-                    fractions.append(
-                        np.count_nonzero(tested[cols]) / float(cols.size))
-
-            coverage_min_future = min(fractions) if fractions else 1.0
-
-            if coverage_min_future >= explore_coverage_target:
-                return nr + 1
-
-        return -1
 
     # ------------------------------------------------------------
     # Active-set outer loop
@@ -3366,13 +3473,16 @@ def streamActiveSetNNLS(
                     if has_hard_orbit_shape else None),
                 "explore_fail_count": int(explore_fail_count),
                 "explore_round": int(explore_round),
+                "stationary_fail_count": int(stationary_fail_count),
+                "stationary_explore_patience": int(stationary_explore_patience),
             })
 
             print(f"[MONO][iter {it + 1}] "
                 f"active_stat={max_grad_active:.3e} "
                 f"dual={max_grad_dual:.3e} tol={tol_here:.3e} "
                 f"working={np.count_nonzero(active)} "
-                f"positive={np.count_nonzero(positive_mask)}", flush=True)
+                f"positive={np.count_nonzero(positive_mask)} "
+                f"stationary_fail={stationary_fail_count}", flush=True)
         
         if support_stationary and not has_hard_orbit_shape:
             # Without hard orbit constraints, the NNLS KKT conditions alone are
@@ -3450,15 +3560,6 @@ def streamActiveSetNNLS(
                     tol_here=float(tol_here),
                 )
             break
-
-
-        if coverage_restore_pending:
-            first_round = max(0, explore_round - explore_fail_count)
-            available = max(0, int(max_active) - current_active.size)
-            for rr in range(first_round, explore_round):
-                old_coverage = _build_coverage_batch(not_active, rr)
-                coverage_tested[old_coverage[:available]] = True
-            coverage_restore_pending = False
         
         improved, best_active, best_z, best_info, best_ATA, best_ATy,\
             best_data_obj = _explore_support(it=it,
@@ -3474,7 +3575,12 @@ def streamActiveSetNNLS(
             f"failures={explore_fail_count}", flush=True)
 
         if improved:
+            # A support change invalidates every convergence challenge made
+            # against the previous committed solution. The complete support is
+            # about to be replaced and the next outer iteration will recompute
+            # ATAz, orbit multipliers, and all full-space gradients.
             explore_fail_count = 0
+            stationary_fail_count = 0
 
             active[:] = False
             active[best_active] = True
@@ -3510,9 +3616,9 @@ def streamActiveSetNNLS(
                 "zero_dropped": (dropped_zero.tolist()),
                 "coverage_min": 0.0,
                 "coverage_total": 0.0,
-                "coverage_target": float(explore_coverage_target),
-                "coverage_exhausted": False,
-                "coverage_rounds_remaining": None,
+                "stationary_fail_count": 0,
+                "stationary_explore_patience":
+                    int(stationary_explore_patience),
             })
 
             _emit_checkpoint(
@@ -3530,11 +3636,22 @@ def streamActiveSetNNLS(
 
         x_is_zero = np.all(z <= positive_tol)
 
+        # Coverage remains useful as a diagnostic showing how widely the
+        # current committed solution has been challenged. It is deliberately
+        # not used as a stopping quota.
         coverage_min, coverage_total = _coverage_summary(not_active)
-        coverage_exhausted = coverage_min >= explore_coverage_target
 
-        coverage_rounds_remaining = (0 if coverage_exhausted else
-            _estimate_coverage_rounds_remaining(not_active, explore_round))
+        # A failed joint-support challenge counts toward convergence only when
+        # the exact full-space KKT conditions were stationary *before* that
+        # challenge. If KKT is nonstationary, the failed trial gives no
+        # convergence certificate.
+        if support_stationary:
+            stationary_fail_count += 1
+        else:
+            stationary_fail_count = 0
+
+        stationary_confirmed = (support_stationary
+            and stationary_fail_count >= stationary_explore_patience)
 
         _emit_diag({
             "kind": "exploration",
@@ -3545,6 +3662,10 @@ def streamActiveSetNNLS(
             "support_stationary": bool(support_stationary),
             "improved": False,
             "explore_fail_count": int(explore_fail_count),
+            "stationary_fail_count": int(stationary_fail_count),
+            "stationary_explore_patience":
+                int(stationary_explore_patience),
+            "stationary_confirmed": bool(stationary_confirmed),
             "n_active": int(current_active.size),
             "n_candidates": int(not_active.size),
             "max_grad_active": float(max_grad_active),
@@ -3552,47 +3673,31 @@ def streamActiveSetNNLS(
             "tol_here": float(tol_here),
             "coverage_min": float(coverage_min),
             "coverage_total": float(coverage_total),
-            "coverage_target": float(explore_coverage_target),
-            "coverage_exhausted": bool(coverage_exhausted),
-            "coverage_rounds_remaining": int(coverage_rounds_remaining),
         })
+
         print(
-            f"[MONO][coverage] min={coverage_min:.3f} "
-            f"total={coverage_total:.3f} "
-            f"target={explore_coverage_target:.3f} "
-            f"rounds_remaining={coverage_rounds_remaining}",
-            flush=True)
+            f"[MONO][challenge] stationary={support_stationary} "
+            f"failures={stationary_fail_count}/"
+            f"{stationary_explore_patience} "
+            f"coverage_min={coverage_min:.3f} "
+            f"coverage_total={coverage_total:.3f}",
+            flush=True,
+        )
 
-        if has_hard_orbit_shape:
-            can_stop = coverage_exhausted and (
-                x_is_zero or support_stationary or active_ok)
-        else:
-            can_stop = x_is_zero or support_stationary or (
-                active_ok and coverage_exhausted)
-
-        if can_stop:
-            if x_is_zero:
-                stop_reason = "zero_solution_exploration_exhausted"
-                stop_category = "converged"
-                stop_converged = True
-            elif support_stationary:
-                stop_reason = "kkt_stationary_search_exhausted"
-                stop_category = "converged"
-                stop_converged = True
-            else:
-                stop_reason = "joint_search_exhausted"
-                stop_category = "search"
-                stop_converged = False
-
+        # The all-zero unconstrained case retains its historical escape path.
+        # For the hard-orbit problem, the meaningful convergence certificate
+        # is exact KKT stationarity surviving several distinct joint-support
+        # challenges.
+        if x_is_zero and not has_hard_orbit_shape:
             _set_stop(
-                stop_reason,
-                stop_category,
+                "zero_solution_exploration_exhausted",
+                "converged",
                 it,
-                converged=stop_converged,
+                converged=True,
                 explore_fail_count=int(explore_fail_count),
+                stationary_fail_count=int(stationary_fail_count),
                 coverage_min=float(coverage_min),
                 coverage_total=float(coverage_total),
-                coverage_target=float(explore_coverage_target),
                 n_active=int(np.count_nonzero(active)),
                 max_grad_active=float(max_grad_active),
                 max_grad_dual=float(max_grad_dual),
@@ -3602,7 +3707,31 @@ def streamActiveSetNNLS(
             _emit_checkpoint(
                 it,
                 final=True,
-                phase=stop_reason,
+                phase="zero_solution_exploration_exhausted",
+            )
+            break
+
+        if stationary_confirmed:
+            _set_stop(
+                "kkt_stationary_joint_search_confirmed",
+                "converged",
+                it,
+                converged=True,
+                explore_fail_count=int(explore_fail_count),
+                stationary_fail_count=int(stationary_fail_count),
+                stationary_explore_patience=int(stationary_explore_patience),
+                coverage_min=float(coverage_min),
+                coverage_total=float(coverage_total),
+                n_active=int(np.count_nonzero(active)),
+                max_grad_active=float(max_grad_active),
+                max_grad_dual=float(max_grad_dual),
+                tol_here=float(tol_here),
+            )
+
+            _emit_checkpoint(
+                it,
+                final=True,
+                phase="kkt_stationary_joint_search_confirmed",
             )
             break
 
