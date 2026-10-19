@@ -252,11 +252,9 @@ def cpuset_count():
         candidates.append(f"/sys/fs/cgroup{cg_cpuset}/cpuset.cpus")
 
     # root-level fallbacks
-    candidates += [
-        "/sys/fs/cgroup/cpuset.cpus.effective",
+    candidates += ["/sys/fs/cgroup/cpuset.cpus.effective",
         "/sys/fs/cgroup/cpuset/cpuset.cpus.effective",
-        "/sys/fs/cgroup/cpuset/cpuset.cpus",
-    ]
+        "/sys/fs/cgroup/cpuset/cpuset.cpus"]
 
     for p in candidates:
         try:
@@ -3167,10 +3165,7 @@ def recommend_streaming_architecture(
 
 # ------------------------------------------------------------------------------
 
-def resolve_parallelism(
-    requested_processes=None,
-    requested_blas=None,
-):
+def resolve_parallelism(requested_processes=None, requested_blas=None):
     """
     Resolve hybrid process/BLAS parallelism against available CPUs.
 
@@ -3212,51 +3207,26 @@ def resolve_parallelism(
         requested_blas = 1
 
     try:
-        requested_processes = max(
-            1,
-            int(requested_processes),
-        )
-        requested_blas = max(
-            1,
-            int(requested_blas),
-        )
+        requested_processes = max(1, int(requested_processes))
+        requested_blas = max(1, int(requested_blas))
     except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "requested_processes and requested_blas must be "
-            "positive integers."
-        ) from exc
+        raise ValueError("requested_processes and requested_blas must be "
+            "positive integers.") from exc
 
     ncpuset, mask = cpuset_count()
 
     try:
-        cores_available = len(
-            os.sched_getaffinity(0)
-        )
+        cores_available = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
         cores_available = int(ncpuset)
 
-    cores_available = max(
-        1,
-        int(cores_available),
-    )
+    cores_available = max(1, int(cores_available))
 
-    print(
-        f"[guard] cpuset mask: {mask}  "
-        f"cores: {ncpuset}"
-    )
-    print(
-        f"[guard] cpuset cores: "
-        f"{cores_available}"
-    )
-    print(
-        f"[guard] BLAS pools: "
-        f"{threadpool_info()}"
-    )
+    print(f"[guard] cpuset mask: {mask}  cores: {ncpuset}")
+    print(f"[guard] cpuset cores: {cores_available}")
+    print(f"[guard] BLAS pools: {threadpool_info()}")
 
-    requested_total = (
-        requested_processes
-        * requested_blas
-    )
+    requested_total = requested_processes * requested_blas
 
     # ------------------------------------------------------------
     # Preserve the exact request whenever it fits.
@@ -3279,25 +3249,10 @@ def resolve_parallelism(
         # --------------------------------------------------------
         candidates = []
 
-        requested_ratio = (
-            requested_processes
-            / float(requested_blas)
-        )
+        requested_ratio = requested_processes / float(requested_blas)
 
-        for procs in range(
-            1,
-            min(
-                requested_processes,
-                cores_available,
-            ) + 1,
-        ):
-            for blas in range(
-                1,
-                min(
-                    requested_blas,
-                    cores_available,
-                ) + 1,
-            ):
+        for procs in range(1, min(requested_processes, cores_available) + 1):
+            for blas in range(1, min(requested_blas, cores_available) + 1):
                 total = procs * blas
 
                 if total > cores_available:
@@ -3305,118 +3260,57 @@ def resolve_parallelism(
 
                 # Prefer genuinely hybrid configurations whenever
                 # the allocation permits one.
-                hybrid = (
-                    procs > 1
-                    and blas > 1
-                )
+                hybrid = (procs > 1 and blas > 1)
 
-                unused = (
-                    cores_available - total
-                )
+                unused = cores_available - total
 
-                ratio = (
-                    procs / float(blas)
-                )
+                ratio = procs / float(blas)
 
                 # Compare multiplicatively rather than by raw
                 # difference.  This treats, e.g., ratios of 2 and
                 # 8 symmetrically around a requested ratio of 4.
-                ratio_error = abs(
-                    math.log(
-                        ratio / requested_ratio
-                    )
-                )
+                ratio_error = abs(math.log(ratio / requested_ratio))
 
                 # Fractional contraction of each requested axis.
-                process_scale = (
-                    procs
-                    / float(requested_processes)
-                )
-                blas_scale = (
-                    blas
-                    / float(requested_blas)
-                )
+                process_scale = procs / float(requested_processes)
+                blas_scale = blas / float(requested_blas)
 
-                balance_error = abs(
-                    process_scale - blas_scale
-                )
+                balance_error = abs(process_scale - blas_scale)
 
                 # Lower score is better.
-                score = (
-                    0 if hybrid else 1,
-                    unused,
-                    balance_error,
-                    ratio_error,
-                    -procs,
-                    -blas,
-                )
+                score = (0 if hybrid else 1, unused, balance_error, ratio_error,
+                    -procs, -blas)
 
-                candidates.append(
-                    (
-                        score,
-                        procs,
-                        blas,
-                    )
-                )
+                candidates.append((score, procs, blas))
 
         if not candidates:
             best_processes = 1
             best_blas = 1
         else:
-            candidates.sort(
-                key=lambda item: item[0]
-            )
+            candidates.sort(key=lambda item: item[0])
+            _, best_processes, best_blas = (candidates[0])
 
-            _, best_processes, best_blas = (
-                candidates[0]
-            )
+    best_total = best_processes * best_blas
 
-    best_total = (
-        best_processes
-        * best_blas
-    )
-
-    if (
-        best_processes != requested_processes
-        or best_blas != requested_blas
-    ):
-        print(
-            "[guard] adjusting hybrid parallelism: "
-            f"CPU_PROCESSES "
-            f"{requested_processes} -> "
-            f"{best_processes}, "
-            f"BLAS_THREADS "
-            f"{requested_blas} -> "
-            f"{best_blas} "
-            f"(requested total="
-            f"{requested_total}, "
-            f"chosen total={best_total}, "
-            f"available cores="
-            f"{cores_available})"
-        )
+    if (best_processes != requested_processes
+        or best_blas != requested_blas):
+        print("[guard] adjusting hybrid parallelism: "
+            f"CPU_PROCESSES {requested_processes} -> {best_processes}, "
+            f"BLAS_THREADS {requested_blas} -> {best_blas} "
+            f"(requested total={requested_total}, "
+            f"chosen total={best_total}, available cores="
+            f"{cores_available})")
     else:
-        print(
-            "[guard] parallelism accepted: "
-            f"CPU_PROCESSES="
-            f"{best_processes}, "
-            f"BLAS_THREADS="
-            f"{best_blas}, "
-            f"total={best_total}/"
-            f"{cores_available}"
-        )
+        print("[guard] parallelism accepted: CPU_PROCESSES="
+            f"{best_processes}, BLAS_THREADS={best_blas}, "
+            f"total={best_total}/{cores_available}")
 
-    return (
-        best_processes,
-        best_blas,
-    )
+    return (best_processes, best_blas)
 
 # ------------------------------------------------------------------------------
 
-def upscaleSolution(
-    solution_path: str,
-    hypercube_path: str,
-    component_map: np.ndarray,
-) -> np.ndarray:
+def upscaleSolution(solution_path: str, hypercube_path: str,
+    component_map: np.ndarray) -> np.ndarray:
     """
     Map an existing CubeFit solution onto a finer component decomposition.
 

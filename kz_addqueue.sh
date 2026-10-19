@@ -18,7 +18,11 @@ printf "Running ${nCPU} cores on ${QUEUE},\n using ${memPerCPU} GB per core.\n\n
 
 printf "Running on galaxy ${galax}.\n\n"
 
-addqueue --sbatch --requeue --serial -n "${nCPU}" -q "${QUEUE}" \
-    -m "${memPerCPU}" -c "genAper_${galax}" -g "CubeFit${galax}" \
-    -o "${curdir}/log.log" "${curdir}/kz_run.py" -- --galaxy "${galax}"
-    # -o "${curdir}/log.log" "${curdir}/kz_rio.py" -- --galaxy "${galax}"
+jobid=$(addqueue --sbatch --requeue --serial -n "1x${nCPU}" -q "${QUEUE}" \
+    -m "${memPerCPU}" -c "genFit_${galax}" -g "CubeFit${galax}" \
+    -o "${curdir}/log.log" "${curdir}/kz_run.py" -- --galaxy "${galax}" \
+    | sed -n 's/.*Submitted batch job \([0-9]\+\).*/\1/p')
+printf "Submitted gen/fit job with ID: ${jobid}\n"
+addqueue --sbatch --requeue --serial --runafter "$jobid" -n "1x${nCPU}" \
+    -q "${QUEUE}" -m "${memPerCPU}" -c "loadFit_${galax}" -g "CubeFit${galax}" \
+    -o "${curdir}/log.log" "${curdir}/kz_rio.py" -- --galaxy "${galax}"

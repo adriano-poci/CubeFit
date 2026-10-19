@@ -29,7 +29,7 @@ def props(galaxy, **kwargs):
     if 'NGC4365' in galaxy:
         propDict = dict(galaxy='NGC4365', mPath='hdhdc4365', SN=100, nCuts=125,
             lOrder=0, specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI',
-            nProcs=1, band='F814W', genSwitch=None, kind='SMILES', cont=False,
+            nProcs=1, band='F814W', runSwitch=None, kind='SMILES', cont=False,
             smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],
             warm='saved_x', cpu_processes=12, blas_threads=4,
             orbitWeights=True, regularisation_scale=1e-2, 
@@ -39,7 +39,7 @@ def props(galaxy, **kwargs):
     elif 'FCC170' in galaxy:
         propDict = dict(galaxy='FCC170', mPath='hd170', SN=100, nCuts=15,
             lOrder=0, specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI',
-            nProcs=1, band='r', genSwitch=None, kind='SMILES', cont=False,
+            nProcs=1, band='r', runSwitch='fit', kind='SMILES', cont=False,
             smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],
             warm='zeros', cpu_processes=12, blas_threads=4,
             orbitWeights=True, regularisation_scale=1e-2,
