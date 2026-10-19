@@ -187,6 +187,23 @@ v2.2:   Changed blind cycling of candidates to tracking cached sets of active
             columns; don't retry non-improving successfully-resolved sets;
         Updated `monolithicNNLS` to solve the new mathematical formulation of the
             solver. 5 October 2026
+v2.3:   Made `_worker_reduced` and `_worker_ATAz` storage-chunk-aware, grouping
+            reads by the physical HDF5 C/P chunk to eliminate redundant
+            hypercube I/O. 13 October 2026
+v2.4:   Assemble all exploration proposals from one union-support Gram matrix,
+            eliminating redundant HyperCube passes for exchange, data, and
+            coverage trials;
+        Removed redundant ATy computation from `_worker_reduced`. 15 October 2026
+v2.5:   Replaced the fixed 50-percent exploration-coverage stopping criterion
+            with consecutive stationary joint-support challenges;
+        Made coverage proposals maximally separated from populations already
+            tested within each orbit, so each stationary challenge probes new
+            regions of SSP space;
+        Reset stationary-challenge evidence after every accepted support change
+            and recompute exact full-space KKT before counting further failures.
+            16 October 2026
+v2.6:   Changed the `regularisation_scale` to be an SSP nearest-neighbour
+            smoothness penalty, rather than a classic L2 ridge. 17 October 2026
 """
 
 from __future__ import annotations, print_function
@@ -287,58 +304,110 @@ def _worker_reduced(
     P: int,
 ):
     """
-    Worker to compute partial ATA_sub and ATy_sub for a batch of tiles,
-    given the active indices and their scaling S_active.
+    Compute a partial reduced Gram matrix using storage-chunk-aware reads.
 
-    Memory-efficient, exact-equivalence implementation that does NOT
-    form the large (Sblk*Lk, k) A2 matrix.  Uses tensor contractions to
-    compute the same sums:
+    Requested columns are grouped by the physical HDF5 ``(C, P)`` chunk
+    containing them. Each intersected model chunk is read once per spatial
+    tile, and all requested columns are extracted from that in-memory slab.
 
-        ATA_loc[i,j] += sum_{s,lambda} (S_i * M_{s,ci,pi,lambda})
-                              * (S_j * M_{s,cj,pj,lambda})
+    Parameters
+    ----------
+    h5_path : str
+        HyperCube HDF5 path.
+    batch : list
+        Spatial ``(s0, s1)`` tile ranges assigned to this worker.
+    keep_idx : ndarray or None
+        Wavelength indices retained by the spectral mask.
+    active_idx : ndarray
+        Global active column indices in C-major, P-minor order.
+    S_active : ndarray
+        Column scalings corresponding to ``active_idx``.
+    CP : int
+        Total number of model columns.
+    P : int
+        Number of stellar-population columns per component.
 
-        ATy_loc[i] += sum_{s,lambda} (S_i * M_{s,ci,pi,lambda}) * Yt[s,lambda]
+    Returns
+    -------
+    ATA_loc : ndarray
+        Partial reduced Gram matrix.
+    ATy_loc : None
+        Retained for API compatibility. The canonical global ``ATy_scaled``
+        vector is used by the caller.
 
-    Inputs
+    Raises
     ------
-    - active_idx: 1D int array of global column indices (length k)
-    - S_active : 1D float array of length k (per-active-column scaling)
-    - P : number of populations per orbit (used for cc/p decode)
-    """
-    k = int(active_idx.size)
-    ATA_loc = np.zeros((k, k), dtype=np.float64)
-    ATy_loc = np.zeros((k,), dtype=np.float64)
+    ValueError
+        If the support indices or scalings are inconsistent.
 
-    cc_arr = (active_idx // P).astype(np.int64)
-    pp_arr = (active_idx % P).astype(np.int64)
+    Examples
+    --------
+    Called internally by ``streamActiveSetNNLS``.
+    """
+    del CP
+
+    active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
+    S_active = np.asarray(S_active, dtype=np.float64).ravel(order="C")
+
+    k = int(active_idx.size)
+
+    if S_active.size != k:
+        raise ValueError(f"S_active has size {S_active.size}; expected {k}.")
+
+    ATA_loc = np.zeros((k, k), dtype=np.float64)
+
+    cc_arr = active_idx // P
+    pp_arr = active_idx % P
 
     with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
         M = f["/HyperCube/models"]
 
-        for (s0, s1) in batch:
-            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
-            if keep_idx is not None:
-                Yt = Yt[:, keep_idx]
-            y_flat = Yt.reshape(-1)
+        if M.chunks is None:
+            C_chunk = 1
+            P_chunk = P
+        else:
+            C_chunk = int(M.chunks[1])
+            P_chunk = int(M.chunks[2])
 
-            Sblk = s1 - s0
-            Lk = Yt.shape[1]
-            rows = Sblk * Lk
+        # Group requested columns by their physical HDF5 C/P chunk.
+        groups = {}
 
-            # Only store the active columns, not the full tile.
-            A_act = np.empty((rows, k), dtype=np.float64)
+        for jj, (cc, pp) in enumerate(zip(cc_arr, pp_arr)):
+            key = (
+                int(cc // C_chunk),
+                int(pp // P_chunk),
+            )
+            groups.setdefault(key, []).append(jj)
 
-            for j, (cc, pp) in enumerate(zip(cc_arr, pp_arr)):
-                col = np.asarray(M[s0:s1, cc, pp, :], dtype=np.float64, order="C")
+        for s0, s1 in batch:
+            L_keep = (int(keep_idx.size) if keep_idx is not None
+                else int(M.shape[3]))
+            rows = int(s1 - s0) * L_keep
+
+            A_act = np.empty((rows, k), dtype=np.float64, order="C")
+
+            for (cblock, pblock), jj_list in groups.items():
+                c0 = cblock * C_chunk
+                c1 = min(c0 + C_chunk, M.shape[1])
+                p0 = pblock * P_chunk
+                p1 = min(p0 + P_chunk, M.shape[2])
+
+                slab = np.asarray(M[s0:s1, c0:c1, p0:p1, :], dtype=np.float32,
+                    order="C")
+
                 if keep_idx is not None:
-                    col = col[:, keep_idx]
-                A_act[:, j] = S_active[j] * col.reshape(-1)
+                    slab = slab[:, :, :, keep_idx]
+
+                for jj in jj_list:
+                    lc = int(cc_arr[jj] - c0)
+                    lp = int(pp_arr[jj] - p0)
+
+                    A_act[:, jj] = S_active[jj] * slab[:, lc, lp, :].reshape(-1)
+
+                del slab
 
             ATA_loc += A_act.T @ A_act
-            ATy_loc += A_act.T @ y_flat
-
-    return ATA_loc, ATy_loc
+    return ATA_loc, None
 
 # ------------------------------------------------------------------------------
 
@@ -418,52 +487,58 @@ def _worker_ATAz(
             raise RuntimeError(
                 f"Model population dimension {M.shape[2]} != expected P={P}.")
 
+        C_chunk = int(M.chunks[1]) if M.chunks else 1
+        P_chunk = int(M.chunks[2]) if M.chunks else P
         Lk = int(keep_idx.size) if keep_idx is not None else int(M.shape[3])
 
         for s0, s1 in batch:
             Sblk = s1 - s0
-
-            # First pass: exact v = A @ (S z), one orbit slice at a time.
             v = np.zeros((Sblk, Lk), dtype=np.float64)
 
-            for cc in range(C):
-                t0 = time.perf_counter()
-                M_cc = M[s0:s1, cc, :, :][...]
-                if keep_idx is not None:
-                    M_cc = M_cc[:, :, keep_idx]
-                M_cc = np.asarray(M_cc, dtype=np.float64, order="C")
-                t_read += time.perf_counter() - t0
+            # First pass: v = A @ (S z).
+            for c0 in range(0, C, C_chunk):
+                c1 = min(c0 + C_chunk, C)
 
-                # M_cc has shape (Sblk, P, Lk)
-                # z_cp[cc] has shape (P,)
-                # result has shape (Sblk, Lk)
-                t0 = time.perf_counter()
-                v += np.tensordot(z_cp[cc], M_cc, axes=(0, 1))
-                t_forward += time.perf_counter() - t0
-                del M_cc
+                for p0 in range(0, P, P_chunk):
+                    p1 = min(p0 + P_chunk, P)
 
-            # Second pass: exact g = A^T @ v, again orbit slice by orbit slice.
-            for cc in range(C):
-                t0 = time.perf_counter()
-                M_cc = M[s0:s1, cc, :, :][...]
-                if keep_idx is not None:
-                    M_cc = M_cc[:, :, keep_idx]
-                M_cc = np.asarray(M_cc, dtype=np.float64, order="C")
-                t_read += time.perf_counter() - t0
+                    t0 = time.perf_counter()
+                    slab = np.asarray(M[s0:s1, c0:c1, p0:p1, :],
+                        dtype=np.float32, order="C")
+                    if keep_idx is not None:
+                        slab = slab[:, :, :, keep_idx]
+                    t_read += time.perf_counter() - t0
 
-                # M_cc: (Sblk, P, Lk)
-                # v   : (Sblk, Lk)
-                # g_cc: (P,)
-                t0 = time.perf_counter()
-                g_cc = np.tensordot(M_cc, v, axes=([0, 2], [0, 1]))
-                t_transpose += time.perf_counter() - t0
-                del M_cc
+                    t0 = time.perf_counter()
+                    v += np.tensordot(slab, z_cp[c0:c1, p0:p1],
+                        axes=([1, 2], [0, 1]))
+                    t_forward += time.perf_counter() - t0
+                    del slab
 
-                base = cc * P
-                partial[base:base + P] += (S_flat[base:base + P] * g_cc)
+            # Second pass: g = A.T @ v.
+            for c0 in range(0, C, C_chunk):
+                c1 = min(c0 + C_chunk, C)
 
-    print(
-        f"[ATAz worker {os.getpid()}] read={t_read:.1f}s "
+                for p0 in range(0, P, P_chunk):
+                    p1 = min(p0 + P_chunk, P)
+
+                    t0 = time.perf_counter()
+                    slab = np.asarray(M[s0:s1, c0:c1, p0:p1, :],
+                        dtype=np.float32, order="C")
+                    if keep_idx is not None:
+                        slab = slab[:, :, :, keep_idx]
+                    t_read += time.perf_counter() - t0
+
+                    t0 = time.perf_counter()
+                    g_blk = np.tensordot(slab, v, axes=([0, 3], [0, 1]))
+                    t_transpose += time.perf_counter() - t0
+
+                    scale_blk = S_flat.reshape(C, P)[c0:c1, p0:p1]
+                    partial.reshape(C, P)[c0:c1, p0:p1] += scale_blk * g_blk
+
+                    del slab
+
+    print(f"[ATAz worker {os.getpid()}] read={t_read:.1f}s "
         f"forward={t_forward:.1f}s transpose={t_transpose:.1f}s",
         flush=True)
     return partial
@@ -987,6 +1062,85 @@ def _nnls_from_quadratic(
 
 # ------------------------------------------------------------------------------
 
+def _ssp_smoothness_hessian(n_metals: int, n_ages: int, n_alphas: int,
+) -> np.ndarray:
+    """
+    Construct the SSP-grid first-difference smoothness Hessian.
+
+    The population ordering is assumed to be
+
+        (metallicity, age, alpha)
+
+    in C-order, matching ``x.reshape(C, n_metals, n_ages, n_alphas)``.
+
+    The returned matrix ``Q`` satisfies
+
+        x.T @ Q @ x = sum_(p,q) (x_p - x_q)^2
+
+    where ``(p, q)`` runs over all immediately adjacent SSP cells along the
+    metallicity, age, and alpha axes.
+
+    Parameters
+    ----------
+    n_metals : int
+        Number of metallicity grid points.
+    n_ages : int
+        Number of age grid points.
+    n_alphas : int
+        Number of alpha-enhancement grid points.
+
+    Returns
+    -------
+    Q : ndarray
+        Positive-semidefinite population smoothness Hessian with shape
+        ``(P, P)``.
+
+    Raises
+    ------
+    ValueError
+        If any SSP dimension is non-positive.
+
+    Examples
+    --------
+    >>> Q = _ssp_smoothness_hessian(5, 9, 7)
+    >>> Q.shape
+    (315, 315)
+    """
+    n_metals = int(n_metals)
+    n_ages = int(n_ages)
+    n_alphas = int(n_alphas)
+
+    if n_metals <= 0 or n_ages <= 0 or n_alphas <= 0:
+        raise ValueError("SSP grid dimensions must all be positive.")
+
+    P = n_metals * n_ages * n_alphas
+    Q = np.zeros((P, P), dtype=np.float64)
+
+    index = np.arange(P, dtype=np.int64).reshape(n_metals, n_ages, n_alphas)
+
+    def _add_edges(left: np.ndarray, right: np.ndarray) -> None:
+        """Accumulate ``(x_i - x_j)^2`` for a collection of grid edges."""
+        ii = left.ravel(order="C")
+        jj = right.ravel(order="C")
+
+        np.add.at(Q, (ii, ii), 1.0)
+        np.add.at(Q, (jj, jj), 1.0)
+        np.add.at(Q, (ii, jj), -1.0)
+        np.add.at(Q, (jj, ii), -1.0)
+
+    if n_metals > 1:
+        _add_edges(index[:-1, :, :], index[1:, :, :])
+
+    if n_ages > 1:
+        _add_edges(index[:, :-1, :], index[:, 1:, :])
+
+    if n_alphas > 1:
+        _add_edges(index[:, :, :-1], index[:, :, 1:])
+
+    return Q
+
+# ------------------------------------------------------------------------------
+
 def _orbit_hard_constraint_solve(
     ATA_sub_reg: np.ndarray,
     ATy_sub: np.ndarray,
@@ -997,7 +1151,7 @@ def _orbit_hard_constraint_solve(
     P: int,
     *,
     numerical_ridge: float = 0.0,
-    scientific_regularisation: float = 0.0,
+    scientific_hessian: np.ndarray | None = None,
     negative_tol: float = 1e-10,
     constraint_tol: float = 1e-8,
 ) -> tuple[np.ndarray, dict]:
@@ -1081,26 +1235,25 @@ def _orbit_hard_constraint_solve(
     S_active = np.asarray(S_active, dtype=np.float64).ravel(order="C")
     shape = np.asarray(orbit_shape, dtype=np.float64).ravel(order="C")
 
-    # The solver works in z-space, but the scientific penalty is defined
-    # in physical x-space:
-    #
-    #     0.5 * scientific_regularisation * sum(x_j^2)
-    #
-    # Since x = S * z, its z-space Hessian contribution is
-    #
-    #     scientific_regularisation * diag(S^2).
-    #
-    # This is the scientific penalty. Keep it completely separate from the
-    # numerical ridge, which exists only to control ill-conditioning.
-    scientific_regularisation = float(scientific_regularisation)
-    if (not np.isfinite(scientific_regularisation)
-        or scientific_regularisation < 0.0):
-        raise ValueError(
-            "scientific_regularisation must be nonnegative and finite.")
-
-    reg_diag = scientific_regularisation * (S_active * S_active)
-
     k = int(active_idx.size)
+
+    # Scientific regularisation is supplied directly as its reduced z-space
+    # Hessian. It may therefore contain off-diagonal couplings between
+    # neighbouring SSP populations.
+    if scientific_hessian is None:
+        H_scientific = np.zeros((k, k), dtype=np.float64)
+    else:
+        H_scientific = np.asarray(
+            scientific_hessian, dtype=np.float64, order="C")
+
+        if H_scientific.shape != (k, k):
+            raise ValueError(
+                "scientific_hessian has a shape inconsistent with active_idx.")
+
+        if not np.all(np.isfinite(H_scientific)):
+            raise ValueError(
+                "scientific_hessian contains non-finite values.")
+
     lambda_zero = np.zeros((C,), dtype=np.float64)
     target_zero = np.zeros((C,), dtype=np.float64)
 
@@ -1254,13 +1407,13 @@ def _orbit_hard_constraint_solve(
 
         KKT = np.zeros((n_total, n_total), dtype=np.float64)
 
-        Hff_reg = Hff + np.diag(reg_diag[free_idx])
+        Hff_reg = Hff + H_scientific[np.ix_(free_idx, free_idx)]
 
-        # Scientific regularisation acts in physical x-space and therefore
-        # enters the z-space Hessian as diag(S_active^2).
+        # Scientific regularisation is defined in physical x-space. Its
+        # transformed reduced z-space Hessian is supplied explicitly above.
         # The numerical ridge remains a separate identity term.
         KKT[:n_free, :n_free] = (Hff_reg + float(numerical_ridge) * np.eye(
-                n_free, dtype=np.float64))
+            n_free, dtype=np.float64))
 
         # Coupling to the equality multipliers.
         KKT[:n_free, n_primal:] = B.T
@@ -1336,7 +1489,7 @@ def _orbit_hard_constraint_solve(
             # zero.
             alpha_stationarity = float(
                 np.dot(constraint_shape, lambda_orbit))
-            dual_grad = (b - (H @ z_out) - (reg_diag * z_out)
+            dual_grad = (b - (H @ z_out) - (H_scientific @ z_out)
                 - (float(numerical_ridge) * z_out)
                 - (S_active * lambda_orbit[orbit_of_col]))
             free_dual = dual_grad[free]
@@ -1609,6 +1762,57 @@ def streamActiveSetNNLS(
     S_flat = np.asarray(inv_sqrt_energy_flat, dtype=np.float64).ravel()
     ATy_scaled = S_flat * ATy_flat
     yty = _compute_yty(h5_path, s_ranges, keep_idx)
+    # ------------------------------------------------------------------
+    # Scientific SSP smoothness regularisation.
+    #
+    # Population ordering in the HyperCube is
+    #
+    #     metallicity x age x alpha
+    #
+    # flattened in C-order. The same P x P smoothness matrix applies
+    # independently to every dynamical component.
+    # ------------------------------------------------------------------
+    with open_h5(h5_path, role="reader") as f:
+        required_ssp = ("/SSPMetals", "/SSPAges", "/SSPAlphas")
+
+        if not all(name in f for name in required_ssp):
+            raise RuntimeError(
+                "SSP smoothness regularisation requires /SSPMetals, "
+                "/SSPAges, and /SSPAlphas.")
+
+        n_metals = int(f["/SSPMetals"].size)
+        n_ages = int(f["/SSPAges"].size)
+        n_alphas = int(f["/SSPAlphas"].size)
+
+    if n_metals * n_ages * n_alphas != P:
+        raise RuntimeError("SSP grid dimensions are inconsistent with P: "
+            f"{n_metals}*{n_ages}*{n_alphas} != {P}.")
+
+    Q_ssp = _ssp_smoothness_hessian(n_metals, n_ages, n_alphas)
+    # ------------------------------------------------------------------
+    # Dimensionless scientific-regularisation scale.
+    #
+    # The solver's z-space data columns are already normalized to unit
+    # energy, so diag(A.T @ A) ~= 1. Normalize the SSP smoothness Hessian
+    # to unit characteristic diagonal curvature as well. The user-facing
+    # regularisation_scale is therefore dimensionless:
+    #
+    #     1e-3 -> ~0.1 per cent of characteristic data curvature
+    #     1e-2 -> ~1   per cent of characteristic data curvature
+    #     1e-1 -> ~10  per cent of characteristic data curvature
+    #
+    # Compute this once and keep it fixed throughout the solve.
+    q_diag = np.diag(Q_ssp)
+
+    smooth_diag = np.tile(q_diag, C) * (S_flat * S_flat)
+    positive_smooth = smooth_diag[smooth_diag > 0.0]
+
+    if positive_smooth.size == 0:
+        smooth_norm = 1.0
+    else:
+        smooth_norm = float(np.median(positive_smooth))
+
+    smooth_scale = float(regularisation_scale) / smooth_norm
 
     grad_ref = max(1.0, float(np.max(np.abs(ATy_scaled))))
     data_scale_ref = _robust_scale_ref(ATy_scaled, fallback=grad_ref)
@@ -1617,17 +1821,36 @@ def streamActiveSetNNLS(
     # Keep joint trials broad enough to expose several alternatives per orbit.
     explore_top_per_orbit = 6
     explore_coverage_per_orbit = 6
-
     explore_batch_size = max(96, min(768, 8 * C))
-
     explore_batches_per_iter = 3
     explore_fail_count = 0
     explore_round = 0
 
-    # Explicit coverage.
-    explore_coverage_target = 0.5
+    # ------------------------------------------------------------------
+    # Stationary joint-search convergence.
+    #
+    # Exact KKT stationarity at the current committed support is necessary but
+    # is not sufficient for the hard-orbit problem. An inactive population can
+    # become useful only after entering jointly with other populations and
+    # allowing the complete constrained support to re-adjust.
+    #
+    # Once exact KKT is stationary, therefore require several consecutive
+    # *joint* exploration failures. Every challenge still contains the
+    # gradient-driven exchange and data trials, plus a deliberately diverse
+    # coverage trial.
+    #
+    # Any accepted support change invalidates all such evidence: the active
+    # coefficients, orbit multipliers, and inactive gradients can all change.
+    # The counter and coverage history are consequently reset on acceptance.
+    # ------------------------------------------------------------------
+    stationary_explore_patience = 3
+    stationary_fail_count = 0
+
+    # Track populations used by coverage challenges for the current committed
+    # solution. This is no longer a fractional stopping criterion. It exists
+    # only to make successive challenges maximally different from one another.
     coverage_tested = np.zeros(CP, dtype=bool)
-    coverage_restore_pending = False
+
     # Cache valid but non-improving proposals for the current committed state.
     failed_proposals = set()
 
@@ -1672,17 +1895,20 @@ def streamActiveSetNNLS(
         saved_regularisation_scale = float(
             resume_state.get("regularisation_scale", 1.0))
 
-        if not np.isclose(
-            saved_regularisation_scale,
-            regularisation_scale,
-            rtol=1e-12,
-            atol=0.0,
-        ):
+        if not np.isclose(saved_regularisation_scale, regularisation_scale,
+            rtol=1e-12, atol=0.0):
             raise ValueError(
                 "Cannot full-resume with a different regularisation_scale: "
                 f"checkpoint={saved_regularisation_scale:.6e}, "
                 f"requested={regularisation_scale:.6e}. "
                 "Use warm_start='saved_x' instead.")
+        saved_reg_mode = resume_state.get(
+            "scientific_regularisation_mode", "legacy_l2")
+
+        if saved_reg_mode != "ssp_first_difference":
+            raise ValueError(
+                "Cannot full-resume a checkpoint using a different scientific "
+                "regularisation model. Use warm_start='saved_x' instead.")
 
         # Historical checkpoints predate the unconstrained orbit_weights=None
         # pathway, so a missing mode flag is interpreted as constrained.
@@ -1766,6 +1992,9 @@ def streamActiveSetNNLS(
         "tol_grad": float(tol_grad),
         "tol_grad_rel": float(tol_grad_rel),
         "regularisation_scale": float(regularisation_scale),
+        "scientific_regularisation_mode": "ssp_first_difference",
+        "smoothness_normalisation": float(smooth_norm),
+        "effective_smoothness_scale": float(smooth_scale),
         "diag_level": int(diag_level),
         "diag_stride": int(diag_stride),
         "diag_topk": int(diag_topk),
@@ -1784,6 +2013,7 @@ def streamActiveSetNNLS(
         "explore_batches_per_iter": int(explore_batches_per_iter),
         "explore_top_per_orbit": int(explore_top_per_orbit),
         "explore_coverage_per_orbit": int(explore_coverage_per_orbit),
+        "stationary_explore_patience": int(stationary_explore_patience),
     })
 
     if x0_flat is None:
@@ -1901,18 +2131,23 @@ def streamActiveSetNNLS(
                 lambda_orbit_current = lambda_saved.copy()
 
         if "explore_fail_count" in resume_state:
-            explore_fail_count = int(
-                resume_state["explore_fail_count"])
+            explore_fail_count = int(resume_state["explore_fail_count"])
 
         if "explore_round" in resume_state:
-            explore_round = int(
-                resume_state["explore_round"])
+            explore_round = int(resume_state["explore_round"])
+
+        # New checkpoints persist the number of consecutive failed joint
+        # challenges observed while exact KKT remained stationary. Historical
+        # checkpoints have no such certificate, so conservatively restart the
+        # stationary confirmation count from zero.
+        if "stationary_fail_count" in resume_state:
+            stationary_fail_count = int(
+                resume_state["stationary_fail_count"])
+
         if "coverage_tested" in resume_state:
             saved = np.asarray(resume_state["coverage_tested"], dtype=bool)
             if saved.size == CP:
                 coverage_tested[:] = saved.ravel(order="C")
-        elif explore_fail_count > 0:
-            coverage_restore_pending = True
 
         if has_hard_orbit_shape and zero_shape_orbits.size > 0:
             for cc in zero_shape_orbits:
@@ -1945,10 +2180,45 @@ def streamActiveSetNNLS(
             ``0.5 * x.T @ A @ x - b.T @ x``.
         """
         return 0.5 * float(x @ (A @ x)) - float(b @ x)
+    def _scientific_gradient_x(x_vec: np.ndarray) -> np.ndarray:
+        """
+        Return the gradient of the SSP smoothness penalty in physical x-space.
+        """
+        x_cp = np.asarray(x_vec, dtype=np.float64).reshape(C, P)
+
+        return (smooth_scale * (x_cp @ Q_ssp)).ravel(order="C")
+
+    def _scientific_objective_x(x_vec: np.ndarray) -> float:
+        """
+        Return the dimensionless-scaled SSP smoothness penalty.
+        """
+        x_cp = np.asarray(x_vec, dtype=np.float64).reshape(C, P)
+
+        return 0.5 * smooth_scale * float(np.sum((x_cp @ Q_ssp) * x_cp))
+
+    def _scientific_hessian_reduced(active_idx: np.ndarray,
+        S_active: np.ndarray) -> np.ndarray:
+        """
+        Return the SSP smoothness Hessian on a reduced support in z-space.
+        """
+        active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
+        S_active = np.asarray(S_active, dtype=np.float64).ravel(order="C")
+
+        orbit_idx = active_idx // P
+        pop_idx = active_idx % P
+
+        H_reg = np.zeros((active_idx.size, active_idx.size), dtype=np.float64)
+
+        same_orbit = orbit_idx[:, None] == orbit_idx[None, :]
+
+        H_reg[same_orbit] = (smooth_scale
+            * Q_ssp[pop_idx[:, None], pop_idx[None, :]][same_orbit]
+            * (S_active[:, None] * S_active[None, :])[same_orbit])
+
+        return H_reg
 
     if start_iter >= max_iter:
-        print(
-            "[MONO] resume_state already reached max_iter; returning the "
+        print("[MONO] resume_state already reached max_iter; returning the "
             "committed solution without entering the outer loop.", flush=True)
         return _current_x_from_z(z)
 
@@ -1971,6 +2241,7 @@ def streamActiveSetNNLS(
             "alpha_current": float(alpha_current),
             "ridge_current": float(ridge_current),
             "regularisation_scale": float(regularisation_scale),
+            "scientific_regularisation_mode": "ssp_first_difference",
             "hard_orbit_shape": bool(has_hard_orbit_shape),
             "orbit_constraint_mode": (
                 "equal_component_mass" if has_hard_orbit_shape else "none"),
@@ -1983,6 +2254,7 @@ def streamActiveSetNNLS(
             "stop_details": dict(stop_details),
             "explore_fail_count": int(explore_fail_count),
             "explore_round": int(explore_round),
+            "stationary_fail_count": int(stationary_fail_count),
             "coverage_tested": coverage_tested.astype(bool).tolist(),
         }
     
@@ -2070,19 +2342,12 @@ def streamActiveSetNNLS(
 
         ATAz = np.zeros((CP,), dtype=np.float64)
 
-        worker_args = [
-            (h5_path, batch, keep_idx, x_cand, CP, S_flat, C, P)
-            for batch in batches
-            if len(batch) > 0
-        ]
+        worker_args = [(h5_path, batch, keep_idx, x_cand, CP, S_flat, C, P)
+            for batch in batches if len(batch) > 0]
         it = executor.map(_worker_ATAz_from_tuple, worker_args)
 
-        for r in tqdm(
-            it,
-            total=len(worker_args),
-            desc="[MONO] ATAz tiles",
-            leave=False,
-        ):
+        for r in tqdm(it, total=len(worker_args), desc="[MONO] ATAz tiles",
+            leave=False):
             try:
                 ATAz += r
             except Exception as e:
@@ -2129,8 +2394,13 @@ def streamActiveSetNNLS(
         ATy_sub = ATy_scaled[active_idx].copy()
 
         return ATA_sub, ATy_sub, S_active
-    def _solve_reduced_active(active_idx):
-        """Assemble and solve the constrained reduced problem."""
+    def _solve_reduced_active(active_idx, assembled=None):
+        """
+        Assemble and solve the constrained reduced problem.
+
+        If ``assembled`` is supplied, use the provided reduced normal equations
+        instead of rereading the HyperCube.
+        """
         active_idx = np.asarray(active_idx, dtype=np.int64)
         k_loc = int(active_idx.size)
 
@@ -2138,14 +2408,29 @@ def streamActiveSetNNLS(
             raise RuntimeError(
                 "Cannot solve reduced problem with empty active support.")
 
-        ATA_loc, ATy_loc, S_loc = _assemble_reduced(active_idx)
+        if assembled is None:
+            ATA_loc, ATy_loc, S_loc = _assemble_reduced(active_idx)
+        else:
+            ATA_loc, ATy_loc, S_loc = assembled
 
-        # Scientific L2 regularisation is defined in physical x-space.
-        # Since x = S * z, its Hessian contribution in z-space is
-        # regularisation_scale * diag(S^2). Include it when assessing
-        # conditioning so the numerical ridge is only as large as necessary.
-        scientific_diag_loc = regularisation_scale * (S_loc * S_loc)
-        ATA_scientific_loc = ATA_loc + np.diag(scientific_diag_loc)
+            ATA_loc = np.asarray(ATA_loc, dtype=np.float64, order="C")
+            ATy_loc = np.asarray(ATy_loc, dtype=np.float64).ravel(order="C")
+            S_loc = np.asarray(S_loc, dtype=np.float64).ravel(order="C")
+
+            if ATA_loc.shape != (k_loc, k_loc):
+                raise ValueError("Preassembled ATA shape is inconsistent with "
+                    "active_idx.")
+
+            if ATy_loc.size != k_loc:
+                raise ValueError("Preassembled ATy size is inconsistent with "
+                    "active_idx.")
+
+            if S_loc.size != k_loc:
+                raise ValueError("Preassembled scaling size is inconsistent "
+                    "with active_idx.")
+
+        H_scientific_loc = _scientific_hessian_reduced(active_idx, S_loc)
+        ATA_scientific_loc = ATA_loc + H_scientific_loc
 
         numerical_ridge_loc, emin_loc, emax_loc, cond_loc = \
             _adaptive_numerical_ridge(ATA_scientific_loc,
@@ -2159,7 +2444,7 @@ def streamActiveSetNNLS(
                 orbit_shape=np.asarray(orbit_shape, dtype=np.float64),
                 C=C, P=P,
                 numerical_ridge=numerical_ridge_loc,
-                scientific_regularisation=regularisation_scale,)
+                scientific_hessian=H_scientific_loc,)
 
             if not info_loc["accepted"]:
                 return active_idx, None, None, None, None, None, None, None,\
@@ -2171,13 +2456,11 @@ def streamActiveSetNNLS(
                 ).ravel(order="C")
 
         else:
-            ATA_reg_loc = (ATA_loc +
-                regularisation_scale * np.diag(S_loc * S_loc) +
-                numerical_ridge_loc * np.eye(k_loc, dtype=np.float64))
+            ATA_reg_loc = (ATA_loc + H_scientific_loc
+                + numerical_ridge_loc * np.eye(k_loc, dtype=np.float64))
 
             z_loc = _nnls_from_quadratic(ATA_reg_loc, ATy_loc,
-                x0=np.maximum(z[active_idx], 0.0),
-                max_iter=10000, tol=1e-11)
+                x0=np.maximum(z[active_idx], 0.0), max_iter=10000, tol=1e-11)
 
             alpha_loc = None
             lambda_loc = None
@@ -2271,8 +2554,8 @@ def streamActiveSetNNLS(
             emax_init = (
                 float(np.max(diag_init)) if diag_init.size else 1.0)
 
-        scientific_diag_init = regularisation_scale * (S_init * S_init)
-        ATA_scientific_init = ATA_init + np.diag(scientific_diag_init)
+        H_scientific_init = _scientific_hessian_reduced(active_idx, S_init)
+        ATA_scientific_init = ATA_init + H_scientific_init
 
         numerical_ridge_init, emin_init, emax_init, cond_init = \
             _adaptive_numerical_ridge(ATA_scientific_init,
@@ -2284,7 +2567,7 @@ def streamActiveSetNNLS(
             active_idx=active_idx, S_active=S_init,
             orbit_shape=np.asarray(orbit_shape, dtype=np.float64), C=C, P=P,
             numerical_ridge=numerical_ridge_init,
-            scientific_regularisation=regularisation_scale)
+            scientific_hessian=H_scientific_init)
 
         if not info_init["accepted"]:
             raise RuntimeError("Initial constrained KKT solve failed: "
@@ -2419,7 +2702,41 @@ def streamActiveSetNNLS(
         return offsets[int(round_idx) % stride]
     def _build_coverage_batch(not_active: np.ndarray,
         round_idx: int) -> np.ndarray:
-        """Build the exact rotating coverage batch for one exploration round."""
+        """
+        Build a maximally separated coverage challenge.
+
+        Coverage is no longer used as a fractional convergence quota. Instead,
+        each orbit contributes inactive populations chosen to be as far as
+        possible from populations already tested at the current committed
+        solution.
+
+        The first population is selected using the coarse-to-fine dyadic
+        sequence so the initial challenge does not privilege one end of the
+        SSP ordering. Subsequent populations are selected greedily by
+        farthest-point sampling. Distance is measured in population-index
+        space within each orbit.
+
+        Parameters
+        ----------
+        not_active : ndarray
+            Global indices of currently inactive candidate columns.
+        round_idx : int
+            Exploration-round index used only to rotate the initial seed when
+            no previous coverage population exists for an orbit.
+
+        Returns
+        -------
+        selected : ndarray
+            Global column indices for the diverse coverage challenge.
+
+        Raises
+        ------
+        None
+
+        Examples
+        --------
+        >>> coverage = _build_coverage_batch(not_active, explore_round)
+        """
         not_active = np.asarray(not_active, dtype=np.int64).ravel(order="C")
 
         if has_hard_orbit_shape:
@@ -2430,24 +2747,83 @@ def streamActiveSetNNLS(
         per_orbit = []
 
         for cc in search_orbits:
-            cols = not_active[(not_active // P) == int(cc)]
+            cc = int(cc)
+            cols = not_active[(not_active // P) == cc]
 
             if cols.size == 0:
                 continue
 
-            n_cov = min(int(explore_coverage_per_orbit), int(cols.size))
-            stride = max(1, int(np.ceil(cols.size / n_cov)))
-            offset = _dyadic_offset(round_idx, stride)
-            positions = np.arange(offset, cols.size, stride,
-                dtype=np.int64)[:n_cov]
-            coverage_cols = cols[positions]
+            # Work in local population coordinates. The global column ordering
+            # is C-major/P-minor, so modulo P gives the SSP population index.
+            pops = cols % P
+            already_mask = coverage_tested[cols]
+            available_cols = cols[~already_mask]
+            available_pops = pops[~already_mask]
 
-            if coverage_cols.size:
-                per_orbit.append(coverage_cols)
+            if available_cols.size == 0:
+                continue
+
+            n_cov = min(int(explore_coverage_per_orbit),
+                int(available_cols.size))
+
+            tested_pops = pops[already_mask].astype(np.int64, copy=False)
+            chosen_cols = []
+            chosen_pops = []
+
+            for _ in range(n_cov):
+                if tested_pops.size or chosen_pops:
+                    # Measure each unselected population by its distance from
+                    # the nearest population already challenged at this
+                    # committed solution. Include choices made earlier in this
+                    # same batch so the batch itself is maximally dispersed.
+                    if chosen_pops:
+                        reference = np.concatenate((tested_pops,
+                            np.asarray(chosen_pops, dtype=np.int64)))
+                    else:
+                        reference = tested_pops
+
+                    distances = np.min(np.abs(available_pops[:, None]
+                            - reference[None, :]), axis=1)
+
+                    # Deterministic tie-break: prefer the population farther
+                    # from the centre of the SSP index range, then the lower
+                    # global column index. This prevents repeated arbitrary
+                    # choices while preserving reproducibility.
+                    centre = 0.5 * float(P - 1)
+                    centre_distance = np.abs(available_pops.astype(np.float64) -
+                        centre)
+
+                    order = np.lexsort((available_cols, -centre_distance,
+                        -distances))
+                    jj = int(order[0])
+
+                else:
+                    # No previous coverage information exists for this orbit.
+                    # Seed the farthest-point sequence at a coarse-to-fine
+                    # location that rotates with the exploration round.
+                    seed_pos = _dyadic_offset(round_idx,
+                        int(available_cols.size))
+                    jj = int(seed_pos)
+
+                chosen_cols.append(int(available_cols[jj]))
+                chosen_pops.append(int(available_pops[jj]))
+
+                keep = np.ones(available_cols.size, dtype=bool)
+                keep[jj] = False
+                available_cols = available_cols[keep]
+                available_pops = available_pops[keep]
+
+                if available_cols.size == 0:
+                    break
+
+            if chosen_cols:
+                per_orbit.append(np.asarray(chosen_cols, dtype=np.int64))
 
         if not per_orbit:
             return np.zeros((0,), dtype=np.int64)
 
+        # Round-robin across orbits so a global batch-size cap cannot
+        # systematically favour low-index orbits.
         offset = _dyadic_offset(round_idx, len(per_orbit))
         per_orbit = per_orbit[offset:] + per_orbit[:offset]
 
@@ -2475,7 +2851,12 @@ def streamActiveSetNNLS(
         return np.asarray(selected, dtype=np.int64)
 
     def _coverage_summary(not_active: np.ndarray) -> tuple[float, float]:
-        """Return minimum per-orbit and total unique coverage fractions."""
+        """
+        Return diagnostic coverage fractions for the current committed state.
+
+        Coverage is reported for run-health diagnostics only. It is not a
+        convergence requirement.
+        """
         if has_hard_orbit_shape:
             search_orbits = positive_shape_orbits
         else:
@@ -2650,26 +3031,18 @@ def streamActiveSetNNLS(
 
         return batches[:int(explore_batches_per_iter)]
 
-    def _explore_support(
-        it: int,
-        current_active: np.ndarray,
-        current_data_obj: float,
-        not_active: np.ndarray,
-        grad_data: np.ndarray,
-        constraint_gradient: np.ndarray,
-        grad_total: np.ndarray,
-        grad_x: np.ndarray,
-    ) -> tuple[
-        bool,
-        np.ndarray,
-        np.ndarray,
-        dict,
-        np.ndarray,
-        np.ndarray,
-        float
-    ]:
+    def _explore_support(it: int, current_active: np.ndarray,
+        current_data_obj: float, not_active: np.ndarray, grad_data: np.ndarray,
+        constraint_gradient: np.ndarray, grad_total: np.ndarray,
+        grad_x: np.ndarray) -> tuple[bool, np.ndarray, np.ndarray, dict,
+        np.ndarray, np.ndarray, float]:
         """
-        Test candidate batches by jointly re-solving the complete support.
+        Test exploration proposals using one union-support Gram assembly.
+
+        The exchange, data-gradient, and coverage proposals are first combined
+        into a single union support. The reduced normal equations are assembled
+        once on that union. Each individual proposal is then solved using the
+        exact corresponding principal submatrix of the union Gram matrix.
 
         Parameters
         ----------
@@ -2681,67 +3054,81 @@ def streamActiveSetNNLS(
             Current unregularised data objective.
         not_active : ndarray
             Currently inactive candidate columns.
+        grad_data : ndarray
+            Current data-fit gradient.
+        constraint_gradient : ndarray
+            Current hard-constraint gradient contribution.
         grad_total : ndarray
             Current constrained reduced gradient.
+        grad_x : ndarray
+            Multiplier-free objective gradient in physical x-space.
 
         Returns
         -------
         improved : bool
-            True when a trial gives a strictly better data fit.
+            True when a trial gives a strictly better total objective.
         best_active : ndarray
             Best trial support found.
         best_z : ndarray
             Best trial reduced coefficients.
         best_info : dict
             Constrained-solve information for the best trial.
+        best_ATA : ndarray
+            Reduced Gram matrix for the best accepted trial.
+        best_ATy : ndarray
+            Reduced linear term for the best accepted trial.
+        best_data_obj : float
+            Data objective of the best accepted trial.
 
         Raises
         ------
-        None
+        RuntimeError
+            If the exploration union cannot be mapped consistently.
 
         Examples
         --------
-        >>> improved, active_new, z_new, info = _explore_support(
-        ...     0, active_idx, data_object, not_active, grad_total)
+        Called internally by ``streamActiveSetNNLS``.
         """
-        current_active = np.asarray(current_active, dtype=np.int64,).ravel(
-            order="C")
+        current_active = np.asarray(current_active, dtype=np.int64
+            ).ravel(order="C")
 
         batches = _build_exploration_batches(not_active, grad_data, grad_total,
             grad_x, it)
 
         if not batches:
-            return (
-                False,
-                current_active.copy(),
-                z[current_active].copy(),
-                {},
-                np.zeros((0, 0), dtype=np.float64),
-                np.zeros((0,), dtype=np.float64),
-                float(current_data_obj),
-            )
+            return (False, current_active.copy(), z[current_active].copy(),
+                {}, np.zeros((0, 0), dtype=np.float64),
+                np.zeros((0,), dtype=np.float64), float(current_data_obj))
 
         best_active = current_active.copy()
         best_z = z[current_active].copy()
         best_info = {}
         best_ATA = None
         best_ATy = None
-        current_reg_obj = (0.5 * float(regularisation_scale)
-            * float(np.sum((S_flat[current_active] * z[current_active]) ** 2)))
+
+        current_reg_obj = _scientific_objective_x(S_flat * z)
         current_total_obj = float(current_data_obj) + current_reg_obj
+
         best_data_obj = float(current_data_obj)
         best_reg_obj = float(current_reg_obj)
         best_total_obj = float(current_total_obj)
+
         explore_obj_tol = (64.0 * np.finfo(np.float64).eps
             * max(1.0, abs(float(current_total_obj))))
 
+        # --------------------------------------------------------------
+        # Prepare all genuinely new trials before touching the HyperCube.
+        # --------------------------------------------------------------
+        prepared_trials = []
+
         for trial_number, (trial_kind, proposal) in enumerate(batches):
+            proposal = np.asarray(proposal, dtype=np.int64).ravel(order="C")
 
             trial_active = np.unique(np.concatenate((current_active, proposal))
                 ).astype(np.int64, copy=False)
 
             if trial_active.size > int(max_active):
-                available = max(0, int(max_active) - current_active.size,)
+                available = max(0, int(max_active) - current_active.size)
 
                 if available <= 0:
                     _emit_diag({
@@ -2756,26 +3143,27 @@ def streamActiveSetNNLS(
                         "proposal_n": int(proposal.size),
                         "trial_n_active": int(current_active.size),
                         "current_data_obj": float(current_data_obj),
-                        "current_regularisation_obj": float(current_reg_obj),
-                        "current_total_obj": float(current_total_obj),
+                        "current_regularisation_obj":
+                            float(current_reg_obj),
+                        "current_total_obj":
+                            float(current_total_obj),
                         "best_data_obj": float(best_data_obj),
-                        "best_regularisation_obj": float(best_reg_obj),
+                        "best_regularisation_obj":
+                            float(best_reg_obj),
                         "best_total_obj": float(best_total_obj),
                         "proposal": proposal.tolist(),
-                        "trial_kind": trial_kind,
+                        "trial_kind": str(trial_kind),
                     })
                     continue
 
                 proposal = proposal[:available]
 
-                trial_active = np.unique(np.concatenate((current_active,
-                    proposal))).astype(np.int64, copy=False)
+                trial_active = np.unique(np.concatenate((
+                    current_active, proposal))).astype(np.int64, copy=False)
 
             proposal_key = tuple(sorted(proposal.tolist()))
 
             if proposal_key in failed_proposals:
-                # This exact joint support has already been validly solved
-                # against the unchanged committed solution.
                 if trial_kind == "coverage":
                     coverage_tested[proposal] = True
 
@@ -2793,9 +3181,65 @@ def streamActiveSetNNLS(
                     "proposal": proposal.tolist(),
                 })
                 continue
-            trial_active, z_trial, info_trial, alpha_trial, lambda_trial,\
-                ATA_trial, ATy_trial, S_trial, ridge_trial, cond_trial = \
-                _solve_reduced_active(trial_active)
+
+            prepared_trials.append({
+                "trial_number": int(trial_number),
+                "trial_kind": str(trial_kind),
+                "proposal": proposal,
+                "proposal_key": proposal_key,
+                "trial_active": trial_active,
+            })
+
+        if not prepared_trials:
+            return (False, best_active, best_z, best_info, best_ATA, best_ATy,
+                best_data_obj)
+
+        # --------------------------------------------------------------
+        # Construct the union of every support that will actually be
+        # tested and assemble its Gram matrix ONCE.
+        # --------------------------------------------------------------
+        exploration_union = np.unique(np.concatenate([current_active] + [
+                trial["proposal"] for trial in prepared_trials])
+            ).astype(np.int64, copy=False)
+
+        print(f"[MONO][explore {explore_round}] "
+            f"assembling union support: current={current_active.size} "
+            f"union={exploration_union.size} trials={len(prepared_trials)}",
+            flush=True,)
+
+        ATA_union, ATy_union, S_union = _assemble_reduced(exploration_union)
+
+        # exploration_union is sorted by np.unique, so searchsorted gives
+        # the exact local positions without a Python dictionary.
+        # Every trial support is a subset of exploration_union.
+        # --------------------------------------------------------------
+        # Solve each proposal using only in-memory submatrices.
+        # --------------------------------------------------------------
+        for trial in prepared_trials:
+            trial_number = trial["trial_number"]
+            trial_kind = trial["trial_kind"]
+            proposal = trial["proposal"]
+            proposal_key = trial["proposal_key"]
+            trial_active = trial["trial_active"]
+
+            loc = np.searchsorted(exploration_union, trial_active)
+
+            if (np.any(loc >= exploration_union.size) or not np.array_equal(
+                exploration_union[loc], trial_active)):
+                raise RuntimeError("Exploration trial is not a subset of the "
+                    "assembled union support.")
+
+            ATA_trial_pre = np.ascontiguousarray(ATA_union[np.ix_(loc, loc)],
+                dtype=np.float64)
+            ATy_trial_pre = np.asarray(ATy_union[loc], dtype=np.float64,
+                order="C")
+            S_trial_pre = np.asarray(S_union[loc], dtype=np.float64,
+                order="C")
+
+            trial_active, z_trial, info_trial, alpha_trial, \
+                lambda_trial, ATA_trial, ATy_trial, S_trial, \
+                ridge_trial, cond_trial = _solve_reduced_active(trial_active,
+                    assembled=(ATA_trial_pre, ATy_trial_pre, S_trial_pre))
 
             del alpha_trial
             del lambda_trial
@@ -2824,26 +3268,33 @@ def streamActiveSetNNLS(
                     "best_total_obj": float(best_total_obj),
                     "proposal": proposal.tolist(),
                     "proposal_grad_data": grad_data[proposal].tolist(),
-                    "proposal_grad_constraint": (
-                        constraint_gradient[proposal].tolist()),
+                    "proposal_grad_constraint":
+                        constraint_gradient[proposal].tolist(),
                     "proposal_grad_total": grad_total[proposal].tolist(),
-                    "trial_kind": trial_kind,
+                    "trial_kind": str(trial_kind),
                 })
                 continue
 
             if trial_kind == "coverage":
                 coverage_tested[proposal] = True
+
             trial_data_obj = _data_quad_obj(ATA_trial, ATy_trial, z_trial)
-            trial_reg_obj = (0.5 * float(regularisation_scale)
-                * float(np.sum((S_trial * z_trial) ** 2)))
+
+            x_trial_full = np.zeros(CP, dtype=np.float64)
+            x_trial_full[trial_active] = S_trial * z_trial
+            trial_reg_obj = _scientific_objective_x(x_trial_full)
+
             trial_total_obj = float(trial_data_obj) + float(trial_reg_obj)
-            total_improvement = float(current_total_obj) - \
-                float(trial_total_obj)
-            data_improvement = float(current_data_obj) - float(trial_data_obj)
-            regularisation_change = float(current_reg_obj) - \
-                float(trial_reg_obj)
-            best_total_improvement = (
-                float(best_total_obj) - float(trial_total_obj))
+
+            total_improvement = (float(current_total_obj)
+                - float(trial_total_obj))
+            data_improvement = (float(current_data_obj)
+                - float(trial_data_obj))
+            regularisation_change = (float(current_reg_obj)
+                - float(trial_reg_obj))
+            best_total_improvement = (float(best_total_obj)
+                - float(trial_total_obj))
+
             rel_total_improvement = (total_improvement
                 / max(1.0, abs(float(current_total_obj))))
             rel_data_improvement = (data_improvement
@@ -2856,6 +3307,7 @@ def streamActiveSetNNLS(
 
             accepted_trial = (trial_total_obj
                 < best_total_obj - explore_obj_tol)
+
             if not accepted_trial:
                 failed_proposals.add(proposal_key)
 
@@ -2867,72 +3319,78 @@ def streamActiveSetNNLS(
                 "trial": int(trial_number),
                 "trial_kind": str(trial_kind),
 
-                # Trial outcome.
                 "accepted": bool(accepted_trial),
                 "solve_accepted": True,
                 "proposal_n": int(proposal.size),
                 "trial_n_active": int(trial_active.size),
 
-                # Objective of the committed state entering exploration.
                 "current_data_obj": float(current_data_obj),
-                "current_regularisation_obj": float(current_reg_obj),
-                "current_total_obj": float(current_total_obj),
+                "current_regularisation_obj":
+                    float(current_reg_obj),
+                "current_total_obj":
+                    float(current_total_obj),
 
-                # Best trial found before this trial.
                 "best_data_obj": float(best_data_obj),
-                "best_regularisation_obj": float(best_reg_obj),
+                "best_regularisation_obj":
+                    float(best_reg_obj),
                 "best_total_obj": float(best_total_obj),
 
-                # This trial.
                 "trial_data_obj": float(trial_data_obj),
-                "trial_regularisation_obj": float(trial_reg_obj),
-                "trial_total_obj": float(trial_total_obj),
+                "trial_regularisation_obj":
+                    float(trial_reg_obj),
+                "trial_total_obj":
+                    float(trial_total_obj),
 
-                # Improvement relative to the committed state.
                 "data_improvement": float(data_improvement),
-                "regularisation_change": float(regularisation_change),
-                "total_improvement": float(total_improvement),
-                "relative_data_improvement": float(rel_data_improvement),
-                "relative_total_improvement": float(rel_total_improvement),
+                "regularisation_change":
+                    float(regularisation_change),
+                "total_improvement":
+                    float(total_improvement),
+                "relative_data_improvement":
+                    float(rel_data_improvement),
+                "relative_total_improvement":
+                    float(rel_total_improvement),
 
-                # Improvement relative to the best trial already seen.
-                "best_total_improvement": float(best_total_improvement),
+                "best_total_improvement":
+                    float(best_total_improvement),
 
                 "improvement_tol": float(explore_obj_tol),
 
-                # Exact candidate identities.
                 "proposal": proposal.tolist(),
 
-                # What each proposed column looked like before the
-                # joint re-solve.
-                "proposal_grad_data": proposal_grad_data_values.tolist(),
-                "proposal_grad_constraint": (
-                    proposal_grad_constraint_values.tolist()),
-                "proposal_grad_total": proposal_grad_total_values.tolist(),
-                "proposal_grad_x": proposal_grad_x_values.tolist(),
+                "proposal_grad_data":
+                    proposal_grad_data_values.tolist(),
+                "proposal_grad_constraint":
+                    proposal_grad_constraint_values.tolist(),
+                "proposal_grad_total":
+                    proposal_grad_total_values.tolist(),
+                "proposal_grad_x":
+                    proposal_grad_x_values.tolist(),
 
-                # Compact screening summaries for plotting without
-                # needing to decode the full proposal vectors.
-                "proposal_grad_data_max": float(np.max(
-                    np.abs(proposal_grad_data_values))),
-                "proposal_grad_constraint_max": float(np.max(
-                    np.abs(proposal_grad_constraint_values))),
-                "proposal_grad_total_max": float(np.max(
-                    np.abs(proposal_grad_total_values))),
-                "proposal_grad_data_max_signed": float(np.max(
-                    proposal_grad_data_values)),
-                "proposal_grad_constraint_max_signed": float(np.max(
-                    proposal_grad_constraint_values)),
-                "proposal_grad_total_max_signed": float(np.max(
-                    proposal_grad_total_values)),
-                "proposal_grad_x_max_signed": float(np.max(
-                    proposal_grad_x_values)),
+                "proposal_grad_data_max": float(
+                    np.max(np.abs(
+                        proposal_grad_data_values))),
+                "proposal_grad_constraint_max": float(
+                    np.max(np.abs(
+                        proposal_grad_constraint_values))),
+                "proposal_grad_total_max": float(
+                    np.max(np.abs(
+                        proposal_grad_total_values))),
+                "proposal_grad_data_max_signed": float(
+                    np.max(proposal_grad_data_values)),
+                "proposal_grad_constraint_max_signed": float(
+                    np.max(proposal_grad_constraint_values)),
+                "proposal_grad_total_max_signed": float(
+                    np.max(proposal_grad_total_values)),
+                "proposal_grad_x_max_signed": float(
+                    np.max(proposal_grad_x_values)),
             })
 
             if accepted_trial:
                 best_total_obj = float(trial_total_obj)
                 best_data_obj = float(trial_data_obj)
                 best_reg_obj = float(trial_reg_obj)
+
                 best_active = trial_active.copy()
                 best_z = z_trial.copy()
                 best_info = dict(info_trial)
@@ -2942,33 +3400,8 @@ def streamActiveSetNNLS(
         improved = bool(best_total_obj
             < float(current_total_obj) - explore_obj_tol)
 
-        return improved, best_active, best_z, best_info, best_ATA, best_ATy,\
-            best_data_obj
-    def _estimate_coverage_rounds_remaining(not_active, start_round):
-        tested = coverage_tested.copy()
-
-        for nr in range(10000):
-            batch = _build_coverage_batch(
-                not_active, int(start_round + nr))
-
-            tested[batch] = True
-
-            fractions = []
-            search_orbits = (positive_shape_orbits if has_hard_orbit_shape
-                else np.arange(C, dtype=np.int64))
-
-            for cc in search_orbits:
-                cols = not_active[(not_active // P) == int(cc)]
-                if cols.size:
-                    fractions.append(
-                        np.count_nonzero(tested[cols]) / float(cols.size))
-
-            coverage_min_future = min(fractions) if fractions else 1.0
-
-            if coverage_min_future >= explore_coverage_target:
-                return nr + 1
-
-        return -1
+        return (improved, best_active, best_z, best_info, best_ATA, best_ATy,
+            best_data_obj)
 
     # ------------------------------------------------------------
     # Active-set outer loop
@@ -2983,10 +3416,12 @@ def streamActiveSetNNLS(
             - float(np.dot(ATy_scaled, z)))
 
         grad_data = ATy_scaled - ATAz_scaled
-        # Scientific regularisation is defined on physical x = S * z.
-        # Its gradient in z-space is regularisation_scale * S^2 * z.
-        grad_regularisation = (float(regularisation_scale) * (S_flat * S_flat)
-            * z)
+
+        # Scientific smoothness gradient. The penalty is defined in physical
+        # x-space, so transform its gradient back to z-space with dx/dz = S.
+        x_current = S_flat * z
+        grad_regularisation_x = _scientific_gradient_x(x_current)
+        grad_regularisation = S_flat * grad_regularisation_x
         # Numerical ridge is deliberately separate from the scientific
         # penalty and exists only to stabilise the reduced linear algebra.
         grad_numerical_ridge = float(ridge_current) * z
@@ -3111,13 +3546,16 @@ def streamActiveSetNNLS(
                     if has_hard_orbit_shape else None),
                 "explore_fail_count": int(explore_fail_count),
                 "explore_round": int(explore_round),
+                "stationary_fail_count": int(stationary_fail_count),
+                "stationary_explore_patience": int(stationary_explore_patience),
             })
 
             print(f"[MONO][iter {it + 1}] "
                 f"active_stat={max_grad_active:.3e} "
                 f"dual={max_grad_dual:.3e} tol={tol_here:.3e} "
                 f"working={np.count_nonzero(active)} "
-                f"positive={np.count_nonzero(positive_mask)}", flush=True)
+                f"positive={np.count_nonzero(positive_mask)} "
+                f"stationary_fail={stationary_fail_count}", flush=True)
         
         if support_stationary and not has_hard_orbit_shape:
             # Without hard orbit constraints, the NNLS KKT conditions alone are
@@ -3195,15 +3633,6 @@ def streamActiveSetNNLS(
                     tol_here=float(tol_here),
                 )
             break
-
-
-        if coverage_restore_pending:
-            first_round = max(0, explore_round - explore_fail_count)
-            available = max(0, int(max_active) - current_active.size)
-            for rr in range(first_round, explore_round):
-                old_coverage = _build_coverage_batch(not_active, rr)
-                coverage_tested[old_coverage[:available]] = True
-            coverage_restore_pending = False
         
         improved, best_active, best_z, best_info, best_ATA, best_ATy,\
             best_data_obj = _explore_support(it=it,
@@ -3219,7 +3648,12 @@ def streamActiveSetNNLS(
             f"failures={explore_fail_count}", flush=True)
 
         if improved:
+            # A support change invalidates every convergence challenge made
+            # against the previous committed solution. The complete support is
+            # about to be replaced and the next outer iteration will recompute
+            # ATAz, orbit multipliers, and all full-space gradients.
             explore_fail_count = 0
+            stationary_fail_count = 0
 
             active[:] = False
             active[best_active] = True
@@ -3255,9 +3689,9 @@ def streamActiveSetNNLS(
                 "zero_dropped": (dropped_zero.tolist()),
                 "coverage_min": 0.0,
                 "coverage_total": 0.0,
-                "coverage_target": float(explore_coverage_target),
-                "coverage_exhausted": False,
-                "coverage_rounds_remaining": None,
+                "stationary_fail_count": 0,
+                "stationary_explore_patience":
+                    int(stationary_explore_patience),
             })
 
             _emit_checkpoint(
@@ -3275,11 +3709,22 @@ def streamActiveSetNNLS(
 
         x_is_zero = np.all(z <= positive_tol)
 
+        # Coverage remains useful as a diagnostic showing how widely the
+        # current committed solution has been challenged. It is deliberately
+        # not used as a stopping quota.
         coverage_min, coverage_total = _coverage_summary(not_active)
-        coverage_exhausted = coverage_min >= explore_coverage_target
 
-        coverage_rounds_remaining = (0 if coverage_exhausted else
-            _estimate_coverage_rounds_remaining(not_active, explore_round))
+        # A failed joint-support challenge counts toward convergence only when
+        # the exact full-space KKT conditions were stationary *before* that
+        # challenge. If KKT is nonstationary, the failed trial gives no
+        # convergence certificate.
+        if support_stationary:
+            stationary_fail_count += 1
+        else:
+            stationary_fail_count = 0
+
+        stationary_confirmed = (support_stationary
+            and stationary_fail_count >= stationary_explore_patience)
 
         _emit_diag({
             "kind": "exploration",
@@ -3290,6 +3735,10 @@ def streamActiveSetNNLS(
             "support_stationary": bool(support_stationary),
             "improved": False,
             "explore_fail_count": int(explore_fail_count),
+            "stationary_fail_count": int(stationary_fail_count),
+            "stationary_explore_patience":
+                int(stationary_explore_patience),
+            "stationary_confirmed": bool(stationary_confirmed),
             "n_active": int(current_active.size),
             "n_candidates": int(not_active.size),
             "max_grad_active": float(max_grad_active),
@@ -3297,47 +3746,31 @@ def streamActiveSetNNLS(
             "tol_here": float(tol_here),
             "coverage_min": float(coverage_min),
             "coverage_total": float(coverage_total),
-            "coverage_target": float(explore_coverage_target),
-            "coverage_exhausted": bool(coverage_exhausted),
-            "coverage_rounds_remaining": int(coverage_rounds_remaining),
         })
+
         print(
-            f"[MONO][coverage] min={coverage_min:.3f} "
-            f"total={coverage_total:.3f} "
-            f"target={explore_coverage_target:.3f} "
-            f"rounds_remaining={coverage_rounds_remaining}",
-            flush=True)
+            f"[MONO][challenge] stationary={support_stationary} "
+            f"failures={stationary_fail_count}/"
+            f"{stationary_explore_patience} "
+            f"coverage_min={coverage_min:.3f} "
+            f"coverage_total={coverage_total:.3f}",
+            flush=True,
+        )
 
-        if has_hard_orbit_shape:
-            can_stop = coverage_exhausted and (
-                x_is_zero or support_stationary or active_ok)
-        else:
-            can_stop = x_is_zero or support_stationary or (
-                active_ok and coverage_exhausted)
-
-        if can_stop:
-            if x_is_zero:
-                stop_reason = "zero_solution_exploration_exhausted"
-                stop_category = "converged"
-                stop_converged = True
-            elif support_stationary:
-                stop_reason = "kkt_stationary_search_exhausted"
-                stop_category = "converged"
-                stop_converged = True
-            else:
-                stop_reason = "joint_search_exhausted"
-                stop_category = "search"
-                stop_converged = False
-
+        # The all-zero unconstrained case retains its historical escape path.
+        # For the hard-orbit problem, the meaningful convergence certificate
+        # is exact KKT stationarity surviving several distinct joint-support
+        # challenges.
+        if x_is_zero and not has_hard_orbit_shape:
             _set_stop(
-                stop_reason,
-                stop_category,
+                "zero_solution_exploration_exhausted",
+                "converged",
                 it,
-                converged=stop_converged,
+                converged=True,
                 explore_fail_count=int(explore_fail_count),
+                stationary_fail_count=int(stationary_fail_count),
                 coverage_min=float(coverage_min),
                 coverage_total=float(coverage_total),
-                coverage_target=float(explore_coverage_target),
                 n_active=int(np.count_nonzero(active)),
                 max_grad_active=float(max_grad_active),
                 max_grad_dual=float(max_grad_dual),
@@ -3347,7 +3780,31 @@ def streamActiveSetNNLS(
             _emit_checkpoint(
                 it,
                 final=True,
-                phase=stop_reason,
+                phase="zero_solution_exploration_exhausted",
+            )
+            break
+
+        if stationary_confirmed:
+            _set_stop(
+                "kkt_stationary_joint_search_confirmed",
+                "converged",
+                it,
+                converged=True,
+                explore_fail_count=int(explore_fail_count),
+                stationary_fail_count=int(stationary_fail_count),
+                stationary_explore_patience=int(stationary_explore_patience),
+                coverage_min=float(coverage_min),
+                coverage_total=float(coverage_total),
+                n_active=int(np.count_nonzero(active)),
+                max_grad_active=float(max_grad_active),
+                max_grad_dual=float(max_grad_dual),
+                tol_here=float(tol_here),
+            )
+
+            _emit_checkpoint(
+                it,
+                final=True,
+                phase="kkt_stationary_joint_search_confirmed",
             )
             break
 
@@ -3368,8 +3825,7 @@ def streamActiveSetNNLS(
 
     data_objective = (0.5 * float(np.dot(z, ATAz_final))
         - float(np.dot(ATy_scaled, z)))
-    scientific_regularisation_objective = (0.5 * float(regularisation_scale)
-        * float(np.sum((S_flat * z) ** 2)))
+    scientific_regularisation_objective = _scientific_objective_x(x_final)
 
     numerical_ridge_objective = 0.5 * float(ridge_current) * float(np.dot(z, z))
 
@@ -3408,7 +3864,16 @@ def streamActiveSetNNLS(
         "kind": "objective_summary",
         "source": "streamActiveSetNNLS",
         "data_objective": float(data_objective),
+        "scientific_regularisation_objective": float(
+            scientific_regularisation_objective),
         "total_objective": float(total_objective),
+        "numerical_ridge_objective": float(numerical_ridge_objective),
+        "stabilised_objective": float(stabilised_objective),
+        "scientific_regularisation": float(regularisation_scale),
+        "scientific_regularisation_mode": "ssp_first_difference",
+        "smoothness_normalisation": float(smooth_norm),
+        "effective_smoothness_scale": float(smooth_scale),
+        "numerical_ridge": float(ridge_current),
         "orbit_resid_l1": orbit_resid_l1,
         "orbit_resid_l2": orbit_resid_l2,
         "orbit_resid_linf": orbit_resid_linf,
@@ -3429,15 +3894,6 @@ def streamActiveSetNNLS(
         "n_active_final": int(np.count_nonzero(active)),
         "max_active": int(max_active),
         "stop_details": dict(stop_details),
-        "scientific_regularisation": float(regularisation_scale),
-        "data_objective": float(data_objective),
-        "scientific_regularisation_objective": float(
-            scientific_regularisation_objective),
-        "total_objective": float(total_objective),
-        "numerical_ridge_objective": float(numerical_ridge_objective),
-        "stabilised_objective": float(stabilised_objective),
-        "scientific_regularisation": float(regularisation_scale),
-        "numerical_ridge": float(ridge_current),
     })
     _emit_diag({
         "kind": "final_solution",

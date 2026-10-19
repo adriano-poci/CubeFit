@@ -355,9 +355,9 @@ class PipelineRunner:
 
     def solve_all_mp_batched(
         self,
-        reader_s_tile=128,
-        reader_c_tile=1,
-        reader_p_tile=360,
+        reader_s_tile=None,
+        reader_c_tile=None,
+        reader_p_tile=None,
         reader_dtype_models="float32",
         reader_apply_mask=True,
         processes=2,
@@ -444,6 +444,8 @@ class PipelineRunner:
                         "continuing without warm-start.")
 
         elif warm_start == "zeros":
+            vprint(
+                "[Pipeline] Start mode: zeros; using fresh solver state.")
             x0_effective = np.zeros(N_expected, dtype=np.float64)
 
         else:

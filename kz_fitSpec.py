@@ -118,6 +118,8 @@ v2.3:   Changed `validationTag` to `runTag` to tag general runs in `genCubeFit`.
 v2.4:   Added `apertures` to `plot_best_worst_spectrum_fits_stacked` and
             `spectraPicks` kwarg parsing in `loadCubeFit` to be able to override
             the best/worst spaxel selection for spectral plots. 9 October 2026
+v2.5:   Improving hypercube chunking for more efficient reads, and let the
+            readers derive the chunks directly in `genCubeFit`. 13 October 2026
 """
 
 # need to set up the logger before any other imports
@@ -586,7 +588,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             '/HyperCube.')
         invalidate_done(hdf5Path)
 
-    nS, nC, nP = 128, 2, 360
+    nS, nC, nP = 128, 1, 360
     biasVel = 0.0
     # --- Optional hard gate before any heavy work
     # Use small prefix slices if nothing is specified.
@@ -692,7 +694,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         # orbit_weights=None, # or None for “free” fit
         orbit_weights=cWeights,
         processes=best_processes, blas_threads=best_blas,
-        reader_s_tile=128, # match /HyperCube/models chunking on S
         warm_start=warm_start, regularisation_scale=regularisation_scale,
         streaming=kwargs.pop('streaming', True))
 
@@ -705,8 +706,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         if "/X_global" in f_wr:
             del f_wr["/X_global"]
 
-        f_wr.create_dataset( "/X_global",
-            data=x_global.astype(np.float64),
+        f_wr.create_dataset( "/X_global", data=x_global.astype(np.float64),
             compression="gzip",
             compression_opts=4)
 
@@ -1659,45 +1659,17 @@ def plot_best_worst_spectrum_fits_stacked(h5_or_path: str,
             model_sel[j, :] = np.asarray(model_ds[int(s), :], dtype=np.float64)
             fit_metric_sel[j] = float(fit_metric[int(s)])
 
-    # Normalise each spectrum independently so every trace has the same
-    # effective vertical height in plot units.
-    plot_amp = 0.42
-    band_step = 1.0
-    offsets = np.arange(len(picks), dtype=np.float64) * band_step
-
     data_plot = np.empty_like(data_sel)
     model_plot = np.empty_like(model_sel)
     scales = np.empty((len(picks),), dtype=np.float64)
     centers = np.empty((len(picks),), dtype=np.float64)
 
-    for j in range(len(picks)):
-        vals = np.concatenate((data_sel[j, mask], model_sel[j, mask]))
-        vals = vals[np.isfinite(vals)]
-
-        if vals.size == 0:
-            center = 0.0
-            scale = 1.0
-        else:
-            center = float(np.nanmedian(vals))
-            spread = np.abs(vals - center)
-            scale = float(np.nanpercentile(spread, 99.0))
-            scale = max(scale, 1e-30)
-
-        centers[j] = center
-        scales[j] = scale
-
-        data_plot[j, :] = plot_amp * (data_sel[j, :] - center) / scale
-        model_plot[j, :] = plot_amp * (model_sel[j, :] - center) / scale
-
     # Masked wavelength intervals.
     masked = ~mask
     mask_spans = []
     if np.any(masked):
-        pad = np.concatenate((
-            np.array([0], dtype=np.int8),
-            masked.view(np.int8),
-            np.array([0], dtype=np.int8),
-        ))
+        pad = np.concatenate((np.array([0], dtype=np.int8),
+            masked.view(np.int8), np.array([0], dtype=np.int8)))
         edges = np.diff(pad)
         starts = np.nonzero(edges == 1)[0]
         ends = np.nonzero(edges == -1)[0]
@@ -1716,12 +1688,13 @@ def plot_best_worst_spectrum_fits_stacked(h5_or_path: str,
     # ------------------------------------------------------------
     n_picks = len(picks)
 
-    plot_amp = 0.36
-    residual_amp = 0.14
-    residual_offset = 0.38
-    band_step = 1.0
-
-    offsets = np.arange(n_picks, dtype=np.float64,) * band_step
+    # Vertical display geometry. Use a large spectral amplitude and slightly
+    # tighte stacking so the spectra occupy more of the available figure.
+    plot_amp = 0.48
+    residual_amp = 0.15
+    residual_offset = 0.40
+    band_step = 0.90
+    offsets = np.arange(n_picks, dtype=np.float64) * band_step
 
     data_plot = np.empty_like(data_sel)
     model_plot = np.empty_like(model_sel)
@@ -1806,12 +1779,12 @@ def plot_best_worst_spectrum_fits_stacked(h5_or_path: str,
         # Data: D_{s,lambda}
         # --------------------------------------------------------
         ax.plot(obs[mask], dat[mask], lw=0.8, color=data_c,
-            solid_capstyle='round')
+            solid_capstyle='round', zorder=2)
         # --------------------------------------------------------
         # Model: M_{s,lambda}
         # --------------------------------------------------------
         ax.plot(obs[mask],mod[mask], lw=0.8, color=model_c,
-            alpha=0.95, solid_capstyle='round')
+            alpha=0.95, solid_capstyle='round', zorder=3)
         # --------------------------------------------------------
         # Fractional residual: 100 r_{s,lambda}
         # --------------------------------------------------------
@@ -1822,9 +1795,9 @@ def plot_best_worst_spectrum_fits_stacked(h5_or_path: str,
         if np.any(valid_resid):
             resid_y = resid_off + residual_amp * resid / residual_scale
             ax.scatter(obs[valid_resid], resid_y[valid_resid], s=2,
-                color=resid_c, alpha=0.95, marker='^')
+                color=resid_c, alpha=0.95, marker='^', zorder=1)
         # r = 0 baseline.
-        ax.axhline(resid_off, lw=0.45, color=resid_c, alpha=0.65)
+        ax.axhline(resid_off, lw=0.45, color=resid_c, alpha=0.65, zorder=0)
 
         # --------------------------------------------------------
         # Masked wavelength regions
@@ -1843,30 +1816,40 @@ def plot_best_worst_spectrum_fits_stacked(h5_or_path: str,
         # Q_s annotation
         # --------------------------------------------------------
         txt = rf"$s={int(s):d}\qquad Q_s={fit_metric_sel[j]:.2f}\%$"
-        ax.text(0.01, off + 0.29, txt, ha='left', va='center',
+        ax.text(0.01, off + 0.26, txt, ha='left', va='center',
             transform=ax.get_yaxis_transform(), color='k', path_effects=[
-                PathEffects.withStroke(linewidth=2.0, foreground='white',)],)
+            PathEffects.withStroke(linewidth=2.0, foreground='white')])
 
     # ------------------------------------------------------------
     # Legend
     # ------------------------------------------------------------
     ax.plot([], [], color=data_c, lw=1.2, label='Data')
     ax.plot([], [], color=model_c, lw=1.2, label='Model')
-    ax.plot([], [], color=resid_c, lw=0.8, label=r"$100\,r_{s,\lambda}$")
+    ax.scatter([], [], s=15, color=resid_c, alpha=0.95, marker='^',
+        label=r"$100\,r_{s,\lambda}$")
 
     # ------------------------------------------------------------
     # Axes
     # ------------------------------------------------------------
     ax.set_xlim(float(np.nanmin(obs[mask])), float(np.nanmax(obs[mask])))
-    ax.set_ylim(
-        offsets[0] - 0.60,
-        offsets[-1] + 0.55*1.5, # add extra for the legend
-    )
+    # Leave approximately one residual-amplitude of room below the lowest
+    # residual baseline, while retaining the tight upper extent.
+    ymin = offsets[0] - residual_offset - 1.15 * residual_amp
+    ymax = offsets[-1] + 0.50
+    ax.set_ylim(ymin, ymax)
     ax.set_xlabel("log(\u03bb [\u212B])")
-    ax.set_ylabel("Normalized flux and fractional residual")
+    ax.set_ylabel("Normalised flux and fractional residual")
     ax.set_yticks([])
     ax.tick_params(axis="y", left=False, labelleft=False,)
-    ax.legend(loc="upper right", frameon=False, fontsize=9,)
+    leg = ax.legend(loc="upper right", frameon=True, fontsize=8,
+        labelspacing=0.15, handlelength=1.4, handletextpad=0.35,
+        borderpad=0.18, borderaxespad=0.18, columnspacing=0.4)
+
+    frame = leg.get_frame()
+    frame.set_facecolor("white")
+    frame.set_alpha(0.82)
+    frame.set_edgecolor("0.75")
+    frame.set_linewidth(0.4)
 
     if title is not None:
         ax.set_title(title, fontsize=13, pad=10,)

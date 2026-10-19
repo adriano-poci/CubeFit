@@ -17,13 +17,13 @@
 
 #SBATCH --job-name="CubeFit_1Gen"
 #SBATCH --time=0-12:00
-#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --mem=150G
+#SBATCH --hint=nomultithread
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=adriano.poci@physics.ox.ac.uk
-#SBATCH --hint=nomultithread
-#SBATCH --exclusive
 
 module purge
 module load foss/2023a
