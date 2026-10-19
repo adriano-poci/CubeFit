@@ -1818,7 +1818,7 @@ def plot_best_worst_spectrum_fits_stacked(h5_or_path: str,
         txt = rf"$s={int(s):d}\qquad Q_s={fit_metric_sel[j]:.2f}\%$"
         ax.text(0.01, off + 0.26, txt, ha='left', va='center',
             transform=ax.get_yaxis_transform(), color='k', path_effects=[
-                PathEffects.withStroke(linewidth=2.0, foreground='white',)],)
+            PathEffects.withStroke(linewidth=2.0, foreground='white')])
 
     # ------------------------------------------------------------
     # Legend

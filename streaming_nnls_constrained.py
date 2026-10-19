@@ -202,6 +202,8 @@ v2.5:   Replaced the fixed 50-percent exploration-coverage stopping criterion
         Reset stationary-challenge evidence after every accepted support change
             and recompute exact full-space KKT before counting further failures.
             16 October 2026
+v2.6:   Changed the `regularisation_scale` to be an SSP nearest-neighbour
+            smoothness penalty, rather than a classic L2 ridge. 17 October 2026
 """
 
 from __future__ import annotations, print_function
@@ -1060,6 +1062,85 @@ def _nnls_from_quadratic(
 
 # ------------------------------------------------------------------------------
 
+def _ssp_smoothness_hessian(n_metals: int, n_ages: int, n_alphas: int,
+) -> np.ndarray:
+    """
+    Construct the SSP-grid first-difference smoothness Hessian.
+
+    The population ordering is assumed to be
+
+        (metallicity, age, alpha)
+
+    in C-order, matching ``x.reshape(C, n_metals, n_ages, n_alphas)``.
+
+    The returned matrix ``Q`` satisfies
+
+        x.T @ Q @ x = sum_(p,q) (x_p - x_q)^2
+
+    where ``(p, q)`` runs over all immediately adjacent SSP cells along the
+    metallicity, age, and alpha axes.
+
+    Parameters
+    ----------
+    n_metals : int
+        Number of metallicity grid points.
+    n_ages : int
+        Number of age grid points.
+    n_alphas : int
+        Number of alpha-enhancement grid points.
+
+    Returns
+    -------
+    Q : ndarray
+        Positive-semidefinite population smoothness Hessian with shape
+        ``(P, P)``.
+
+    Raises
+    ------
+    ValueError
+        If any SSP dimension is non-positive.
+
+    Examples
+    --------
+    >>> Q = _ssp_smoothness_hessian(5, 9, 7)
+    >>> Q.shape
+    (315, 315)
+    """
+    n_metals = int(n_metals)
+    n_ages = int(n_ages)
+    n_alphas = int(n_alphas)
+
+    if n_metals <= 0 or n_ages <= 0 or n_alphas <= 0:
+        raise ValueError("SSP grid dimensions must all be positive.")
+
+    P = n_metals * n_ages * n_alphas
+    Q = np.zeros((P, P), dtype=np.float64)
+
+    index = np.arange(P, dtype=np.int64).reshape(n_metals, n_ages, n_alphas)
+
+    def _add_edges(left: np.ndarray, right: np.ndarray) -> None:
+        """Accumulate ``(x_i - x_j)^2`` for a collection of grid edges."""
+        ii = left.ravel(order="C")
+        jj = right.ravel(order="C")
+
+        np.add.at(Q, (ii, ii), 1.0)
+        np.add.at(Q, (jj, jj), 1.0)
+        np.add.at(Q, (ii, jj), -1.0)
+        np.add.at(Q, (jj, ii), -1.0)
+
+    if n_metals > 1:
+        _add_edges(index[:-1, :, :], index[1:, :, :])
+
+    if n_ages > 1:
+        _add_edges(index[:, :-1, :], index[:, 1:, :])
+
+    if n_alphas > 1:
+        _add_edges(index[:, :, :-1], index[:, :, 1:])
+
+    return Q
+
+# ------------------------------------------------------------------------------
+
 def _orbit_hard_constraint_solve(
     ATA_sub_reg: np.ndarray,
     ATy_sub: np.ndarray,
@@ -1070,7 +1151,7 @@ def _orbit_hard_constraint_solve(
     P: int,
     *,
     numerical_ridge: float = 0.0,
-    scientific_regularisation: float = 0.0,
+    scientific_hessian: np.ndarray | None = None,
     negative_tol: float = 1e-10,
     constraint_tol: float = 1e-8,
 ) -> tuple[np.ndarray, dict]:
@@ -1154,26 +1235,25 @@ def _orbit_hard_constraint_solve(
     S_active = np.asarray(S_active, dtype=np.float64).ravel(order="C")
     shape = np.asarray(orbit_shape, dtype=np.float64).ravel(order="C")
 
-    # The solver works in z-space, but the scientific penalty is defined
-    # in physical x-space:
-    #
-    #     0.5 * scientific_regularisation * sum(x_j^2)
-    #
-    # Since x = S * z, its z-space Hessian contribution is
-    #
-    #     scientific_regularisation * diag(S^2).
-    #
-    # This is the scientific penalty. Keep it completely separate from the
-    # numerical ridge, which exists only to control ill-conditioning.
-    scientific_regularisation = float(scientific_regularisation)
-    if (not np.isfinite(scientific_regularisation)
-        or scientific_regularisation < 0.0):
-        raise ValueError(
-            "scientific_regularisation must be nonnegative and finite.")
-
-    reg_diag = scientific_regularisation * (S_active * S_active)
-
     k = int(active_idx.size)
+
+    # Scientific regularisation is supplied directly as its reduced z-space
+    # Hessian. It may therefore contain off-diagonal couplings between
+    # neighbouring SSP populations.
+    if scientific_hessian is None:
+        H_scientific = np.zeros((k, k), dtype=np.float64)
+    else:
+        H_scientific = np.asarray(
+            scientific_hessian, dtype=np.float64, order="C")
+
+        if H_scientific.shape != (k, k):
+            raise ValueError(
+                "scientific_hessian has a shape inconsistent with active_idx.")
+
+        if not np.all(np.isfinite(H_scientific)):
+            raise ValueError(
+                "scientific_hessian contains non-finite values.")
+
     lambda_zero = np.zeros((C,), dtype=np.float64)
     target_zero = np.zeros((C,), dtype=np.float64)
 
@@ -1327,13 +1407,13 @@ def _orbit_hard_constraint_solve(
 
         KKT = np.zeros((n_total, n_total), dtype=np.float64)
 
-        Hff_reg = Hff + np.diag(reg_diag[free_idx])
+        Hff_reg = Hff + H_scientific[np.ix_(free_idx, free_idx)]
 
-        # Scientific regularisation acts in physical x-space and therefore
-        # enters the z-space Hessian as diag(S_active^2).
+        # Scientific regularisation is defined in physical x-space. Its
+        # transformed reduced z-space Hessian is supplied explicitly above.
         # The numerical ridge remains a separate identity term.
         KKT[:n_free, :n_free] = (Hff_reg + float(numerical_ridge) * np.eye(
-                n_free, dtype=np.float64))
+            n_free, dtype=np.float64))
 
         # Coupling to the equality multipliers.
         KKT[:n_free, n_primal:] = B.T
@@ -1409,7 +1489,7 @@ def _orbit_hard_constraint_solve(
             # zero.
             alpha_stationarity = float(
                 np.dot(constraint_shape, lambda_orbit))
-            dual_grad = (b - (H @ z_out) - (reg_diag * z_out)
+            dual_grad = (b - (H @ z_out) - (H_scientific @ z_out)
                 - (float(numerical_ridge) * z_out)
                 - (S_active * lambda_orbit[orbit_of_col]))
             free_dual = dual_grad[free]
@@ -1682,6 +1762,57 @@ def streamActiveSetNNLS(
     S_flat = np.asarray(inv_sqrt_energy_flat, dtype=np.float64).ravel()
     ATy_scaled = S_flat * ATy_flat
     yty = _compute_yty(h5_path, s_ranges, keep_idx)
+    # ------------------------------------------------------------------
+    # Scientific SSP smoothness regularisation.
+    #
+    # Population ordering in the HyperCube is
+    #
+    #     metallicity x age x alpha
+    #
+    # flattened in C-order. The same P x P smoothness matrix applies
+    # independently to every dynamical component.
+    # ------------------------------------------------------------------
+    with open_h5(h5_path, role="reader") as f:
+        required_ssp = ("/SSPMetals", "/SSPAges", "/SSPAlphas")
+
+        if not all(name in f for name in required_ssp):
+            raise RuntimeError(
+                "SSP smoothness regularisation requires /SSPMetals, "
+                "/SSPAges, and /SSPAlphas.")
+
+        n_metals = int(f["/SSPMetals"].size)
+        n_ages = int(f["/SSPAges"].size)
+        n_alphas = int(f["/SSPAlphas"].size)
+
+    if n_metals * n_ages * n_alphas != P:
+        raise RuntimeError("SSP grid dimensions are inconsistent with P: "
+            f"{n_metals}*{n_ages}*{n_alphas} != {P}.")
+
+    Q_ssp = _ssp_smoothness_hessian(n_metals, n_ages, n_alphas)
+    # ------------------------------------------------------------------
+    # Dimensionless scientific-regularisation scale.
+    #
+    # The solver's z-space data columns are already normalized to unit
+    # energy, so diag(A.T @ A) ~= 1. Normalize the SSP smoothness Hessian
+    # to unit characteristic diagonal curvature as well. The user-facing
+    # regularisation_scale is therefore dimensionless:
+    #
+    #     1e-3 -> ~0.1 per cent of characteristic data curvature
+    #     1e-2 -> ~1   per cent of characteristic data curvature
+    #     1e-1 -> ~10  per cent of characteristic data curvature
+    #
+    # Compute this once and keep it fixed throughout the solve.
+    q_diag = np.diag(Q_ssp)
+
+    smooth_diag = np.tile(q_diag, C) * (S_flat * S_flat)
+    positive_smooth = smooth_diag[smooth_diag > 0.0]
+
+    if positive_smooth.size == 0:
+        smooth_norm = 1.0
+    else:
+        smooth_norm = float(np.median(positive_smooth))
+
+    smooth_scale = float(regularisation_scale) / smooth_norm
 
     grad_ref = max(1.0, float(np.max(np.abs(ATy_scaled))))
     data_scale_ref = _robust_scale_ref(ATy_scaled, fallback=grad_ref)
@@ -1764,17 +1895,20 @@ def streamActiveSetNNLS(
         saved_regularisation_scale = float(
             resume_state.get("regularisation_scale", 1.0))
 
-        if not np.isclose(
-            saved_regularisation_scale,
-            regularisation_scale,
-            rtol=1e-12,
-            atol=0.0,
-        ):
+        if not np.isclose(saved_regularisation_scale, regularisation_scale,
+            rtol=1e-12, atol=0.0):
             raise ValueError(
                 "Cannot full-resume with a different regularisation_scale: "
                 f"checkpoint={saved_regularisation_scale:.6e}, "
                 f"requested={regularisation_scale:.6e}. "
                 "Use warm_start='saved_x' instead.")
+        saved_reg_mode = resume_state.get(
+            "scientific_regularisation_mode", "legacy_l2")
+
+        if saved_reg_mode != "ssp_first_difference":
+            raise ValueError(
+                "Cannot full-resume a checkpoint using a different scientific "
+                "regularisation model. Use warm_start='saved_x' instead.")
 
         # Historical checkpoints predate the unconstrained orbit_weights=None
         # pathway, so a missing mode flag is interpreted as constrained.
@@ -1858,6 +1992,9 @@ def streamActiveSetNNLS(
         "tol_grad": float(tol_grad),
         "tol_grad_rel": float(tol_grad_rel),
         "regularisation_scale": float(regularisation_scale),
+        "scientific_regularisation_mode": "ssp_first_difference",
+        "smoothness_normalisation": float(smooth_norm),
+        "effective_smoothness_scale": float(smooth_scale),
         "diag_level": int(diag_level),
         "diag_stride": int(diag_stride),
         "diag_topk": int(diag_topk),
@@ -2043,10 +2180,45 @@ def streamActiveSetNNLS(
             ``0.5 * x.T @ A @ x - b.T @ x``.
         """
         return 0.5 * float(x @ (A @ x)) - float(b @ x)
+    def _scientific_gradient_x(x_vec: np.ndarray) -> np.ndarray:
+        """
+        Return the gradient of the SSP smoothness penalty in physical x-space.
+        """
+        x_cp = np.asarray(x_vec, dtype=np.float64).reshape(C, P)
+
+        return (smooth_scale * (x_cp @ Q_ssp)).ravel(order="C")
+
+    def _scientific_objective_x(x_vec: np.ndarray) -> float:
+        """
+        Return the dimensionless-scaled SSP smoothness penalty.
+        """
+        x_cp = np.asarray(x_vec, dtype=np.float64).reshape(C, P)
+
+        return 0.5 * smooth_scale * float(np.sum((x_cp @ Q_ssp) * x_cp))
+
+    def _scientific_hessian_reduced(active_idx: np.ndarray,
+        S_active: np.ndarray) -> np.ndarray:
+        """
+        Return the SSP smoothness Hessian on a reduced support in z-space.
+        """
+        active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
+        S_active = np.asarray(S_active, dtype=np.float64).ravel(order="C")
+
+        orbit_idx = active_idx // P
+        pop_idx = active_idx % P
+
+        H_reg = np.zeros((active_idx.size, active_idx.size), dtype=np.float64)
+
+        same_orbit = orbit_idx[:, None] == orbit_idx[None, :]
+
+        H_reg[same_orbit] = (smooth_scale
+            * Q_ssp[pop_idx[:, None], pop_idx[None, :]][same_orbit]
+            * (S_active[:, None] * S_active[None, :])[same_orbit])
+
+        return H_reg
 
     if start_iter >= max_iter:
-        print(
-            "[MONO] resume_state already reached max_iter; returning the "
+        print("[MONO] resume_state already reached max_iter; returning the "
             "committed solution without entering the outer loop.", flush=True)
         return _current_x_from_z(z)
 
@@ -2069,6 +2241,7 @@ def streamActiveSetNNLS(
             "alpha_current": float(alpha_current),
             "ridge_current": float(ridge_current),
             "regularisation_scale": float(regularisation_scale),
+            "scientific_regularisation_mode": "ssp_first_difference",
             "hard_orbit_shape": bool(has_hard_orbit_shape),
             "orbit_constraint_mode": (
                 "equal_component_mass" if has_hard_orbit_shape else "none"),
@@ -2169,19 +2342,12 @@ def streamActiveSetNNLS(
 
         ATAz = np.zeros((CP,), dtype=np.float64)
 
-        worker_args = [
-            (h5_path, batch, keep_idx, x_cand, CP, S_flat, C, P)
-            for batch in batches
-            if len(batch) > 0
-        ]
+        worker_args = [(h5_path, batch, keep_idx, x_cand, CP, S_flat, C, P)
+            for batch in batches if len(batch) > 0]
         it = executor.map(_worker_ATAz_from_tuple, worker_args)
 
-        for r in tqdm(
-            it,
-            total=len(worker_args),
-            desc="[MONO] ATAz tiles",
-            leave=False,
-        ):
+        for r in tqdm(it, total=len(worker_args), desc="[MONO] ATAz tiles",
+            leave=False):
             try:
                 ATAz += r
             except Exception as e:
@@ -2263,12 +2429,8 @@ def streamActiveSetNNLS(
                 raise ValueError("Preassembled scaling size is inconsistent "
                     "with active_idx.")
 
-        # Scientific L2 regularisation is defined in physical x-space.
-        # Since x = S * z, its Hessian contribution in z-space is
-        # regularisation_scale * diag(S^2). Include it when assessing
-        # conditioning so the numerical ridge is only as large as necessary.
-        scientific_diag_loc = regularisation_scale * (S_loc * S_loc)
-        ATA_scientific_loc = ATA_loc + np.diag(scientific_diag_loc)
+        H_scientific_loc = _scientific_hessian_reduced(active_idx, S_loc)
+        ATA_scientific_loc = ATA_loc + H_scientific_loc
 
         numerical_ridge_loc, emin_loc, emax_loc, cond_loc = \
             _adaptive_numerical_ridge(ATA_scientific_loc,
@@ -2282,7 +2444,7 @@ def streamActiveSetNNLS(
                 orbit_shape=np.asarray(orbit_shape, dtype=np.float64),
                 C=C, P=P,
                 numerical_ridge=numerical_ridge_loc,
-                scientific_regularisation=regularisation_scale,)
+                scientific_hessian=H_scientific_loc,)
 
             if not info_loc["accepted"]:
                 return active_idx, None, None, None, None, None, None, None,\
@@ -2294,13 +2456,11 @@ def streamActiveSetNNLS(
                 ).ravel(order="C")
 
         else:
-            ATA_reg_loc = (ATA_loc +
-                regularisation_scale * np.diag(S_loc * S_loc) +
-                numerical_ridge_loc * np.eye(k_loc, dtype=np.float64))
+            ATA_reg_loc = (ATA_loc + H_scientific_loc
+                + numerical_ridge_loc * np.eye(k_loc, dtype=np.float64))
 
             z_loc = _nnls_from_quadratic(ATA_reg_loc, ATy_loc,
-                x0=np.maximum(z[active_idx], 0.0),
-                max_iter=10000, tol=1e-11)
+                x0=np.maximum(z[active_idx], 0.0), max_iter=10000, tol=1e-11)
 
             alpha_loc = None
             lambda_loc = None
@@ -2329,95 +2489,6 @@ def streamActiveSetNNLS(
             numerical_ridge_loc,
             cond_loc,
         )
-    def _solve_reduced_from_assembled(
-        active_idx,
-        ATA_loc,
-        ATy_loc,
-        S_loc,
-    ):
-        """
-        Solve a constrained reduced problem from preassembled normal equations.
-
-        Parameters
-        ----------
-        active_idx : ndarray
-            Global column indices of the reduced support.
-        ATA_loc : ndarray
-            Reduced data Hessian on ``active_idx``.
-        ATy_loc : ndarray
-            Reduced data linear term on ``active_idx``.
-        S_loc : ndarray
-            Column scalings on ``active_idx``.
-
-        Returns
-        -------
-        result : tuple
-            Same result tuple as ``_solve_reduced_active``.
-
-        Raises
-        ------
-        ValueError
-            If the supplied reduced arrays have inconsistent dimensions.
-
-        Examples
-        --------
-        Used internally during joint-support exploration.
-        """
-        active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
-        ATA_loc = np.asarray(ATA_loc, dtype=np.float64, order="C")
-        ATy_loc = np.asarray(ATy_loc, dtype=np.float64).ravel(order="C")
-        S_loc = np.asarray(S_loc, dtype=np.float64).ravel(order="C")
-
-        k_loc = int(active_idx.size)
-
-        if ATA_loc.shape != (k_loc, k_loc):
-            raise ValueError(
-                "ATA_loc has a shape inconsistent with active_idx.")
-        if ATy_loc.size != k_loc or S_loc.size != k_loc:
-            raise ValueError(
-                "ATy_loc or S_loc has a size inconsistent with active_idx.")
-
-        scientific_diag_loc = (regularisation_scale * (S_loc * S_loc))
-        ATA_scientific_loc = (ATA_loc + np.diag(scientific_diag_loc))
-
-        numerical_ridge_loc, emin_loc, emax_loc, cond_loc = \
-            _adaptive_numerical_ridge(ATA_scientific_loc,
-                target_cond=numerical_target_cond,
-                min_ridge=numerical_ridge_floor)
-
-        if has_hard_orbit_shape:
-            z_raw_loc, info_loc = _orbit_hard_constraint_solve(
-                ATA_sub_reg=ATA_loc, ATy_sub=ATy_loc,
-                active_idx=active_idx, S_active=S_loc,
-                orbit_shape=np.asarray(orbit_shape, dtype=np.float64),
-                C=C, P=P, numerical_ridge=numerical_ridge_loc,
-                scientific_regularisation=regularisation_scale)
-
-            if not info_loc["accepted"]:
-                return (active_idx, None, None, None, None, None, None, None, None, None)
-
-            z_loc = np.asarray(z_raw_loc, dtype=np.float64).copy()
-            alpha_loc = float(info_loc["alpha"])
-            lambda_loc = np.asarray(info_loc["lambda_orbit"],
-                dtype=np.float64).ravel(order="C")
-
-        else:
-            ATA_reg_loc = (ATA_loc +
-                regularisation_scale * np.diag(S_loc * S_loc) +
-                numerical_ridge_loc * np.eye(k_loc, dtype=np.float64))
-
-            z_loc = _nnls_from_quadratic(ATA_reg_loc, ATy_loc,
-                x0=np.maximum(z[active_idx], 0.0),
-                max_iter=10000, tol=1e-11)
-
-            alpha_loc = None
-            lambda_loc = None
-
-            info_loc = {
-                "accepted": True,
-                "mu": 0.0,
-                "lambda_orbit": np.zeros((C,), dtype=np.float64),
-            }
 
     def _prune_zero_support(
         z_vec: np.ndarray,
@@ -2483,8 +2554,8 @@ def streamActiveSetNNLS(
             emax_init = (
                 float(np.max(diag_init)) if diag_init.size else 1.0)
 
-        scientific_diag_init = regularisation_scale * (S_init * S_init)
-        ATA_scientific_init = ATA_init + np.diag(scientific_diag_init)
+        H_scientific_init = _scientific_hessian_reduced(active_idx, S_init)
+        ATA_scientific_init = ATA_init + H_scientific_init
 
         numerical_ridge_init, emin_init, emax_init, cond_init = \
             _adaptive_numerical_ridge(ATA_scientific_init,
@@ -2496,7 +2567,7 @@ def streamActiveSetNNLS(
             active_idx=active_idx, S_active=S_init,
             orbit_shape=np.asarray(orbit_shape, dtype=np.float64), C=C, P=P,
             numerical_ridge=numerical_ridge_init,
-            scientific_regularisation=regularisation_scale)
+            scientific_hessian=H_scientific_init)
 
         if not info_init["accepted"]:
             raise RuntimeError("Initial constrained KKT solve failed: "
@@ -3035,8 +3106,7 @@ def streamActiveSetNNLS(
         best_ATA = None
         best_ATy = None
 
-        current_reg_obj = (0.5 * float(regularisation_scale) * float(np.sum(
-                (S_flat[current_active] * z[current_active]) ** 2)))
+        current_reg_obj = _scientific_objective_x(S_flat * z)
         current_total_obj = float(current_data_obj) + current_reg_obj
 
         best_data_obj = float(current_data_obj)
@@ -3210,8 +3280,9 @@ def streamActiveSetNNLS(
 
             trial_data_obj = _data_quad_obj(ATA_trial, ATy_trial, z_trial)
 
-            trial_reg_obj = (0.5 * float(regularisation_scale)
-                * float(np.sum((S_trial * z_trial) ** 2)))
+            x_trial_full = np.zeros(CP, dtype=np.float64)
+            x_trial_full[trial_active] = S_trial * z_trial
+            trial_reg_obj = _scientific_objective_x(x_trial_full)
 
             trial_total_obj = float(trial_data_obj) + float(trial_reg_obj)
 
@@ -3345,10 +3416,12 @@ def streamActiveSetNNLS(
             - float(np.dot(ATy_scaled, z)))
 
         grad_data = ATy_scaled - ATAz_scaled
-        # Scientific regularisation is defined on physical x = S * z.
-        # Its gradient in z-space is regularisation_scale * S^2 * z.
-        grad_regularisation = (float(regularisation_scale) * (S_flat * S_flat)
-            * z)
+
+        # Scientific smoothness gradient. The penalty is defined in physical
+        # x-space, so transform its gradient back to z-space with dx/dz = S.
+        x_current = S_flat * z
+        grad_regularisation_x = _scientific_gradient_x(x_current)
+        grad_regularisation = S_flat * grad_regularisation_x
         # Numerical ridge is deliberately separate from the scientific
         # penalty and exists only to stabilise the reduced linear algebra.
         grad_numerical_ridge = float(ridge_current) * z
@@ -3752,8 +3825,7 @@ def streamActiveSetNNLS(
 
     data_objective = (0.5 * float(np.dot(z, ATAz_final))
         - float(np.dot(ATy_scaled, z)))
-    scientific_regularisation_objective = (0.5 * float(regularisation_scale)
-        * float(np.sum((S_flat * z) ** 2)))
+    scientific_regularisation_objective = _scientific_objective_x(x_final)
 
     numerical_ridge_objective = 0.5 * float(ridge_current) * float(np.dot(z, z))
 
@@ -3792,7 +3864,16 @@ def streamActiveSetNNLS(
         "kind": "objective_summary",
         "source": "streamActiveSetNNLS",
         "data_objective": float(data_objective),
+        "scientific_regularisation_objective": float(
+            scientific_regularisation_objective),
         "total_objective": float(total_objective),
+        "numerical_ridge_objective": float(numerical_ridge_objective),
+        "stabilised_objective": float(stabilised_objective),
+        "scientific_regularisation": float(regularisation_scale),
+        "scientific_regularisation_mode": "ssp_first_difference",
+        "smoothness_normalisation": float(smooth_norm),
+        "effective_smoothness_scale": float(smooth_scale),
+        "numerical_ridge": float(ridge_current),
         "orbit_resid_l1": orbit_resid_l1,
         "orbit_resid_l2": orbit_resid_l2,
         "orbit_resid_linf": orbit_resid_linf,
@@ -3813,15 +3894,6 @@ def streamActiveSetNNLS(
         "n_active_final": int(np.count_nonzero(active)),
         "max_active": int(max_active),
         "stop_details": dict(stop_details),
-        "scientific_regularisation": float(regularisation_scale),
-        "data_objective": float(data_objective),
-        "scientific_regularisation_objective": float(
-            scientific_regularisation_objective),
-        "total_objective": float(total_objective),
-        "numerical_ridge_objective": float(numerical_ridge_objective),
-        "stabilised_objective": float(stabilised_objective),
-        "scientific_regularisation": float(regularisation_scale),
-        "numerical_ridge": float(ridge_current),
     })
     _emit_diag({
         "kind": "final_solution",

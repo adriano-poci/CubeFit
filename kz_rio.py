@@ -122,14 +122,14 @@ def main():
         propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6])
-        propDict['runTag'] = '5e-7'
-        propDict['regularisation_scale'] = 5e-7
+        # propDict['runTag'] = '5e-7'
+        propDict['regularisation_scale'] = 3e-2
         ############################ SSP library to generate mock-data fit
         # propDict['sspIdx'] = ([-1.79, -1.26, -0.6, -0.25, 0.0, 0.15, 0.26],
         #     [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
         #     [0.0, 0.4])
         # propDict['regularisation_scale'] = 0.0
-        propDict['warm'] = 'resume'
+        propDict['warm'] = 'saved_x'
         propDict['spectraPicks'] = [1363, 1116, 1998,1039][::-1]
 
     print(propDict)
