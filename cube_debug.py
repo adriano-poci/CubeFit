@@ -30,6 +30,7 @@ from tqdm.auto import tqdm
 from typing import Optional, Sequence
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from scipy.optimize import minimize
 
 from CubeFit.hdf5_manager import open_h5
 from CubeFit.hypercube_builder import read_global_column_energy
@@ -1321,6 +1322,351 @@ def diagnose_orbit_weight_encoding(
         "corr_log_x_weight": corr_x_weight,
         "corr_log_x_losvd": corr_x_amp,
         "corr_log_x_inverse_losvd": corr_x_inv_amp,
+    }
+
+# ------------------------------------------------------------------------------
+
+def test_hypercube_boundary_convex_hull(h5_path, mask=None, component=None,
+    max_iter=2000, ftol=1e-12):
+    """
+    Test whether interior HyperCube population columns lie in the convex hull
+    of SSP-grid boundary columns.
+
+    For each dynamical component, every interior population column is fitted
+    using a nonnegative unit-sum mixture of boundary population columns from
+    the same component:
+
+        min_w ||B w - a||_2^2
+
+    subject to
+
+        w >= 0
+        sum(w) = 1.
+
+    This tests the actual spectral-model geometry seen by CubeFit, including
+    the dynamical component, LOSVD convolution, spectral sampling, and any
+    other transformations already encoded in the HyperCube.
+
+    Parameters
+    ----------
+    h5_path : str
+        CubeFit HyperCube HDF5 file.
+    mask : ndarray, optional
+        Boolean wavelength mask. True retains a wavelength pixel. If None,
+        ``/Mask`` is used when available, otherwise all wavelengths are used.
+    component : int, optional
+        Test only this dynamical-component index. If None, test every
+        component.
+    max_iter : int, optional
+        Maximum SLSQP iterations for each convex-hull projection.
+    ftol : float, optional
+        SLSQP objective tolerance.
+
+    Returns
+    -------
+    out : dict
+        SSP coordinates, boundary mask, tested components, relative
+        reconstruction errors, and convex-hull weights.
+
+    Raises
+    ------
+    ValueError
+        If dimensions, mask, or component index are invalid.
+    RuntimeError
+        If required HyperCube datasets are absent or an optimization fails.
+
+    Examples
+    --------
+    >>> out = test_hypercube_boundary_convex_hull(
+    ...     "hypercube_109_00.h5", component=0)
+    """
+    h5_path = str(h5_path)
+
+    with open_h5(h5_path, role="reader") as f:
+        required = (
+            "/HyperCube/models",
+            "/SSPMetals",
+            "/SSPAges",
+            "/SSPAlphas",
+        )
+
+        missing = [name for name in required if name not in f]
+
+        if missing:
+            raise RuntimeError(
+                f"HyperCube is missing required datasets: {missing}")
+
+        M = f["/HyperCube/models"]
+
+        if M.ndim != 4:
+            raise RuntimeError(
+                "/HyperCube/models must have shape (S, C, P, L).")
+
+        S, C, P, L = map(int, M.shape)
+
+        metals = np.asarray(f["/SSPMetals"][...],
+            dtype=np.float64).ravel(order="C")
+        ages = np.asarray(f["/SSPAges"][...],
+            dtype=np.float64).ravel(order="C")
+        alphas = np.asarray(f["/SSPAlphas"][...],
+            dtype=np.float64).ravel(order="C")
+
+        nMetals = int(metals.size)
+        nAges = int(ages.size)
+        nAlphas = int(alphas.size)
+
+        if nMetals*nAges*nAlphas != P:
+            raise RuntimeError(
+                "SSP dimensions are inconsistent with HyperCube P: "
+                f"{nMetals}*{nAges}*{nAlphas} != {P}.")
+
+        if mask is None and "/Mask" in f:
+            candidate = np.asarray(
+                f["/Mask"][...], dtype=bool).ravel(order="C")
+
+            if candidate.size == L:
+                mask = candidate
+
+        if mask is None:
+            keep_idx = None
+            L_keep = L
+        else:
+            mask = np.asarray(mask, dtype=bool).ravel(order="C")
+
+            if mask.size != L:
+                raise ValueError(
+                    f"mask has size {mask.size}; expected L={L}.")
+
+            keep_idx = np.flatnonzero(mask).astype(np.int64)
+            L_keep = int(keep_idx.size)
+
+    # ------------------------------------------------------------
+    # Population-grid boundary.
+    # ------------------------------------------------------------
+    boundary = np.zeros(
+        (nMetals, nAges, nAlphas), dtype=bool)
+
+    boundary[0, :, :] = True
+    boundary[-1, :, :] = True
+    boundary[:, 0, :] = True
+    boundary[:, -1, :] = True
+    boundary[:, :, 0] = True
+    boundary[:, :, -1] = True
+
+    boundary_flat = boundary.ravel(order="C")
+    boundary_idx = np.flatnonzero(boundary_flat).astype(np.int64)
+    interior_idx = np.flatnonzero(~boundary_flat).astype(np.int64)
+
+    if component is None:
+        components = np.arange(C, dtype=np.int64)
+    else:
+        component = int(component)
+
+        if component < 0 or component >= C:
+            raise ValueError(
+                f"component must lie in [0, {C - 1}].")
+
+        components = np.array([component], dtype=np.int64)
+
+    print(
+        f"HyperCube: S={S}, C={C}, P={P}, L={L}, "
+        f"L_keep={L_keep}")
+    print(
+        f"SSP grid: {nMetals} x {nAges} x {nAlphas}")
+    print(
+        f"Boundary populations: {boundary_idx.size}; "
+        f"interior populations: {interior_idx.size}")
+    print(
+        f"Testing {components.size} dynamical component(s).")
+
+    # One result per C,P location. Boundary populations are left NaN because
+    # the primary experiment is specifically interior -> boundary.
+    residual_relative = np.full(
+        (C, P), np.nan, dtype=np.float64)
+
+    residual_rms = np.full(
+        (C, P), np.nan, dtype=np.float64)
+
+    weights = {}
+
+    def _solve_convex_hull(target, basis):
+        """Project one model column onto the convex hull of basis columns."""
+        n_basis = int(basis.shape[1])
+
+        x0 = np.full(
+            n_basis, 1.0/n_basis, dtype=np.float64)
+
+        def objective(w):
+            resid = basis @ w-target
+            return 0.5*float(np.dot(resid, resid))
+
+        def gradient(w):
+            return basis.T @ (basis @ w-target)
+
+        result = minimize(
+            objective,
+            x0,
+            jac=gradient,
+            method="SLSQP",
+            bounds=[(0.0, None)]*n_basis,
+            constraints={
+                "type": "eq",
+                "fun": lambda w: np.sum(w)-1.0,
+                "jac": lambda w: np.ones_like(w),
+            },
+            options={
+                "maxiter": int(max_iter),
+                "ftol": float(ftol),
+                "disp": False,
+            },
+        )
+
+        if not result.success:
+            raise RuntimeError(
+                "Convex-hull projection failed: "
+                f"{result.message}")
+
+        w = np.maximum(
+            np.asarray(result.x, dtype=np.float64), 0.0)
+
+        total = float(np.sum(w))
+
+        if total <= 0.0:
+            raise RuntimeError(
+                "Convex-hull projection returned zero total weight.")
+
+        w /= total
+
+        return w
+
+    # ------------------------------------------------------------
+    # Read and test one component at a time.
+    #
+    # This deliberately avoids loading the complete S x C x P x L
+    # HyperCube into memory.
+    # ------------------------------------------------------------
+    with open_h5(h5_path, role="reader") as f:
+        M = f["/HyperCube/models"]
+
+        for nc, cc in enumerate(components, start=1):
+            print(
+                f"\nComponent {cc} "
+                f"({nc}/{components.size})")
+
+            # Shape after transpose/reshape:
+            #
+            #     (P, S * L_keep)
+            #
+            # Each row is therefore the complete model column for one
+            # population of this dynamical component.
+            if keep_idx is None:
+                block = np.asarray(
+                    M[:, cc, :, :], dtype=np.float64)
+            else:
+                block = np.asarray(
+                    M[:, cc, :, :], dtype=np.float64)
+                block = block[:, :, keep_idx]
+
+            spectra = block.transpose(1, 0, 2).reshape(P, -1)
+
+            del block
+
+            # Normalize each complete HyperCube column to unit Euclidean norm.
+            # This tests spectral/model SHAPE rather than arbitrary column
+            # amplitude. It also mirrors the solver's column normalization
+            # conceptually.
+            norms = np.linalg.norm(spectra, axis=1)
+
+            valid_norm = np.isfinite(norms) & (norms > 0.0)
+
+            if not np.all(valid_norm[boundary_idx]):
+                bad = boundary_idx[~valid_norm[boundary_idx]]
+
+                raise RuntimeError(
+                    f"Component {cc} has zero/nonfinite boundary "
+                    f"columns: {bad.tolist()}")
+
+            spectra = np.divide(
+                spectra,
+                norms[:, None],
+                out=np.zeros_like(spectra),
+                where=norms[:, None] > 0.0)
+
+            # Basis columns are all boundary populations for this same
+            # dynamical component.
+            basis = spectra[boundary_idx, :].T
+
+            for ni, pp in enumerate(interior_idx, start=1):
+                if not valid_norm[pp]:
+                    continue
+
+                target = spectra[pp, :]
+
+                w = _solve_convex_hull(target, basis)
+                model = basis @ w
+                resid = target-model
+
+                residual_rms[cc, pp] = float(
+                    np.sqrt(np.mean(resid*resid)))
+
+                residual_relative[cc, pp] = float(
+                    np.linalg.norm(resid)/
+                    max(np.linalg.norm(target), 1e-30))
+
+                weights[(int(cc), int(pp))] = {
+                    "source_indices": boundary_idx.copy(),
+                    "weights": w.copy(),
+                }
+
+                print(
+                    f"\r  interior {ni:3d}/{interior_idx.size}: "
+                    f"p={pp:3d} "
+                    f"rel={residual_relative[cc, pp]:.3e}",
+                    end="",
+                    flush=True,
+                )
+
+            print()
+
+            del spectra
+            del basis
+
+    # ------------------------------------------------------------
+    # Global summary.
+    # ------------------------------------------------------------
+    tested = residual_relative[np.isfinite(residual_relative)]
+
+    print()
+    print("Interior -> boundary convex-hull reconstruction")
+    print("------------------------------------------------")
+
+    if tested.size:
+        print(
+            f"N       = {tested.size}")
+        print(
+            f"min     = {np.min(tested):.6e}")
+        print(
+            f"p16     = {np.percentile(tested, 16):.6e}")
+        print(
+            f"median  = {np.median(tested):.6e}")
+        print(
+            f"p84     = {np.percentile(tested, 84):.6e}")
+        print(
+            f"max     = {np.max(tested):.6e}")
+
+    return {
+        "h5_path": h5_path,
+        "shape": (S, C, P, L),
+        "metals": metals,
+        "ages": ages,
+        "alphas": alphas,
+        "boundary_mask": boundary,
+        "boundary_indices": boundary_idx,
+        "interior_indices": interior_idx,
+        "components": components,
+        "residual_rms": residual_rms,
+        "residual_relative": residual_relative,
+        "weights": weights,
     }
 
 # ------------------------------------------------------------------------------

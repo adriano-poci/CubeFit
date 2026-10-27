@@ -45,6 +45,10 @@ v1.9:   Reworked `plot_diagnostic_jsonl_dashboard` for joint-support
             September 2026
 v2.0:   Updated `plot_diagnostic_jsonl_dashboard` to reflect the new definition
             of orbital weights. 3 October 2026
+v2.1:   Rebuilt `plot_diagnostic_jsonl_dashboard` for the exact constrained
+            KKT active-set solver, replacing obsolete exploration and coverage
+            diagnostics with KKT, promotion, gradient, support, constraint,
+            and runtime health diagnostics. 25 October 2026
 """
 
 from __future__ import annotations
@@ -518,992 +522,654 @@ def _homogenise_ticks(ax, *, nbins: int = 4) -> None:
 
 def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     max_points: int | None = 5000, save_path: str | None = None,
-    show: bool = False, figsize: tuple[float, float] = (24.0, 13.0),
+    show: bool = False, figsize: tuple[float, float] = (22.0, 10.5),
 ) -> list[dict]:
     """
-    Plot diagnostics for the equal-component-mass constrained solver.
+    Plot diagnostics for the exact constrained KKT active-set solver.
 
-    The dashboard combines ``iter_pre``, ``iter_post``, setup, and final
-    records emitted by the constrained streaming active-set solver. Records
-    sharing an iteration number are merged so that pre-solve gradients and
-    post-solve objective, support, and constraint diagnostics appear on the
-    same iteration axis.
+    The dashboard combines ``kkt`` and ``kkt_promotion`` records by outer
+    iteration. It is designed for the exact convex-QP solver in which
+    full-space KKT violations are deterministically promoted into the working
+    set and the complete constrained reduced problem is then re-solved.
 
     The panels show:
 
-    1. Accepted and trial data-objective evolution.
-    2. Exploration objective gains and acceptance threshold.
-    3. Current-support KKT convergence.
-    4. Inactive-column constrained-gradient state.
-    5. Committed and trial support sizes.
-    6. Exploration rounds and consecutive failures.
-    7. Proposed, retained, and discarded trial columns.
-    8. Remaining candidate search space.
-    9. Fitted common component mass and numerical ridge.
-    10. Common-amplitude KKT stationarity.
-    11. Cumulative and per-iteration runtime.
-    12. Current-support stationarity versus exploration acceptance.
+    1. Full-space KKT convergence relative to tolerance.
+    2. Data, regularisation, constraint, and ridge gradient magnitudes.
+    3. Number and fraction of unresolved inactive dual violations.
+    4. Working and strictly positive support sizes.
+    5. Promotion survival and zero-return behaviour.
+    6. Fitted common component mass and hard-constraint stationarity.
+    7. Per-iteration and cumulative runtime.
+    8. Current solver state and final objective summary.
 
     Parameters
     ----------
-    jsonl_path : str
-        Path to the solver diagnostics JSONL file.
+    jsonl_paths : str or list of str
+        One or more diagnostics JSONL paths. Multiple files are merged in the
+        supplied order, allowing resumed runs to be plotted continuously.
     max_points : int or None, optional
-        Maximum number of merged iteration records to retain. ``None`` keeps
-        all records.
+        Maximum number of merged outer iterations to retain. ``None`` keeps
+        all iterations.
     save_path : str or None, optional
-        Output image path. If ``None``, the figure is not written.
+        Output image path. If None, the figure is not written.
     show : bool, optional
-        If True, display the figure with ``plt.show()``.
+        If True, display the figure.
     figsize : tuple of float, optional
         Figure size in inches.
 
     Returns
     -------
-    fig : matplotlib.figure.Figure
-        Generated dashboard figure.
-    axes : dict of str to matplotlib.axes.Axes
-        Named subplot axes.
-    records : list of dict
-        Raw JSONL records successfully parsed from the file.
+    raw_records : list of dict
+        Raw JSONL records successfully parsed from all supplied files.
 
     Raises
     ------
     FileNotFoundError
-        If ``jsonl_path`` does not exist.
+        If an input diagnostics file does not exist.
     ValueError
-        If ``max_points`` is not positive or ``None``.
+        If ``max_points`` is non-positive or no usable KKT records exist.
     OSError
-        If the input file cannot be read or the output cannot be written.
+        If an input file cannot be read or the output cannot be written.
 
     Examples
     --------
-    >>> fig, axes, records = plot_diagnostic_jsonl_dashboard(
-    ...     "diagnostics.jsonl",
-    ...     save_path="diagnostics_dashboard.png",
-    ... )
+    >>> records = plot_diagnostic_jsonl_dashboard(
+    ...     "diagnostics.jsonl", save_path="diagnostics_dashboard.png")
     """
     eps = 1e-300
 
     if max_points is not None and int(max_points) <= 0:
         raise ValueError("max_points must be positive or None.")
 
-    def _load_records() -> list[dict]:
-        paths = (
-            [jsonl_paths] if isinstance(jsonl_paths, str)
-            else list(jsonl_paths)
-        )
-        parsed = []
-
-        for path in paths:
-            with open(path, "r", encoding="utf-8") as handle:
-                for line in handle:
-                    text = line.strip()
-                    if not text:
-                        continue
-
-                    try:
-                        record = json.loads(text)
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        continue
-
-                    if isinstance(record, dict):
-                        parsed.append(record)
-
-        return parsed
-
-    def _finite_scalar(record: dict, *keys: str, default: float = np.nan
-        ) -> float:
+    def _finite_scalar(record: dict, *keys: str,
+        default: float = np.nan) -> float:
+        """Return the first finite scalar found under the supplied keys."""
         for key in keys:
             value = record.get(key)
+
             if value is None:
                 continue
+
             try:
                 value = float(value)
             except (TypeError, ValueError):
                 continue
+
             if np.isfinite(value):
                 return value
 
         return float(default)
 
-    def _vector(record: dict, *keys: str) -> np.ndarray | None:
-        for key in keys:
-            value = record.get(key)
-            if value is None:
-                continue
-            try:
-                array = np.asarray(value, dtype=np.float64).ravel(order="C")
-            except (TypeError, ValueError):
-                continue
-            if array.size > 0:
-                return array
+    def _latest_finite(values: np.ndarray,
+        default: float = np.nan) -> float:
+        """Return the latest finite value in an array."""
+        values = np.asarray(values, dtype=np.float64)
+        values = values[np.isfinite(values)]
 
-        return None
+        if values.size == 0:
+            return float(default)
 
-    def _merge_iteration_records(
-        raw_records: list[dict],
-    ) -> tuple[list[dict], dict]:
-        """
-        Merge exploration-solver diagnostics by outer iteration.
+        return float(values[-1])
 
-        Parameters
-        ----------
-        raw_records : list of dict
-            Raw JSONL diagnostic records.
-
-        Returns
-        -------
-        merged : list of dict
-            One merged diagnostic record per outer iteration.
-        non_iteration : dict
-            Setup and final records without an iteration number.
-
-        Raises
-        ------
-        None
-
-        Examples
-        --------
-        >>> merged, non_iteration = _merge_iteration_records(records)
-        """
-        merged_by_iter: dict[int, dict] = {}
-        non_iteration: dict[str, dict] = {}
-        setup_records = []
-
-        for record in raw_records:
-            kind = str(record.get("kind", ""))
-
-            try:
-                iteration = int(record["iter"])
-            except (KeyError, TypeError, ValueError):
-                if kind:
-                    non_iteration[kind] = dict(record)
-
-                    if kind == "mono_setup":
-                        setup_records.append(dict(record))
-
-                continue
-
-            current = merged_by_iter.setdefault(iteration,
-                {"iter": iteration})
-
-            if kind == "exploration_trial":
-                current.setdefault(
-                    "_exploration_trials", []).append(dict(record))
-
-                # Retain the best successful trial as the scalar representative
-                # of this iteration. The complete trial set remains available 
-                # above.
-                old_obj = _finite_scalar(current,
-                    "exploration_trial_trial_total_obj",
-                    "exploration_trial_trial_data_obj")
-                new_obj = _finite_scalar(record,
-                    "trial_total_obj",
-                    "trial_data_obj")
-
-                if not np.isfinite(old_obj) or (
-                    np.isfinite(new_obj) and new_obj < old_obj):
-                    for key, value in record.items():
-                        if key not in {"kind", "iter"}:
-                            current[f"exploration_trial_{key}"] = value
-
-                current["_has_exploration_trial"] = True
-                continue
-
-            if kind == "kkt":
-                for key, value in record.items():
-                    if key not in {"kind", "iter"}:
-                        current[key] = value
-
-                current["_has_kkt"] = True
-                continue
-
-            prefix = f"{kind}_"
-
-            for key, value in record.items():
-                if key not in {"kind", "iter"}:
-                    current[f"{prefix}{key}"] = value
-
-            if kind:
-                current[f"_has_{kind}"] = True
-
-        merged = [
-            merged_by_iter[key]
-            for key in sorted(merged_by_iter)
-        ]
-
-        if max_points is not None:
-            merged = merged[-int(max_points):]
-
-        non_iteration["_setup_records"] = setup_records
-
-        return merged, non_iteration
-
-    def _series(
-        merged: list[dict],
-        *keys: str,
-        default: float = np.nan,
-    ) -> np.ndarray:
-        return np.asarray([_finite_scalar(record, *keys, default=default)
-            for record in merged], dtype=np.float64)
+    def _series(records: list[dict], *keys: str,
+        default: float = np.nan) -> np.ndarray:
+        """Extract a scalar history from merged iteration records."""
+        return np.asarray([
+            _finite_scalar(record, *keys, default=default)
+            for record in records
+        ], dtype=np.float64)
 
     def _plot_finite(axis, x_values: np.ndarray, y_values: np.ndarray,
-        label: str, *, absolute: bool = False, positive_log: bool = False,
-        color: str | None = None, linestyle: str | None = None, **kwargs
-        ) -> None:
-        x_array = np.asarray(x_values, dtype=np.float64)
-        y_array = np.asarray(y_values, dtype=np.float64)
-
-        mask = np.isfinite(x_array) & np.isfinite(y_array)
-        if not np.any(mask):
-            return
-
-        x_plot = x_array[mask]
-        y_plot = y_array[mask]
-
-        if absolute:
-            y_plot = np.abs(y_plot)
+        label: str, *, positive_log: bool = False, **kwargs) -> None:
+        """Plot only finite values, optionally on a logarithmic y-axis."""
+        x_values = np.asarray(x_values, dtype=np.float64)
+        y_values = np.asarray(y_values, dtype=np.float64)
+        valid = np.isfinite(x_values) & np.isfinite(y_values)
 
         if positive_log:
-            positive = y_plot > 0.0
-            if not np.any(positive):
-                return
+            valid &= y_values > 0.0
 
-            axis.semilogy(x_plot[positive], np.maximum(y_plot[positive], eps),
-                label=label, color=color, linestyle=linestyle, **kwargs)
+        if not np.any(valid):
+            return
+
+        if positive_log:
+            axis.semilogy(x_values[valid],
+                np.maximum(y_values[valid], eps), label=label, **kwargs)
         else:
-            axis.plot(x_plot, y_plot, label=label, color=color,
-                linestyle=linestyle, **kwargs)
+            axis.plot(x_values[valid], y_values[valid], label=label,
+                **kwargs)
 
-    def _fmt_sci(value):
-        """Format a scalar as compact scientific-notation mathtext."""
+    def _fmt_sci(value: float) -> str:
+        """Return compact scientific-notation mathtext."""
         if not np.isfinite(value):
-            return r"\mathrm{nan}"
+            return r"\mathrm{n/a}"
+
         if value == 0.0:
             return "0"
 
         exponent = int(np.floor(np.log10(abs(value))))
-        mantissa = value / 10.0 ** exponent
-        return rf"{mantissa:.2f}\times 10^{{{exponent}}}"
+        mantissa = value/(10.0**exponent)
 
-    def _latest_vector(merged: list[dict], *keys: str) -> np.ndarray | None:
-        for record in reversed(merged):
-            value = _vector(record, *keys)
+        return rf"{mantissa:.2f}\times10^{{{exponent}}}"
 
-            if value is not None:
-                return value
+    paths = [jsonl_paths] if isinstance(jsonl_paths, str) else list(jsonl_paths)
+    raw_records = []
 
-        return None
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
 
-    def _trial_records(merged: list[dict]) -> list[dict]:
-        """
-        Flatten all exploration trials while retaining their iteration.
+                if not text:
+                    continue
 
-        Parameters
-        ----------
-        merged : list of dict
-            Merged outer-iteration diagnostic records.
+                try:
+                    record = json.loads(text)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
 
-        Returns
-        -------
-        trials : list of dict
-            Individual exploration-trial records.
+                if isinstance(record, dict):
+                    raw_records.append(record)
 
-        Raises
-        ------
-        None
+    # ------------------------------------------------------------------
+    # Merge records by outer iteration.
+    #
+    # KKT is the pre-promotion state. kkt_promotion describes the exact
+    # support transition committed from that state. We deliberately do not
+    # copy final_solution.x into the merged records because it can be huge.
+    # ------------------------------------------------------------------
+    merged_by_iter = {}
+    setup_records = []
+    final_record = {}
 
-        Examples
-        --------
-        >>> trials = _trial_records(merged)
-        """
-        trials = []
+    for record in raw_records:
+        kind = str(record.get("kind", ""))
 
-        for record in merged:
+        if kind == "mono_setup":
+            setup_records.append(dict(record))
+            continue
+
+        if kind == "objective_summary":
+            final_record = dict(record)
+            continue
+
+        if kind not in {"kkt", "kkt_promotion"}:
+            continue
+
+        try:
             iteration = int(record["iter"])
+        except (KeyError, TypeError, ValueError):
+            continue
 
-            for trial in record.get("_exploration_trials", []):
-                item = dict(trial)
-                item["_plot_iter"] = iteration
-                trials.append(item)
+        current = merged_by_iter.setdefault(iteration, {"iter": iteration})
 
-        return trials
+        if kind == "kkt":
+            for key, value in record.items():
+                if key not in {"kind", "iter"}:
+                    current[key] = value
 
-    def _trial_series(trials: list[dict], *keys: str, default: float = np.nan,
-    ) -> np.ndarray:
-        """
-        Extract a scalar series from individual exploration trials.
+            current["_has_kkt"] = True
 
-        Parameters
-        ----------
-        trials : list of dict
-            Exploration-trial records.
-        *keys : str
-            Keys searched in priority order.
-        default : float, optional
-            Value used when no finite scalar is available.
+        else:
+            for key, value in record.items():
+                if key not in {"kind", "iter"}:
+                    current[f"promotion_{key}"] = value
 
-        Returns
-        -------
-        values : ndarray
-            Extracted float64 values.
+            current["_has_promotion"] = True
 
-        Raises
-        ------
-        None
+    merged = [merged_by_iter[key] for key in sorted(merged_by_iter)]
 
-        Examples
-        --------
-        >>> values = _trial_series(trials, "trial_total_obj")
-        """
-        return np.asarray([_finite_scalar(record, *keys, default=default)
-            for record in trials], dtype=np.float64)
-
-    raw_records = _load_records()
-    merged, non_iteration = _merge_iteration_records(raw_records)
-    trials = _trial_records(merged)
-
-    fig = plt.figure(figsize=figsize)
-    grid = gridspec.GridSpec(3, 4, figure=fig)
-
-    axes = {
-        "objective": fig.add_subplot(grid[0, 0]),
-        "improvement": fig.add_subplot(grid[0, 1]),
-        "kkt": fig.add_subplot(grid[0, 2]),
-        "constraint": fig.add_subplot(grid[0, 3]),
-        "support": fig.add_subplot(grid[1, 0]),
-        "coverage": fig.add_subplot(grid[1, 1]),
-        "search_outcomes": fig.add_subplot(grid[1, 2]),
-        "search_efficiency": fig.add_subplot(grid[1, 3]),
-        "amplitude": fig.add_subplot(grid[2, 0]),
-        "convergence": fig.add_subplot(grid[2, 1]),
-        "runtime": fig.add_subplot(grid[2, 2]),
-        "status": fig.add_subplot(grid[2, 3]),
-    }
+    if max_points is not None:
+        merged = merged[-int(max_points):]
 
     if not merged:
-        for axis in axes.values():
-            axis.set_axis_off()
+        raise ValueError("No KKT iteration diagnostics found.")
 
-        axes["objective"].set_axis_on()
-        axes["objective"].text(0.5, 0.5,
-            "No iteration diagnostics found", ha="center", va="center",
-            transform=axes["objective"].transAxes)
+    setup = setup_records[-1] if setup_records else {}
 
-        if save_path:
-            fig.savefig(save_path, dpi=150, bbox_inches="tight")
-
-        if show:
-            plt.show()
-
-        return raw_records
-
-    iterations = np.asarray([int(record["iter"]) for record in merged],
-        dtype=np.int64)
+    iterations = np.asarray(
+        [int(record["iter"]) for record in merged], dtype=np.int64)
 
     # ------------------------------------------------------------------
-    # Extract exploration-solver histories
+    # KKT state.
     # ------------------------------------------------------------------
-    # Committed state at the start of each exploration iteration.
-    data_objective = _series(merged,
-        "exploration_trial_current_data_obj",
-        "exploration_accept_data_objective_before")
-    regularisation_objective = _series(merged,
-        "exploration_trial_current_regularisation_obj")
-    total_objective = _series(merged,
-        "exploration_trial_current_total_obj")
-
-    # Every joint-support trial is retained separately. This is essential now
-    # that several candidate batches may be tested within one outer iteration.
-    trial_iterations = np.asarray([int(record["_plot_iter"]) for record in trials
-        ], dtype=np.int64)
-
-    trial_numbers = _trial_series(trials, "trial")
-    trial_data_objective = _trial_series(trials, "trial_data_obj")
-    trial_regularisation_objective = _trial_series(
-        trials, "trial_regularisation_obj")
-    trial_total_objective = _trial_series(trials, "trial_total_obj")
-
-    trial_data_improvement = _trial_series(trials, "data_improvement")
-    trial_regularisation_change = _trial_series(
-        trials, "regularisation_change")
-    trial_total_improvement = _trial_series(
-        trials, "total_improvement", "improvement")
-    trial_best_improvement = _trial_series(
-        trials, "best_total_improvement")
-
-    trial_rel_data_improvement = _trial_series(
-        trials, "relative_data_improvement")
-    trial_rel_total_improvement = _trial_series(
-        trials, "relative_total_improvement", "relative_improvement")
-
-    trial_improvement_tol = _trial_series(trials, "improvement_tol")
-
-    trial_accepted_all = _trial_series(
-        trials, "accepted", default=0.0)
-    trial_solve_accepted = _trial_series(
-        trials, "solve_accepted", default=np.nan)
-
-    trial_support_all = _trial_series(trials, "trial_n_active")
-    proposal_n_all = _trial_series(trials, "proposal_n")
-
-    alpha = _series(merged, "alpha")
-    ridge = _series(merged, "ridge")
+    tol = _series(merged, "kkt_tol", "tol")
     grad_active = _series(merged, "max_grad_active")
-    grad_inactive = _series(merged, "max_grad_inactive")
     grad_dual = _series(merged, "max_grad_dual")
-
     kkt_violation = _series(merged, "kkt_violation")
-    kkt_tol = _series(merged, "kkt_tol", "tol")
 
-    best_dual_value = _series(merged, "best_dual_value")
-    n_active = _series(merged, "n_working_active",
-        "exploration_accept_n_active_after", "exploration_n_active")
+    kkt_ratio = np.divide(
+        kkt_violation, tol, out=np.full_like(tol, np.nan), where=tol > 0.0)
+
+    active_ratio = np.divide(
+        np.abs(grad_active), tol, out=np.full_like(tol, np.nan),
+        where=tol > 0.0)
+
+    dual_ratio = np.divide(
+        np.maximum(grad_dual, 0.0), tol, out=np.full_like(tol, np.nan),
+        where=tol > 0.0)
+
+    # ------------------------------------------------------------------
+    # Gradient decomposition.
+    # ------------------------------------------------------------------
+    grad_data = _series(merged, "max_grad_data")
+    grad_regularisation = _series(merged, "max_grad_regularisation")
+    grad_constraint = _series(merged, "max_grad_constraint")
+    grad_ridge = _series(merged, "max_grad_numerical_ridge")
+
+    # ------------------------------------------------------------------
+    # Support and dual-feasibility state.
+    # ------------------------------------------------------------------
+    n_active = _series(merged, "n_working_active")
     n_positive = _series(merged, "n_positive")
-    n_zero_free = _series(merged, "n_zero_free",)
-    n_candidates = _series(merged, "exploration_n_candidates",)
+    n_zero_free = _series(merged, "n_zero_free")
+    n_violators = _series(merged, "n_dual_violators")
 
-    trial_support = _series(merged, "exploration_trial_trial_n_active",)
-    proposal_n = _series(merged, "exploration_trial_proposal_n",)
-    n_added = np.asarray([float(len(record.get(
-        "exploration_accept_added_columns", [])))
-        if "_has_exploration_accept" in record else np.nan
-        for record in merged], dtype=np.float64)
-    n_zero_dropped = _series(merged,"exploration_accept_n_zero_dropped",)
-
-    explore_round = _series(merged, "explore_round",
-        "exploration_explore_round", "exploration_trial_explore_round")
-    explore_fail_count = _series(merged, "exploration_explore_fail_count",
-        "explore_fail_count", default=0.0)
-    coverage_min = _series(merged, "exploration_coverage_min")
-    coverage_total = _series(merged, "exploration_coverage_total")
-    coverage_target = _series(merged, "exploration_coverage_target")
-    coverage_remaining = _series(merged,
-        "exploration_coverage_rounds_remaining")
-
-    have_coverage = np.any(np.isfinite(coverage_min))
-    have_coverage_remaining = np.any(np.isfinite(coverage_remaining))
-
-    support_stationary = _series(merged, "support_stationary",
-        default=np.nan)
-    trial_accepted = _series(merged, "exploration_trial_accepted",
-        default=np.nan)
-    constraint_dot_lambda = _series(merged, "constraint_dot_lambda",
-        "shape_dot_lambda")
-    elapsed_time = _series(merged, "t_sec")
-
-    def _trial_gradient_max(record: dict, scalar_key: str, vector_key: str,
-        ) -> float:
-        value = _finite_scalar(record, scalar_key)
-
-        if np.isfinite(value):
-            return value
-
-        vector = _vector(record, vector_key)
-
-        if vector is None:
-            return np.nan
-
-        return float(np.max(np.abs(vector)))
-
-    trial_grad_data_max = np.asarray([_trial_gradient_max(record,
-            "proposal_grad_data_max", "proposal_grad_data")
-        for record in trials], dtype=np.float64)
-    trial_grad_constraint_max = np.asarray([_trial_gradient_max(record,
-            "proposal_grad_constraint_max", "proposal_grad_constraint")
-        for record in trials], dtype=np.float64)
-    trial_grad_total_max = np.asarray([_trial_gradient_max(record,
-            "proposal_grad_total_max","proposal_grad_total")
-        for record in trials], dtype=np.float64)
-
-    any_trial_accepted = np.asarray([float(any(bool(trial.get("accepted", False))
-            for trial in record.get("_exploration_trials", [])))
-        if record.get("_exploration_trials") else np.nan for record in merged
-        ], dtype=np.float64)
-    accepted_iteration = np.zeros(iterations.size, dtype=bool)
-    accepted_iteration[:] = np.isfinite(any_trial_accepted) & \
-        (any_trial_accepted > 0.5)
-    explores_since_improvement = np.zeros(iterations.size, dtype=np.float64)
-    last_accept = None
-    for ii in range(iterations.size):
-        if accepted_iteration[ii]:
-            last_accept = ii
-            explores_since_improvement[ii] = 0.0
-        elif last_accept is None:
-            explores_since_improvement[ii] = np.nan
-        else:
-            explores_since_improvement[ii] = (
-                explore_round[ii] - explore_round[last_accept]
-                if np.isfinite(explore_round[ii])
-                and np.isfinite(explore_round[last_accept])
-                else iterations[ii] - iterations[last_accept])
+    violator_fraction = np.divide(
+        n_violators, n_zero_free, out=np.full_like(n_violators, np.nan),
+        where=n_zero_free > 0.0)
 
     # ------------------------------------------------------------------
-    # Panel 1: scientific-objective evolution
+    # Exact KKT-promotion outcomes.
     # ------------------------------------------------------------------
-    # Is the accepted solution still improving?
-    axis = axes["objective"]
+    n_promoted = _series(merged, "promotion_n_promoted")
+    n_dropped = _series(merged, "promotion_n_zero_dropped")
+    n_active_after = _series(merged, "promotion_n_active_after")
 
-    _plot_finite(axis, iterations, data_objective,
-        "Committed data objective", lw=1.4, color="tab:blue")
-
-    _plot_finite(axis, iterations, total_objective,
-        "Committed total objective", lw=1.6, color="tab:green")
-
-    accepted_trial = (np.isfinite(trial_iterations)
-        & np.isfinite(trial_total_objective)
-        & np.isfinite(trial_accepted_all) & (trial_accepted_all > 0.5))
-
-    if np.any(accepted_trial):
-        axis.scatter(trial_iterations[accepted_trial],
-            trial_total_objective[accepted_trial], s=30,
-            facecolors="none", edgecolors="tab:orange",
-            label="Accepted support", zorder=4)
-
-    axis.set_title("Committed objective")
-    axis.set_xlabel("Iteration")
-    axis.set_ylabel(r"$J$")
-    _homogenise_ticks(axis)
-    axis.legend(fontsize=8, loc="best")
+    retained = n_promoted-n_dropped
+    retention_fraction = np.divide(
+        retained, n_promoted, out=np.full_like(retained, np.nan),
+        where=n_promoted > 0.0)
 
     # ------------------------------------------------------------------
-    # Panel 2: joint-support objective-gain decomposition
+    # Constraint and amplitude state.
     # ------------------------------------------------------------------
-    axis = axes["improvement"]
-
-    finite_gain = (
-        np.isfinite(trial_iterations)
-        & np.isfinite(trial_total_improvement)
-    )
-
-    if np.any(finite_gain):
-        axis.scatter(trial_iterations[finite_gain],
-            trial_total_improvement[finite_gain],
-            s=10, alpha=0.20, color="tab:gray",
-            label="Tested support")
-
-    if np.any(accepted_trial):
-        axis.scatter(trial_iterations[accepted_trial],
-            trial_total_improvement[accepted_trial],
-            s=32, color="tab:green",
-            label="Accepted improvement", zorder=4)
-
-    axis.axhline(0.0, lw=0.9, color="black", linestyle=":")
-
-    axis.set_title("Joint-search improvement")
-    axis.set_xlabel("Iteration")
-    axis.set_ylabel(r"$J_\mathrm{current}-J_\mathrm{trial}$")
-    _homogenise_ticks(axis)
-    axis.legend(fontsize=8, loc="best")
+    alpha = _series(merged, "alpha", "promotion_alpha")
+    constraint_dot_lambda = _series(merged, "constraint_dot_lambda")
+    ridge = _series(merged, "ridge")
 
     # ------------------------------------------------------------------
-    # Panel 3: constrained KKT convergence
+    # Runtime.
+    #
+    # t_sec is emitted on the KKT record, so its difference measures the
+    # complete previous promotion/re-solve/ATAz cycle rather than merely
+    # plotting overhead.
+    # ------------------------------------------------------------------
+    elapsed = _series(merged, "t_sec")
+    iter_time = np.full_like(elapsed, np.nan)
+
+    if elapsed.size > 1:
+        iter_time[1:] = np.diff(elapsed)
+
+    rolling_time = np.full_like(iter_time, np.nan)
+    window = min(5, iter_time.size)
+
+    for ii in range(window-1, iter_time.size):
+        values = iter_time[ii-window+1:ii+1]
+        values = values[np.isfinite(values)]
+
+        if values.size:
+            rolling_time[ii] = float(np.median(values))
+
+    # ------------------------------------------------------------------
+    # Figure layout.
+    # ------------------------------------------------------------------
+    fig = plt.figure(figsize=figsize)
+    grid = gridspec.GridSpec(2, 4, figure=fig)
+
+    axes = {
+        "kkt": fig.add_subplot(grid[0, 0]),
+        "gradients": fig.add_subplot(grid[0, 1]),
+        "violators": fig.add_subplot(grid[0, 2]),
+        "support": fig.add_subplot(grid[0, 3]),
+        "promotion": fig.add_subplot(grid[1, 0]),
+        "constraint": fig.add_subplot(grid[1, 1]),
+        "runtime": fig.add_subplot(grid[1, 2]),
+        "status": fig.add_subplot(grid[1, 3]),
+    }
+
+    # ------------------------------------------------------------------
+    # Panel 1: the actual convergence certificate.
     # ------------------------------------------------------------------
     axis = axes["kkt"]
 
-    kkt_ratio = np.divide(kkt_violation, kkt_tol,
-        out=np.full_like(kkt_violation, np.nan), where=kkt_tol > 0.0)
+    _plot_finite(axis, iterations, kkt_ratio, "Overall KKT / tol",
+        positive_log=True, lw=1.7)
+    _plot_finite(axis, iterations, active_ratio, "Active / tol",
+        positive_log=True, lw=1.2)
+    _plot_finite(axis, iterations, dual_ratio, "Inactive dual / tol",
+        positive_log=True, lw=1.2)
 
-    active_ratio = np.divide(np.abs(grad_active), kkt_tol,
-        out=np.full_like(grad_active, np.nan), where=kkt_tol > 0.0)
-
-    dual_ratio = np.divide(np.maximum(grad_dual, 0.0), kkt_tol,
-        out=np.full_like(grad_dual, np.nan), where=kkt_tol > 0.0)
-
-    _plot_finite(axis, iterations, kkt_ratio, "Overall KKT / tolerance",
-        positive_log=True, lw=1.6, color="tab:red")
-
-    _plot_finite(axis, iterations, active_ratio,
-        "Positive stationarity / tolerance", positive_log=True, lw=1.2,
-        color="tab:blue")
-
-    _plot_finite(axis, iterations, dual_ratio,
-        "Zero-variable dual / tolerance", positive_log=True, lw=1.2,
-        color="tab:orange")
-
-    axis.axhline(1.0, lw=1.0, color="black", linestyle="--",
-        label="KKT boundary",)
-
-    axis.set_title("Current-support KKT")
+    axis.axhline(1.0, color="black", linestyle="--", lw=1.0,
+        label="Convergence boundary")
+    axis.set_title("Full-space KKT convergence")
     axis.set_xlabel("Iteration")
     axis.set_ylabel("Violation / tolerance")
     _homogenise_ticks(axis)
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 4: candidate-screening decomposition
+    # Panel 2: what currently dominates the gradient scale?
     # ------------------------------------------------------------------
-    # Is the orbital hard-constraint healthy?
-    axis = axes["constraint"]
+    axis = axes["gradients"]
 
-    _plot_finite(axis, iterations, np.abs(constraint_dot_lambda),
-        r"$|\mathbf{1}_{+}^{T}\lambda|$",
-        positive_log=True, lw=1.4, color="tab:blue")
+    _plot_finite(axis, iterations, grad_data, r"$|g_{\rm data}|_{\max}$",
+        positive_log=True, lw=1.4)
+    _plot_finite(axis, iterations, grad_regularisation,
+        r"$|g_{\rm smooth}|_{\max}$", positive_log=True, lw=1.4)
+    _plot_finite(axis, iterations, grad_constraint,
+        r"$|g_{\rm constraint}|_{\max}$", positive_log=True, lw=1.4)
+    _plot_finite(axis, iterations, grad_ridge, r"$|g_{\rm ridge}|_{\max}$",
+        positive_log=True, lw=1.0, linestyle=":")
 
-    _plot_finite(axis, iterations, ridge,
-        "Numerical ridge",
-        positive_log=True, lw=1.2, color="tab:orange")
-
-    axis.set_title("Constraint / numerical health")
+    axis.set_title("Gradient decomposition")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Magnitude")
+    axis.set_ylabel("Maximum magnitude")
     _homogenise_ticks(axis)
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 5: active and effective support
+    # Panel 3: unresolved full-space dual violations.
+    # ------------------------------------------------------------------
+    axis = axes["violators"]
+
+    _plot_finite(axis, iterations, n_violators, "Violating columns", lw=1.7)
+    axis.set_title("Unresolved dual violations")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel("Columns")
+    _homogenise_ticks(axis)
+
+    axis_fraction = axis.twinx()
+    _plot_finite(axis_fraction, iterations, 100.0*violator_fraction,
+        "Violating fraction", lw=1.2, linestyle="--")
+    axis_fraction.set_ylabel("Zero/free columns [%]")
+    axis_fraction.set_ylim(bottom=0.0)
+    _homogenise_ticks(axis_fraction)
+
+    lines1, labels1 = axis.get_legend_handles_labels()
+    lines2, labels2 = axis_fraction.get_legend_handles_labels()
+    axis.legend(lines1+lines2, labels1+labels2, fontsize=8, loc="best")
+
+    # ------------------------------------------------------------------
+    # Panel 4: support evolution.
     # ------------------------------------------------------------------
     axis = axes["support"]
 
-    _plot_finite(axis, iterations, n_active,
-        "Working support", lw=1.6, color="tab:blue")
+    _plot_finite(axis, iterations, n_active, "Working support", lw=1.6)
+    _plot_finite(axis, iterations, n_positive, "Positive coefficients",
+        lw=1.4)
 
-    _plot_finite(axis, iterations, n_positive,
-        "Positive coefficients", lw=1.3, color="tab:green")
+    setup_C = _finite_scalar(setup, "C")
 
-    axis.set_title("Committed support")
+    if np.isfinite(setup_C) and setup_C > 0.0:
+        axis.axhline(setup_C, color="black", linestyle=":", lw=1.0,
+            label=rf"$C={int(setup_C)}$ floor")
+
+    axis.set_title("Active-set size")
     axis.set_xlabel("Iteration")
     axis.set_ylabel("Columns")
     _homogenise_ticks(axis)
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 6: active-set dynamics
+    # Panel 5: do promoted KKT violators survive the exact re-solve?
     # ------------------------------------------------------------------
-    axis = axes["coverage"]
+    axis = axes["promotion"]
 
-    if have_coverage:
-        _plot_finite(axis, iterations, 100.0*coverage_min,
-            "Minimum orbit coverage", lw=1.8, color="tab:blue")
+    _plot_finite(axis, iterations, n_promoted, "Promoted", lw=1.4)
+    _plot_finite(axis, iterations, retained, "Retained after solve", lw=1.6)
+    _plot_finite(axis, iterations, n_dropped, "Returned to zero", lw=1.2)
 
-        _plot_finite(axis, iterations, 100.0*coverage_total,
-            "Total unique coverage", lw=1.3, color="tab:green")
-
-        finite_target = coverage_target[np.isfinite(coverage_target)]
-        if finite_target.size:
-            target = 100.0*float(finite_target[-1])
-            axis.axhline(target, lw=1.2, color="black", linestyle="--",
-                label=f"Required coverage ({target:.0f}%)")
-
-        axis.set_ylim(0.0, 100.0)
-        axis.set_title("Support-search certification")
-        axis.set_ylabel("Unique coverage [%]")
-
-    else:
-        _plot_finite(axis, iterations, explore_round,
-            "Exploration round", lw=1.5, color="tab:blue")
-
-        _plot_finite(axis, iterations, explore_fail_count,
-            "Consecutive failures", lw=1.5, color="tab:red")
-
-        axis.set_title("Support-search progress (legacy diagnostics)")
-        axis.set_ylabel("Exploration round")
-
-        axis.text(0.03, 0.97,
-            "Coverage not recorded\n"
-            "in this run",
-            transform=axis.transAxes, ha="left", va="top",
-            fontsize=8,
-            bbox=dict(boxstyle="round", fc="white", alpha=0.85))
-
+    axis.set_title("KKT-promotion outcome")
     axis.set_xlabel("Iteration")
+    axis.set_ylabel("Columns")
     _homogenise_ticks(axis)
-    axis.legend(fontsize=8, loc="best")
+
+    axis_retention = axis.twinx()
+    _plot_finite(axis_retention, iterations, 100.0*retention_fraction,
+        "Retention", lw=1.1, linestyle="--")
+    axis_retention.set_ylim(0.0, 105.0)
+    axis_retention.set_ylabel("Retention [%]")
+    _homogenise_ticks(axis_retention)
+
+    lines1, labels1 = axis.get_legend_handles_labels()
+    lines2, labels2 = axis_retention.get_legend_handles_labels()
+    axis.legend(lines1+lines2, labels1+labels2, fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 7: proposal and support survival
+    # Panel 6: hard-constraint health and fitted common mass.
     # ------------------------------------------------------------------
-    axis = axes["search_outcomes"]
+    axis = axes["constraint"]
 
-    accepted_y = np.where(accepted_iteration, 1.0, 0.0)
-
-    axis.step(iterations, accepted_y, where="mid",
-        lw=1.4, color="tab:green", label="Accepted improvement")
-
-    _plot_finite(axis, iterations, support_stationary,
-        "KKT stationary", lw=1.2, color="tab:blue")
-
-    axis.set_ylim(-0.05, 1.05)
-    axis.set_yticks([0.0, 1.0])
-    axis.set_yticklabels(["No", "Yes"])
-    axis.set_title("Optimization vs certification")
-    axis.set_xlabel("Iteration")
-    axis.legend(fontsize=8, loc="best")
-
-    # ------------------------------------------------------------------
-    # Panel 8: hard-prior feasibility
-    # ------------------------------------------------------------------
-    axis = axes["search_efficiency"]
-
-    if have_coverage_remaining:
-        _plot_finite(axis, iterations, coverage_remaining,
-            "Estimated explores remaining",
-            lw=1.8, color="tab:blue")
-
-        _plot_finite(axis, iterations, explore_fail_count,
-            "Failed explores", lw=1.2, color="tab:red")
-
-        axis.set_title("Search remaining")
-        axis.set_ylabel("Exploration rounds")
-
-    else:
-        _plot_finite(axis, iterations, explore_fail_count,
-            "Consecutive failed explores",
-            lw=1.6, color="tab:red")
-
-        axis.set_title("Search persistence")
-        axis.set_ylabel("Failed explores")
-
-    axis.set_xlabel("Iteration")
-    _homogenise_ticks(axis)
-    axis.legend(fontsize=8, loc="best")
-
-    # ------------------------------------------------------------------
-    # Panel 9: common component mass and numerical stabilisation
-    # ------------------------------------------------------------------
-    axis = axes["amplitude"]
-
-    _plot_finite(axis, iterations, alpha,
-        r"Common coefficient mass $\alpha$",
-        lw=1.5, color="tab:blue")
-
-    axis.set_title(r"Global amplitude $\alpha$")
+    _plot_finite(axis, iterations, alpha, r"Common mass $\alpha$", lw=1.6)
+    axis.set_title("Hard-constraint health")
     axis.set_xlabel("Iteration")
     axis.set_ylabel(r"$\alpha$")
     _homogenise_ticks(axis)
 
-    # ------------------------------------------------------------------
-    # Panel 10: common-amplitude KKT stationarity
-    # ------------------------------------------------------------------
-    axis = axes["convergence"]
+    axis_constraint = axis.twinx()
+    _plot_finite(axis_constraint, iterations,
+        np.abs(constraint_dot_lambda),
+        r"$|\mathbf{1}^{T}\lambda|$", positive_log=True, lw=1.3)
 
-    local_ok = np.isfinite(kkt_ratio) & (kkt_ratio <= 1.0)
-    axis.step(iterations, local_ok.astype(float), where="mid",
-        lw=1.5, label="KKT satisfied", color="tab:blue")
+    axis_constraint.set_ylabel("Amplitude-KKT residual")
+    _homogenise_ticks(axis_constraint)
 
-    if have_coverage:
-        coverage_ok = (np.isfinite(coverage_min)
-            & np.isfinite(coverage_target) & (coverage_min >= coverage_target))
-        certified = local_ok & coverage_ok
-
-        axis.step(iterations, coverage_ok.astype(float), where="mid",
-            lw=1.3, label="Coverage satisfied", color="tab:orange")
-
-        axis.step(iterations, certified.astype(float), where="mid",
-            lw=1.8, label="Convergence certified", color="tab:green")
-
-        axis.set_title("Convergence conditions")
-
-    else:
-        axis.set_title("Local convergence")
-
-        axis.text(0.03, 0.08,
-            "Global coverage certification unavailable",
-            transform=axis.transAxes, ha="left", va="bottom",
-            fontsize=8)
-
-    axis.set_ylim(-0.05, 1.05)
-    axis.set_yticks([0.0, 1.0])
-    axis.set_yticklabels(["No", "Yes"])
-    axis.set_xlabel("Iteration")
-    axis.legend(fontsize=8, loc="best")
+    lines1, labels1 = axis.get_legend_handles_labels()
+    lines2, labels2 = axis_constraint.get_legend_handles_labels()
+    axis.legend(lines1+lines2, labels1+labels2, fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 11: solver progress and stall state
+    # Panel 7: computational health.
     # ------------------------------------------------------------------
     axis = axes["runtime"]
 
-    iter_time = np.full_like(elapsed_time, np.nan)
-    if elapsed_time.size > 1:
-        iter_time[1:] = np.diff(elapsed_time)
-
-    _plot_finite(axis, iterations, iter_time,
-        "Iteration time", lw=1.0, color="tab:orange", alpha=0.55)
-
-    window = min(5, iter_time.size)
-    rolling_time = np.full_like(iter_time, np.nan)
-
-    for ii in range(window - 1, iter_time.size):
-        values = iter_time[ii-window+1:ii+1]
-        values = values[np.isfinite(values)]
-        if values.size:
-            rolling_time[ii] = np.median(values)
-
-    _plot_finite(axis, iterations, rolling_time,
-        "5-iteration median", lw=1.7, color="tab:blue")
+    _plot_finite(axis, iterations, iter_time, "Iteration time", lw=1.0,
+        alpha=0.55)
+    _plot_finite(axis, iterations, rolling_time, "5-iteration median",
+        lw=1.7)
 
     axis.set_title("Runtime health")
     axis.set_xlabel("Iteration")
     axis.set_ylabel("Seconds / iteration")
     _homogenise_ticks(axis)
-    axis.legend(fontsize=8, loc="best")
+
+    axis_elapsed = axis.twinx()
+    _plot_finite(axis_elapsed, iterations, elapsed/3600.0, "Elapsed",
+        lw=1.0, linestyle=":")
+    axis_elapsed.set_ylabel("Elapsed [h]")
+    _homogenise_ticks(axis_elapsed)
+
+    lines1, labels1 = axis.get_legend_handles_labels()
+    lines2, labels2 = axis_elapsed.get_legend_handles_labels()
+    axis.legend(lines1+lines2, labels1+labels2, fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 12: runtime and numerical conditioning
+    # Panel 8: current solver state.
     # ------------------------------------------------------------------
-    # What is the solver actually doing?
     axis = axes["status"]
     axis.set_axis_off()
 
-    def _latest_finite(values, default=np.nan):
-        values = np.asarray(values, dtype=np.float64)
-        values = values[np.isfinite(values)]
-        return float(values[-1]) if values.size else float(default)
-
     latest_kkt = _latest_finite(kkt_ratio)
-    latest_fail = _latest_finite(explore_fail_count)
+    latest_active = _latest_finite(active_ratio)
+    latest_dual = _latest_finite(dual_ratio)
+    latest_violators = _latest_finite(n_violators)
+    latest_support = _latest_finite(n_active)
+    latest_positive = _latest_finite(n_positive)
+    latest_alpha = _latest_finite(alpha)
+    latest_ridge = _latest_finite(ridge)
+    latest_time = _latest_finite(elapsed)
+    latest_retention = _latest_finite(retention_fraction)
 
-    kkt_ok = np.isfinite(latest_kkt) and latest_kkt <= 1.0
+    latest_record = merged[-1]
+    best_col = _finite_scalar(latest_record, "best_dual_col")
+    best_orbit = _finite_scalar(latest_record, "best_dual_orbit")
+    best_population = _finite_scalar(latest_record, "best_dual_population")
+    best_value = _finite_scalar(latest_record, "best_dual_value")
 
-    if have_coverage:
-        latest_cov_min = _latest_finite(coverage_min)
-        latest_cov_total = _latest_finite(coverage_total)
-        latest_cov_target = _latest_finite(coverage_target)
+    converged = np.isfinite(latest_kkt) and latest_kkt <= 1.0
 
-        cov_ok = (np.isfinite(latest_cov_min) and np.isfinite(latest_cov_target)
-            and latest_cov_min >= latest_cov_target)
+    if final_record:
+        stop_converged = bool(final_record.get("stop_converged", False))
+        stop_reason = str(final_record.get("stop_reason", "unknown"))
 
-        if kkt_ok and cov_ok:
+        if stop_converged:
             phase = "CONVERGED"
-        elif kkt_ok:
-            phase = "CERTIFYING SUPPORT"
         else:
-            phase = "OPTIMIZING"
+            phase = f"STOPPED: {stop_reason.replace('_', ' ')}"
+    elif converged:
+        phase = "KKT SATISFIED"
     else:
-        latest_cov_min = np.nan
-        latest_cov_total = np.nan
-        latest_cov_target = np.nan
+        phase = "OPTIMIZING"
 
-        phase = "KKT STATIONARY / SEARCHING" if kkt_ok else "OPTIMIZING"
-
-    lines = [rf"$\bf{{{phase}}}$",
+    lines = [
+        rf"$\bf{{{phase}}}$",
         "",
         f"Iteration: {int(iterations[-1])}",
         f"KKT / tol: {latest_kkt:.3g}"
-            if np.isfinite(latest_kkt) else "KKT / tol: n/a"]
+        if np.isfinite(latest_kkt) else "KKT / tol: n/a",
+        f"Active / tol: {latest_active:.3g}"
+        if np.isfinite(latest_active) else "Active / tol: n/a",
+        f"Dual / tol: {latest_dual:.3g}"
+        if np.isfinite(latest_dual) else "Dual / tol: n/a",
+        f"Dual violators: {int(latest_violators)}"
+        if np.isfinite(latest_violators) else "Dual violators: n/a",
+        f"Support: {int(latest_support)} working / "
+        f"{int(latest_positive)} positive"
+        if np.isfinite(latest_support) and np.isfinite(latest_positive)
+        else "Support: n/a",
+    ]
 
-    if have_coverage:
-        lines.extend([f"Min coverage: {100.0*latest_cov_min:.1f}%",
-            f"Total coverage: {100.0*latest_cov_total:.1f}%",
-            f"Target: {100.0*latest_cov_target:.0f}%"])
-    else:
-        lines.append("Coverage: not recorded")
+    if np.isfinite(setup_C) and setup_C > 0.0 and np.isfinite(latest_positive):
+        lines.append(
+            f"Positive / component: {latest_positive/setup_C:.2f}")
 
-    if np.isfinite(latest_fail):
-        lines.append(f"Failed explores: {int(latest_fail)}")
+    if np.isfinite(latest_retention):
+        lines.append(f"Last promotion retention: "
+            f"{100.0*latest_retention:.1f}%")
 
-    if have_coverage_remaining:
-        latest_remaining = _latest_finite(coverage_remaining)
-        if np.isfinite(latest_remaining):
-            lines.append(
-                f"Est. explores remaining: {int(np.ceil(latest_remaining))}")
+    if np.isfinite(best_col) and best_col >= 0.0:
+        lines.extend([
+            "",
+            f"Worst inactive: column {int(best_col)}",
+            f"orbit={int(best_orbit)}, population={int(best_population)}",
+            f"reduced gradient={best_value:.3e}",
+        ])
 
-    axis.text(0.05, 0.95, "\n".join(lines),
-        transform=axis.transAxes, ha="left", va="top", fontsize=11,
-        bbox=dict(boxstyle="round", fc="white", alpha=0.9))
+    if np.isfinite(latest_alpha):
+        lines.append(rf"$\alpha={latest_alpha:.6g}$")
+
+    if np.isfinite(latest_ridge):
+        lines.append(f"ridge={latest_ridge:.3e}")
+
+    if np.isfinite(latest_time):
+        lines.append(f"elapsed={latest_time/3600.0:.2f} h")
+
+    final_data = _finite_scalar(final_record, "data_objective")
+    final_reg = _finite_scalar(
+        final_record, "scientific_regularisation_objective")
+    final_scientific = _finite_scalar(final_record, "scientific_objective")
+    final_ridge_obj = _finite_scalar(final_record,
+        "numerical_ridge_objective")
+    final_total = _finite_scalar(final_record, "total_objective")
+    final_orbit_linf = _finite_scalar(final_record, "orbit_resid_linf")
+
+    if final_record:
+        lines.extend(["", "Final objective"])
+
+        if np.isfinite(final_data):
+            lines.append(f"data: {final_data:.4e}")
+        if np.isfinite(final_reg):
+            lines.append(f"smoothness: {final_reg:.4e}")
+        if np.isfinite(final_scientific):
+            lines.append(f"scientific: {final_scientific:.4e}")
+        if np.isfinite(final_ridge_obj):
+            lines.append(f"ridge: {final_ridge_obj:.4e}")
+        if np.isfinite(final_total):
+            lines.append(f"total: {final_total:.4e}")
+        if np.isfinite(final_orbit_linf):
+            lines.append(f"orbit Linf: {final_orbit_linf:.3e}")
+
+    axis.text(0.04, 0.97, "\n".join(lines), transform=axis.transAxes,
+        ha="left", va="top", fontsize=9.5,
+        bbox=dict(boxstyle="round", fc="white", alpha=0.90))
 
     axis.set_title("Current solver state")
+
     # ------------------------------------------------------------------
-    # Figure-level summary
+    # Figure-level summary.
     # ------------------------------------------------------------------
-    final_record = non_iteration.get("objective_summary", {})
+    setup_P = _finite_scalar(setup, "P")
+    setup_reg = _finite_scalar(setup, "regularisation_scale")
+    setup_smooth = _finite_scalar(setup, "effective_smoothness_scale")
+    setup_batch = _finite_scalar(setup, "kkt_promote_batch")
+    setup_ridge = _finite_scalar(setup, "numerical_ridge")
 
-    final_data_objective = _finite_scalar(final_record, "data_objective")
-    final_total_objective = _finite_scalar(final_record, "total_objective")
+    title_parts = [
+        "CubeFit exact constrained active-set diagnostics",
+        f"iterations={iterations[0]}-{iterations[-1]}",
+    ]
 
-    final_scientific_obj = _finite_scalar(final_record,
-        "scientific_regularisation_objective")
-    final_numerical_obj = _finite_scalar(final_record,
-        "numerical_ridge_objective")
-    final_scientific_scale = _finite_scalar(final_record,
-        "scientific_regularisation", "regularisation_scale")
-    final_numerical_ridge = _finite_scalar(final_record, "numerical_ridge",
-        "ridge")
-
-    final_alpha_summary = _finite_scalar(final_record, "alpha")
-    if not np.isfinite(final_alpha_summary):
-        finite_alpha = alpha[np.isfinite(alpha)]
-        final_alpha_summary = (float(finite_alpha[-1]) if finite_alpha.size
-            else np.nan)
-
-    title_parts = ["CubeFit constrained streaming diagnostics",
-        f"iterations={iterations[0]}-{iterations[-1]}"]
-    setup_record = non_iteration.get("mono_setup", {})
-    setup_C = _finite_scalar(setup_record, "C")
-    setup_P = _finite_scalar(setup_record, "P")
-    setup_reg = _finite_scalar(setup_record, "regularisation_scale")
     if np.isfinite(setup_C) and np.isfinite(setup_P):
         title_parts.append(f"C={int(setup_C)}, P={int(setup_P)}")
+
     if np.isfinite(setup_reg):
         title_parts.append(
-            rf"$\mathrm{{reg}}={_fmt_sci(setup_reg)}$")
-    if np.isfinite(final_scientific_obj):
+            rf"$\eta={_fmt_sci(setup_reg)}$")
+
+    if np.isfinite(setup_batch):
+        title_parts.append(f"KKT batch={int(setup_batch)}")
+
+    if np.isfinite(latest_kkt):
         title_parts.append(
-            rf"$J_\mathrm{{reg}}={_fmt_sci(final_scientific_obj)}$")
+            rf"$\mathrm{{KKT}}/\mathrm{{tol}}={_fmt_sci(latest_kkt)}$")
 
-    finite_dual = grad_dual[np.isfinite(grad_dual)]
-    finite_kkt = kkt_violation[np.isfinite(kkt_violation)]
-    finite_tol = kkt_tol[np.isfinite(kkt_tol)]
+    if np.isfinite(latest_violators):
+        title_parts.append(f"violators={int(latest_violators)}")
 
-    if (finite_kkt.size and finite_tol.size and finite_tol[-1] > 0.0):
-        final_kkt_ratio = finite_kkt[-1] / finite_tol[-1]
+    if np.isfinite(latest_positive):
+        title_parts.append(f"positive={int(latest_positive)}")
 
-        title_parts.append(rf"$\mathrm{{KKT}}/\mathrm{{tol}}="
-            rf"{_fmt_sci(final_kkt_ratio)}$")
-    finite_round = explore_round[np.isfinite(explore_round)]
-    finite_fail = explore_fail_count[np.isfinite(explore_fail_count)]
+    if np.isfinite(latest_time):
+        title_parts.append(f"elapsed={latest_time/3600.0:.2f} h")
 
-    if finite_round.size:
-        title_parts.append(f"explore={int(finite_round[-1])}")
+    if final_record:
+        stop_reason = str(final_record.get("stop_reason", "unknown"))
+        title_parts.append(f"stop={stop_reason}")
 
-    if finite_fail.size:
-        title_parts.append(f"fail={int(finite_fail[-1])}")
+    # Keep x-axis formatting consistent across every time-history panel.
+    for name, axis in axes.items():
+        if name == "status":
+            continue
 
-    if have_coverage:
-        finite_cov = coverage_min[np.isfinite(coverage_min)]
-        finite_target = coverage_target[np.isfinite(coverage_target)]
-
-        if finite_cov.size and finite_target.size:
-            title_parts.append(f"coverage={100.0*finite_cov[-1]:.1f}/"
-                f"{100.0*finite_target[-1]:.0f}%")
-
-    if have_coverage_remaining:
-        finite_remaining = coverage_remaining[
-            np.isfinite(coverage_remaining)]
-
-        if finite_remaining.size:
-            title_parts.append(
-                f"remaining~{int(np.ceil(finite_remaining[-1]))}")
-
-    if np.isfinite(final_alpha_summary):
-        title_parts.append(rf"$\alpha={_fmt_sci(final_alpha_summary)}$")
-
-    if np.isfinite(final_data_objective):
-        title_parts.append(rf"data objective=${_fmt_sci(final_data_objective)}$")
-    elif np.isfinite(final_total_objective):
-        title_parts.append(rf"objective=${_fmt_sci(final_total_objective)}$")
-
-    for axis in axes.values():
-        if axis.axison:
-            axis.xaxis.set_major_locator(mticker.MaxNLocator(nbins=5,
-                integer=True))
-            axis.xaxis.set_major_formatter(mticker.FuncFormatter(_fmt_compact))
-            axis.tick_params(axis="x", which="major", labelsize=9)
-
-    fig.suptitle(" | ".join(title_parts), fontsize=11, y=0.995)
-    fig.subplots_adjust(left=0.045, right=0.965, bottom=0.055, top=0.955,
-        hspace=0.28, wspace=0.32)
-    for axis in fig.axes:
+        axis.xaxis.set_major_locator(
+            mticker.MaxNLocator(nbins=5, integer=True))
+        axis.xaxis.set_major_formatter(
+            mticker.FuncFormatter(_fmt_compact))
+        axis.tick_params(axis="x", which="major", labelsize=9)
         axis.xaxis.labelpad = 2
         axis.yaxis.labelpad = 2
 
+    # Also format the secondary y axes created by twinx().
+    for axis in fig.axes:
+        if axis not in axes.values():
+            axis.tick_params(axis="y", which="major", labelsize=8)
+            axis.yaxis.labelpad = 2
+
+    fig.suptitle(" | ".join(title_parts), fontsize=11, y=0.995)
+    fig.subplots_adjust(left=0.055, right=0.955, bottom=0.075, top=0.925,
+        hspace=0.30, wspace=0.38)
+
     if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight", pad_inches=0.04)
+        fig.savefig(save_path, dpi=175, bbox_inches="tight",
+            pad_inches=0.04)
+
     if show:
         plt.show()
 
-    plt.close('all')
+    plt.close(fig)
+
     return raw_records
 
 # ------------------------------------------------------------------------------

@@ -121,7 +121,6 @@ def main():
             [-0.2, 0.0, 0.2, 0.4, 0.6])
     if propDict['nCuts'] == 3:
         propDict['regularisation_scale'] = 1e-2
-        propDict['lOrder'] = 0
         # propDict['validationPath'] = str(curdir/args.galaxy/
         #     'hypercube_3_00.h5')
         # propDict['runTag'] = 'datafit.w.lambda2e-5_stat_SSPoffset'
@@ -139,7 +138,7 @@ def main():
         #     [0.0, 0.2, 0.4])
         propDict['warm'] = 'zeros'
     elif propDict['nCuts'] == 20:
-        propDict['lOrder'] = 0
+        propDict['regularisation_scale'] = 1e-3
         # propDict['validationPath'] = str(curdir/args.galaxy/
         #     'hypercube_3_00_5e-6_SSPoffset.h5')
         # propDict['runTag'] = 'stat_Coffset_SSPoffset'
@@ -150,13 +149,12 @@ def main():
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6])
         # propDict['runTag'] = '5e-7'
-        propDict['regularisation_scale'] = 3e-2
         ############################ SSP library to generate mock-data fit
         # propDict['sspIdx'] = ([-1.79, -1.26, -0.6, -0.25, 0.0, 0.15, 0.26],
         #     [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
         #     [0.0, 0.4])
         # propDict['regularisation_scale'] = 0.0
-        propDict['warm'] = 'saved_x'
+        propDict['warm'] = 'zeros'
     print(propDict)
 
     _configure_solver_environment(args, propDict)
