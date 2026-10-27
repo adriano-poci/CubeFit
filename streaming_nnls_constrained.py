@@ -263,7 +263,7 @@ def _diag_append_jsonl(path: str | None, record: dict) -> None:
 
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, default=_diag_json_default,
-                separators=(",", ":")) + "\n")
+            separators=(",", ":")) + "\n")
 
 def _support_stats_1d(vec: np.ndarray) -> dict:
     """
