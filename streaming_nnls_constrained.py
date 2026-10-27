@@ -185,8 +185,8 @@ v2.1:   Added `_exploration_cycle_rounds` to terminate exploration cycles when
             the full candidate list has been cycled over. 4 October 2026
 v2.2:   Changed blind cycling of candidates to tracking cached sets of active
             columns; don't retry non-improving successfully-resolved sets;
-        Updated `monolithicNNLS` to solve the new mathematical formulation of the
-            solver. 5 October 2026
+        Updated `monolithicNNLS` to solve the new mathematical formulation of
+            the solver. 5 October 2026
 v2.3:   Made `_worker_reduced` and `_worker_ATAz` storage-chunk-aware, grouping
             reads by the physical HDF5 C/P chunk to eliminate redundant
             hypercube I/O. 13 October 2026
