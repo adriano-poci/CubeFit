@@ -205,8 +205,9 @@ v2.5:   Replaced the fixed 50-percent exploration-coverage stopping criterion
 v2.6:   Changed the `regularisation_scale` to be an SSP nearest-neighbour
             smoothness penalty, rather than a classic L2 ridge. 17 October 2026
 v2.7:   Made the constrained reduced solve more numerically robust;
-        Added automatic smaller-batch retries when adding new populations.
-        27 October 2026
+        Added automatic smaller-batch retries when adding new populations;
+        Compute normal equations only once in the orbit-constrained path of
+            `monolithicNNLS`. 27 October 2026
 """
 
 from __future__ import annotations, print_function
@@ -2957,7 +2958,7 @@ def streamActiveSetNNLS(
                     max_grad_dual=float(max_grad_dual),
                     tol_here=float(tol_here),
                 )
-                break            # The complete convex quadratic problem satisfies the full-space
+                break
             # KKT conditions, which are sufficient for global optimality.
 
             # --------------------------------------------------------
@@ -3164,6 +3165,8 @@ def streamActiveSetNNLS(
         "kind": "objective_summary",
         "source": "streamActiveSetNNLS",
         "data_objective": float(data_objective),
+        "residual_objective": float(residual_objective),
+        "smooth_to_residual": float(smooth_to_residual),
         "scientific_regularisation_objective": float(
             scientific_regularisation_objective),
         "scientific_objective": float(scientific_objective),
@@ -3338,16 +3341,25 @@ def monolithicNNLS(
     reuse_cache: bool = True,
 ):
     """
-    Solve the complete CubeFit problem using the literal full A and y.
+    Solve the raw, unregularised CubeFit NNLS problem using literal A and y.
 
     The complete masked physical-space design matrix and data vector are
-    materialized. No streamed normal equations, column scaling, support
-    exploration, or reduced active-set machinery are used.
+    materialized. No scientific regularisation, column scaling, streamed
+    normal equations, support heuristics, or reduced active-set machinery are
+    used.
 
-    Without orbit constraints, the problem is solved directly using classical
-    SciPy NNLS. With orbit constraints, SLSQP solves the same literal
-    least-squares objective subject to non-negativity and equal total
-    coefficient mass in every positive-weight component.
+    Without orbit constraints, this solves
+
+        min ||A @ x - y||_2
+
+        subject to x >= 0.
+
+    With orbit constraints, it solves the same raw least-squares problem with
+    the additional hard requirement that every participating dynamical
+    component has equal total population coefficient mass.
+
+    This function is intended as an independent unregularised reference
+    solution for testing the streamed solver.
 
     Parameters
     ----------
@@ -3369,7 +3381,8 @@ def monolithicNNLS(
     monolithic_max_active : int, optional
         Accepted for API compatibility and ignored.
     regularisation_scale : float, optional
-        Physical-space L2 regularisation strength. Default is 1.0.
+        Accepted for API compatibility and ignored. The monolithic reference
+        solve is always completely unregularised.
     cache_path : str, optional
         Accepted for API compatibility and ignored.
     reuse_cache : bool, optional
@@ -3396,16 +3409,10 @@ def monolithicNNLS(
     ...     h5_path, cfg, orbit_weights=weights)
     """
     del tracker, block_size, monolithic_max_active
-    del cache_path, reuse_cache
+    del cache_path, reuse_cache, regularisation_scale
 
     if resume_state:
         raise ValueError("monolithicNNLS does not support full-state resume.")
-
-    regularisation_scale = float(regularisation_scale)
-    if (not np.isfinite(regularisation_scale)
-        or regularisation_scale < 0.0):
-        raise ValueError(
-            "regularisation_scale must be nonnegative and finite.")
 
     if not _HAS_SCIPY_OPTIMIZE:
         raise RuntimeError("SciPy optimize is required for monolithicNNLS.")
@@ -3436,6 +3443,7 @@ def monolithicNNLS(
         positive_orbits = np.zeros(0, dtype=np.int64)
 
     n_free = int(free_idx.size)
+    n_rows = int(A.shape[0])
     if n_free == 0:
         raise RuntimeError("No free columns remain for monolithic solve.")
 
@@ -3446,26 +3454,16 @@ def monolithicNNLS(
     # Classical unconstrained-orbit NNLS: literal A and y.
     # ------------------------------------------------------------------
     if not constrained:
-        if regularisation_scale > 0.0:
-            sqrt_reg = np.sqrt(regularisation_scale)
-            A_fit = np.vstack((A,
-                sqrt_reg*np.eye(n_free, dtype=np.float64)))
-            y_fit = np.concatenate((y,
-                np.zeros(n_free, dtype=np.float64)))
-        else:
-            A_fit = A
-            y_fit = y
+        print("[MONOLITHIC] solving raw NNLS with scipy.optimize.nnls",
+            flush=True)
 
-        print("[MONOLITHIC] solving with scipy.optimize.nnls", flush=True)
+        x_free, rnorm = nnls(A, y, maxiter=max(3*n_free, 10000))
 
-        x_free, rnorm = nnls(A_fit, y_fit, maxiter=max(3*n_free, 10000))
         x_free = np.asarray(x_free, dtype=np.float64)
 
         solver_name = "scipy.optimize.nnls"
         iterations = None
         optimality = None
-
-        del A_fit, y_fit
 
     # ------------------------------------------------------------------
     # Constrained literal least squares.
@@ -3478,6 +3476,13 @@ def monolithicNNLS(
     # ------------------------------------------------------------------
     else:
         free_c = free_idx//P
+
+        print("[MONOLITHIC] forming normal equations", flush=True)
+        ATA = A.T @ A
+        ATy = A.T @ y
+        yty = float(np.dot(y, y))
+        ATA = 0.5*(ATA+ATA.T)
+
         n_constraints = max(0, int(positive_orbits.size)-1)
         E = np.zeros((n_constraints, n_free), dtype=np.float64)
 
@@ -3501,15 +3506,12 @@ def monolithicNNLS(
         objective_scale = data_scale*data_scale
 
         def _objective(x_vec):
-            residual = A @ x_vec-y
-            value = np.dot(residual, residual)
-            value += regularisation_scale*np.dot(x_vec, x_vec)
-            return 0.5*float(value)/objective_scale
+            value = (0.5*float(x_vec @ (ATA @ x_vec))
+                - float(np.dot(ATy, x_vec)) + 0.5*yty)
+            return value/objective_scale
 
         def _gradient(x_vec):
-            residual = A @ x_vec-y
-            grad = A.T @ residual
-            grad += regularisation_scale*x_vec
+            grad = ATA @ x_vec-ATy
             return np.asarray(grad/objective_scale, dtype=np.float64)
 
         if x0 is None:
@@ -3522,18 +3524,16 @@ def monolithicNNLS(
                 local = np.flatnonzero(free_c == int(cc))
                 x_seed[local] = alpha0/float(local.size)
         else:
-            x0_flat = np.asarray(
-                x0, dtype=np.float64).ravel(order="C")
+            x0_flat = np.asarray(x0, dtype=np.float64).ravel(order="C")
 
             if x0_flat.size != CP:
-                raise ValueError(
-                    f"x0 has size {x0_flat.size}; expected {CP}.")
+                raise ValueError(f"x0 has size {x0_flat.size}; expected {CP}.")
 
             x_seed = np.maximum(x0_flat[free_idx], 0.0)
 
             # Make the supplied seed exactly equal-mass feasible.
-            masses = np.bincount(free_c, weights=x_seed,
-                minlength=C).astype(np.float64)
+            masses = np.bincount(free_c, weights=x_seed, minlength=C
+                ).astype(np.float64)
             alpha0 = float(np.mean(masses[positive_orbits]))
 
             for cc in positive_orbits:
@@ -3545,6 +3545,9 @@ def monolithicNNLS(
                 elif alpha0 > 0.0:
                     x_seed[local] = alpha0/float(local.size)
 
+        # SLSQP now needs only ATA, ATy, and yty. Release the very large
+        # literal design matrix before entering the iterative optimizer.
+        del A
         bounds = Bounds(np.zeros(n_free, dtype=np.float64),
             np.full(n_free, np.inf, dtype=np.float64))
 
@@ -3560,11 +3563,9 @@ def monolithicNNLS(
 
         if result.x is None or not result.success:
             message = "no solution" if result.x is None else result.message
-            raise RuntimeError(
-                f"Monolithic constrained NNLS failed: {message}")
+            raise RuntimeError(f"Monolithic constrained NNLS failed: {message}")
 
-        x_free = np.maximum(
-            np.asarray(result.x, dtype=np.float64), 0.0)
+        x_free = np.maximum(np.asarray(result.x, dtype=np.float64), 0.0)
 
         solver_name = "scipy.optimize.SLSQP"
         iterations = int(result.nit)
@@ -3578,12 +3579,14 @@ def monolithicNNLS(
     x_flat[known_zero.ravel(order="C")] = 0.0
     x = x_flat.reshape(C, P)
 
-    residual = A @ x_free-y
-    residual_ss = float(np.dot(residual, residual))
+    residual_ss = (float(x_free @ (ATA @ x_free))
+        - 2.0*float(np.dot(ATy, x_free)) + yty)
+    # Roundoff in the normal-equation expression can produce a tiny negative
+    # value when the residual is extremely small.
+    residual_ss = max(residual_ss, 0.0)
     data_objective = 0.5*residual_ss
-    reg_objective = (0.5*regularisation_scale
-        * float(np.dot(x_free, x_free)))
-    total_objective = data_objective+reg_objective
+    reg_objective = 0.0
+    total_objective = data_objective
 
     orbit_mass = np.sum(x, axis=1)
 
@@ -3591,8 +3594,7 @@ def monolithicNNLS(
         alpha = float(np.mean(orbit_mass[positive_orbits]))
         orbit_target = alpha*(orbit_shape > 0.0)
         orbit_resid = orbit_mass-orbit_target
-        orbit_linf = float(
-            np.max(np.abs(orbit_resid[positive_orbits])))
+        orbit_linf = float(np.max(np.abs(orbit_resid[positive_orbits])))
     else:
         alpha = None
         orbit_target = None
@@ -3605,7 +3607,7 @@ def monolithicNNLS(
         "solver": solver_name,
         "success": True,
         "elapsed_sec": elapsed,
-        "rows": int(A.shape[0]),
+        "rows": int(n_rows),
         "cols": int(CP),
         "n_free": int(n_free),
         "n_active": int(np.count_nonzero(x_free > 0.0)),
@@ -3614,11 +3616,12 @@ def monolithicNNLS(
         "x_norm": float(np.linalg.norm(x)),
         "x_max": float(np.max(x)),
         "residual_ss": residual_ss,
-        "rmse": float(np.sqrt(residual_ss/max(1, A.shape[0]))),
+        "rmse": float(np.sqrt(residual_ss/max(1, n_rows))),
         "data_objective": data_objective,
         "scientific_regularisation_objective": reg_objective,
         "total_objective": total_objective,
-        "regularisation_scale": regularisation_scale,
+        "regularisation_scale": 0.0,
+        "scientific_regularisation_mode": "none",
         "alpha": alpha,
         "orbit_mass": orbit_mass,
         "orbit_target": orbit_target,
