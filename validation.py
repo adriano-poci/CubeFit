@@ -477,7 +477,7 @@ def _best_stats_loc(ax, legend, box, *curves):
 # ------------------------------------------------------------------------------
 
 def compare_validation_solution(input_path, validation_path, mPath,
-    input_nCuts, validation_nCuts, save_path=None):
+    input_nCuts, validation_nCuts, save_path=None, dataLabels=['Mock', 'Fit']):
     """
     Compare a validation fit with its generating CubeFit solution.
 
@@ -502,6 +502,9 @@ def compare_validation_solution(input_path, validation_path, mPath,
     save_path : str or pathlib.Path, optional
         Output path for the primary stellar-population figure. Additional
         figures are written beside it with descriptive suffixes.
+    dataLabels : list of str, optional
+        Labels for the two datasets in the comparison plots. Default is
+        ``['Mock', 'Fit']``.
 
     Returns
     -------
@@ -535,6 +538,8 @@ def compare_validation_solution(input_path, validation_path, mPath,
     input_path = plp.Path(input_path)
     validation_path = plp.Path(validation_path)
     bDir = mDir/'tri_models'/mPath
+
+    iLabel, vLabel = dataLabels
 
     # ------------------------------------------------------------------
     # Helpers.
@@ -679,8 +684,7 @@ def compare_validation_solution(input_path, validation_path, mPath,
                 f"decomp_{decomp['nCuts']} contains {nzComp.size} active "
                 f"components, but X_global has C={n_components}.")
 
-        matrix = np.zeros(
-            (n_orbits, n_components), dtype=np.float64)
+        matrix = np.zeros((n_orbits, n_components), dtype=np.float64)
 
         for cc, comp in enumerate(nzComp):
             key = f"{comp:{pred}d}"
@@ -689,10 +693,8 @@ def compare_validation_solution(input_path, validation_path, mPath,
                 raise RuntimeError(
                     f"Component {comp} is absent from decomposition metadata.")
 
-            weights = np.asarray(
-                oDict["weights"][key], dtype=np.float64)
-            mask = np.asarray(
-                oDict["wheres"][key], dtype=bool)
+            weights = np.asarray(oDict["weights"][key], dtype=np.float64)
+            mask = np.asarray(oDict["wheres"][key], dtype=bool)
 
             if weights.shape != mask.shape:
                 raise ValueError(
@@ -700,8 +702,7 @@ def compare_validation_solution(input_path, validation_path, mPath,
                     f"{weights.shape} != {mask.shape}.")
 
             if weights.size != n_orbits:
-                raise ValueError(
-                    f"Component {comp}: decomposition contains "
+                raise ValueError(f"Component {comp}: decomposition contains "
                     f"{weights.size} orbits, expected {n_orbits}.")
 
             weights = np.where(mask, weights, 0.0)
@@ -714,11 +715,8 @@ def compare_validation_solution(input_path, validation_path, mPath,
 
     def _family_summary(orbit_x, orbit_types, axes):
         """Collapse an orbit-space solution onto intrinsic orbit families."""
-        families = (
-            ("z_tube", "z-tubes", 3),
-            ("x_tube", "x-tubes", 1),
-            ("box", "boxes", 4),
-        )
+        families = (("z_tube", "z-tubes", 3), ("x_tube", "x-tubes", 1),
+            ("box", "boxes", 4))
 
         result = {}
 
@@ -754,25 +752,19 @@ def compare_validation_solution(input_path, validation_path, mPath,
     input_x_path = _x_path(input_path)
     validation_x_path = _x_path(validation_path)
 
-    for path in (
-        input_path, validation_path, input_x_path, validation_x_path
-    ):
+    for path in (input_path, validation_path, input_x_path, validation_x_path):
         if not path.is_file():
-            raise FileNotFoundError(
-                f"Required HDF5 file not found: {path}")
+            raise FileNotFoundError(f"Required HDF5 file not found: {path}")
 
     with h5py.File(input_x_path, "r") as f:
         if "/X_global" not in f:
             raise RuntimeError(f"{input_x_path} has no /X_global.")
-        x_input = np.asarray(
-            f["/X_global"][...], dtype=np.float64)
+        x_input = np.asarray(f["/X_global"][...], dtype=np.float64)
 
     with h5py.File(validation_x_path, "r") as f:
         if "/X_global" not in f:
-            raise RuntimeError(
-                f"{validation_x_path} has no /X_global.")
-        x_fit = np.asarray(
-            f["/X_global"][...], dtype=np.float64)
+            raise RuntimeError(f"{validation_x_path} has no /X_global.")
+        x_fit = np.asarray(f["/X_global"][...], dtype=np.float64)
 
     if x_input.ndim != 2 or x_fit.ndim != 2:
         raise ValueError("X_global must have shape (C, P).")
@@ -805,8 +797,8 @@ def compare_validation_solution(input_path, validation_path, mPath,
         and lib_input == lib_fit)
 
     same_axes = (physical_available and all(a.shape == b.shape
-            and np.allclose(a, b, rtol=1e-12, atol=1e-14)
-            for a, b in zip(axes_input, axes_fit)))
+        and np.allclose(a, b, rtol=1e-12, atol=1e-14)
+        for a, b in zip(axes_input, axes_fit)))
 
     same_templates = (t_input.shape == t_fit.shape
         and l_input.shape == l_fit.shape and np.allclose(
@@ -843,11 +835,10 @@ def compare_validation_solution(input_path, validation_path, mPath,
         raise FileNotFoundError(f"Fit orbit library not found: {fit_nnOrb}")
 
     if input_nnOrb.resolve() != fit_nnOrb.resolve():
-        raise ValueError(
-            "Generating and validation decompositions do not reference "
-            "the same Schwarzschild orbit library:\n"
-            f"  Mock: {input_nnOrb}\n"
-            f"  Fit:  {fit_nnOrb}")
+        raise ValueError('Generating and validation decompositions do not '
+            'reference the same Schwarzschild orbit library:\n'
+            f"  {iLabel}: {input_nnOrb}\n"
+            f"  {vLabel}:  {fit_nnOrb}")
 
     NOrbs, inds, energs, I2s, I3s, regs, orbit_types, \
         schwarzschild_weights, lcuts = cu.Read.orbits(input_nnOrb)
@@ -863,22 +854,18 @@ def compare_validation_solution(input_path, validation_path, mPath,
             "different lengths.")
 
     if int(NOrbs) != n_orbits:
-        raise RuntimeError(
-            f"Orbit library reports NOrbs={NOrbs}, but contains "
+        raise RuntimeError(f"Orbit library reports NOrbs={NOrbs}, but contains "
             f"{n_orbits} orbit classifications.")
 
     # The only supported intrinsic families in the current decomposition.
     supported_types = np.array([1, 3, 4], dtype=np.int64)
-    populated_types = np.unique(
-        orbit_types[schwarzschild_weights > 0.0])
+    populated_types = np.unique(orbit_types[schwarzschild_weights > 0.0])
 
-    unsupported = populated_types[
-        ~np.isin(populated_types, supported_types)]
+    unsupported = populated_types[~np.isin(populated_types, supported_types)]
 
     if unsupported.size:
-        raise RuntimeError(
-            "Positive-weight Schwarzschild orbits contain unsupported "
-            f"types {unsupported.tolist()}.")
+        raise RuntimeError('Positive-weight Schwarzschild orbits contain '
+            f"unsupported types {unsupported.tolist()}.")
 
     M_input = _component_orbit_matrix(input_decomp, n_orbits, C_input)
     M_fit = _component_orbit_matrix(fit_decomp, n_orbits, C_fit)
@@ -896,36 +883,32 @@ def compare_validation_solution(input_path, validation_path, mPath,
 
     if not np.allclose(input_orbit_population_mass, input_population_mass,
         rtol=1e-10, atol=1e-12):
-        err = float(np.max(np.abs(
-            input_orbit_population_mass-input_population_mass)))
-        raise RuntimeError(
-            "Mock component-to-orbit expansion does not conserve "
-            f"SSP coefficient mass; max error={err:.6e}.")
+        err = float(np.max(np.abs(input_orbit_population_mass
+        - input_population_mass)))
+        raise RuntimeError(f"{iLabel} component-to-orbit expansion does not "
+            f"conserve SSP coefficient mass; max error={err:.6e}.")
 
     if not np.allclose(fit_orbit_population_mass, fit_population_mass,
         rtol=1e-10, atol=1e-12):
-        err = float(np.max(np.abs(
-            fit_orbit_population_mass-fit_population_mass)))
-        raise RuntimeError(
-            "Fit component-to-orbit expansion does not conserve "
-            f"SSP coefficient mass; max error={err:.6e}.")
+        err = float(np.max(np.abs(fit_orbit_population_mass-
+            fit_population_mass)))
+        raise RuntimeError(f"{vLabel} component-to-orbit expansion does not "
+            f"conserve SSP coefficient mass; max error={err:.6e}.")
 
-    orbital_input = _family_summary(
-        orbit_x_input, orbit_types, axes_input)
-    orbital_fit = _family_summary(
-        orbit_x_fit, orbit_types, axes_fit)
+    orbital_input = _family_summary(orbit_x_input, orbit_types, axes_input)
+    orbital_fit = _family_summary(orbit_x_fit, orbit_types, axes_fit)
 
     print("[validation] common orbit-space reconstruction")
     print(f"  orbit library           = {input_nnOrb}")
     print(f"  number of orbits        = {n_orbits}")
-    print(f"  Mock decomposition      = {input_nCuts}")
-    print(f"  Fit decomposition       = {validation_nCuts}")
+    print(f"  {iLabel} decomposition      = {input_nCuts}")
+    print(f"  {vLabel} decomposition       = {validation_nCuts}")
 
     for key in ("z_tube", "x_tube", "box"):
         mock_mass = orbital_input[key]["coefficient_mass"]
         fit_mass = orbital_fit[key]["coefficient_mass"]
         print(f"  {orbital_input[key]['label']:8s}: "
-            f"Mock={mock_mass:.6e} Fit={fit_mass:.6e}")
+            f"{iLabel}={mock_mass:.6e} {vLabel}={fit_mass:.6e}")
 
     # ------------------------------------------------------------------
     # Metrics and figures.
@@ -951,8 +934,8 @@ def compare_validation_solution(input_path, validation_path, mPath,
     # ------------------------------------------------------------------
 
     if physical_available:
-        physical_figure, axes = plt.subplots(
-            2, 3, figsize=(15, 8.0))
+        physical_figure, axes = plt.subplots(2, 3,
+            figsize=np.asarray((15, 8.0))*0.9)
 
         physical_axes = axes[0]
         orbital_axes = axes[1]
@@ -965,15 +948,13 @@ def compare_validation_solution(input_path, validation_path, mPath,
                 r"[$\alpha$/Fe] $[{\rm dex}]$", "Alpha distribution"))
 
         if same_library:
-            input_label = "Mock"
-            fit_label = "Fit"
+            input_label = iLabel
+            fit_label = vLabel
         else:
-            input_label = (
-                f"Mock: {lib_input}"
-                if lib_input is not None else "Mock")
-            fit_label = (
-                f"Fit: {lib_fit}"
-                if lib_fit is not None else "Fit")
+            input_label = (f"{iLabel}: {lib_input}"
+                if lib_input is not None else iLabel)
+            fit_label = (f"{vLabel}: {lib_fit}"
+                if lib_fit is not None else vLabel)
 
         for ax, (key, idx, prop, xlabel, title) in zip(
             physical_axes, distributions):
@@ -996,18 +977,19 @@ def compare_validation_solution(input_path, validation_path, mPath,
             fit_mean = global_fit[prop]
 
             if prop == "age":
-                labels = (r"$\langle{\rm Age}\rangle_{\rm Mock}$",
-                    r"$\langle{\rm Age}\rangle_{\rm Fit}$")
+                labels = (rf"$\langle{{\rm Age}}\rangle_{{\rm {iLabel}}}$",
+                    rf"$\langle{{\rm Age}}\rangle_{{\rm {vLabel}}}$")
                 values = (rf"$= {mock_mean:.2f}\ [{UTS.gyr}]$",
                     rf"$= {fit_mean:.2f}\ [{UTS.gyr}]$",)
             elif prop == "metal":
-                labels = (r"$\langle[Z/H]\rangle_{\rm Mock}$",
-                    r"$\langle[Z/H]\rangle_{\rm Fit}$")
+                labels = (rf"$\langle[Z/H]\rangle_{{\rm {iLabel}}}$",
+                    rf"$\langle[Z/H]\rangle_{{\rm {vLabel}}}$")
                 values = (rf"$= {mock_mean:.3f}\ [{{\rm dex}}]$",
                     rf"$= {fit_mean:.3f}\ [{{\rm dex}}]$")
             else:
-                labels = (r"$\langle[\alpha/{\rm Fe}]\rangle_{\rm Mock}$",
-                    r"$\langle[\alpha/{\rm Fe}]\rangle_{\rm Fit}$")
+                labels = (
+                    rf"$\langle[\alpha/{{\rm Fe}}]\rangle_{{\rm {iLabel}}}$",
+                    rf"$\langle[\alpha/{{\rm Fe}}]\rangle_{{\rm {vLabel}}}$")
                 values = (rf"$= {mock_mean:.3f}\ [{{\rm dex}}]$",
                     rf"$= {fit_mean:.3f}\ [{{\rm dex}}]$")
 
@@ -1059,10 +1041,8 @@ def compare_validation_solution(input_path, validation_path, mPath,
             ("metal", "[Z/H]", "dex"),
             ("alpha", "[alpha/Fe]", "dex")):
             delta = global_fit[key]-global_input[key]
-            print(f"  {label:10s}: "
-                f"{global_input[key]:.6g} -> "
-                f"{global_fit[key]:.6g}  "
-                f"delta={delta:+.6g} [{unit}]")
+            print(f"  {label:10s}: {global_input[key]:.6g} -> "
+                f"{global_fit[key]:.6g}  delta={delta:+.6g} [{unit}]")
 
     # ------------------------------------------------------------------
     # Common orbital-family comparison.
@@ -1075,11 +1055,17 @@ def compare_validation_solution(input_path, validation_path, mPath,
         family_labels = ("z-tubes", "x-tubes", "boxes")
         xx = np.arange(len(family_order), dtype=np.float64)
 
-        properties = (("age", rf"$\langle{{\rm Age}}\rangle\, [{{{UTS.gyr}}}]$"),
-            ("metal", r"$\langle[Z/H]\rangle\, [{\rm dex}]$"),
-            ("alpha", r"$\langle[\alpha/{\rm Fe}]\rangle\, [{\rm dex}]$"))
+        properties = (
+            ("age", rf"$\langle{{\rm Age}}\rangle\, [{{{UTS.gyr}}}]$",
+                1, 0.2),
+            ("metal", r"$\langle[Z/H]\rangle\, [{\rm dex}]$",
+                0, 0.1),
+            ("alpha", r"$\langle[\alpha/{\rm Fe}]\rangle\, [{\rm dex}]$",
+                2, 0.1),
+        )
 
-        for ax, (prop, ylabel) in zip(orbital_axes, properties):
+        for ax, (prop, ylabel, axis_idx, min_span) in zip(orbital_axes,
+            properties):
             mock_values = np.asarray([orbital_input[key]["global"][prop]
                 for key in family_order], dtype=np.float64)
 
@@ -1088,6 +1074,54 @@ def compare_validation_solution(input_path, validation_path, mPath,
 
             ax.plot(xx, mock_values, "o-", label=input_label)
             ax.plot(xx, fit_values, "s--", label=fit_label)
+
+            values = np.concatenate((mock_values, fit_values))
+            values = values[np.isfinite(values)]
+
+            if values.size:
+                data_min = float(np.min(values))
+                data_max = float(np.max(values))
+
+                lib_min = float(min(np.min(axes_input[axis_idx]),
+                    np.min(axes_fit[axis_idx])))
+                lib_max = float(max(np.max(axes_input[axis_idx]),
+                    np.max(axes_fit[axis_idx])))
+
+                # Establish the unpadded plotting interval. Use the actual data
+                # extent unless it is smaller than the desired minimum span.
+                data_span = data_max-data_min
+
+                if data_span < min_span:
+                    span = min(min_span, lib_max-lib_min)
+                    centre = 0.5*(data_min+data_max)
+                    ymin = centre-0.5*span
+                    ymax = centre+0.5*span
+
+                    # Keep the artificial minimum-span expansion within the SSP
+                    # library, shifting rather than shrinking where possible.
+                    if ymin < lib_min:
+                        ymax += lib_min-ymin
+                        ymin = lib_min
+
+                    if ymax > lib_max:
+                        ymin -= ymax-lib_max
+                        ymax = lib_max
+
+                    ymin = max(ymin, lib_min)
+                    ymax = min(ymax, lib_max)
+                else:
+                    ymin = data_min
+                    ymax = data_max
+
+                # Apply Matplotlib's normal fractional margin to the final
+                # interval, including any artificially imposed minimum span.
+                ymargin = ax.margins()[1]
+                padding = ymargin*(ymax-ymin)
+
+                ax.set_ylim(
+                    ymin-padding,
+                    ymax+padding,
+                )
 
             ax.set_xticks(xx)
             ax.set_xticklabels(family_labels)
@@ -1234,21 +1268,15 @@ def compare_validation_solution(input_path, validation_path, mPath,
     if not physical_available:
         with h5py.File(input_path, "r") as f:
             if "/ModelCube" not in f:
-                raise RuntimeError(
-                    f"{input_path} has no /ModelCube.")
-            model_input = np.asarray(
-                f["/ModelCube"][...], dtype=np.float64)
-            wave_input = np.asarray(
-                f["/ObsPix"][...], dtype=np.float64)
+                raise RuntimeError(f"{input_path} has no /ModelCube.")
+            model_input = np.asarray(f["/ModelCube"][...], dtype=np.float64)
+            wave_input = np.asarray(f["/ObsPix"][...], dtype=np.float64)
 
         with h5py.File(validation_path, "r") as f:
             if "/ModelCube" not in f:
-                raise RuntimeError(
-                    f"{validation_path} has no /ModelCube.")
-            model_fit = np.asarray(
-                f["/ModelCube"][...], dtype=np.float64)
-            wave_fit = np.asarray(
-                f["/ObsPix"][...], dtype=np.float64)
+                raise RuntimeError(f"{validation_path} has no /ModelCube.")
+            model_fit = np.asarray(f["/ModelCube"][...], dtype=np.float64)
+            wave_fit = np.asarray(f["/ObsPix"][...], dtype=np.float64)
 
         if model_input.shape != model_fit.shape:
             raise ValueError(f"ModelCube shapes differ: "
@@ -1258,24 +1286,22 @@ def compare_validation_solution(input_path, validation_path, mPath,
             raise ValueError("ModelCube wavelength grids differ.")
 
         spectral_resid = model_fit-model_input
-        model_norm = float(
-            np.linalg.norm(model_input))
+        model_norm = float(np.linalg.norm(model_input))
 
-        relative_l2_spectral = (
-            float(np.linalg.norm(spectral_resid))/model_norm
+        relative_l2_spectral = (float(np.linalg.norm(spectral_resid))/model_norm
             if model_norm > 0.0 else np.nan)
 
         scale = np.sqrt(np.mean(model_input*model_input, axis=1))
         rms = np.sqrt(np.mean(spectral_resid*spectral_resid, axis=1))
 
-        fractional_rms = np.divide(rms, scale,
-            out=np.full_like(rms, np.nan), where=scale > 0.0)
+        fractional_rms = np.divide(rms, scale, out=np.full_like(rms, np.nan),
+            where=scale > 0.0)
 
         spectral_figure, axes = plt.subplots(1, 2, figsize=(11, 4.5))
 
         ax = axes[0]
-        ax.plot(wave_input, np.mean(model_input, axis=0), label="Mock")
-        ax.plot(wave_fit, np.mean(model_fit, axis=0), "--", label="Fit")
+        ax.plot(wave_input, np.mean(model_input, axis=0), label=iLabel)
+        ax.plot(wave_fit, np.mean(model_fit, axis=0), "--", label=vLabel)
         ax.set_xlabel(r"$\ln\lambda$")
         ax.set_ylabel("Mean model flux")
         ax.set_title("Mean reconstructed spectrum")
@@ -1304,8 +1330,7 @@ def compare_validation_solution(input_path, validation_path, mPath,
 
     if save_path is not None:
         save_path = plp.Path(save_path)
-        save_path.parent.mkdir(
-            parents=True, exist_ok=True)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
 
         primary_figure = (physical_figure if physical_figure is not None
             else spectral_figure)

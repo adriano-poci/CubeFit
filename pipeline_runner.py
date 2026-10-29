@@ -476,7 +476,7 @@ class PipelineRunner:
             vprint("[Pipeline] Using tracker with mode:", tracker_mode)
 
         cfg = MPConfig(processes=int(processes), blas_threads=int(blas_threads),
-            apply_mask=bool(reader_apply_mask))
+            apply_mask=bool(reader_apply_mask), verbose=True)
 
         try:
             with logger.capture_all_output():

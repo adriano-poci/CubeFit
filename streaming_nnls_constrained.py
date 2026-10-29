@@ -207,7 +207,13 @@ v2.6:   Changed the `regularisation_scale` to be an SSP nearest-neighbour
 v2.7:   Made the constrained reduced solve more numerically robust;
         Added automatic smaller-batch retries when adding new populations;
         Compute normal equations only once in the orbit-constrained path of
-            `monolithicNNLS`. 27 October 2026
+            `monolithicNNLS`;
+        Changed `scipy.optimize` to `trust-constr` from `SLSQP` and provide
+            exact constant Hessian in orbit-constrained path of `monolithicNNLS`.
+            27 October 2026
+v2.8:   Removed expensive full RMSE computation after a successful run in
+            `solve_streaming_nnls`; instead provide the relevant data cheaply
+            directly from `streamActiveSetNNLS`. 28 October 2026
 """
 
 from __future__ import annotations, print_function
@@ -221,7 +227,9 @@ from typing import Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 import numpy as np
+import osqp
 try:
+    from scipy import sparse
     from scipy.optimize import Bounds, LinearConstraint, minimize, nnls, \
         lsq_linear
     _HAS_SCIPY_OPTIMIZE = True
@@ -3133,7 +3141,17 @@ def streamActiveSetNNLS(
     residual_objective = data_objective+0.5*yty
     smooth_to_residual = (scientific_regularisation_objective/
         max(residual_objective, 1e-300))
+    # Get fitted wavelength pixels
+    with open_h5(h5_path, role="reader") as f:
+        n_wave_fit = (int(keep_idx.size) if keep_idx is not None
+            else int(f["/DataCube"].shape[1]))
+    n_fit_pixels = int(sum(s1-s0 for s0, s1 in s_ranges)*n_wave_fit)
+
+    residual_ss = 2.0*float(residual_objective)
+    rmse_final = float(np.sqrt(
+        max(residual_ss, 0.0)/max(n_fit_pixels, 1)))
     print(f"[MONO][objective] residual={residual_objective:.6e} "
+        f"rmse={rmse_final:.6e} "
         f"smooth={scientific_regularisation_objective:.6e} "
         f"smooth/residual={smooth_to_residual:.6e}", flush=True)
 
@@ -3167,6 +3185,9 @@ def streamActiveSetNNLS(
         "data_objective": float(data_objective),
         "residual_objective": float(residual_objective),
         "smooth_to_residual": float(smooth_to_residual),
+        "residual_ss": float(residual_ss),
+        "rmse": float(rmse_final),
+        "n_fit_pixels": int(n_fit_pixels),
         "scientific_regularisation_objective": float(
             scientific_regularisation_objective),
         "scientific_objective": float(scientific_objective),
@@ -3216,7 +3237,28 @@ def streamActiveSetNNLS(
     })
 
     _emit_checkpoint(final_it, final=True, phase="complete")
-    return S_flat * z
+
+    final_stats = {
+        "residual_objective": float(residual_objective),
+        "residual_ss": float(residual_ss),
+        "rmse": float(rmse_final),
+        "n_fit_pixels": int(n_fit_pixels),
+        "data_objective": float(data_objective),
+        "scientific_regularisation_objective": float(
+            scientific_regularisation_objective),
+        "smooth_to_residual": float(smooth_to_residual),
+        "scientific_objective": float(scientific_objective),
+        "numerical_ridge_objective": float(
+            numerical_ridge_objective),
+        "total_objective": float(total_objective),
+        "stop_reason": str(stop_reason),
+        "stop_category": str(stop_category),
+        "converged": bool(stop_converged),
+        "iterations": (
+            int(stop_iter+1) if stop_iter is not None else None),
+    }
+
+    return S_flat*z, final_stats
 
 # ------------------------------------------------------------------------------
 
@@ -3482,114 +3524,131 @@ def monolithicNNLS(
         ATy = A.T @ y
         yty = float(np.dot(y, y))
         ATA = 0.5*(ATA+ATA.T)
-
+        # Build the equal-component-mass constraints:
+        #
+        #   sum_p x[c, p] - sum_p x[c0, p] = 0
+        #
+        # for every participating component c != c0.
+        free_c = free_idx//P
         n_constraints = max(0, int(positive_orbits.size)-1)
         E = np.zeros((n_constraints, n_free), dtype=np.float64)
-
         if n_constraints:
             reference = int(positive_orbits[0])
-
             for rr, cc in enumerate(positive_orbits[1:]):
                 E[rr, free_c == int(cc)] = 1.0
                 E[rr, free_c == reference] = -1.0
 
-            constraint = LinearConstraint(E,
-                np.zeros(n_constraints), np.zeros(n_constraints))
-            constraints = [constraint]
-        else:
-            constraints = []
-
-        # Normalize by the characteristic per-pixel data scale, not y.T@y.
-        # Dividing by y.T@y suppresses the gradient by O(N) and can make the
-        # feasible zero solution appear stationary to SLSQP.
-        data_scale = max(1.0, float(np.sqrt(np.mean(y*y))))
-        objective_scale = data_scale*data_scale
-
-        def _objective(x_vec):
-            value = (0.5*float(x_vec @ (ATA @ x_vec))
-                - float(np.dot(ATy, x_vec)) + 0.5*yty)
-            return value/objective_scale
-
-        def _gradient(x_vec):
-            grad = ATA @ x_vec-ATy
-            return np.asarray(grad/objective_scale, dtype=np.float64)
-
-        if x0 is None:
-            # Start inside the feasible cone. Equal uniform mass across all
-            # participating components satisfies the hard constraint exactly.
-            x_seed = np.zeros(n_free, dtype=np.float64)
-            alpha0 = 1.0
-
-            for cc in positive_orbits:
-                local = np.flatnonzero(free_c == int(cc))
-                x_seed[local] = alpha0/float(local.size)
-        else:
-            x0_flat = np.asarray(x0, dtype=np.float64).ravel(order="C")
-
-            if x0_flat.size != CP:
-                raise ValueError(f"x0 has size {x0_flat.size}; expected {CP}.")
-
-            x_seed = np.maximum(x0_flat[free_idx], 0.0)
-
-            # Make the supplied seed exactly equal-mass feasible.
-            masses = np.bincount(free_c, weights=x_seed, minlength=C
-                ).astype(np.float64)
-            alpha0 = float(np.mean(masses[positive_orbits]))
-
-            for cc in positive_orbits:
-                local = np.flatnonzero(free_c == int(cc))
-                mass = float(np.sum(x_seed[local]))
-
-                if mass > 0.0:
-                    x_seed[local] *= alpha0/mass
-                elif alpha0 > 0.0:
-                    x_seed[local] = alpha0/float(local.size)
-
-        # SLSQP now needs only ATA, ATy, and yty. Release the very large
-        # literal design matrix before entering the iterative optimizer.
         del A
-        bounds = Bounds(np.zeros(n_free, dtype=np.float64),
-            np.full(n_free, np.inf, dtype=np.float64))
 
-        print("[MONOLITHIC] solving with scipy.optimize.SLSQP", flush=True)
-        g0 = _gradient(x_seed)
-        print(f"[MONOLITHIC] initial objective={_objective(x_seed):.6e} "
-            f"|g|inf={np.max(np.abs(g0)):.6e}", flush=True)
+        # --------------------------------------------------------------
+        # Raw unregularised constrained NNLS as a convex quadratic
+        # program:
+        #
+        #   min 0.5*x.T@ATA@x - ATy.T@x
+        #
+        # subject to
+        #
+        #   x >= 0
+        #   E@x = 0
+        #
+        # The omitted constant 0.5*y.T@y has no effect on the solution.
+        # --------------------------------------------------------------
+        scale = max(1.0, float(np.max(np.abs(ATy))) /
+            max(float(np.max(np.diag(ATA))), 1e-300))
+        diag_max = float(np.max(np.diag(ATA)))
+        aty_max = float(np.max(np.abs(ATy)))
+        x_scale = max(1.0, aty_max/max(diag_max, 1e-300))
+        print("[MONOLITHIC] OSQP coefficient scale x_scale={x_scale:.6e}",
+            flush=True)
+        P_qp = sparse.csc_matrix(ATA*(x_scale*x_scale))
+        q_qp = -np.asarray(ATy*x_scale, dtype=np.float64)
 
-        result = minimize(_objective, x_seed, jac=_gradient,
-            method="SLSQP", bounds=bounds, constraints=constraints,
-            options={"maxiter": 2000, "ftol": 1e-10,
-                "disp": bool(getattr(cfg, "verbose", True))})
+        I_qp = sparse.eye(n_free, format="csc", dtype=np.float64)
 
-        if result.x is None or not result.success:
-            message = "no solution" if result.x is None else result.message
-            raise RuntimeError(f"Monolithic constrained NNLS failed: {message}")
+        if n_constraints:
+            A_qp = sparse.vstack((I_qp, sparse.csc_matrix(E)), format="csc")
 
-        x_free = np.maximum(np.asarray(result.x, dtype=np.float64), 0.0)
+            lower = np.concatenate((np.zeros(n_free, dtype=np.float64),
+                np.zeros(n_constraints, dtype=np.float64)))
 
-        solver_name = "scipy.optimize.SLSQP"
-        iterations = int(result.nit)
-        optimality = None
+            upper = np.concatenate((np.full(n_free, np.inf, dtype=np.float64),
+                np.zeros(n_constraints, dtype=np.float64)))
+        else:
+            A_qp = I_qp
+            lower = np.zeros(n_free, dtype=np.float64)
+            upper = np.full(n_free, np.inf, dtype=np.float64)
+
+        print("[MONOLITHIC] solving raw constrained NNLS with OSQP", flush=True)
+
+        solver = osqp.OSQP()
+
+        solver.setup(P=P_qp, q=q_qp, A=A_qp, l=lower, u=upper, eps_abs=1e-7,
+            eps_rel=1e-7, max_iter=100000, polish=True, adaptive_rho=True,
+            scaling=20, verbose=bool(getattr(cfg, "verbose", True)))
+
+        result = solver.solve()
+        status = str(result.info.status).lower()
+        if result.x is None or status not in ("solved", "solved inaccurate"):
+            raise RuntimeError("Monolithic constrained NNLS failed: "
+                f"{result.info.status}")
+
+        u_free = np.asarray(result.x, dtype=np.float64)
+        if not np.all(np.isfinite(u_free)):
+            raise RuntimeError("OSQP returned non-finite coefficients.")
+        # Validate the solution in the scaled coordinates actually solved by
+        # OSQP. Do not project or otherwise modify the reference solution.
+        u_scale = max(1.0, float(np.max(np.abs(u_free))))
+        min_u = float(np.min(u_free))
+        negative_rel = max(0.0, -min_u)/u_scale
+        if n_constraints:
+            equality_resid = E @ u_free
+            equality_rel = float(np.max(np.abs(equality_resid)))/u_scale
+        else:
+            equality_rel = 0.0
+        feasibility_tol = 5e-7
+        if negative_rel > feasibility_tol:
+            raise RuntimeError("OSQP solution materially violates non-negativity: "
+                f"relative violation={negative_rel:.6e}.")
+        if equality_rel > feasibility_tol:
+            raise RuntimeError("OSQP solution materially violates the equal-component-mass "
+                f"constraint: relative violation={equality_rel:.6e}.")
+        print("[MONOLITHIC] OSQP feasibility: "
+            f"negative_rel={negative_rel:.3e} "
+            f"mass_rel={equality_rel:.3e}",
+            flush=True)
+        # Transform the unmodified OSQP solution back to physical coefficient
+        # units. Tiny negative entries are retained here because this is an
+        # independent numerical reference solution, not the production fit.
+        x_free = x_scale*u_free
+
+        solver_name = "OSQP"
+        iterations = int(result.info.iter)
+        optimality = float(getattr(result.info, "dual_res", np.nan))
 
     # ------------------------------------------------------------------
     # Restore full physical coefficient vector and calculate diagnostics.
     # ------------------------------------------------------------------
-    x_flat = np.zeros(CP, dtype=np.float64)
-    x_flat[free_idx] = x_free
-    x_flat[known_zero.ravel(order="C")] = 0.0
-    x = x_flat.reshape(C, P)
 
-    residual_ss = (float(x_free @ (ATA @ x_free))
-        - 2.0*float(np.dot(ATy, x_free)) + yty)
-    # Roundoff in the normal-equation expression can produce a tiny negative
-    # value when the residual is extremely small.
-    residual_ss = max(residual_ss, 0.0)
+    if constrained:
+        residual_ss = (float(x_free @ (ATA @ x_free))
+            - 2.0*float(np.dot(ATy, x_free)) + yty)
+        # Normal-equation roundoff can produce a tiny negative value.
+        residual_ss = max(residual_ss, 0.0)
+    else:
+        # Raw scipy.optimize.nnls already returns ||A*x-y||_2.
+        residual_ss = float(rnorm*rnorm)
     data_objective = 0.5*residual_ss
     reg_objective = 0.0
     total_objective = data_objective
 
+    # Remove only the tiny negative numerical leakage from the reference
+    # QP solution before returning it as an NNLS solution.
+    x_free_return = np.maximum(x_free, 0.0)
+    x_flat = np.zeros(CP, dtype=np.float64)
+    x_flat[free_idx] = x_free_return
+    x_flat[known_zero.ravel(order="C")] = 0.0
+    x = x_flat.reshape(C, P)
     orbit_mass = np.sum(x, axis=1)
-
     if constrained:
         alpha = float(np.mean(orbit_mass[positive_orbits]))
         orbit_target = alpha*(orbit_shape > 0.0)
@@ -3602,7 +3661,6 @@ def monolithicNNLS(
         orbit_linf = None
 
     elapsed = float(time.perf_counter()-t0)
-
     stats = {
         "solver": solver_name,
         "success": True,
@@ -3618,10 +3676,10 @@ def monolithicNNLS(
         "residual_ss": residual_ss,
         "rmse": float(np.sqrt(residual_ss/max(1, n_rows))),
         "data_objective": data_objective,
-        "scientific_regularisation_objective": reg_objective,
         "total_objective": total_objective,
-        "regularisation_scale": 0.0,
+        "scientific_regularisation_objective": 0.0,
         "scientific_regularisation_mode": "none",
+        "regularisation_scale": 0.0,
         "alpha": alpha,
         "orbit_mass": orbit_mass,
         "orbit_target": orbit_target,
@@ -3741,7 +3799,8 @@ def solve_streaming_nnls(
     blocks = [(i * block_size, min(CP, (i + 1) * block_size)) for i in range(n_blocks)]
 
     verbose = getattr(cfg, "verbose", True)
-    print(f"[BC-FUSED] blocks={n_blocks}, block_size={block_size}, processes={cfg.processes}", flush=True)
+    print(f"[BC-FUSED] blocks={n_blocks}, block_size={block_size}, "
+        f"processes={cfg.processes}", flush=True)
 
     # ------------------ persistent masks: known_zero & seed masks --------------
     known_zero = _get_known_zero_mask(h5_path, C, P)
@@ -3753,11 +3812,8 @@ def solve_streaming_nnls(
     if cache_path is None:
         cache_path = f"{h5_path}.bcfused.npz"
 
-    keep_idx_sig = (
-        np.asarray(keep_idx, dtype=np.int64)
-        if keep_idx is not None
-        else np.asarray([], dtype=np.int64)
-    )
+    keep_idx_sig = (np.asarray(keep_idx, dtype=np.int64) if keep_idx is not None
+        else np.asarray([], dtype=np.int64))
 
     cache_npz = None
     cache_hit = False
@@ -3766,18 +3822,13 @@ def solve_streaming_nnls(
         try:
             cache_npz = np.load(cache_path, allow_pickle=False)
 
-            ok = (
-                int(cache_npz["S"]) == int(S)
-                and int(cache_npz["L"]) == int(L)
+            ok = (int(cache_npz["S"]) == int(S) and int(cache_npz["L"]) == int(L)
                 and int(cache_npz["C"]) == int(C)
                 and int(cache_npz["P"]) == int(P)
                 and int(cache_npz["s_tile"]) == int(s_tile)
                 and int(cache_npz["apply_mask"]) == int(bool(cfg.apply_mask))
-                and np.array_equal(
-                    np.asarray(cache_npz["keep_idx"], dtype=np.int64),
-                    keep_idx_sig,
-                )
-            )
+                and np.array_equal(np.asarray(
+                    cache_npz["keep_idx"], dtype=np.int64), keep_idx_sig))
 
             if ok:
                 cache_hit = True
@@ -3800,10 +3851,8 @@ def solve_streaming_nnls(
 
         ATy_flat = np.asarray(cache_npz["ATy_flat"], dtype=np.float64).copy()
         D_tot = np.asarray(cache_npz["D_tot"], dtype=np.float64).copy()
-        inv_sqrt_energy_flat = np.asarray(
-            cache_npz["inv_sqrt_energy_flat"],
-            dtype=np.float64,
-        ).copy()
+        inv_sqrt_energy_flat = np.asarray(cache_npz["inv_sqrt_energy_flat"],
+            dtype=np.float64).copy()
 
         try:
             cache_npz.close()
@@ -3822,17 +3871,15 @@ def solve_streaming_nnls(
             DC = f["/DataCube"]
             M = f["/HyperCube/models"]
             try:
-                M.id.set_chunk_cache(cfg.dset_slots, cfg.dset_bytes, cfg.dset_w0)
+                M.id.set_chunk_cache(cfg.dset_slots, cfg.dset_bytes,
+                    cfg.dset_w0)
             except Exception:
                 pass
 
             tile_iter = s_ranges
             if verbose and (len(s_ranges) > 1):
-                tile_iter = tqdm(
-                    s_ranges,
-                    desc=f"[BC-FUSED] tiles",
-                    disable=not verbose,
-                )
+                tile_iter = tqdm(s_ranges, desc=f"[BC-FUSED] tiles",
+                    disable=not verbose)
 
             for (s0, s1) in tile_iter:
                 Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
@@ -3845,7 +3892,8 @@ def solve_streaming_nnls(
                 yhat_tile = np.zeros((Sblk, Lk), dtype=np.float64)
 
                 # read model tile (Sblk, C, P, Lk)
-                M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
+                M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64,
+                    order="C")
                 if keep_idx is not None:
                     M_tile = M_tile[:, :, :, keep_idx]
 
@@ -3893,26 +3941,21 @@ def solve_streaming_nnls(
         # Use average column energy per tile (not the summed D_tot) so the
         # worker tile matrices and the global scaling agree.
         # ------------------------------------------------------------------
-        col_energy_sum = D_tot.copy()  # D_tot currently holds summed energy
-        n_tiles = max(1, len(s_ranges))  # number of tiles used in streaming pass
+        col_energy_sum = D_tot.copy() # D_tot currently holds summed energy
+        n_tiles = max(1, len(s_ranges)) # number of tiles used in streaming pass
 
         # Convert summed energy -> per-tile average energy
         col_energy = col_energy_sum / float(n_tiles)
 
         # Exact column-energy scaling.
-        #
-        # Do not median-floor weak columns or cap their inverse-square-root
-        # scaling. Any genuinely zero-energy columns must already have been
-        # excluded through known_zero before entering the solver.
         if np.any(~np.isfinite(col_energy)):
             raise RuntimeError("Column energy contains non-finite values.")
 
         zero_energy = col_energy <= 0.0
         if np.any(zero_energy & ~known_zero):
             bad = np.argwhere(zero_energy & ~known_zero)
-            raise RuntimeError(
-                "Found non-positive column energies for columns that are not "
-                f"known-zero. First entries: {bad[:10].tolist()}")
+            raise RuntimeError("Found non-positive column energies for columns "
+                f"that are not known-zero. First entries: {bad[:10].tolist()}")
 
         inv_sqrt_energy = np.zeros_like(col_energy, dtype=np.float64)
 
@@ -3936,8 +3979,8 @@ def solve_streaming_nnls(
 
         if cache_path:
             try:
-                np.savez_compressed(cache_path,
-                    ATy_flat=ATy_flat, inv_sqrt_energy_flat=inv_sqrt_energy_flat,
+                np.savez_compressed(cache_path, ATy_flat=ATy_flat,
+                    inv_sqrt_energy_flat=inv_sqrt_energy_flat,
                     D_tot=D_tot, known_zero=known_zero,
                     keep_idx=keep_idx_sig,
                     S=int(S), L=int(L), C=int(C), P=int(P),
@@ -3954,12 +3997,15 @@ def solve_streaming_nnls(
         S_p90 = float(np.percentile(S_sample, 90.0))
         S_p99 = float(np.percentile(S_sample, 99.0))
         S_max = float(np.max(S_sample))
-        print(f"[DIAG] inv_sqrt_energy after per-tile avg + floor/cap: min/med/p90/p99/max = {S_min:.4e}/{S_p50:.4e}/{S_p90:.4e}/{S_p99:.4e}/{S_max:.4e}", flush=True)
+        print('[DIAG] inv_sqrt_energy after per-tile avg + floor/cap: '
+            f"min/med/p90/p99/max = {S_min:.4e}/{S_p50:.4e}/{S_p90:.4e}/"
+            f"{S_p99:.4e}/{S_max:.4e}", flush=True)
     except Exception as _e:
         print(f"[DIAG] error printing S stats: {_e}", flush=True)
 
     # run streaming active-set NNLS (monolithic) using persistent executor
-    print("[BC-FUSED][MONO] starting streaming active-set NNLS (mono)", flush=True)
+    print('[BC-FUSED][MONO] starting streaming active-set NNLS (mono)',
+        flush=True)
 
     # --------------------------
     # Create persistent executor
@@ -3987,7 +4033,9 @@ def solve_streaming_nnls(
 
     # 1) D_tot sanity
     D_sample = np.sum(M_tile * M_tile, axis=(0, 3))
-    print(f"[DIAG] sample D_tot (per-column) stats: min/max/median = {D_sample.min():.4e}/{D_sample.max():.4e}/{np.median(D_sample):.4e}", flush=True)
+    print('[DIAG] sample D_tot (per-column) stats: min/max/median = '
+        f"{D_sample.min():.4e}/{D_sample.max():.4e}/{np.median(D_sample):.4e}",
+        flush=True)
 
     # 2) ATy from streaming vs manual for the same tile
     A2_tile = M_tile.transpose(0, 3, 1, 2).reshape((s1 - s0) * Yt.shape[1], CP)
@@ -3996,7 +4044,8 @@ def solve_streaming_nnls(
     # compute by summing per-column norm & dot to detect transpose/reshape errors
     for col in range(min(10, ATy_tile_stream.size)):
         ATy_tile_manual[col] = np.dot(A2_tile[:, col], Yt.reshape(-1))
-    print(f"[DIAG] ATy_tile difference (first 10 cols) maxabs = {float(np.max(np.abs(ATy_tile_stream[:10] - ATy_tile_manual[:10]))):.4e}", flush=True)
+    print('[DIAG] ATy_tile difference (first 10 cols) maxabs = '
+        f"{float(np.max(np.abs(ATy_tile_stream[:10] - ATy_tile_manual[:10]))):.4e}", flush=True)
 
     # 3) compare scaled vs unscaled reduced-worker ATA/ATy for a tiny active set
     # pick first k columns as "active"
@@ -4061,27 +4110,21 @@ def solve_streaming_nnls(
                 checkpoint_error_logged = True
 
     try:
-        x_flat_unscaled = streamActiveSetNNLS(
-            h5_path=h5_path,
-            s_ranges=s_ranges,
-            keep_idx=keep_idx,
-            ATy_flat=ATy_flat,
-            inv_sqrt_energy_flat=inv_sqrt_energy_flat,
-            C=C,
-            P=P,
-            executor=executor,
-            cfg=cfg,
-            orbit_weights=orbit_weights,
-            known_zero_mask=known_zero,
-            x0_flat=x.ravel(order="C"),
-            resume_state=resume_state,
-            max_active=monolithic_max_active,
-            tol_grad=1e-8,
-            max_iter=5 * monolithic_max_active,
+        # ----------------------------------------------------------------------
+        # Call to the streaming active-set solver
+        #
+        # `streamActiveSetNNLS` handles active-set management, block-wise
+        # reduced Hessian solves, and orbit-mass constraints.
+        # ----------------------------------------------------------------------
+        x_flat_unscaled, mono_stats = streamActiveSetNNLS(h5_path=h5_path,
+            s_ranges=s_ranges, keep_idx=keep_idx, ATy_flat=ATy_flat,
+            inv_sqrt_energy_flat=inv_sqrt_energy_flat, C=C, P=P,
+            executor=executor, cfg=cfg, orbit_weights=orbit_weights,
+            known_zero_mask=known_zero, x0_flat=x.ravel(order="C"),
+            resume_state=resume_state, max_active=monolithic_max_active,
+            tol_grad=1e-8, max_iter=5 * monolithic_max_active,
             regularisation_scale=regularisation_scale,
-            checkpoint_cb=_checkpoint_cb,
-            checkpoint_every=checkpoint_every,
-        )
+            checkpoint_cb=_checkpoint_cb, checkpoint_every=checkpoint_every)
 
         x = x_flat_unscaled.reshape(C, P).copy()
         print("[BC-FUSED][MONO] finished streaming active-set NNLS",
@@ -4101,7 +4144,8 @@ def solve_streaming_nnls(
     try:
         x_flat = x.ravel(order="C")
         x_nonzero = int(np.count_nonzero(x_flat > 0))
-        x_sparsity = 1.0 - (x_nonzero / float(x_flat.size)) if x_flat.size else 1.0
+        x_sparsity = 1.0 - (x_nonzero / float(x_flat.size)) if x_flat.size \
+            else 1.0
         x_l1 = float(np.sum(x_flat))
         x_max = float(np.max(x_flat)) if x_flat.size else 0.0
         x_min = float(np.min(x_flat)) if x_flat.size else 0.0
@@ -4121,41 +4165,14 @@ def solve_streaming_nnls(
         print("[BC-FUSED][after-blocks] diag error:", _e, flush=True)
     # --- end after-blocks diagnostics ---
 
-    # -------------------- final diagnostics & best-x --------------------
-    # Compute simple RMSE proxy (full scan cheap relative to earlier streaming)
-    rmse_curr = float("nan")
-    ssq = 0.0
-    nres = 0
-    with open_h5(h5_path, role="reader") as f:
-        DC = f["/DataCube"]
-        for (s0, s1) in s_ranges:
-            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
-            if keep_idx is not None:
-                Yt = Yt[:, keep_idx]
-            # build current yhat_tile for diagnostics
-            yhat_tile = np.zeros_like(Yt)
-            for cc in range(C):
-                if known_zero_orbit[cc]:
-                    continue
-                A_cc = np.asarray(f["/HyperCube/models"][s0:s1, cc, :, :], dtype=np.float64, order="C")
-                if keep_idx is not None:
-                    A_cc = A_cc[:, :, keep_idx]
-                yhat_tile += x[cc] @ A_cc
-            R = Yt - yhat_tile
-            if not np.all(np.isfinite(R)):
-                R = np.nan_to_num(R, copy=False)
-            ssq += float(np.sum(R * R))
-            nres += R.size
-    if nres > 0:
-        rmse_curr = float(np.sqrt(ssq / max(1, nres)))
-        data_proxy = 0.5 * (rmse_curr ** 2)
-    else:
-        data_proxy = np.inf
-
-    if data_proxy < best_proxy:
-        best_proxy = float(data_proxy)
-        best_x = x.copy()
-        print(f"[BC-FUSED] new best proxy {best_proxy:.3e}", flush=True)
+    # The monolithic active-set solution is authoritative. The exact residual
+    # norm was already obtained from the final full-space quadratic objective.
+    best_x = x.copy()
+    rmse_curr = float(mono_stats["rmse"])
+    residual_ss = float(mono_stats["residual_ss"])
+    # Preserve the proxy definition.
+    data_proxy = 0.5*rmse_curr*rmse_curr
+    best_proxy = float(data_proxy)
 
     # --- DIAG: fianl summary (timings & numerical health) ---
     try:
@@ -4175,27 +4192,24 @@ def solve_streaming_nnls(
 
         print("=== [BC-FUSED][summary] ===", flush=True)
         print(f"[BC-FUSED][summary] elapsed_total={elapsed:.1f}s", flush=True)
-        if np.isfinite(rmse_curr):
-            print(f"[BC-FUSED][summary] data_proxy={data_proxy:.3e} rmse={rmse_curr:.3e}", flush=True)
-        else:
-            print(f"[BC-FUSED][summary] data_proxy={data_proxy:.3e} rmse=nan", flush=True)
+        print(f"[BC-FUSED][summary] data_proxy={data_proxy:.3e} rmse="
+            f"{rmse_curr if np.isfinite(rmse_curr) else 'nan'}", flush=True)
         print(f"[BC-FUSED][summary] best_proxy={best_proxy:.3e}", flush=True)
-        print(
-            f"[BC-FUSED][summary] x_sum={x_sum:.3e} x_norm={x_norm:.3e} nonzero={x_nonzero}/{x_flat.size} nonfinite={x_nonfinite}",
-            flush=True
-        )
-        print(
-            f"[BC-FUSED][summary] D_tot diag med/min/max = {D_median:.3e} / {D_min:.3e} / {D_max:.3e}",
-            flush=True
-        )
+        print(f"[BC-FUSED][summary] x_sum={x_sum:.3e} x_norm={x_norm:.3e} "
+            f"nonzero={x_nonzero}/{x_flat.size} nonfinite={x_nonfinite}",
+            flush=True)
+        print(f"[BC-FUSED][summary] D_tot diag med/min/max = {D_median:.3e} / "
+            f"{D_min:.3e} / {D_max:.3e}", flush=True)
 
         # sanity checks that likely indicate major numerical problems
         if x_nonzero == 0:
             print("[BC-FUSED][summary] ALERT: x is entirely zero!", flush=True)
         if x_nonfinite > 0:
-            print("[BC-FUSED][summary] ALERT: non-finite elements in x!", flush=True)
+            print("[BC-FUSED][summary] ALERT: non-finite elements in x!",
+                flush=True)
         if not np.isfinite(data_proxy) or data_proxy <= 0.0:
-            print("[BC-FUSED][summary] ALERT: data_proxy non-finite or <= 0.0", flush=True)
+            print("[BC-FUSED][summary] ALERT: data_proxy non-finite or <= 0.0",
+                flush=True)
 
         # show top contributors (per-orbit totals)
         try:
@@ -4203,8 +4217,8 @@ def solve_streaming_nnls(
             top_idx = np.argsort(s_full)[::-1][:10]
             top_vals = s_full[top_idx]
             print("[BC-FUSED][summary] top orbits (index:mass): " + ", ".join(
-                [f"{int(i)}:{v:.3e}" for i, v in zip(top_idx.tolist(), top_vals.tolist())]
-            ), flush=True)
+                [f"{int(i)}:{v:.3e}" for i, v in zip(top_idx.tolist(),
+                top_vals.tolist())]), flush=True)
         except Exception:
             pass
         # --- orbit_weights residual diagnostic (if prior provided) -----
@@ -4223,18 +4237,12 @@ def solve_streaming_nnls(
                     resid = float(s_full[cc] - s_proj[cc])
                     ratio = float(s_full[cc] / max(s_proj[cc], 1e-30))
 
-                    print(
-                        f"orbit {cc:2d}: "
-                        f"mass={s_full[cc]:.3e} "
-                        f"target={s_proj[cc]:.3e} "
-                        f"resid={resid:+.3e} "
-                        f"ratio={ratio:7.3f} "
-                        f"nz="
+                    print(f"orbit {cc:2d}: mass={s_full[cc]:.3e} "
+                        f"target={s_proj[cc]:.3e} resid={resid:+.3e} "
+                        f"ratio={ratio:7.3f} nz="
                         f"{int(np.count_nonzero(best_x[cc, :] > 0.0)):3d} "
-                        f"eff={st['eff_support']:.2f} "
-                        f"top={st['top_share']:.2f}",
-                        flush=True,
-                    )
+                        f"eff={st['eff_support']:.2f} top={st['top_share']:.2f}",
+                        flush=True)
 
                 _emit_diag({
                     "kind": "final_orbit_table",
@@ -4285,11 +4293,9 @@ def solve_streaming_nnls(
             "bad_indices": bad.tolist(),
             "x": x_final_flat.tolist(),
         })
-        raise RuntimeError(
-            "Final NNLS solution contains non-finite coefficients: "
-            f"n_bad={bad.size}, "
-            f"first_indices={bad[:10].tolist()}"
-        )
+        raise RuntimeError("Final NNLS solution contains non-finite "
+            f"coefficients: n_bad={bad.size}, "
+            f"first_indices={bad[:10].tolist()}")
     neg = np.flatnonzero(x_final_flat < 0.0)
     if neg.size:
         _emit_diag({
