@@ -214,6 +214,9 @@ v2.7:   Made the constrained reduced solve more numerically robust;
 v2.8:   Removed expensive full RMSE computation after a successful run in
             `solve_streaming_nnls`; instead provide the relevant data cheaply
             directly from `streamActiveSetNNLS`. 28 October 2026
+v2.9:   Changed `_ssp_smoothness_hessian` from first-difference regularisation
+            to template-value-aware second-difference smoothness regularisation.
+            30 October 2026
 """
 
 from __future__ import annotations, print_function
@@ -1074,119 +1077,167 @@ def _nnls_from_quadratic(
 
 # ------------------------------------------------------------------------------
 
-def _ssp_smoothness_hessian(n_metals: int, n_ages: int,
-    n_alphas: int) -> np.ndarray:
+def _ssp_smoothness_hessian(umetals: np.ndarray, uages: np.ndarray,
+    ualphas: np.ndarray) -> np.ndarray:
     """
-    Construct a boundary-balanced SSP-grid first-difference Hessian.
+    Construct the N-dimensional SSP-grid curvature Hessian.
 
-    The population ordering is
+    The regularisation penalizes second differences independently along
+    metallicity, age, and alpha enhancement. The physical SSP coordinates
+    are used explicitly, so non-uniform grid spacing is handled correctly.
 
-        (metallicity, age, alpha)
+    For three consecutive coordinates
 
-    in C-order, matching
+        u0 < u1 < u2,
 
-        x.reshape(C, n_metals, n_ages, n_alphas).
+    the local curvature stencil is proportional to the change in first
+    derivative,
 
-    The regularization is a weighted nearest-neighbour penalty,
+        (x2 - x1)/(u2 - u1) - (x1 - x0)/(u1 - u0),
 
-        x.T @ Q @ x = sum_(i,j) w_ij * (x_i - x_j)^2,
+    giving coefficients
 
-    where ``(i, j)`` runs over immediately adjacent SSP cells.
+        [1/h0, -(1/h0 + 1/h1), 1/h1],
 
-    Edge weights compensate for the smaller number of neighbours available
-    to SSP cells on grid faces, edges, and corners. Unlike a symmetric
-    normalized graph Laplacian, this remains an ordinary weighted Laplacian,
-    so a spatially uniform SSP distribution has exactly zero penalty.
+    where
+
+        h0 = u1 - u0
+        h1 = u2 - u1.
+
+    Each stencil is normalized to unit Euclidean norm before being added to
+    the Hessian. This retains the correct non-uniform-grid null space while
+    preventing the numerical units and ranges of age, metallicity, and alpha
+    from imposing arbitrary relative regularisation strengths.
+
+    Only complete three-point stencils are used. No artificial boundary
+    condition is imposed. The regularisation therefore does not assume zero
+    slope, reflection, periodicity, or continuation beyond the supplied SSP
+    library.
+
+    The objective for one dynamical component is
+
+        0.5 * x.T @ Q @ x,
+
+    with
+
+        Q = D_Z.T @ D_Z
+          + D_age.T @ D_age
+          + D_alpha.T @ D_alpha.
+
+    The operator is symmetric positive semidefinite. Constant populations
+    and populations linear in any one physical SSP coordinate have zero
+    curvature.
 
     Parameters
     ----------
-    n_metals : int
-        Number of metallicity grid points.
-    n_ages : int
-        Number of age grid points.
-    n_alphas : int
-        Number of alpha-enhancement grid points.
+    umetals : ndarray
+        Strictly increasing SSP metallicity coordinates.
+    uages : ndarray
+        Strictly increasing SSP age coordinates.
+    ualphas : ndarray
+        Strictly increasing SSP alpha-enhancement coordinates.
 
     Returns
     -------
     Q : ndarray
-        Positive-semidefinite population smoothness Hessian with shape
-        ``(P, P)``.
+        Dense curvature Hessian with shape ``(P, P)``, where
+
+            P = n_metals * n_ages * n_alphas.
+
+        Population indexing follows C order,
+
+            (metallicity, age, alpha).
 
     Raises
     ------
     ValueError
-        If any SSP dimension is non-positive.
+        If any coordinate array is empty, contains non-finite values, or is
+        not strictly increasing.
 
     Examples
     --------
-    >>> Q = _ssp_smoothness_hessian(5, 9, 7)
+    >>> Q = _ssp_smoothness_hessian(
+    ...     np.array([-1.49, -0.96, -0.66, -0.35, 0.06, 0.15, 0.26]),
+    ...     np.array([3., 6., 8., 9., 10., 11., 12., 13., 14.]),
+    ...     np.array([-0.2, 0.0, 0.2, 0.4, 0.6]))
     >>> Q.shape
     (315, 315)
-    >>> np.max(np.abs(Q @ np.ones(315))) < 1e-12
-    True
     """
-    n_metals = int(n_metals)
-    n_ages = int(n_ages)
-    n_alphas = int(n_alphas)
+    umetals = np.asarray(umetals, dtype=np.float64).ravel(order="C")
+    uages = np.asarray(uages, dtype=np.float64).ravel(order="C")
+    ualphas = np.asarray(ualphas, dtype=np.float64).ravel(order="C")
 
-    if n_metals <= 0 or n_ages <= 0 or n_alphas <= 0:
-        raise ValueError("SSP grid dimensions must all be positive.")
+    for name, values in (("umetals", umetals),
+        ("uages", uages), ("ualphas", ualphas)):
+        if values.size == 0:
+            raise ValueError(f"{name} must not be empty.")
 
-    P = n_metals*n_ages*n_alphas
+        if np.any(~np.isfinite(values)):
+            raise ValueError(f"{name} contains non-finite values.")
+
+        if values.size > 1 and np.any(np.diff(values) <= 0.0):
+            raise ValueError(f"{name} must be strictly increasing.")
+
+    n_metals = int(umetals.size)
+    n_ages = int(uages.size)
+    n_alphas = int(ualphas.size)
+
+    shape = (n_metals, n_ages, n_alphas)
+    P = int(np.prod(shape))
+
     Q = np.zeros((P, P), dtype=np.float64)
 
-    index = np.arange(P, dtype=np.int64).reshape(
-        n_metals, n_ages, n_alphas)
+    def _index(iz, ia, ialpha):
+        return np.ravel_multi_index(
+            (iz, ia, ialpha), shape, order="C")
 
-    # Count the number of available nearest neighbours of every SSP cell.
-    # For a fully three-dimensional grid these are 6, 5, 4, and 3 for
-    # interior, face, edge, and corner cells respectively.
-    degree = np.zeros(
-        (n_metals, n_ages, n_alphas), dtype=np.float64)
+    def _add_stencil(p0, p1, p2, u0, u1, u2):
+        h0 = float(u1-u0)
+        h1 = float(u2-u1)
 
-    if n_metals > 1:
-        degree[:-1, :, :] += 1.0
-        degree[1:, :, :] += 1.0
+        if h0 <= 0.0 or h1 <= 0.0:
+            raise ValueError('SSP coordinates must be strictly increasing.')
 
-    if n_ages > 1:
-        degree[:, :-1, :] += 1.0
-        degree[:, 1:, :] += 1.0
+        coeff = np.asarray((1.0/h0, -(1.0/h0+1.0/h1), 1.0/h1), dtype=np.float64)
 
-    if n_alphas > 1:
-        degree[:, :, :-1] += 1.0
-        degree[:, :, 1:] += 1.0
+        coeff_norm = float(np.linalg.norm(coeff))
 
-    degree_flat = degree.ravel(order="C")
+        if not np.isfinite(coeff_norm) or coeff_norm <= 0.0:
+            raise RuntimeError('Invalid SSP curvature stencil.')
 
-    def _add_edges(left: np.ndarray, right: np.ndarray) -> None:
-        """
-        Add one collection of boundary-balanced nearest-neighbour edges.
-        """
-        ii = left.ravel(order="C")
-        jj = right.ravel(order="C")
+        coeff /= coeff_norm
+        idx = np.asarray((p0, p1, p2), dtype=np.int64)
 
-        di = degree_flat[ii]
-        dj = degree_flat[jj]
+        Q[np.ix_(idx, idx)] += np.outer(coeff, coeff)
 
-        # Average inverse endpoint degree. An edge touching a low-degree
-        # boundary cell therefore carries more regularization weight than an
-        # interior-interior edge.
-        weight = 0.5*(1.0/di+1.0/dj)
+    # Metallicity curvature at fixed age and alpha.
+    if n_metals >= 3:
+        for iz in range(1, n_metals-1):
+            for ia in range(n_ages):
+                for ialpha in range(n_alphas):
+                    _add_stencil(_index(iz-1, ia, ialpha),
+                        _index(iz, ia, ialpha), _index(iz+1, ia, ialpha),
+                        umetals[iz-1], umetals[iz], umetals[iz+1])
 
-        np.add.at(Q, (ii, ii), weight)
-        np.add.at(Q, (jj, jj), weight)
-        np.add.at(Q, (ii, jj), -weight)
-        np.add.at(Q, (jj, ii), -weight)
+    # Age curvature at fixed metallicity and alpha.
+    if n_ages >= 3:
+        for iz in range(n_metals):
+            for ia in range(1, n_ages-1):
+                for ialpha in range(n_alphas):
+                    _add_stencil(_index(iz, ia-1, ialpha),
+                        _index(iz, ia, ialpha), _index(iz, ia+1, ialpha),
+                        uages[ia-1], uages[ia], uages[ia+1])
 
-    if n_metals > 1:
-        _add_edges(index[:-1, :, :], index[1:, :, :])
+    # Alpha-enhancement curvature at fixed metallicity and age.
+    if n_alphas >= 3:
+        for iz in range(n_metals):
+            for ia in range(n_ages):
+                for ialpha in range(1, n_alphas-1):
+                    _add_stencil(_index(iz, ia, ialpha-1),
+                        _index(iz, ia, ialpha), _index(iz, ia, ialpha+1),
+                        ualphas[ialpha-1], ualphas[ialpha], ualphas[ialpha+1])
 
-    if n_ages > 1:
-        _add_edges(index[:, :-1, :], index[:, 1:, :])
-
-    if n_alphas > 1:
-        _add_edges(index[:, :, :-1], index[:, :, 1:])
+    Q = 0.5*(Q+Q.T)
 
     return Q
 
@@ -1661,8 +1712,7 @@ def _orbit_hard_constraint_solve(
             # With z >= 0, equal-mass feasibility implies alpha >= 0.
             # A materially negative alpha therefore indicates a failed solve.
             if alpha_trial < -negative_tol:
-                return (
-                    np.zeros((k,), dtype=np.float64),
+                return (np.zeros((k,), dtype=np.float64),
                     _failure_info("negative_alpha", n_free=n_free,
                         removed_local_indices=removed,
                         alpha=float(alpha_trial), lambda_orbit=lambda_orbit))
@@ -1796,15 +1846,10 @@ def _compute_yty(
         DC = f["/DataCube"]
 
         for s0, s1 in s_ranges:
-            Yt = np.asarray(
-                DC[s0:s1, :],
-                dtype=np.float64,
-                order="C",
-            )
+            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C",)
 
             if keep_idx is not None:
                 Yt = Yt[:, keep_idx]
-
             yty += float(np.sum(Yt * Yt))
 
     return yty
@@ -1889,42 +1934,72 @@ def streamActiveSetNNLS(
         required_ssp = ("/SSPMetals", "/SSPAges", "/SSPAlphas")
 
         if not all(name in f for name in required_ssp):
-            raise RuntimeError(
-                "SSP smoothness regularisation requires /SSPMetals, "
-                "/SSPAges, and /SSPAlphas.")
+            raise RuntimeError('SSP smoothness regularisation requires '
+                '/SSPMetals, /SSPAges, and /SSPAlphas.')
 
-        n_metals = int(f["/SSPMetals"].size)
-        n_ages = int(f["/SSPAges"].size)
-        n_alphas = int(f["/SSPAlphas"].size)
+        umetals = np.asarray(f["/SSPMetals"][...],
+            dtype=np.float64).ravel(order="C")
+        uages = np.asarray(f["/SSPAges"][...],
+            dtype=np.float64).ravel(order="C")
+        ualphas = np.asarray(f["/SSPAlphas"][...],
+            dtype=np.float64).ravel(order="C")
+    n_metals = int(umetals.size)
+    n_ages = int(uages.size)
+    n_alphas = int(ualphas.size)
 
     if n_metals * n_ages * n_alphas != P:
         raise RuntimeError("SSP grid dimensions are inconsistent with P: "
             f"{n_metals}*{n_ages}*{n_alphas} != {P}.")
 
-    Q_ssp = _ssp_smoothness_hessian(n_metals, n_ages, n_alphas)
+    Q_ssp = _ssp_smoothness_hessian(umetals, uages, ualphas)
 
     # ------------------------------------------------------------------
     # Dimensionless scientific-regularisation scale.
     #
-    # The solver's z-space data columns are already normalized to unit
-    # energy, so diag(A.T @ A) ~= 1. Normalize the SSP smoothness Hessian
-    # to unit characteristic diagonal curvature as well. The user-facing
-    # regularisation_scale is therefore dimensionless:
+    # Q_ssp is the physical-coordinate second-difference curvature
+    # Hessian. In solver z-space,
     #
-    #     1e-3 -> ~0.1 per cent of characteristic data curvature
-    #     1e-2 -> ~1   per cent of characteristic data curvature
-    #     1e-1 -> ~10  per cent of characteristic data curvature
+    #     x = S z,
     #
-    # Compute this once and keep it fixed throughout the solve.
-    q_diag = np.diag(Q_ssp)
-    q_null = float(np.max(np.abs(
-        Q_ssp @ np.ones(P, dtype=np.float64))))
+    # so its diagonal curvature is
+    #
+    #     diag(S Q_ssp S).
+    #
+    # Normalize by the median positive diagonal curvature. Since the
+    # solver's data columns are normalized to unit energy, the user-facing
+    # regularisation_scale remains dimensionless and directly controls the
+    # characteristic scientific curvature relative to the data curvature.
+    #
+    # This normalization changes only the overall strength of Q_ssp. It
+    # does not alter its SSP-grid geometry or its linear null modes.
+    # ------------------------------------------------------------------
+    zz, tt, aa = np.meshgrid(
+        umetals, uages, ualphas, indexing="ij")
+
+    uniform_mode = np.ones(P, dtype=np.float64)
+    metal_mode = zz.ravel(order="C")
+    age_mode = tt.ravel(order="C")
+    alpha_mode = aa.ravel(order="C")
+
+    uniform_null = float(np.max(np.abs(
+        Q_ssp @ uniform_mode)))
+    metal_linear_null = float(np.max(np.abs(
+        Q_ssp @ metal_mode)))
+    age_linear_null = float(np.max(np.abs(
+        Q_ssp @ age_mode)))
+    alpha_linear_null = float(np.max(np.abs(
+        Q_ssp @ alpha_mode)))
 
     print(
-        "[MONO][smoothness] "
-        f"diag=[{np.min(q_diag):.3f}, {np.max(q_diag):.3f}] "
-        f"uniform_null={q_null:.3e}",
+        f"[MONO][smoothness] "
+        f"uniform_null={uniform_null:.3e} "
+        f"linear_null="
+        f"({metal_linear_null:.3e}, "
+        f"{age_linear_null:.3e}, "
+        f"{alpha_linear_null:.3e})",
         flush=True)
+
+    q_diag = np.diag(Q_ssp)
 
     smooth_diag = np.tile(q_diag, C) * (S_flat * S_flat)
     positive_smooth = smooth_diag[smooth_diag > 0.0]
@@ -2142,8 +2217,7 @@ def streamActiveSetNNLS(
 
                 current_mass = float(np.sum(x_seed[cc, :]))
 
-                if (np.isfinite(current_mass)
-                    and current_mass > 0.0):
+                if np.isfinite(current_mass) and current_mass > 0.0:
                     # Preserve the warm-start population mixture.
                     x_seed[cc, :] *= (target_cc / current_mass)
                 else:
@@ -2156,12 +2230,77 @@ def streamActiveSetNNLS(
                         raise ValueError(
                             f"Orbit {cc} has no allowed population columns.")
 
-                    local_score = ATy_scaled[base + allowed_p]
-                    p_seed = int(allowed_p[int(np.argmax(local_score))])
+                    # ------------------------------------------------------
+                    # Construct a component-local multi-population seed.
+                    #
+                    # The old initialization placed the complete component mass
+                    # on the single SSP with maximum normalized A.T@y. Because
+                    # all dynamical components share the same SSP library, that
+                    # can initialize many components at exactly the same SSP.
+                    #
+                    # Instead retain several locally preferred populations and
+                    # distribute the component's required mass smoothly among
+                    # them. This remains entirely component-local: no population
+                    # information is shared between dynamical components.
+                    # ------------------------------------------------------
+                    local_score = np.asarray(ATy_scaled[base + allowed_p],
+                        dtype=np.float64,)
+                    n_seed = min(8, allowed_p.size)
+
+                    # Select this component's own strongest candidate SSPs.
+                    top_local = np.argpartition(local_score, -n_seed)[-n_seed:]
+
+                    # Sort only for deterministic behaviour and diagnostics.
+                    top_local = top_local[np.argsort(local_score[top_local],
+                        kind="stable")[::-1]]
+                    seed_p = allowed_p[top_local]
+                    seed_score = local_score[top_local].copy()
+
+                    # Robust component-local score scale. Only score differences
+                    # matter for the softmax.
+                    score_center = float(np.median(seed_score))
+                    score_dev = np.abs(seed_score-score_center)
+                    score_scale = float(np.median(score_dev))
+
+                    if not np.isfinite(score_scale) or score_scale <= 0.0:
+                        score_scale = float(np.std(seed_score))
+                    if not np.isfinite(score_scale) or score_scale <= 0.0:
+                        score_scale = max(float(np.max(np.abs(seed_score)
+                            )), 1.0)
+
+                    # Temperature > 1 deliberately avoids reproducing the
+                    # near-delta-function behaviour of the old argmax seed.
+                    temperature = 2.0
+                    logits = ((seed_score-np.max(seed_score))
+                        / (temperature*score_scale))
+
+                    # Avoid pathological exponentials without changing the
+                    # ordering of the candidate SSPs.
+                    logits = np.clip(logits, -50.0, 0.0)
+                    seed_weight = np.exp(logits)
+                    weight_sum = float(np.sum(seed_weight))
+
+                    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+                        seed_weight = np.full(n_seed, 1.0/n_seed,
+                            dtype=np.float64)
+                    else:
+                        seed_weight /= weight_sum
 
                     x_seed[cc, :] = 0.0
-                    x_seed[cc, p_seed] = target_cc
+                    x_seed[cc, seed_p] = target_cc*seed_weight
 
+            seed_population = np.full(C, -1, dtype=np.int64)
+
+            for cc in positive_shape_orbits:
+                positive_p = np.flatnonzero(x_seed[int(cc)] > 0.0)
+
+                if positive_p.size:
+                    seed_population[int(cc)] = int(positive_p[np.argmax(
+                        x_seed[int(cc), positive_p])])
+
+            print("[MONO][seed] population indices: " + " ".join(
+                f"{cc}:{seed_population[cc]}" for cc in positive_shape_orbits),
+                flush=True)
             x_seed_flat = x_seed.ravel(order="C")
 
             z = np.divide(x_seed_flat, S_flat,
@@ -2181,7 +2320,7 @@ def streamActiveSetNNLS(
                 alpha_current = 0.0
     z[known_zero_flat] = 0.0
     z_scale0 = np.max(z) + 1e-30
-    active = z > (1e-10 * z_scale0)
+    active = z > 0.0
     active[known_zero_flat] = False
 
     if has_hard_orbit_shape and zero_shape_orbits.size > 0:
@@ -3123,6 +3262,24 @@ def streamActiveSetNNLS(
 
     # Final objective summary in the solver's own scaled space.
     x_final = _current_x_from_z(z)
+    x_final_cp = x_final.reshape(C, P)
+    final_population = np.argmax(x_final_cp, axis=1)
+    curvature_raw = 0.5*float(np.sum((x_final_cp @ Q_ssp)*x_final_cp))
+    smooth_objective = smooth_scale*curvature_raw
+
+    same_as_seed = (final_population[positive_shape_orbits]
+        == seed_population[positive_shape_orbits])
+    print('[MONO][seed-vs-final] dominant population indices:', flush=True)
+    for cc in positive_shape_orbits:
+        cc = int(cc)
+        print(f"  component={cc:3d} seed={seed_population[cc]:3d} "
+            f"final={final_population[cc]:3d} "
+            f"same={bool(final_population[cc] == seed_population[cc])}",
+            flush=True)
+
+    print(f"[MONO][seed-vs-final] same={np.count_nonzero(same_as_seed)}/"
+        f"{positive_shape_orbits.size} ({np.mean(same_as_seed):.1%})",
+        flush=True)
     ATAz_final = _compute_ATAz_scaled(z)
 
     data_objective = (0.5 * float(np.dot(z, ATAz_final))
@@ -3152,6 +3309,7 @@ def streamActiveSetNNLS(
         max(residual_ss, 0.0)/max(n_fit_pixels, 1)))
     print(f"[MONO][objective] residual={residual_objective:.6e} "
         f"rmse={rmse_final:.6e} "
+        f"curvature={curvature_raw:.6e} "
         f"smooth={scientific_regularisation_objective:.6e} "
         f"smooth/residual={smooth_to_residual:.6e}", flush=True)
 
@@ -3936,16 +4094,8 @@ def solve_streaming_nnls(
 
         # ------------------------ end streaming --------------------------
 
-        # ------------------------------------------------------------------
-        # compute inv_sqrt_energy and scaled targets (per-tile average energy)
-        # Use average column energy per tile (not the summed D_tot) so the
-        # worker tile matrices and the global scaling agree.
-        # ------------------------------------------------------------------
-        col_energy_sum = D_tot.copy() # D_tot currently holds summed energy
-        n_tiles = max(1, len(s_ranges)) # number of tiles used in streaming pass
-
-        # Convert summed energy -> per-tile average energy
-        col_energy = col_energy_sum / float(n_tiles)
+        # Exact global physical column energy.
+        col_energy = D_tot.copy()
 
         # Exact column-energy scaling.
         if np.any(~np.isfinite(col_energy)):
@@ -4193,7 +4343,8 @@ def solve_streaming_nnls(
         print("=== [BC-FUSED][summary] ===", flush=True)
         print(f"[BC-FUSED][summary] elapsed_total={elapsed:.1f}s", flush=True)
         print(f"[BC-FUSED][summary] data_proxy={data_proxy:.3e} rmse="
-            f"{rmse_curr if np.isfinite(rmse_curr) else 'nan'}", flush=True)
+            f"{rmse_curr if np.isfinite(rmse_curr) else float('nan'):.3e}",
+            flush=True)
         print(f"[BC-FUSED][summary] best_proxy={best_proxy:.3e}", flush=True)
         print(f"[BC-FUSED][summary] x_sum={x_sum:.3e} x_norm={x_norm:.3e} "
             f"nonzero={x_nonzero}/{x_flat.size} nonfinite={x_nonfinite}",

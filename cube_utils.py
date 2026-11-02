@@ -31,7 +31,9 @@ v1.12:  Added `upscaledSolution` and `constrainUpscaledSolution` to upward
             propagate a solution from a small run to seed a production run. 25
             September 2026 
 v1.13:  Return `statGrid` from `_oneTimeSpec` to provide the errors of the
-            rebinned spectra. 4 October 2026 
+            rebinned spectra. 4 October 2026
+v1.14:  Added `hypercube_cold/hot` functions to compress/uncompress HDF5
+            hypercubes using zstd or zlib. 31 October 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -41,6 +43,8 @@ import numpy as np
 from tqdm import tqdm
 import os, glob, time, re, math, sys, builtins, warnings, traceback
 import pathlib as plp
+import shutil
+import subprocess
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
 from astropy.io import fits as pf
@@ -6007,5 +6011,403 @@ def diagnose_hypercube_scaling(
                 f"{audit['weight_amp_log_slope']:.6f}"
             )
     return result
+
+# ------------------------------------------------------------------------------
+
+def hypercube_cold(h5_path, method="zstd", remove_original=True,
+    overwrite=False, threads=0):
+    """
+    Compress a CubeFit HDF5 HyperCube for cold storage.
+
+    The source HDF5 file is compressed losslessly using either Zstandard or
+    7-Zip. The completed archive is explicitly tested before the original
+    HDF5 file is optionally removed.
+
+    Compression is performed into a temporary file and atomically renamed
+    only after successful compression and archive verification.
+
+    Parameters
+    ----------
+    h5_path : str or pathlib.Path
+        Path to the hot HDF5 HyperCube.
+    method : {"zstd", "7z"}, optional
+        Lossless compression backend. Default is ``"zstd"``.
+    remove_original : bool, optional
+        Remove the original HDF5 file after successful archive verification.
+        Default is True.
+    overwrite : bool, optional
+        Replace an existing cold archive. Default is False.
+    threads : int, optional
+        Number of compression threads. Zero requests all available threads
+        where supported. Default is 0.
+
+    Returns
+    -------
+    archive_path : pathlib.Path
+        Path to the verified cold-storage archive.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the source file or requested compression executable is missing.
+    FileExistsError
+        If the destination exists and ``overwrite`` is False.
+    ValueError
+        If ``method`` or ``threads`` is invalid.
+    RuntimeError
+        If compression or archive verification fails.
+
+    Examples
+    --------
+    >>> archive = hypercube_cold(
+    ...     "hypercube_109.h5", method="zstd")
+    >>> archive = hypercube_cold(
+    ...     "hypercube_109.h5", method="7z")
+    """
+    h5_path = plp.Path(h5_path)
+
+    if not h5_path.is_file():
+        raise FileNotFoundError(
+            f"HyperCube does not exist: {h5_path}")
+
+    method = str(method).lower()
+
+    if method not in ("zstd", "7z"):
+        raise ValueError(
+            "method must be 'zstd' or '7z'.")
+
+    threads = int(threads)
+
+    if threads < 0:
+        raise ValueError(
+            "threads must be nonnegative.")
+
+    if method == "zstd":
+        executable = shutil.which("zstd")
+        archive_path = plp.Path(str(h5_path)+".zst")
+    else:
+        executable = shutil.which("7zz")
+
+        if executable is None:
+            executable = shutil.which("7z")
+
+        archive_path = plp.Path(str(h5_path)+".7z")
+
+    if executable is None:
+        raise FileNotFoundError(
+            f"Required {method} executable was not found.")
+
+    if archive_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Cold archive already exists: {archive_path}")
+
+    tmp_path = plp.Path(str(archive_path)+".tmp")
+
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    source_size = h5_path.stat().st_size
+
+    print(f"[COLD] source : {h5_path}")
+    print(f"[COLD] method : {method}")
+    print(
+        f"[COLD] size   : "
+        f"{source_size/(1024.0**3):.3f} GiB",
+        flush=True)
+
+    try:
+        if method == "zstd":
+            cmd = [
+                executable,
+                "--ultra",
+                "-22",
+                "--long=31",
+                f"-T{threads}",
+                "-f",
+                str(h5_path),
+                "-o",
+                str(tmp_path),
+            ]
+
+        else:
+            # -mx=9    maximum compression
+            # -m0=lzma2
+            # -md=1536m large LZMA2 dictionary
+            # -ms=on   solid archive
+            # -mmt     multithreading
+            #
+            # The archive contains only one HDF5 file, so solid mode has no
+            # semantic downside but makes the archival intent explicit.
+            cmd = [
+                executable,
+                "a",
+                "-t7z",
+                "-mx=9",
+                "-m0=lzma2",
+                "-md=1536m",
+                "-ms=on",
+                f"-mmt={threads}" if threads > 0 else "-mmt=on",
+                str(tmp_path),
+                str(h5_path),
+            ]
+
+        print(
+            f"[COLD] compressing -> {archive_path.name}",
+            flush=True)
+
+        result = subprocess.run(cmd)
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"{method} compression failed with exit code "
+                f"{result.returncode}.")
+
+        if not tmp_path.is_file() or tmp_path.stat().st_size == 0:
+            raise RuntimeError(
+                "Compression completed without producing a valid archive.")
+
+        print("[COLD] verifying archive...", flush=True)
+
+        if method == "zstd":
+            test_cmd = [
+                executable,
+                "--test",
+                "--long=31",
+                str(tmp_path),
+            ]
+        else:
+            test_cmd = [
+                executable,
+                "t",
+                str(tmp_path),
+            ]
+
+        result = subprocess.run(test_cmd)
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"{method} archive verification failed with exit code "
+                f"{result.returncode}.")
+
+        if archive_path.exists():
+            archive_path.unlink()
+
+        os.replace(tmp_path, archive_path)
+
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+        raise
+
+    archive_size = archive_path.stat().st_size
+    ratio = source_size/archive_size
+
+    print("[COLD] archive verified")
+    print(
+        f"[COLD] archive: "
+        f"{archive_size/(1024.0**3):.3f} GiB")
+    print(
+        f"[COLD] ratio  : {ratio:.3f}x")
+
+    if remove_original:
+        h5_path.unlink()
+
+        print(
+            f"[COLD] removed hot HyperCube: {h5_path}",
+            flush=True)
+    else:
+        print(
+            f"[COLD] retained hot HyperCube: {h5_path}",
+            flush=True)
+
+    return archive_path
+
+# ------------------------------------------------------------------------------
+
+def hypercube_hot(archive_path, remove_archive=True, overwrite=False,
+    threads=0):
+    """
+    Restore a cold-storage CubeFit HyperCube.
+
+    Zstandard and 7-Zip archives are detected from their filename extension.
+    Restoration is performed into a temporary file and atomically renamed
+    after successful decompression.
+
+    Parameters
+    ----------
+    archive_path : str or pathlib.Path
+        Cold-storage archive ending in ``.zst`` or ``.7z``.
+    remove_archive : bool, optional
+        Remove the cold archive after successful restoration. Default is
+        True.
+    overwrite : bool, optional
+        Replace an existing hot HDF5 file. Default is False.
+    threads : int, optional
+        Number of decompression threads. Zero requests the backend default.
+        Default is 0.
+
+    Returns
+    -------
+    h5_path : pathlib.Path
+        Path to the restored HDF5 HyperCube.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the archive or required decompression executable is missing.
+    FileExistsError
+        If the restored HDF5 path exists and ``overwrite`` is False.
+    ValueError
+        If the archive extension or ``threads`` is invalid.
+    RuntimeError
+        If archive verification or decompression fails.
+
+    Examples
+    --------
+    >>> h5_path = hypercube_hot("hypercube_109.h5.zst")
+    >>> h5_path = hypercube_hot("hypercube_109.h5.7z")
+    """
+    archive_path = plp.Path(archive_path)
+
+    if not archive_path.is_file():
+        raise FileNotFoundError(f"Cold archive does not exist: {archive_path}")
+
+    threads = int(threads)
+
+    if threads < 0:
+        raise ValueError('threads must be nonnegative.')
+
+    suffix = archive_path.suffix.lower()
+
+    if suffix == ".zst":
+        method = "zstd"
+        executable = shutil.which("zstd")
+        h5_path = archive_path.with_suffix("")
+
+    elif suffix == ".7z":
+        method = "7z"
+        executable = shutil.which("7zz")
+
+        if executable is None:
+            executable = shutil.which("7z")
+
+        h5_path = archive_path.with_suffix("")
+
+    else:
+        raise ValueError('Cold archive must end in .zst or .7z.')
+
+    if executable is None:
+        raise FileNotFoundError(f"Required {method} executable was not found.")
+
+    if h5_path.exists() and not overwrite:
+        raise FileExistsError(f"Hot HyperCube already exists: {h5_path}")
+
+    tmp_path = plp.Path(str(h5_path)+".tmp")
+
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    archive_size = archive_path.stat().st_size
+
+    print(f"[HOT] archive: {archive_path}")
+    print(f"[HOT] method : {method}")
+    print(f"[HOT] size   : {archive_size/(1024.0**3):.3f} GiB", flush=True)
+
+    # Test the cold archive before beginning a potentially very expensive
+    # restoration.
+    print("[HOT] verifying archive...", flush=True)
+
+    if method == "zstd":
+        test_cmd = [executable, "--test", "--long=31", str(archive_path)]
+    else:
+        test_cmd = [executable, "t", str(archive_path)]
+
+    result = subprocess.run(test_cmd)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"{method} archive verification failed with exit code "
+            f"{result.returncode}.")
+
+    try:
+        if method == "zstd":
+            cmd = [executable, "-d", "--long=31", "-f", str(archive_path), "-o",
+                str(tmp_path)]
+
+        else:
+            # 7z extracts according to the filename stored inside the
+            # archive. Use a temporary directory so that an interrupted
+            # extraction cannot leave the final HDF5 path looking valid.
+            tmp_dir = plp.Path(str(h5_path)+".extract_tmp")
+
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+
+            tmp_dir.mkdir(parents=True)
+
+            try:
+                cmd = [executable, "x", "-y",
+                    f"-mmt={threads}" if threads > 0 else "-mmt=on",
+                    f"-o{tmp_dir}", str(archive_path)]
+
+                print(f"[HOT] restoring -> {h5_path.name}", flush=True)
+
+                result = subprocess.run(cmd)
+
+                if result.returncode != 0:
+                    raise RuntimeError("7z decompression failed with exit code "
+                        f"{result.returncode}.")
+
+                extracted = list(tmp_dir.iterdir())
+
+                if len(extracted) != 1 or not extracted[0].is_file():
+                    raise RuntimeError(
+                        "7z archive did not contain exactly one file.")
+
+                shutil.move(str(extracted[0]), str(tmp_path))
+
+            finally:
+                if tmp_dir.exists():
+                    shutil.rmtree(tmp_dir)
+
+            cmd = None
+
+        if cmd is not None:
+            print(f"[HOT] restoring -> {h5_path.name}", flush=True)
+
+            result = subprocess.run(cmd)
+
+            if result.returncode != 0:
+                raise RuntimeError(f"{method} decompression failed with exit "
+                    f"code {result.returncode}.")
+
+        if not tmp_path.is_file() or tmp_path.stat().st_size == 0:
+            raise RuntimeError(
+                "Decompression completed without producing a valid file.")
+
+        if h5_path.exists():
+            h5_path.unlink()
+
+        os.replace(tmp_path, h5_path)
+
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+        raise
+
+    restored_size = h5_path.stat().st_size
+
+    print(f"[HOT] restored: {restored_size/(1024.0**3):.3f} GiB", flush=True)
+
+    if remove_archive:
+        archive_path.unlink()
+
+        print(f"[HOT] removed cold archive: {archive_path}", flush=True)
+    else:
+        print(f"[HOT] retained cold archive: {archive_path}", flush=True)
+
+    return h5_path
 
 # ------------------------------------------------------------------------------

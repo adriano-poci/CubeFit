@@ -1670,3 +1670,1386 @@ def test_hypercube_boundary_convex_hull(h5_path, mask=None, component=None,
     }
 
 # ------------------------------------------------------------------------------
+
+def diagnose_dynamical_population_mirroring(hypercube_path, x_path,
+    population_floor=1e-8, dynamical_cosine_cut=0.2,
+    population_cosine_cut=0.9):
+    """
+    Test whether dynamically distinct components receive similar SSP mixtures.
+
+    Parameters
+    ----------
+    hypercube_path : str or pathlib.Path
+        CubeFit HyperCube HDF5 file.
+    x_path : str or pathlib.Path
+        CubeFit solution HDF5 file containing ``/X_global``.
+    population_floor : float, optional
+        Relative coefficient floor applied separately to each component
+        before calculating population similarity. Default is 1e-8.
+    dynamical_cosine_cut : float, optional
+        Component pairs below this spatial-amplitude cosine are classified
+        as dynamically dissimilar. Default is 0.2.
+    population_cosine_cut : float, optional
+        Population cosine above this value is classified as strongly
+        mirrored. Default is 0.9.
+
+    Returns
+    -------
+    out : dict
+        Component and pairwise diagnostics.
+
+    Raises
+    ------
+    ValueError
+        If stored dimensions are inconsistent.
+    RuntimeError
+        If required datasets are unavailable or invalid.
+
+    Examples
+    --------
+    >>> out = diagnose_dynamical_population_mirroring(
+    ...     hdf5Path, xPath)
+    """
+    from CubeFit.hdf5_manager import open_h5
+
+    hypercube_path = str(hypercube_path)
+    x_path = str(x_path)
+
+    with open_h5(hypercube_path, role="reader") as f:
+        required = (
+            "/HyperCube/norm/losvd_amp",
+            "/SSPMetals",
+            "/SSPAges",
+            "/SSPAlphas",
+        )
+
+        missing = [key for key in required if key not in f]
+
+        if missing:
+            raise RuntimeError(
+                "Missing HyperCube datasets: " + ", ".join(missing))
+
+        amp = np.asarray(
+            f["/HyperCube/norm/losvd_amp"][...],
+            dtype=np.float64, order="C")
+
+        metals = np.asarray(
+            f["/SSPMetals"][...],
+            dtype=np.float64).ravel(order="C")
+
+        ages = np.asarray(
+            f["/SSPAges"][...],
+            dtype=np.float64).ravel(order="C")
+
+        alphas = np.asarray(
+            f["/SSPAlphas"][...],
+            dtype=np.float64).ravel(order="C")
+
+    with open_h5(x_path, role="reader") as f:
+        if "/X_global" not in f:
+            raise RuntimeError("Solution file has no /X_global.")
+
+        X = np.asarray(
+            f["/X_global"][...],
+            dtype=np.float64, order="C")
+
+    if X.ndim != 2:
+        raise ValueError(
+            f"/X_global must have shape (C,P); got {X.shape}.")
+
+    C, P = map(int, X.shape)
+    S = int(amp.shape[0])
+
+    n_metals = int(metals.size)
+    n_ages = int(ages.size)
+    n_alphas = int(alphas.size)
+
+    if amp.shape != (S, C):
+        raise ValueError(
+            f"losvd_amp has shape {amp.shape}; expected (S,{C}).")
+
+    if n_metals*n_ages*n_alphas != P:
+        raise ValueError(
+            "SSP dimensions are inconsistent with /X_global.")
+
+    if np.any(~np.isfinite(X)) or np.any(~np.isfinite(amp)):
+        raise RuntimeError("Stored solution/amplitudes contain non-finite values.")
+
+    scale = max(float(np.max(np.abs(X))), 1.0)
+
+    if np.min(X) < -1e-10*scale:
+        raise RuntimeError(
+            "/X_global contains materially negative coefficients.")
+
+    X = np.maximum(X, 0.0)
+
+    # ------------------------------------------------------------------
+    # Normalize each component population independently.
+    # ------------------------------------------------------------------
+    component_mass = np.sum(X, axis=1)
+
+    if np.any(component_mass <= 0.0):
+        raise RuntimeError(
+            "At least one fitted component has zero coefficient mass.")
+
+    Q = X/component_mass[:, None]
+
+    # Remove numerical tails independently for each component, then
+    # renormalize. This prevents tiny coefficients from masquerading as
+    # genuine population overlap.
+    for cc in range(C):
+        cut = population_floor*float(np.max(Q[cc]))
+        Q[cc, Q[cc] < cut] = 0.0
+
+        total = float(np.sum(Q[cc]))
+
+        if total > 0.0:
+            Q[cc] /= total
+
+    # ------------------------------------------------------------------
+    # Population cosine similarity.
+    # ------------------------------------------------------------------
+    qnorm = np.linalg.norm(Q, axis=1)
+
+    Qn = np.divide(
+        Q, qnorm[:, None],
+        out=np.zeros_like(Q),
+        where=qnorm[:, None] > 0.0)
+
+    population_cosine = Qn @ Qn.T
+    np.clip(population_cosine, 0.0, 1.0, out=population_cosine)
+
+    # Total-variation distance is useful alongside cosine:
+    #
+    #     0 -> identical mixtures
+    #     1 -> disjoint mixtures.
+    population_tv = np.zeros((C, C), dtype=np.float64)
+
+    for cc in range(C):
+        population_tv[cc] = 0.5*np.sum(
+            np.abs(Q[cc][None, :]-Q), axis=1)
+
+    # ------------------------------------------------------------------
+    # Dynamical spatial-map cosine similarity.
+    # ------------------------------------------------------------------
+    amp_norm = np.linalg.norm(amp, axis=0)
+
+    An = np.divide(
+        amp,
+        amp_norm[None, :],
+        out=np.zeros_like(amp),
+        where=amp_norm[None, :] > 0.0)
+
+    dynamical_cosine = An.T @ An
+    np.clip(dynamical_cosine, 0.0, 1.0, out=dynamical_cosine)
+
+    # ------------------------------------------------------------------
+    # SSP coordinates and boundary masks.
+    # ------------------------------------------------------------------
+    indices = np.asarray([
+        np.unravel_index(
+            pp, (n_metals, n_ages, n_alphas), order="C")
+        for pp in range(P)
+    ], dtype=np.int64)
+
+    iz = indices[:, 0]
+    ia = indices[:, 1]
+    ialpha = indices[:, 2]
+
+    metal_boundary = (iz == 0) | (iz == n_metals-1)
+    age_boundary = (ia == 0) | (ia == n_ages-1)
+    alpha_boundary = (ialpha == 0) | (ialpha == n_alphas-1)
+
+    any_boundary = (
+        metal_boundary | age_boundary | alpha_boundary)
+
+    # ------------------------------------------------------------------
+    # Per-component population summaries.
+    # ------------------------------------------------------------------
+    dominant_population = np.argmax(Q, axis=1)
+
+    dominant_fraction = Q[
+        np.arange(C), dominant_population]
+
+    boundary_fraction = np.sum(
+        Q[:, any_boundary], axis=1)
+
+    age_boundary_fraction = np.sum(
+        Q[:, age_boundary], axis=1)
+
+    metal_boundary_fraction = np.sum(
+        Q[:, metal_boundary], axis=1)
+
+    alpha_boundary_fraction = np.sum(
+        Q[:, alpha_boundary], axis=1)
+
+    metal_grid = metals[iz]
+    age_grid = ages[ia]
+    alpha_grid = alphas[ialpha]
+
+    mean_metal = Q @ metal_grid
+    mean_age = Q @ age_grid
+    mean_alpha = Q @ alpha_grid
+
+    projected_amp = np.sum(amp, axis=0)
+    relative_amp = projected_amp/np.max(projected_amp)
+
+    # ------------------------------------------------------------------
+    # Pair statistics.
+    # ------------------------------------------------------------------
+    iu = np.triu_indices(C, k=1)
+
+    dyn_pair = dynamical_cosine[iu]
+    pop_pair = population_cosine[iu]
+    tv_pair = population_tv[iu]
+
+    dissimilar = dyn_pair < dynamical_cosine_cut
+    mirrored = pop_pair > population_cosine_cut
+
+    dissimilar_mirrored = dissimilar & mirrored
+
+    # Exact same dominant SSP is an even simpler mirroring statistic.
+    same_dominant = (
+        dominant_population[iu[0]]
+        == dominant_population[iu[1]])
+
+    dissimilar_same_dominant = (
+        dissimilar & same_dominant)
+
+    # Store explicit component-pair records.
+    pair_records = []
+
+    for kk in range(dyn_pair.size):
+        cc = int(iu[0][kk])
+        dd = int(iu[1][kk])
+
+        pair_records.append((
+            cc,
+            dd,
+            float(dyn_pair[kk]),
+            float(pop_pair[kk]),
+            float(tv_pair[kk]),
+            bool(same_dominant[kk]),
+        ))
+
+    # The most interesting pairs are dynamically most dissimilar while
+    # retaining high population similarity.
+    suspicious = [
+        item for item in pair_records
+        if item[2] < dynamical_cosine_cut
+    ]
+
+    suspicious.sort(
+        key=lambda item: (-item[3], item[2]))
+
+    # ------------------------------------------------------------------
+    # Dominant-SSP occupancy.
+    # ------------------------------------------------------------------
+    occupancy = np.bincount(
+        dominant_population, minlength=P)
+
+    occupied = np.flatnonzero(occupancy > 0)
+
+    occupancy_order = occupied[
+        np.argsort(occupancy[occupied])[::-1]]
+
+    # ------------------------------------------------------------------
+    # Report.
+    # ------------------------------------------------------------------
+    print()
+    print("="*78)
+    print("DYNAMICAL / POPULATION MIRRORING DIAGNOSTIC")
+    print("="*78)
+    print(f"C={C}  P={P}  S={S}")
+    print(f"Distinct dominant SSPs      : {occupied.size}/{C}")
+    print(
+        f"Median boundary mass        : "
+        f"{np.median(boundary_fraction):.6f}")
+    print(
+        f"Median age-boundary mass    : "
+        f"{np.median(age_boundary_fraction):.6f}")
+    print(
+        f"Median metal-boundary mass  : "
+        f"{np.median(metal_boundary_fraction):.6f}")
+    print(
+        f"Median alpha-boundary mass  : "
+        f"{np.median(alpha_boundary_fraction):.6f}")
+
+    print()
+    print("All component pairs:")
+    print(
+        f"  dynamical cosine min/median/max = "
+        f"{np.min(dyn_pair):.6f} / "
+        f"{np.median(dyn_pair):.6f} / "
+        f"{np.max(dyn_pair):.6f}")
+    print(
+        f"  population cosine min/median/max = "
+        f"{np.min(pop_pair):.6f} / "
+        f"{np.median(pop_pair):.6f} / "
+        f"{np.max(pop_pair):.6f}")
+    print(
+        f"  population TV min/median/max = "
+        f"{np.min(tv_pair):.6f} / "
+        f"{np.median(tv_pair):.6f} / "
+        f"{np.max(tv_pair):.6f}")
+
+    print()
+    print(
+        f"Dynamically dissimilar pairs "
+        f"(cos < {dynamical_cosine_cut:g}): "
+        f"{np.count_nonzero(dissimilar)}/{dyn_pair.size}")
+
+    if np.any(dissimilar):
+        print(
+            f"  population cosine min/median/max = "
+            f"{np.min(pop_pair[dissimilar]):.6f} / "
+            f"{np.median(pop_pair[dissimilar]):.6f} / "
+            f"{np.max(pop_pair[dissimilar]):.6f}")
+        print(
+            f"  population TV min/median/max = "
+            f"{np.min(tv_pair[dissimilar]):.6f} / "
+            f"{np.median(tv_pair[dissimilar]):.6f} / "
+            f"{np.max(tv_pair[dissimilar]):.6f}")
+        print(
+            f"  strongly mirrored "
+            f"(pop cosine > {population_cosine_cut:g}) = "
+            f"{np.count_nonzero(dissimilar_mirrored)}/"
+            f"{np.count_nonzero(dissimilar)}")
+        print(
+            f"  same dominant SSP = "
+            f"{np.count_nonzero(dissimilar_same_dominant)}/"
+            f"{np.count_nonzero(dissimilar)}")
+
+    print()
+    print("Most commonly dominant SSPs:")
+    print(
+        "  p   count      [Z/H]      age    alpha   boundary")
+
+    for pp in occupancy_order[:15]:
+        print(
+            f"{pp:3d}  {occupancy[pp]:5d}  "
+            f"{metal_grid[pp]:9.4f}  "
+            f"{age_grid[pp]:7.3f}  "
+            f"{alpha_grid[pp]:7.3f}  "
+            f"{str(bool(any_boundary[pp])):>8s}")
+
+    print()
+    print("Per component:")
+    print(
+        " comp    A/Amax  dom_p   dom_frac      <Z>      <age>   "
+        "<alpha>  boundary")
+
+    for cc in range(C):
+        print(
+            f"{cc:4d}  "
+            f"{relative_amp[cc]:8.3e}  "
+            f"{dominant_population[cc]:5d}  "
+            f"{dominant_fraction[cc]:9.5f}  "
+            f"{mean_metal[cc]:8.4f}  "
+            f"{mean_age[cc]:8.3f}  "
+            f"{mean_alpha[cc]:8.4f}  "
+            f"{boundary_fraction[cc]:8.5f}")
+
+    print()
+    print("Most suspicious dynamically distinct pairs:")
+    print(
+        "  c1   c2   dyn_cos   pop_cos      TV    same_dom")
+
+    for cc, dd, dyn, pop, tv, same in suspicious[:25]:
+        print(
+            f"{cc:4d} {dd:4d}  "
+            f"{dyn:8.5f}  "
+            f"{pop:8.5f}  "
+            f"{tv:8.5f}  "
+            f"{str(same):>8s}")
+
+    print("="*78)
+    print()
+
+    return {
+        "population": Q,
+        "population_cosine": population_cosine,
+        "population_tv": population_tv,
+        "dynamical_cosine": dynamical_cosine,
+        "component_mass": component_mass,
+        "projected_amplitude": projected_amp,
+        "relative_amplitude": relative_amp,
+        "dominant_population": dominant_population,
+        "dominant_fraction": dominant_fraction,
+        "dominant_occupancy": occupancy,
+        "boundary_fraction": boundary_fraction,
+        "age_boundary_fraction": age_boundary_fraction,
+        "metal_boundary_fraction": metal_boundary_fraction,
+        "alpha_boundary_fraction": alpha_boundary_fraction,
+        "mean_metal": mean_metal,
+        "mean_age": mean_age,
+        "mean_alpha": mean_alpha,
+        "dynamically_dissimilar": dissimilar,
+        "dissimilar_population_cosine": pop_pair[dissimilar],
+        "dissimilar_population_tv": tv_pair[dissimilar],
+        "dissimilar_mirrored": dissimilar_mirrored,
+        "dissimilar_same_dominant": dissimilar_same_dominant,
+        "suspicious_pairs": suspicious,
+    }
+
+# ------------------------------------------------------------------------------
+
+def diagnose_extreme_ssp_reconstruction(h5_path,
+    populations=(4, 129, 224, 310, 312, 314), coeff_floor=1e-4):
+    """
+    Inspect nonnegative reconstructions of selected SSP templates.
+
+    Each selected SSP is reconstructed from every other SSP in the stored
+    library. The function reports the reconstruction error and the physical
+    SSP coordinates receiving significant reconstruction weight.
+
+    Parameters
+    ----------
+    h5_path : str
+        CubeFit HyperCube HDF5 path.
+    populations : sequence of int, optional
+        Flattened SSP indices to test.
+    coeff_floor : float, optional
+        Report reconstruction coefficients larger than this fraction of the
+        total reconstruction coefficient sum. Default is 1e-4.
+
+    Returns
+    -------
+    out : dict
+        Reconstruction coefficients, errors, and physical summaries.
+
+    Raises
+    ------
+    ValueError
+        If inputs or stored SSP dimensions are invalid.
+    RuntimeError
+        If required HDF5 datasets are unavailable.
+
+    Examples
+    --------
+    >>> out = diagnose_extreme_ssp_reconstruction(
+    ...     hdf5Path, populations=(4, 129, 224, 310, 312, 314))
+    """
+    import numpy as np
+    from scipy.optimize import nnls
+    from CubeFit.hdf5_manager import open_h5
+
+    populations = np.asarray(
+        populations, dtype=np.int64).ravel(order="C")
+
+    with open_h5(h5_path, role="reader") as f:
+        required = (
+            "/Templates",
+            "/SSPMetals",
+            "/SSPAges",
+            "/SSPAlphas",
+        )
+
+        missing = [key for key in required if key not in f]
+
+        if missing:
+            raise RuntimeError(
+                "Missing HDF5 datasets: " + ", ".join(missing))
+
+        T = np.asarray(
+            f["/Templates"][...],
+            dtype=np.float64, order="C")
+
+        metals = np.asarray(
+            f["/SSPMetals"][...],
+            dtype=np.float64).ravel(order="C")
+
+        ages = np.asarray(
+            f["/SSPAges"][...],
+            dtype=np.float64).ravel(order="C")
+
+        alphas = np.asarray(
+            f["/SSPAlphas"][...],
+            dtype=np.float64).ravel(order="C")
+
+    n_metals = int(metals.size)
+    n_ages = int(ages.size)
+    n_alphas = int(alphas.size)
+    P = n_metals*n_ages*n_alphas
+
+    if T.ndim != 2 or T.shape[0] != P:
+        raise ValueError(
+            f"/Templates has shape {T.shape}; expected ({P}, T_c).")
+
+    if np.any(populations < 0) or np.any(populations >= P):
+        raise ValueError(
+            f"populations must lie in [0, {P-1}].")
+
+    if not np.isfinite(coeff_floor) or coeff_floor < 0.0:
+        raise ValueError(
+            "coeff_floor must be finite and nonnegative.")
+
+    # Physical coordinates for every flattened population.
+    indices = np.asarray([
+        np.unravel_index(
+            pp, (n_metals, n_ages, n_alphas), order="C")
+        for pp in range(P)
+    ], dtype=np.int64)
+
+    iz = indices[:, 0]
+    ia = indices[:, 1]
+    ialpha = indices[:, 2]
+
+    metal_grid = metals[iz]
+    age_grid = ages[ia]
+    alpha_grid = alphas[ialpha]
+
+    # Normalize spectra exactly as in the previous redundancy test.
+    template_norm = np.linalg.norm(T, axis=1)
+
+    if np.any(~np.isfinite(template_norm)) or np.any(template_norm <= 0.0):
+        raise RuntimeError(
+            "/Templates contains invalid spectra.")
+
+    Tn = T/template_norm[:, None]
+
+    results = {}
+
+    for pp in populations:
+        pp = int(pp)
+
+        use = np.ones(P, dtype=bool)
+        use[pp] = False
+
+        other = np.flatnonzero(use)
+
+        coeff_other, residual = nnls(
+            Tn[use].T,
+            Tn[pp])
+
+        coeff = np.zeros(P, dtype=np.float64)
+        coeff[other] = coeff_other
+
+        coeff_sum = float(np.sum(coeff))
+
+        if coeff_sum <= 0.0:
+            raise RuntimeError(
+                f"SSP {pp} has an empty NNLS reconstruction.")
+
+        # q is used only to interpret the reconstruction as a population
+        # mixture. The actual spectral reconstruction remains coeff.
+        q = coeff/coeff_sum
+
+        significant = q >= coeff_floor
+        significant_idx = np.flatnonzero(significant)
+
+        order = significant_idx[
+            np.argsort(q[significant_idx])[::-1]]
+
+        mean_metal = float(np.sum(q*metal_grid))
+        mean_age = float(np.sum(q*age_grid))
+        mean_alpha = float(np.sum(q*alpha_grid))
+
+        var_metal = float(np.sum(
+            q*(metal_grid-mean_metal)**2))
+        var_age = float(np.sum(
+            q*(age_grid-mean_age)**2))
+        var_alpha = float(np.sum(
+            q*(alpha_grid-mean_alpha)**2))
+
+        effective_n = float(np.exp(
+            -np.sum(q[q > 0.0]*np.log(q[q > 0.0]))))
+
+        target_coord = (
+            float(metal_grid[pp]),
+            float(age_grid[pp]),
+            float(alpha_grid[pp]),
+        )
+
+        # Distances are reported axis by axis because the three SSP
+        # coordinates have different physical units/scales.
+        mean_abs_dmetal = float(np.sum(
+            q*np.abs(metal_grid-metal_grid[pp])))
+        mean_abs_dage = float(np.sum(
+            q*np.abs(age_grid-age_grid[pp])))
+        mean_abs_dalpha = float(np.sum(
+            q*np.abs(alpha_grid-alpha_grid[pp])))
+
+        results[pp] = {
+            "coefficients": coeff,
+            "population_fraction": q,
+            "residual": float(residual),
+            "coefficient_sum": coeff_sum,
+            "significant_indices": order,
+            "effective_n": effective_n,
+            "mean_metal": mean_metal,
+            "mean_age": mean_age,
+            "mean_alpha": mean_alpha,
+            "std_metal": np.sqrt(var_metal),
+            "std_age": np.sqrt(var_age),
+            "std_alpha": np.sqrt(var_alpha),
+            "mean_abs_dmetal": mean_abs_dmetal,
+            "mean_abs_dage": mean_abs_dage,
+            "mean_abs_dalpha": mean_abs_dalpha,
+        }
+
+        print()
+        print("="*76)
+        print(
+            f"SSP {pp}: "
+            f"[Z/H]={target_coord[0]:.4f} "
+            f"age={target_coord[1]:.3f} "
+            f"alpha={target_coord[2]:.3f}")
+        print("="*76)
+
+        print(
+            f"fractional spectral residual : {residual:.6e}")
+        print(
+            f"raw coefficient sum         : {coeff_sum:.6e}")
+        print(
+            f"effective reconstruction N  : {effective_n:.3f}")
+
+        print(
+            f"weighted mean               : "
+            f"[Z/H]={mean_metal:.4f} "
+            f"age={mean_age:.3f} "
+            f"alpha={mean_alpha:.4f}")
+
+        print(
+            f"weighted std                : "
+            f"[Z/H]={np.sqrt(var_metal):.4f} "
+            f"age={np.sqrt(var_age):.3f} "
+            f"alpha={np.sqrt(var_alpha):.4f}")
+
+        print(
+            f"mean |delta|                : "
+            f"[Z/H]={mean_abs_dmetal:.4f} "
+            f"age={mean_abs_dage:.3f} "
+            f"alpha={mean_abs_dalpha:.4f}")
+
+        print()
+        print(
+            f"Reconstruction populations "
+            f"(fraction >= {coeff_floor:g}):")
+        print(
+            "  p      fraction      [Z/H]      age    alpha")
+
+        for qq in order:
+            print(
+                f"{qq:3d}  "
+                f"{q[qq]:12.6e}  "
+                f"{metal_grid[qq]:9.4f}  "
+                f"{age_grid[qq]:7.3f}  "
+                f"{alpha_grid[qq]:7.3f}")
+
+    print()
+    print("="*76)
+    print("SUMMARY")
+    print("="*76)
+    print(
+        "  p       residual    Neff    "
+        "<|dZ|>   <|dt|>  <|dalpha|>")
+
+    for pp in populations:
+        rr = results[int(pp)]
+
+        print(
+            f"{int(pp):3d}  "
+            f"{rr['residual']:12.6e}  "
+            f"{rr['effective_n']:6.2f}  "
+            f"{rr['mean_abs_dmetal']:7.4f}  "
+            f"{rr['mean_abs_dage']:7.3f}  "
+            f"{rr['mean_abs_dalpha']:10.4f}")
+
+    print("="*76)
+
+    return results
+
+# ------------------------------------------------------------------------------
+
+def diagnose_ssp_neighbour_distances(h5_path):
+    """
+    Measure spectral distances between adjacent SSP grid points.
+
+    Tests whether the physical SSP grid has strongly nonuniform spectral
+    resolution, particularly at its boundaries.
+
+    Parameters
+    ----------
+    h5_path : str
+        CubeFit HyperCube HDF5 path.
+
+    Returns
+    -------
+    out : dict
+        Neighbour distances and summary statistics for each SSP axis.
+
+    Raises
+    ------
+    ValueError
+        If the stored SSP grid is inconsistent.
+    RuntimeError
+        If required datasets are unavailable or invalid.
+
+    Examples
+    --------
+    >>> out = diagnose_ssp_neighbour_distances(hdf5Path)
+    """
+    import numpy as np
+    from CubeFit.hdf5_manager import open_h5
+
+    with open_h5(h5_path, role="reader") as f:
+        required = (
+            "/Templates",
+            "/SSPMetals",
+            "/SSPAges",
+            "/SSPAlphas",
+        )
+
+        missing = [key for key in required if key not in f]
+
+        if missing:
+            raise RuntimeError(
+                "Missing HDF5 datasets: " + ", ".join(missing))
+
+        T = np.asarray(
+            f["/Templates"][...], dtype=np.float64, order="C")
+
+        metals = np.asarray(
+            f["/SSPMetals"][...],
+            dtype=np.float64).ravel(order="C")
+
+        ages = np.asarray(
+            f["/SSPAges"][...],
+            dtype=np.float64).ravel(order="C")
+
+        alphas = np.asarray(
+            f["/SSPAlphas"][...],
+            dtype=np.float64).ravel(order="C")
+
+    n_metals = int(metals.size)
+    n_ages = int(ages.size)
+    n_alphas = int(alphas.size)
+    shape = (n_metals, n_ages, n_alphas)
+    P = int(np.prod(shape))
+
+    if T.ndim != 2 or T.shape[0] != P:
+        raise ValueError(
+            f"/Templates has shape {T.shape}; expected ({P}, T_c).")
+
+    norms = np.linalg.norm(T, axis=1)
+
+    if np.any(~np.isfinite(norms)) or np.any(norms <= 0.0):
+        raise RuntimeError("/Templates contains invalid spectra.")
+
+    T = T/norms[:, None]
+
+    def _p(iz, ia, ialpha):
+        return np.ravel_multi_index(
+            (iz, ia, ialpha), shape, order="C")
+
+    records = {
+        "metal": [],
+        "age": [],
+        "alpha": [],
+    }
+
+    # ------------------------------------------------------------------
+    # Metallicity neighbours.
+    # ------------------------------------------------------------------
+    for iz in range(n_metals-1):
+        for ia in range(n_ages):
+            for ialpha in range(n_alphas):
+                p0 = _p(iz, ia, ialpha)
+                p1 = _p(iz+1, ia, ialpha)
+
+                distance = float(np.linalg.norm(T[p1]-T[p0]))
+
+                boundary = (
+                    iz == 0
+                    or iz+1 == n_metals-1
+                )
+
+                records["metal"].append((
+                    p0, p1, distance, boundary,
+                    metals[iz], metals[iz+1],
+                    ages[ia], alphas[ialpha],
+                ))
+
+    # ------------------------------------------------------------------
+    # Age neighbours.
+    # ------------------------------------------------------------------
+    for iz in range(n_metals):
+        for ia in range(n_ages-1):
+            for ialpha in range(n_alphas):
+                p0 = _p(iz, ia, ialpha)
+                p1 = _p(iz, ia+1, ialpha)
+
+                distance = float(np.linalg.norm(T[p1]-T[p0]))
+
+                boundary = (
+                    ia == 0
+                    or ia+1 == n_ages-1
+                )
+
+                records["age"].append((
+                    p0, p1, distance, boundary,
+                    ages[ia], ages[ia+1],
+                    metals[iz], alphas[ialpha],
+                ))
+
+    # ------------------------------------------------------------------
+    # Alpha neighbours.
+    # ------------------------------------------------------------------
+    for iz in range(n_metals):
+        for ia in range(n_ages):
+            for ialpha in range(n_alphas-1):
+                p0 = _p(iz, ia, ialpha)
+                p1 = _p(iz, ia, ialpha+1)
+
+                distance = float(np.linalg.norm(T[p1]-T[p0]))
+
+                boundary = (
+                    ialpha == 0
+                    or ialpha+1 == n_alphas-1
+                )
+
+                records["alpha"].append((
+                    p0, p1, distance, boundary,
+                    alphas[ialpha], alphas[ialpha+1],
+                    metals[iz], ages[ia],
+                ))
+
+    out = {}
+
+    print()
+    print("="*78)
+    print("SSP NEAREST-NEIGHBOUR SPECTRAL-DISTANCE DIAGNOSTIC")
+    print("="*78)
+    print(
+        f"SSP grid: {n_metals} x {n_ages} x {n_alphas} = {P}")
+
+    for axis in ("metal", "age", "alpha"):
+        rec = records[axis]
+
+        distance = np.asarray(
+            [rr[2] for rr in rec], dtype=np.float64)
+
+        boundary = np.asarray(
+            [rr[3] for rr in rec], dtype=bool)
+
+        interior = ~boundary
+
+        boundary_values = distance[boundary]
+        interior_values = distance[interior]
+
+        med_all = float(np.median(distance))
+        med_boundary = float(np.median(boundary_values))
+        med_interior = float(np.median(interior_values))
+
+        print()
+        print(f"{axis.upper()} AXIS")
+        print("-"*78)
+        print(
+            f"all edges      : N={distance.size:4d} "
+            f"median={med_all:.6e} "
+            f"min={np.min(distance):.6e} "
+            f"max={np.max(distance):.6e}")
+        print(
+            f"boundary edges : N={boundary_values.size:4d} "
+            f"median={med_boundary:.6e} "
+            f"min={np.min(boundary_values):.6e} "
+            f"max={np.max(boundary_values):.6e}")
+        print(
+            f"interior edges : N={interior_values.size:4d} "
+            f"median={med_interior:.6e} "
+            f"min={np.min(interior_values):.6e} "
+            f"max={np.max(interior_values):.6e}")
+        print(
+            f"boundary/interior median distance = "
+            f"{med_boundary/med_interior:.6f}")
+
+        # Proposed raw spectral weight before clipping:
+        #
+        #     w = (median distance / local distance)^2
+        #
+        raw_weight = (med_all/distance)**2
+
+        order_short = np.argsort(distance)
+        order_long = order_short[::-1]
+
+        print()
+        print("10 spectrally closest adjacent pairs:")
+
+        for kk in order_short[:10]:
+            rr = rec[int(kk)]
+
+            if axis == "metal":
+                print(
+                    f"  p={rr[0]:3d}->{rr[1]:3d} "
+                    f"d={rr[2]:.6e} "
+                    f"w={raw_weight[kk]:8.3f} "
+                    f"Z={rr[4]:.3f}->{rr[5]:.3f} "
+                    f"age={rr[6]:.1f} "
+                    f"alpha={rr[7]:.1f} "
+                    f"boundary={rr[3]}")
+
+            elif axis == "age":
+                print(
+                    f"  p={rr[0]:3d}->{rr[1]:3d} "
+                    f"d={rr[2]:.6e} "
+                    f"w={raw_weight[kk]:8.3f} "
+                    f"age={rr[4]:.1f}->{rr[5]:.1f} "
+                    f"Z={rr[6]:.3f} "
+                    f"alpha={rr[7]:.1f} "
+                    f"boundary={rr[3]}")
+
+            else:
+                print(
+                    f"  p={rr[0]:3d}->{rr[1]:3d} "
+                    f"d={rr[2]:.6e} "
+                    f"w={raw_weight[kk]:8.3f} "
+                    f"alpha={rr[4]:.1f}->{rr[5]:.1f} "
+                    f"Z={rr[6]:.3f} "
+                    f"age={rr[7]:.1f} "
+                    f"boundary={rr[3]}")
+
+        print()
+        print("10 spectrally most separated adjacent pairs:")
+
+        for kk in order_long[:10]:
+            rr = rec[int(kk)]
+
+            if axis == "metal":
+                print(
+                    f"  p={rr[0]:3d}->{rr[1]:3d} "
+                    f"d={rr[2]:.6e} "
+                    f"w={raw_weight[kk]:8.3f} "
+                    f"Z={rr[4]:.3f}->{rr[5]:.3f} "
+                    f"age={rr[6]:.1f} "
+                    f"alpha={rr[7]:.1f} "
+                    f"boundary={rr[3]}")
+
+            elif axis == "age":
+                print(
+                    f"  p={rr[0]:3d}->{rr[1]:3d} "
+                    f"d={rr[2]:.6e} "
+                    f"w={raw_weight[kk]:8.3f} "
+                    f"age={rr[4]:.1f}->{rr[5]:.1f} "
+                    f"Z={rr[6]:.3f} "
+                    f"alpha={rr[7]:.1f} "
+                    f"boundary={rr[3]}")
+
+            else:
+                print(
+                    f"  p={rr[0]:3d}->{rr[1]:3d} "
+                    f"d={rr[2]:.6e} "
+                    f"w={raw_weight[kk]:8.3f} "
+                    f"alpha={rr[4]:.1f}->{rr[5]:.1f} "
+                    f"Z={rr[6]:.3f} "
+                    f"age={rr[7]:.1f} "
+                    f"boundary={rr[3]}")
+
+        out[axis] = {
+            "records": rec,
+            "distance": distance,
+            "boundary": boundary,
+            "raw_weight": raw_weight,
+            "median": med_all,
+            "boundary_median": med_boundary,
+            "interior_median": med_interior,
+        }
+
+    print()
+    print("="*78)
+
+    return out
+
+# ------------------------------------------------------------------------------
+
+def test_redundant_ssp_replacement(hypercube_path, x_path, error_cube,
+    coeff_floor=1e-10, s_chunk=128):
+    """
+    Replace fitted SSP coefficients by their leave-one-out redundant
+    representations and measure the observational effect.
+
+    Only SSPs that actually carry fitted population are reconstructed.
+    The modified solution preserves each dynamical component's total
+    coefficient mass exactly.
+
+    The test evaluates
+
+        sqrt(mean((A @ (x_new - x_old) / sigma)**2))
+
+    over fitted pixels with valid observational uncertainties.
+
+    Parameters
+    ----------
+    hypercube_path : str or pathlib.Path
+        CubeFit HyperCube HDF5 file.
+    x_path : str or pathlib.Path
+        CubeFit solution HDF5 file containing ``/X_global``.
+    error_cube : ndarray
+        Observational 1-sigma errors with shape ``(S, L)``.
+    coeff_floor : float, optional
+        Ignore fitted coefficients below this fraction of the largest
+        coefficient in their component. Default is ``1e-10``.
+    s_chunk : int, optional
+        Spatial read chunk. Default is 128.
+
+    Returns
+    -------
+    out : dict
+        Original and redistributed solutions, reconstruction information,
+        and model-change diagnostics.
+
+    Raises
+    ------
+    ValueError
+        If dimensions are inconsistent.
+    RuntimeError
+        If required datasets are unavailable or invalid.
+
+    Examples
+    --------
+    >>> out = test_redundant_ssp_replacement(
+    ...     hdf5Path, xPath, errorCube)
+    """
+    from scipy.optimize import nnls
+    from CubeFit.hdf5_manager import open_h5
+
+    hypercube_path = str(hypercube_path)
+    x_path = str(x_path)
+    error_cube = np.asarray(error_cube, dtype=np.float64)
+    s_chunk = int(s_chunk)
+
+    # ------------------------------------------------------------------
+    # Read the small quantities first.
+    # ------------------------------------------------------------------
+    with open_h5(hypercube_path, role="reader") as f:
+        required = (
+            "/HyperCube/models",
+            "/Templates",
+            "/Mask",
+            "/SSPMetals",
+            "/SSPAges",
+            "/SSPAlphas",
+        )
+
+        missing = [key for key in required if key not in f]
+
+        if missing:
+            raise RuntimeError(
+                "Missing datasets: " + ", ".join(missing))
+
+        S, C, P, L = map(
+            int, f["/HyperCube/models"].shape)
+
+        T = np.asarray(
+            f["/Templates"][...],
+            dtype=np.float64, order="C")
+
+        mask = np.asarray(
+            f["/Mask"][...],
+            dtype=bool).ravel(order="C")
+
+        metals = np.asarray(
+            f["/SSPMetals"][...],
+            dtype=np.float64).ravel(order="C")
+
+        ages = np.asarray(
+            f["/SSPAges"][...],
+            dtype=np.float64).ravel(order="C")
+
+        alphas = np.asarray(
+            f["/SSPAlphas"][...],
+            dtype=np.float64).ravel(order="C")
+
+    with open_h5(x_path, role="reader") as f:
+        if "/X_global" not in f:
+            raise RuntimeError("Solution file has no /X_global.")
+
+        x_old = np.asarray(
+            f["/X_global"][...],
+            dtype=np.float64, order="C")
+
+    if x_old.shape != (C, P):
+        raise ValueError(
+            f"/X_global has shape {x_old.shape}; expected {(C, P)}.")
+
+    if error_cube.shape != (S, L):
+        raise ValueError(
+            f"error_cube has shape {error_cube.shape}; "
+            f"expected {(S, L)}.")
+
+    if T.shape[0] != P:
+        raise ValueError(
+            f"/Templates has shape {T.shape}; expected P={P}.")
+
+    # ------------------------------------------------------------------
+    # Identify only SSPs that actually carry fitted mass.
+    # ------------------------------------------------------------------
+    x_old = np.maximum(x_old, 0.0)
+
+    used = np.zeros(P, dtype=bool)
+
+    for cc in range(C):
+        xmax = float(np.max(x_old[cc]))
+
+        if xmax <= 0.0:
+            continue
+
+        used |= x_old[cc] > coeff_floor*xmax
+
+    used_p = np.flatnonzero(used)
+
+    print(
+        f"[REDUNDANCY] fitted SSPs requiring reconstruction: "
+        f"{used_p.size}/{P}",
+        flush=True)
+
+    # ------------------------------------------------------------------
+    # Normalize the stored SSP spectra and calculate the leave-one-out
+    # reconstruction only for SSPs actually used by this solution.
+    # ------------------------------------------------------------------
+    norm = np.linalg.norm(T, axis=1)
+
+    if np.any(norm <= 0.0) or np.any(~np.isfinite(norm)):
+        raise RuntimeError("/Templates contains invalid spectra.")
+
+    Tn = T/norm[:, None]
+
+    reconstruction = {}
+    reconstruction_error = {}
+
+    for pp in used_p:
+        use = np.ones(P, dtype=bool)
+        use[pp] = False
+
+        other = np.flatnonzero(use)
+
+        coeff, residual = nnls(
+            Tn[use].T,
+            Tn[pp])
+
+        full = np.zeros(P, dtype=np.float64)
+        full[other] = coeff
+
+        # We need coefficient-mass conservation because the production
+        # solution has an equal-component-mass constraint.
+        total = float(np.sum(full))
+
+        if total <= 0.0:
+            raise RuntimeError(
+                f"Empty reconstruction for SSP {pp}.")
+
+        full /= total
+
+        reconstruction[int(pp)] = full
+        reconstruction_error[int(pp)] = float(residual)
+
+    # ------------------------------------------------------------------
+    # Replace every materially populated SSP by its redundant
+    # representation.
+    #
+    # Each unit of x[:,pp] is replaced by a unit-sum nonnegative vector,
+    # so component mass is conserved analytically.
+    # ------------------------------------------------------------------
+    x_new = np.zeros_like(x_old)
+
+    for cc in range(C):
+        xmax = float(np.max(x_old[cc]))
+
+        if xmax <= 0.0:
+            continue
+
+        cut = coeff_floor*xmax
+
+        for pp in range(P):
+            value = float(x_old[cc, pp])
+
+            if value <= 0.0:
+                continue
+
+            if value > cut and pp in reconstruction:
+                x_new[cc] += value*reconstruction[pp]
+            else:
+                x_new[cc, pp] += value
+
+    # Remove roundoff and enforce exactly the original component sums.
+    x_new = np.maximum(x_new, 0.0)
+
+    mass_old = np.sum(x_old, axis=1)
+    mass_new = np.sum(x_new, axis=1)
+
+    for cc in range(C):
+        if mass_new[cc] > 0.0:
+            x_new[cc] *= mass_old[cc]/mass_new[cc]
+
+    mass_error = float(np.max(
+        np.abs(np.sum(x_new, axis=1)-mass_old)))
+
+    # ------------------------------------------------------------------
+    # Determine which dynamical components actually changed.
+    # ------------------------------------------------------------------
+    delta = x_new-x_old
+
+    delta_scale = max(
+        float(np.max(np.abs(delta))), 1.0)
+
+    changed_coeff = (
+        np.abs(delta) > 1e-12*delta_scale)
+
+    changed_components = np.flatnonzero(
+        np.any(changed_coeff, axis=1))
+
+    print(
+        f"[REDUNDANCY] changed components: "
+        f"{changed_components.size}/{C}",
+        flush=True)
+
+    print(
+        f"[REDUNDANCY] component-mass error: "
+        f"{mass_error:.6e}",
+        flush=True)
+
+    # ------------------------------------------------------------------
+    # Valid observational pixels.
+    # ------------------------------------------------------------------
+    valid = (
+        mask[None, :]
+        & np.isfinite(error_cube)
+        & (error_cube > 0.0)
+    )
+
+    n_valid = int(np.count_nonzero(valid))
+
+    if n_valid == 0:
+        raise RuntimeError(
+            "No fitted pixels have valid positive errors.")
+
+    # ------------------------------------------------------------------
+    # ONE streaming HyperCube pass, reading only changed components.
+    #
+    # Directly calculate
+    #
+    #     delta_model = A @ (x_new - x_old)
+    #
+    # rather than constructing either complete model cube.
+    # ------------------------------------------------------------------
+    noise_ss = 0.0
+    model_ss = 0.0
+    model_n = 0
+    max_noise_delta = 0.0
+
+    with open_h5(hypercube_path, role="reader") as f:
+        M = f["/HyperCube/models"]
+
+        for s0 in range(0, S, s_chunk):
+            s1 = min(s0+s_chunk, S)
+            ns = s1-s0
+
+            delta_model = np.zeros(
+                (ns, L), dtype=np.float64)
+
+            for cc in changed_components:
+                block = np.asarray(
+                    M[s0:s1, int(cc), :, :],
+                    dtype=np.float64, order="C")
+
+                delta_model += np.einsum(
+                    "spl,p->sl",
+                    block,
+                    delta[cc],
+                    optimize=True)
+
+            local_valid = valid[s0:s1]
+            local_sigma = error_cube[s0:s1]
+
+            dv = delta_model[local_valid]
+            sv = local_sigma[local_valid]
+
+            weighted = dv/sv
+
+            noise_ss += float(np.dot(weighted, weighted))
+
+            model_ss += float(np.dot(dv, dv))
+            model_n += int(dv.size)
+
+            if weighted.size:
+                max_noise_delta = max(max_noise_delta,
+                    float(np.max(np.abs(weighted))))
+
+    noise_rms = float(np.sqrt(noise_ss/n_valid))
+
+    model_change_rms = float(np.sqrt(model_ss/max(model_n, 1)))
+
+    # ------------------------------------------------------------------
+    # Compact physical summaries before and after.
+    # ------------------------------------------------------------------
+    n_metals = int(metals.size)
+    n_ages = int(ages.size)
+    n_alphas = int(alphas.size)
+
+    indices = np.asarray([np.unravel_index(
+        pp, (n_metals, n_ages, n_alphas), order="C") for pp in range(P)
+    ], dtype=np.int64)
+
+    iz = indices[:, 0]
+    ia = indices[:, 1]
+    ialpha = indices[:, 2]
+
+    boundary = ((iz == 0) | (iz == n_metals-1)
+        | (ia == 0) | (ia == n_ages-1)
+        | (ialpha == 0) | (ialpha == n_alphas-1))
+
+    def _boundary_fraction(x):
+        total = np.sum(x, axis=1)
+
+        return np.divide(np.sum(x[:, boundary], axis=1), total,
+            out=np.zeros(C, dtype=np.float64), where=total > 0.0)
+
+    boundary_old = _boundary_fraction(x_old)
+    boundary_new = _boundary_fraction(x_new)
+
+    print()
+    print("="*72)
+    print("REDUNDANT SSP REPLACEMENT TEST")
+    print("="*72)
+    print(f"used SSPs                  : {used_p.size}/{P}")
+    print(f"changed components         : "
+        f"{changed_components.size}/{C}")
+    print(f"component-mass error       : {mass_error:.6e}")
+    print(f"model-change noise RMS     : {noise_rms:.6e} sigma")
+    print(f"maximum pixel change       : {max_noise_delta:.6e} sigma")
+    print(f"ordinary model-change RMS  : {model_change_rms:.6e}")
+    print(f"median boundary mass before: {np.median(boundary_old):.6f}")
+    print(f"median boundary mass after : {np.median(boundary_new):.6f}")
+
+    print()
+    print('Reconstructed fitted SSPs:')
+    print('  p      error       dominant replacement')
+
+    for pp in used_p:
+        rr = reconstruction[int(pp)]
+        qq = int(np.argmax(rr))
+
+        print(f"{pp:3d}  {reconstruction_error[int(pp)]:.6e}  "
+            f"{qq:3d} ({metals[iz[qq]]:.3f}, {ages[ia[qq]]:.1f}, "
+            f"{alphas[ialpha[qq]]:.1f}) frac={rr[qq]:.5f}")
+
+    print("="*72)
+
+    return {
+        "x_original": x_old,
+        "x_redundant": x_new,
+        "delta_x": delta,
+        "used_populations": used_p,
+        "changed_components": changed_components,
+        "reconstruction": reconstruction,
+        "reconstruction_error": reconstruction_error,
+        "noise_rms": noise_rms,
+        "noise_ss": noise_ss,
+        "max_noise_delta": max_noise_delta,
+        "model_change_rms": model_change_rms,
+        "mass_error": mass_error,
+        "boundary_fraction_original": boundary_old,
+        "boundary_fraction_redundant": boundary_new,
+    }
+
+# ------------------------------------------------------------------------------

@@ -120,7 +120,7 @@ def main():
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6])
     if propDict['nCuts'] == 3:
-        propDict['regularisation_scale'] = 0.0
+        propDict['regularisation_scale'] = 5e-4
         # propDict['validationPath'] = str(curdir/args.galaxy/
         #     'hypercube_3_00.h5')
         # propDict['runTag'] = 'datafit.w.lambda2e-5_stat_SSPoffset'
