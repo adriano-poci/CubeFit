@@ -156,6 +156,7 @@ from CubeFit.hypercube_builder import build_hypercube, assert_preflight_ok,\
 from CubeFit.pipeline_runner   import PipelineRunner
 from CubeFit import cube_utils as cu
 from CubeFit import validation as cfv
+from CubeFit import plotting as cfp
 from dynamics.IFU.Constants import Constants, Units, UnitStr
 from dynamics.IFU.Functions import Plot, Geometric
 from cythonModules import C_utils as Cu
@@ -1940,7 +1941,7 @@ def plot_circularity_alpha_components(arSOL, ualphas, nzComp, pred, oDict,
     measurement.
 
     The three intrinsic orbital families use their physically appropriate
-    circularities: lambda_z for z-tubes, lambda_x for x-tubes, and lambda_L
+    circularities: lambda_z for z-tube, lambda_x for x-tube, and lambda_L
     for box orbits. All are displayed on the same [-1, 1] circularity axis.
 
     Colour identifies orbital family. Strip opacity scales with the square
@@ -1962,8 +1963,8 @@ def plot_circularity_alpha_components(arSOL, ualphas, nzComp, pred, oDict,
         Dynamical decomposition dictionary containing ``wheres`` and
         ``weights``.
     otypes : ndarray
-        Intrinsic type of each fitted component: 0 for z-tubes, 1 for
-        x-tubes, and 2 for boxes.
+        Intrinsic type of each fitted component: 0 for z-tube, 1 for
+        x-tube, and 2 for boxes.
     lZMSign : ndarray
         Signed z-axis circularity of each Schwarzschild orbit.
     lXMSign : ndarray
@@ -2041,8 +2042,8 @@ def plot_circularity_alpha_components(arSOL, ualphas, nzComp, pred, oDict,
 
     # Each family uses its own physically appropriate circularity coordinate.
     families = (
-        (0, r"$z$-tubes", lZMSign, "tab:blue"),
-        (1, r"$x$-tubes", lXMSign, "tab:orange"),
+        (0, r"$z$-tube", lZMSign, "tab:blue"),
+        (1, r"$x$-tube", lXMSign, "tab:orange"),
         (2, "Box orbits", lLMSign, "tab:green"),
     )
 
@@ -2967,604 +2968,6 @@ def plot_integral_population_atlas(arSOL, umetals, uages, ualphas, nzComp,
 
 # ------------------------------------------------------------------------------
 
-def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
-    oDict, otypes, rM, lZMSign, lXMSign, lLMSign, save_path=None,
-    cmap="inferno", bin_threshold=20, n_circ_bins=20):
-    """
-    Plot the complete fitted component-by-population CubeFit solution.
-
-    Dynamical components are arranged vertically in three intrinsic orbital
-    families. Within each family, components are ordered by their physically
-    appropriate circularity, with dynamical-weighted radius used as the
-    secondary ordering coordinate.
-
-    Each major horizontal block represents one alpha enhancement. Age runs
-    horizontally within each alpha block, while metallicity occupies thin
-    vertical sub-rows within every dynamical-component row. The resulting
-    image therefore preserves the complete fitted ``C x P`` solution.
-
-    Colour gives the logarithmic fraction of each component's fitted
-    stellar-population mass in a given metallicity-age-alpha cell. Marker
-    size in the circularity panel represents the relative Schwarzschild
-    dynamical weight of each component.
-
-    Parameters
-    ----------
-    arSOL : ndarray
-        Fitted SSP coefficients with shape
-        ``(C, nMetals, nAges, nAlphas)``.
-    umetals : ndarray
-        SSP metallicities with shape ``(nMetals,)``.
-    uages : ndarray
-        SSP ages with shape ``(nAges,)``.
-    ualphas : ndarray
-        SSP alpha enhancements with shape ``(nAlphas,)``.
-    nzComp : ndarray
-        Original decomposition component numbers represented by ``arSOL``.
-    pred : str
-        Integer formatting specification used for decomposition keys.
-    oDict : dict
-        Dynamical decomposition dictionary containing ``wheres`` and
-        ``weights``.
-    otypes : ndarray
-        Intrinsic component types: 0 for z-tubes, 1 for x-tubes, and 2 for
-        boxes.
-    rM : ndarray
-        Intrinsic radius of every Schwarzschild orbit.
-    lZMSign : ndarray
-        Signed z-axis circularity of every Schwarzschild orbit.
-    lXMSign : ndarray
-        Signed x-axis circularity of every Schwarzschild orbit.
-    lLMSign : ndarray
-        Total-angular-momentum circularity of every Schwarzschild orbit.
-    save_path : pathlib.Path or str, optional
-        Output figure path.
-    cmap : str, optional
-        Matplotlib colormap.
-    bin_threshold : int, optional
-        Maximum number of fitted dynamical components shown individually.
-        Above this threshold, components are rebinned onto fixed circularity
-        grids within each orbital family. Default is 20.
-    n_circ_bins : int, optional
-        Number of circularity bins per orbital family when component binning
-        is used. Default is 8.
-
-    Returns
-    -------
-    out : dict
-        Figure and all component ordering, dynamical-coordinate, mass, and
-        image quantities used to construct it.
-
-    Raises
-    ------
-    ValueError
-        If supplied arrays have inconsistent dimensions.
-    RuntimeError
-        If component types are invalid or a component has no valid
-        constituent orbital weight.
-
-    Examples
-    --------
-    >>> out = plot_chemodynamical_atlas(
-    ...     arSOL, umetals, uages, ualphas, nzComp, pred, oDict, otypes,
-    ...     rM, lZMSign, lXMSign, lLMSign,
-    ...     save_path="chemodynamical_atlas.png")
-    """
-    arSOL = np.asarray(arSOL, dtype=np.float64)
-    umetals = np.asarray(umetals, dtype=np.float64).ravel(order="C")
-    uages = np.asarray(uages, dtype=np.float64).ravel(order="C")
-    ualphas = np.asarray(ualphas, dtype=np.float64).ravel(order="C")
-    nzComp = np.asarray(nzComp, dtype=np.int64).ravel(order="C")
-    otypes = np.asarray(otypes, dtype=np.int64).ravel(order="C")
-    rM = np.asarray(rM, dtype=np.float64).ravel(order="C")
-    lZMSign = np.asarray(lZMSign, dtype=np.float64).ravel(order="C")
-    lXMSign = np.asarray(lXMSign, dtype=np.float64).ravel(order="C")
-    lLMSign = np.asarray(lLMSign, dtype=np.float64).ravel(order="C")
-
-    if arSOL.ndim != 4:
-        raise ValueError(
-            "arSOL must have shape (C, nMetals, nAges, nAlphas).")
-
-    C, nMetals, nAges, nAlphas = map(int, arSOL.shape)
-    NOrbs = int(rM.size)
-    bin_threshold = int(bin_threshold)
-    n_circ_bins = int(n_circ_bins)
-    if bin_threshold < 1:
-        raise ValueError("bin_threshold must be positive.")
-    if n_circ_bins < 1:
-        raise ValueError("n_circ_bins must be positive.")
-    binned = C > bin_threshold
-
-    if nzComp.size != C or otypes.size != C:
-        raise ValueError(
-            "arSOL, nzComp, and otypes have inconsistent component counts.")
-
-    if umetals.size != nMetals:
-        raise ValueError("umetals is inconsistent with arSOL.")
-    if uages.size != nAges:
-        raise ValueError("uages is inconsistent with arSOL.")
-    if ualphas.size != nAlphas:
-        raise ValueError("ualphas is inconsistent with arSOL.")
-
-    for name, values in (("lZMSign", lZMSign), ("lXMSign", lXMSign),
-        ("lLMSign", lLMSign),):
-        if values.size != NOrbs:
-            raise ValueError(f"{name} has {values.size} entries; expected "
-                f"{NOrbs}.")
-
-    if not np.all(np.isin(otypes, (0, 1, 2))):
-        raise RuntimeError(
-            f"Invalid intrinsic component types: {np.unique(otypes)}.")
-
-    families = ((0, r"$z$-tubes", lZMSign, r"$\lambda_z$"),
-        (1, r"$x$-tubes", lXMSign, r"$\lambda_x$"),
-        (2, "box", lLMSign, r"$\lambda_L$"))
-
-    # ------------------------------------------------------------------
-    # Characterise every fitted component by its actual constituent
-    # Schwarzschild orbits. These coordinates are used only for ordering.
-    # ------------------------------------------------------------------
-    component_circularity = np.full(C, np.nan, dtype=np.float64)
-    component_radius = np.full(C, np.nan, dtype=np.float64)
-    component_orbit_weight = np.zeros(C, dtype=np.float64)
-    component_orbit_fraction = np.zeros((C, NOrbs), dtype=np.float64)
-
-    for type_id, _, circularity, _ in families:
-        for cc, component in enumerate(nzComp):
-            if otypes[cc] != type_id:
-                continue
-
-            key = f"{component:{pred}d}"
-            mask = np.asarray(oDict["wheres"][key], dtype=bool)
-            weight = np.asarray(oDict["weights"][key], dtype=np.float64)
-
-            if mask.size != NOrbs or weight.size != NOrbs:
-                raise ValueError(
-                    f"Component {component} orbit arrays have incorrect "
-                    "dimensions.")
-
-            valid = mask & np.isfinite(weight) & (weight > 0.0)
-            valid &= np.isfinite(rM) & np.isfinite(circularity)
-
-            if not np.any(valid):
-                raise RuntimeError(
-                    f"Component {component} has no valid orbital weight.")
-
-            total_weight = float(np.sum(weight[valid]))
-            component_orbit_weight[cc] = total_weight
-            component_orbit_fraction[cc, valid] = weight[valid]/total_weight
-
-            component_circularity[cc] = float(
-                np.sum(weight[valid]*circularity[valid])/total_weight)
-
-            component_radius[cc] = float(
-                np.sum(weight[valid]*rM[valid])/total_weight)
-
-    # ------------------------------------------------------------------
-    # Build the physical row ordering.
-    #
-    # Circularity is the primary coordinate. Radius breaks ties and orders
-    # components occupying similar circularity slices.
-    #
-    # Highest circularity is placed at the top of each family.
-    # ------------------------------------------------------------------
-    family_orders = []
-    family_bounds = []
-    row_start = 0
-
-    for type_id, _, _, _ in families:
-        family = np.flatnonzero(otypes == type_id)
-
-        if family.size:
-            local = np.lexsort((
-                component_radius[family],
-                -component_circularity[family],
-            ))
-            family = family[local]
-
-        family_orders.append(family)
-        family_bounds.append((row_start, row_start+family.size))
-        row_start += family.size
-
-    order = np.concatenate(family_orders)
-
-    if order.size != C or np.unique(order).size != C:
-        raise RuntimeError(
-            "Internal component ordering does not contain every component "
-            "exactly once.")
-
-    # ------------------------------------------------------------------
-    # Construct the displayed dynamical rows.
-    #
-    # Small decompositions retain one row per fitted component. Large
-    # decompositions are projected onto the same fixed circularity sampling
-    # within each orbital family. A component's complete fitted population
-    # mixture is apportioned according to the fraction of its constituent
-    # Schwarzschild weight in each circularity bin.
-    # ------------------------------------------------------------------
-    component_mass = np.sum(arSOL, axis=(1, 2, 3))
-    total_mass = float(np.sum(component_mass))
-
-    if not np.isfinite(total_mass) or total_mass <= 0.0:
-        raise RuntimeError("The fitted solution has no positive total mass.")
-
-    circ_edges = None
-    circ_centers = None
-
-    if not binned:
-        display_solution = arSOL[order, :, :, :]
-        display_mass = component_mass[order]
-        display_orbit_weight = component_orbit_weight[order]
-        display_circularity = component_circularity[order]
-        display_radius = component_radius[order]
-        display_types = otypes[order]
-        display_components = nzComp[order]
-        display_family_bounds = family_bounds
-        display_C = C
-
-    else:
-        circ_edges = np.linspace(
-            -1.0, 1.0, n_circ_bins+1, dtype=np.float64)
-        circ_centers = 0.5*(circ_edges[:-1]+circ_edges[1:])
-
-        display_C = len(families)*n_circ_bins
-
-        display_solution = np.zeros((display_C, nMetals, nAges, nAlphas),
-            dtype=np.float64)
-        display_mass = np.zeros(display_C, dtype=np.float64)
-        display_orbit_weight = np.zeros(display_C, dtype=np.float64)
-        display_circularity = np.zeros(display_C, dtype=np.float64)
-        display_radius = np.full(display_C, np.nan, dtype=np.float64)
-        display_types = np.empty(display_C, dtype=np.int64)
-        display_components = np.full(display_C, -1, dtype=np.int64)
-
-        display_family_bounds = []
-        row_start = 0
-
-        for type_id, _, circularity, _ in families:
-            family_rows = slice(row_start, row_start+n_circ_bins)
-
-            # Reverse the bin order so high circularity is displayed at the
-            # top, matching the individual-component atlas.
-            display_circularity[family_rows] = circ_centers[::-1]
-            display_types[family_rows] = type_id
-
-            radius_num = np.zeros(n_circ_bins, dtype=np.float64)
-            radius_den = np.zeros(n_circ_bins, dtype=np.float64)
-
-            for cc in np.flatnonzero(otypes == type_id):
-                orbit_fraction = component_orbit_fraction[cc]
-
-                valid = ((orbit_fraction > 0.0) & np.isfinite(circularity)
-                    & np.isfinite(rM))
-
-                if not np.any(valid):
-                    continue
-
-                bin_fraction = np.histogram(circularity[valid],
-                    bins=circ_edges, weights=orbit_fraction[valid])[0]
-
-                # np.histogram includes the rightmost edge in the final bin,
-                # so every valid orbit fraction is represented exactly once.
-                fraction_sum = float(np.sum(bin_fraction))
-
-                if not np.isclose(fraction_sum, 1.0, rtol=1e-12, atol=1e-12):
-                    raise RuntimeError(f"Component {nzComp[cc]} circularity "
-                        f"binning conserves {fraction_sum:.16e}, expected 1.")
-
-                # Internal bin index increases from -1 to +1. Convert to the
-                # displayed row index, which runs from +1 to -1.
-                for bb in np.flatnonzero(bin_fraction > 0.0):
-                    rr = row_start+(n_circ_bins-1-bb)
-                    frac = float(bin_fraction[bb])
-
-                    display_solution[rr] += frac*arSOL[cc]
-                    display_orbit_weight[rr] += (
-                        frac*component_orbit_weight[cc])
-
-                # Radius is determined directly from the Schwarzschild-orbit
-                # distribution occupying each circularity bin.
-                orbit_bin = np.searchsorted(circ_edges, circularity[valid],
-                    side="right")-1
-                orbit_bin = np.clip(orbit_bin, 0, n_circ_bins-1)
-                frac_weight = orbit_fraction[valid]
-
-                np.add.at(radius_num, orbit_bin, frac_weight*rM[valid])
-                np.add.at(radius_den, orbit_bin, frac_weight)
-
-            radius_mean = np.divide(radius_num, radius_den,
-                out=np.full(n_circ_bins, np.nan, dtype=np.float64),
-                where=radius_den > 0.0)
-
-            display_radius[family_rows] = radius_mean[::-1]
-
-            display_family_bounds.append((row_start, row_start+n_circ_bins))
-            row_start += n_circ_bins
-
-        display_mass = np.sum(display_solution, axis=(1, 2, 3))
-
-        binned_total = float(np.sum(display_solution))
-
-        if not np.isclose(binned_total, total_mass, rtol=1e-12,
-            atol=1e-12*max(1.0, total_mass)):
-            raise RuntimeError('Circularity binning does not conserve fitted '
-                f"population mass: {binned_total:.16e} != {total_mass:.16e}.")
-
-        print(f"SFH atlas: rebinned {C} components onto "
-            f"{n_circ_bins} circularity bins per family ({display_C} rows).")
-
-    population_fraction = display_solution/total_mass
-    family_bounds = display_family_bounds
-
-    # ------------------------------------------------------------------
-    # Flatten only the display dimensions.
-    #
-    # Rows:
-    #
-    #   component 0, ZN
-    #                ZN-1
-    #                ...
-    #   component 1, ZN
-    #                ...
-    #
-    # Columns:
-    #
-    #   alpha0: age0 ... ageN
-    #   alpha1: age0 ... ageN
-    #   ...
-    #
-    # The underlying C x Z x t x alpha values are otherwise untouched.
-    # ------------------------------------------------------------------
-    # Reverse metallicity within each component so increasing [Z/H] is
-    # displayed upwards, matching the conventional SFH projection.
-    image = population_fraction[:, ::-1, :, :]
-    image = image.transpose(0, 1, 3, 2)
-    image = image.reshape(display_C*nMetals, nAlphas*nAges)
-
-    positive = image > 0.0
-    log_image = np.full_like(image, np.nan, dtype=np.float64)
-    log_image[positive] = np.log10(image[positive])
-    if not np.any(positive):
-        raise RuntimeError(
-            "The fitted solution contains no positive population weights.")
-
-    log_positive = log_image[positive]
-    sfh_min = float(np.min(log_positive))
-    wmin = max(sfh_min, -12.0)
-    wmax = float(np.max(log_positive))
-
-    print(f"SFH atlas limits: {wmin:.2f} ({sfh_min:.2f}) to {wmax:.2f}")
-
-    # ------------------------------------------------------------------
-    # Figure geometry.
-    #
-    # The circularity panel gives the physical dynamical coordinate of every
-    # component. Marker size represents its relative Schwarzschild dynamical
-    # weight, while the main matrix shows its normalized population mixture.
-    # ------------------------------------------------------------------
-    fig = plt.figure(figsize=np.asarray((15.0, 12.0))*0.8)
-
-    gs = gridspec.GridSpec(
-        1, 2, figure=fig, width_ratios=(0.65, 8.0), wspace=0.035)
-
-    ax_dyn = fig.add_subplot(gs[0, 0])
-    ax_pop = fig.add_subplot(gs[0, 1])
-
-    cmap_obj = colormaps[cmap].copy()
-    cmap_obj.set_bad((0.0, 0.0, 0.0, 0.0))
-
-    if nAges == 1:
-        age_edges = np.array([uages[0]-0.5, uages[0]+0.5], dtype=np.float64)
-    else:
-        age_edges = np.empty(nAges+1, dtype=np.float64)
-        age_edges[1:-1] = 0.5*(uages[:-1]+uages[1:])
-        age_edges[0] = uages[0]-0.5*(uages[1]-uages[0])
-        age_edges[-1] = uages[-1]+0.5*(uages[-1]-uages[-2])
-    age_min = float(age_edges[0])
-    age_max = float(age_edges[-1])
-    age_width = age_max-age_min
-    x_edges = np.empty(nAlphas*nAges+1, dtype=np.float64)
-    for aa in range(nAlphas):
-        start = aa*nAges
-        x_edges[start:start+nAges+1] = (aa*age_width+(age_edges-age_min))
-    y_edges = np.arange(display_C*nMetals+1, dtype=np.float64)-0.5
-    im = ax_pop.pcolormesh(x_edges, y_edges, log_image, cmap=cmap_obj,
-        vmin=wmin, vmax=wmax, shading="flat")
-    ax_pop.set_ylim(display_C*nMetals-0.5, -0.5)
-
-    # ------------------------------------------------------------------
-    # Alpha labels.
-    #
-    # Each alpha block occupies exactly 1/nAlphas of the population axis.
-    # Place its value above the centre of that block in axes coordinates,
-    # matching the existing orbital-SFH figure style.
-    # ------------------------------------------------------------------
-    for aa, alpha in enumerate(ualphas):
-        xpos = (aa+0.5)/nAlphas
-        lT = ax_pop.text(xpos, 1.012, rf"${alpha:.2f}$", ha="center",
-            va="bottom", color=POT.pgreen, transform=ax_pop.transAxes,
-            clip_on=False)
-        lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
-            foreground="k")])
-    lT = ax_pop.text(-0.025, 1.012, r"$[\alpha/{\rm Fe}]=$", ha="left",
-        va="bottom", color=POT.pgreen, transform=ax_pop.transAxes,
-        clip_on=False)
-    lT.set_path_effects([PathEffects.withStroke(linewidth=1.5, foreground="k")])
-
-    for aa in range(1, nAlphas):
-        xx = aa*age_width
-        ax_pop.axvline(xx, color="black", lw=1.0)
-
-    age_locator = mticker.MaxNLocator(nbins=5)
-    base_ticks = age_locator.tick_values(
-        float(np.min(uages)), float(np.max(uages)))
-
-    base_ticks = base_ticks[(base_ticks >= np.min(uages)) &
-        (base_ticks <= np.max(uages))]
-    age_ticks = []
-    age_labels = []
-    for aa in range(nAlphas):
-        age_ticks.extend(aa*age_width+(base_ticks-age_min))
-        age_labels.extend([f"{age:g}" for age in base_ticks])
-    ax_pop.set_xticks(age_ticks)
-    ax_pop.set_xticklabels(age_labels)
-    ax_pop.set_xlabel(r"$t\ [{\rm Gyr}]$")
-
-    # Thin lines distinguish metallicity sub-rows; stronger lines distinguish
-    # independent fitted dynamical components.
-    for cc in range(display_C):
-        base = cc*nMetals
-
-        for zz in range(1, nMetals):
-            ax_pop.axhline(
-                base+zz-0.5, color="white", lw=0.15, alpha=0.45)
-
-        if cc > 0:
-            ax_pop.axhline(
-                base-0.5, color="0.45", lw=0.35, alpha=0.7)
-
-    # ------------------------------------------------------------------
-    # Family boundaries.
-    #
-    # Family labels are placed beside their corresponding circularity panels
-    # below, rather than inside the stellar-population matrix.
-    # ------------------------------------------------------------------
-    family_colors = ("tab:blue", "tab:orange", "tab:green")
-
-    for start, stop in family_bounds:
-        if stop <= start or start == 0:
-            continue
-
-        y0 = start*nMetals-0.5
-
-        for axis in (ax_dyn, ax_pop):
-            axis.axhline(y0, color="black", lw=1.5, zorder=10)
-
-    # ------------------------------------------------------------------
-    # Dynamical-coordinate panel.
-    #
-    # Each component is represented once at the centre of its metallicity
-    # sub-rows. Family-specific circularities all occupy the same [-1, 1]
-    # numerical scale.
-    #
-    # Circularity determines horizontal position in this narrow auxiliary
-    # panel, while radius is encoded by marker size. The main atlas itself
-    # remains ordered primarily by circularity and secondarily by radius.
-    # ------------------------------------------------------------------
-    row_centers = (np.arange(display_C, dtype=np.float64)*nMetals
-        + 0.5*(nMetals-1))
-
-    # Marker areas use one common scale across all orbital families. In the
-    # component atlas they retain the original Schwarzschild dynamical-weight
-    # meaning. In the binned atlas they instead show the fitted population
-    # mass occupying each circularity bin.
-    if binned:
-        marker_weight = display_mass
-    else:
-        marker_weight = display_orbit_weight
-    marker_total = float(np.sum(marker_weight))
-    if marker_total > 0.0:
-        dynamical_mass_fraction = marker_weight/marker_total
-    else:
-        dynamical_mass_fraction = np.zeros(display_C, dtype=np.float64)
-    max_marker_weight = float(np.max(marker_weight))
-    if max_marker_weight > 0.0:
-        mass_scale = marker_weight/max_marker_weight
-    else:
-        mass_scale = np.zeros(display_C, dtype=np.float64)
-
-    marker_sizes = 5.0+75.0*mass_scale
-
-    for ff, (type_id, _, _, _) in enumerate(families):
-        family_rows = np.flatnonzero(display_types == type_id)
-        populated = display_mass[family_rows] > 0.0
-        family_rows = family_rows[populated]
-
-        ax_dyn.scatter(
-            display_circularity[family_rows],
-            row_centers[family_rows], s=marker_sizes[family_rows],
-            color=family_colors[ff], edgecolor="none", zorder=3)
-
-    ax_dyn.set_xlim(-1.05, 1.05)
-    ax_dyn.set_ylim(display_C*nMetals-0.5, -0.5)
-    ax_dyn.set_xlabel(r"$\lambda$")
-    ax_dyn.set_ylabel('')
-    ax_dyn.set_yticks([])
-    # Put each family name beside its own circularity region, formatted like
-    # a conventional vertical axis label.
-    for ff, ((start, stop), (_, label, _, _)) in enumerate(
-        zip(family_bounds, families)):
-        if stop <= start:
-            continue
-
-        y0 = start*nMetals-0.5
-        y1 = stop*nMetals-0.5
-        yc = 0.5*(y0+y1)
-
-        ax_dyn.text(-0.24, yc, label, color=family_colors[ff], fontsize=10,
-            fontweight="bold", rotation=90, rotation_mode="anchor",
-            ha="center", va="center",
-            transform=ax_dyn.get_yaxis_transform(), clip_on=False)
-
-    # ------------------------------------------------------------------
-    # Common vertical geometry.
-    # ------------------------------------------------------------------
-    ax_pop.set_ylim(display_C*nMetals-0.5, -0.5)
-    ax_pop.set_yticks([])
-
-    fig.subplots_adjust(left=0.055, right=0.96, bottom=0.07, top=0.92)
-
-    # ------------------------------------------------------------------
-    # Colourbar: logarithmic fraction of the complete fitted population.
-    # ------------------------------------------------------------------
-    miText = POT.prec(1, wmin)
-    maText = POT.prec(1, wmax)
-    cax = POT.attachAxis(ax_pop, 'right', 0.025)
-    cb = plt.colorbar(im, cax=cax, orientation='vertical')
-    cax.text(0.5, 0.5, r'$\log_{10}$ Population Fraction', va='center',
-        ha='center', rotation=270., color=POT.pgreen, transform=cax.transAxes,
-        path_effects=[PathEffects.withStroke(linewidth=1.5, foreground='k')])
-    cax.text(0.5, 5e-3, miText, va='bottom', ha='center', color='k',
-        transform=cax.transAxes, rotation=270.)
-    cax.text(0.5, 1.0-5e-3, maText, va='top', ha='center', color='w',
-        transform=cax.transAxes, rotation=270.)
-    cb.set_ticks([])
-
-    if save_path is not None:
-        save_path = plp.Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(
-            save_path, dpi=300, bbox_inches="tight", pad_inches=0.03)
-
-    return {
-        "figure": fig,
-        "binned": binned,
-        "bin_threshold": bin_threshold,
-        "n_circularity_bins": n_circ_bins if binned else None,
-        "circularity_edges": circ_edges,
-        "circularity_centers": circ_centers,
-        "order": order,
-        "family_orders": family_orders,
-        "family_bounds": family_bounds,
-        "component_numbers": nzComp,
-        "component_types": otypes,
-        "component_circularity": component_circularity,
-        "component_radius": component_radius,
-        "component_coefficient_mass": component_mass,
-        "component_dynamical_weight": component_orbit_weight,
-        "display_solution": display_solution,
-        "display_types": display_types,
-        "display_circularity": display_circularity,
-        "display_radius": display_radius,
-        "display_coefficient_mass": display_mass,
-        "display_dynamical_weight": display_orbit_weight,
-        "display_mass_fraction": dynamical_mass_fraction,
-        "population_fraction": population_fraction,
-        "image": log_image,
-    }
-
-# ------------------------------------------------------------------------------
-
 def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     full=False, slope=1.30, IMF='KB', iso='pad', weighting='luminosity',
     lOrder=4, rescale=False, specRange=None, lsf=False, band='r', smask=None,
@@ -3710,22 +3113,28 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     pc = RZ.getPC()
     km = RZ.getKM()
 
+    FWHMs = []
+    for pj in range(INF['orblib']['nAP']):
+        PSF = INF['orblib']['psfs'][pj]
+        FWHM = PSF.computeRe(plot=False)[1]*2.
+        FWHMs += [FWHM]
+    FWHM = np.min(FWHMs)
+    print(f"Minimum FWHM: {FWHM:.3f} arcsec")
+
     sRadius = np.logspace(par['rLogMin'], par['rLogMax'], par['nE']) #spherical
     refML = par['gpML']
     tMGE = par['tMGE']
     sMGE = par['sMGE']
     minQ = np.min([sMGE.q.min(), tMGE.q.min()])
     bTheta, bPhi, bPsi = Cu.oneQPUtoTPP(fpd['q'], fpd['p'], fpd['u'], minQ)
-    cRadius = sRadius * np.sin(np.radians(bPhi))  # Spherical -> Cylindrical
-    wc = np.nonzero(cRadius <= 0.1)[0]
-    inner = cRadius[wc]
+    cRadius = sRadius*np.sin(np.radians(bPsi))
+    wc = np.nonzero(cRadius <= FWHM)[0]
     cRadius = np.delete(cRadius, wc)
-    cRadius = np.append(np.nanmean(inner), cRadius)
+    cRadius = np.insert(cRadius, 0, FWHM)
     nCRad = cRadius.size
-    wc = np.nonzero(sRadius <= 0.1)[0]
-    inner = sRadius[wc]
-    sRadius = np.delete(sRadius, wc)
-    sRadius = np.append(np.nanmean(inner), sRadius)
+    sBins = np.arange(sRadius.min(), sRadius.max(), FWHM)
+    digiC = np.digitize(sRadius, bins=sBins)
+    sRadius = np.append(1e-5, sBins[np.unique(digiC)-1])
     nSRad = sRadius.size
     print(f"# Radial bins: {nCRad} cylindrical, {nSRad} spherical")
 
@@ -4025,8 +3434,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     compVel = np.ma.ones((nComp, nSRad), dtype=float)*np.nan
     for nc in range(nComp):
         cnData = np.take(intData, nc, axis=1).reshape(18, -1)
-        print(orbSOL.shape)
-        print(cnData.shape)
         _, svR, _, _, _ = Cgh.broadBetaCompsCyl(cnData,
             np.append(cRadius, 1e15), 'z', -np.inf, 0.0)
         _, vMean, _, _, _ = Cgh.broadVelCompsSph(cnData,
@@ -4516,7 +3923,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         otypes = copy(nzComp) - 1
         diskComps = bulgeComps = None
 
-    satube = (otypes == 0) # group short-axis tubes
+    satube = (otypes == 0) # group short-axis tube
     latube = (otypes == 1)
     boxess = (otypes == 2)
     if 'circ_alpha' in pplots:
@@ -4529,7 +3936,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 f"{lOrder:02d}.png")
             plt.close('all')
         except Exception as e:
-            print(f"Could not make orbital circularity-alpha plot: {e}")
+            print(f"[ERROR] Could not make orbital circularity-alpha plot: {e}")
     if 'sfh' in pplots:
         try:
             coSFH = np.zeros((nMetals, nAges, nAlphas), dtype=float)
@@ -4569,7 +3976,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             wmin = np.max((sfhMin, -12))
             print(f"SFH plot limits: {wmin:.2f} ({sfhMin:.2f}) to {wmax:.2f}")
 
-            fig = plt.figure(figsize=plt.figaspect(3./4.))
+            fig = plt.figure(figsize=plt.figaspect(3./4.)*1.1)
             gs = gridspec.GridSpec(3, nAlphas, hspace=0., wspace=0.)
             # one column per alpha, 3 orbit types
             for ali in range(nAlphas):
@@ -4589,7 +3996,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 if not ax.get_subplotspec().is_first_col():
                     ax.set_yticklabels([])
                 if ax.get_subplotspec().is_first_col():
-                    lT = ax.text(1e-2, 1e-2, r'$z$ Tubes', va='bottom',
+                    lT = ax.text(1e-2, 1e-2, r'$z$-tube', va='bottom',
                         ha='left', color=POT.pgreen, transform=ax.transAxes)
                     lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                         foreground='k')])
@@ -4608,7 +4015,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 if not ax.get_subplotspec().is_first_col():
                     ax.set_yticklabels([])
                 if ax.get_subplotspec().is_first_col():
-                    lT = ax.text(1e-2, 1e-2, r'$x$ Tubes', va='bottom',
+                    lT = ax.text(1e-2, 1e-2, r'$x$-tube', va='bottom',
                         ha='left', color=POT.pgreen, transform=ax.transAxes)
                     lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                         foreground='k')])
@@ -4622,7 +4029,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 if not ax.get_subplotspec().is_first_col():
                     ax.set_yticklabels([])
                 if ax.get_subplotspec().is_first_col():
-                    lT = ax.text(1e-2, 1e-2, r'Box', va='bottom', ha='left',
+                    lT = ax.text(1e-2, 1e-2, r'box', va='bottom', ha='left',
                         color=POT.pgreen, transform=ax.transAxes)
                     lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                         foreground='k')])
@@ -4734,7 +4141,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     f"{tag}_{lOrder:02d}.png")
                 
         except AssertionError as e:
-            print(f"Could not make orbital SFH plot: {e}")
+            print(f"[ERROR] Could not make orbital SFH plot: {e}")
         
         # also make a 3-panel plot of metallicity (x) vs alpha (y)
         try:
@@ -4760,10 +4167,10 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
             print(f"Zα plot limits: {vmin2:.2f} to {vmax2:.2f}")
 
-            fig2 = plt.figure(figsize=plt.figaspect(1./3.)*0.75)
+            fig2 = plt.figure(figsize=plt.figaspect(1./3.)*0.6)
             gs2 = gridspec.GridSpec(1, 3, wspace=0.0, hspace=0.0)
-            panels = [(coZalpha, 'Short-axis Tubes'),
-                (laZalpha, 'Long-axis Tubes'), (boZalpha, 'Boxes')]
+            panels = [(coZalpha, r'$z$-tube'),
+                (laZalpha, r'$x$-tube'), (boZalpha, r'box')]
             for pi, (arr, title) in enumerate(panels):
                 ax = fig2.add_subplot(gs2[0, pi])
                 # arr shape (nMetals, nAlphas) -> transpose for imshow so
@@ -4805,7 +4212,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 f"{tag}_{lOrder:02d}.png")
         
         except Exception as e:
-            print(f"Could not make Z-α plot: {e}")
+            print(f"[ERROR] Could not make Z-α plot: {e}")
             pass
 
         # metallicity vs alpha, per age
@@ -4817,7 +4224,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             vmax3 = float(np.log10(np.max(chemSFH[chemSFH>0])))
             print(f"Zαt plot limits: {vmin3:.2f} to {vmax3:.2f}")
 
-            fig3 = plt.figure(figsize=plt.figaspect(3.)*0.75)
+            fig3 = plt.figure(figsize=plt.figaspect(3.)*0.6)
             gs3 = gridspec.GridSpec(3, 1, wspace=0.0, hspace=0.0)
             cuts = [(uages < 6.0), (uages >= 10.0), (uages <= 14.0)]
             labels = ['Age < 6 Gyr', 'Age ≥ 10 Gyr', 'Age < 14 Gyr']
@@ -4862,7 +4269,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             fig3.savefig(figDir/f"orbitSFH_alphaMetalAge_{nComp:{pred}d}_"
                 f"i{proj}{tag}_{lOrder:02d}.png")
         except Exception as e:
-            print(f"Could not make Z-t-α plot: {e}")
+            print(f"[ERROR] Could not make Z-t-α plot: {e}")
             pass
         
         # 3D corner
@@ -4874,7 +4281,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             vmax4 = np.log10(np.max([np.max(x[x>0]) for x in
                 [ageAlpha, metalAlpha, metalAge]]))
             print(f"corner plot limits: {vmin4:.2f} to {vmax4:.2f}")
-            fig4 = plt.figure(figsize=plt.figaspect(1.0)*0.75)
+            fig4 = plt.figure(figsize=plt.figaspect(1.0)*0.8)
             gs4 = gridspec.GridSpec(2, 2, wspace=0.0, hspace=0.0)
             ax = fig4.add_subplot(gs4[2])
             # arr shape (nMetals, nAlphas) -> transpose for imshow so y=alpha
@@ -4928,12 +4335,18 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             fig4.savefig(figDir/f"orbitSFH_corner_{nComp:{pred}d}_i{proj}"
                 f"{tag}_{lOrder:02d}.png")
         except Exception as e:
-            print(f"Could not make corner plot: {e}")
+            print(f"[ERROR] Could not make corner plot: {e}")
             pass
         plt.close('all')
     
     if 'proj' in pplots and nComp > 3:
         logger.log("Generating projected maps...")
+        projProps = np.atleast_1d(kwargs.pop('projProps', ['z', 't', 'a']))
+        projOrbs = np.atleast_1d(kwargs.pop('projOrbs', ['sa', 'la', 'bo']))
+        assert len(projProps) > 0, 'No projected properties specified.'
+        assert len(projOrbs) > 0, 'No projected orbital types specified.'
+        logger.log(f"Projecting properties {projProps} for orbital types "
+            f"{projOrbs}...")
         with logger.capture_all_output():
             try:
                 saSOL = arSOL[satube, :, :, :]
@@ -4991,37 +4404,42 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                             axis=1)),
                         bo=_MWProp(boAlpha, np.compress(boxess, aperMass,
                         axis=1))))
+                smask = np.isin(['z', 't', 'a'], projProps)
+                omask = np.isin(['sa', 'la', 'bo'], projOrbs)
+                if not smask.any() or not omask.any():
+                    raise ValueError('No valid projected properties or orbital '
+                        'types specified.')
                 
-                orbKeys = ['sa', 'la', 'bo']
-                orbSpecs = [r'$z$-tubes', r'$x$-tubes', 'box']
+                orbSpecs = np.array([r'$z$-tube', r'$x$-tube', 'box'])[omask]
                 amin = np.min([np.nanmin(maps['age'][otype]) for otype in
-                    orbKeys])
+                    projOrbs])
                 amax = np.max([np.nanmax(maps['age'][otype]) for otype in
-                    orbKeys])
+                    projOrbs])
                 mmin = np.min([np.nanmin(maps['metal'][otype]) for otype in
-                    orbKeys])
+                    projOrbs])
                 mmax = np.max([np.nanmax(maps['metal'][otype]) for otype in
-                    orbKeys])
+                    projOrbs])
                 hmin = np.min([np.nanmin(maps['alpha'][otype]) for otype in
-                    orbKeys])
+                    projOrbs])
                 hmax = np.max([np.nanmax(maps['alpha'][otype]) for otype in
-                    orbKeys])
-                print(f"Age map limits: {amin:.2f} to {amax:.2f}")
-                print(f"Metal map limits: {mmin:.2f} to {mmax:.2f}")
-                print(f"Alpha map limits: {hmin:.2f} to {hmax:.2f}")
-                propSpecs = [('metal', r"$[Fe/H]$", mmin, mmax),
+                    projOrbs])
+                propSpecs = np.array([
+                    ('metal', r"$[Z/H]$", mmin, mmax),
                     ('age', rf"$t\ [{UTS.gyr}]$", amin, amax),
-                    ('alpha', r"$[\alpha/Fe]$", hmin, hmax)]
+                    ('alpha', r"$[\alpha/Fe]$", hmin, hmax)
+                ], dtype=object)[smask]
+                print('\n'.join(
+                    f"{pp[0]} map limits: {pp[2]:.2f} to {pp[3]:.2f}"
+                    for pp in propSpecs))
 
-
-                fig = plt.figure(figsize=plt.figaspect((yLen/1.1/xLen)*\
-                    (len(propSpecs)/len(orbKeys))*1.1))
-                gs = gridspec.GridSpec(len(propSpecs), len(orbKeys), hspace=0.0,
+                fig = plt.figure(figsize=plt.figaspect((yLen*1.1 / xLen) *
+                    (smask.sum() / omask.sum())) * (
+                    0.6 + 0.2 * (smask.sum() - 1)))
+                gs = gridspec.GridSpec(smask.sum(), omask.sum(), hspace=0.0,
                     wspace=0.0)
-
                 for ri, (prop, label, vmin, vmax) in enumerate(propSpecs):
                     mappable = None
-                    for oi, (orb_key, otype) in enumerate(zip(orbKeys,
+                    for oi, (orb_key, otype) in enumerate(zip(projOrbs,
                         orbSpecs)):
                         ax = fig.add_subplot(gs[ri, oi])
                         arr = maps[prop][orb_key]
@@ -5079,18 +4497,19 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     f"orbitMaps_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png")
                 plt.close('all')
             except Exception as e:
-                print(f"Could not make projection plots: {e}")
+                print(f"[ERROR] Could not make projection plots: {e}")
                 traceback.print_exc()
                 pass
     if 'atlas' in pplots:
         try:
-            atlas = plot_chemodynamical_atlas(
+            kwargsAtlas = kwargs.pop('kwargsAtlas', {})
+            atlas = cfp.plot_chemodynamical_atlas(
                 arSOL=arSOL, umetals=umetals, uages=uages,
                 ualphas=ualphas, nzComp=nzComp, pred=pred, oDict=oDict,
                 otypes=otypes, rM=rM, lZMSign=lZMSign,
                 lXMSign=lXMSign, lLMSign=lLMSign, save_path=figDir/
                 f"chemodynamical_atlas_{nComp:{pred}d}_i{proj}{tag}_"
-                f"{lOrder:02d}.png", cmap=moncmapr)
+                f"{lOrder:02d}.png", cmap=moncmapr, **kwargsAtlas)
             # atlas = plot_integral_population_atlas(arSOL, umetals, uages,
             #     ualphas, nzComp, pred, oDict, energs, I2s, I3s,
             #     save_path=figDir/
@@ -5098,8 +4517,17 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             #     cmap=moncmapr)
             plt.close('all')
         except Exception as e:
-            print(f"Could not make chemo-dynamical atlas: {e}")
-
+            print(f"[ERROR] Could not make chemo-dynamical atlas: {e}")
+    if 'radial' in pplots:
+        try:
+            radial_profiles = cfp.plot_population_radial_profiles(
+                arSOL=arSOL, umetals=umetals, uages=uages,
+                ualphas=ualphas, intData=intData, cRadius=cRadius,
+                otypes=otypes, dataMax=dataMax, save_path=figDir/
+                f"population_radial_profiles_{nComp:{pred}d}_i{proj}{tag}_"
+                f"{lOrder:02d}.png")
+        except Exception as e:
+            print(f"[ERROR] Could not make radial profiles: {e}")
     
     return picks
 

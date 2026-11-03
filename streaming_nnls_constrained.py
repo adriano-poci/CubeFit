@@ -217,6 +217,9 @@ v2.8:   Removed expensive full RMSE computation after a successful run in
 v2.9:   Changed `_ssp_smoothness_hessian` from first-difference regularisation
             to template-value-aware second-difference smoothness regularisation.
             30 October 2026
+v2.10:  Added post-convergence minimum-L2 redistribution with targeted support
+            expansion for less sparse solutions when `regularisation_scale=0`. 3
+            November 2026
 """
 
 from __future__ import annotations, print_function
@@ -243,6 +246,8 @@ from CubeFit.hdf5_manager import open_h5
 from CubeFit import cube_utils as cu
 
 vprint = cu.vprint
+
+SCIENTIFIC_REGULARISATION_MODE = 'ssp_second_difference_neumann'
 
 def _init_worker(blas_threads: int):
     # called once per process; set BLAS env vars
@@ -1080,13 +1085,14 @@ def _nnls_from_quadratic(
 def _ssp_smoothness_hessian(umetals: np.ndarray, uages: np.ndarray,
     ualphas: np.ndarray) -> np.ndarray:
     """
-    Construct the N-dimensional SSP-grid curvature Hessian.
+    Construct the N-dimensional SSP-grid curvature Hessian with
+    zero-normal-gradient boundary closure.
 
     The regularisation penalizes second differences independently along
     metallicity, age, and alpha enhancement. The physical SSP coordinates
     are used explicitly, so non-uniform grid spacing is handled correctly.
 
-    For three consecutive coordinates
+    For three consecutive interior coordinates
 
         u0 < u1 < u2,
 
@@ -1104,29 +1110,36 @@ def _ssp_smoothness_hessian(umetals: np.ndarray, uages: np.ndarray,
         h0 = u1 - u0
         h1 = u2 - u1.
 
-    Each stencil is normalized to unit Euclidean norm before being added to
-    the Hessian. This retains the correct non-uniform-grid null space while
-    preventing the numerical units and ranges of age, metallicity, and alpha
-    from imposing arbitrary relative regularisation strengths.
+    At each lower and upper SSP-library boundary, the normal first
+    derivative is additionally penalized,
 
-    Only complete three-point stencils are used. No artificial boundary
-    condition is imposed. The regularisation therefore does not assume zero
-    slope, reflection, periodicity, or continuation beyond the supplied SSP
-    library.
+        (x1 - x0)/(u1 - u0),
 
-    The objective for one dynamical component is
+    and
+
+        (xN - xN-1)/(uN - uN-1).
+
+    This is a zero-normal-gradient, or Neumann, boundary closure. It does
+    not penalize population mass merely for lying on an SSP-library
+    boundary. Instead, it penalizes a coefficient field whose slope points
+    through the finite edge of the library.
+
+    Every stencil is normalized to unit Euclidean norm before being added
+    to the Hessian. This retains the physical non-uniform-grid geometry
+    while preventing the numerical units and ranges of age, metallicity,
+    and alpha from setting arbitrary relative regularisation strengths.
+
+    The complete objective for one dynamical component is
 
         0.5 * x.T @ Q @ x,
 
-    with
+    where Q contains the sum of metallicity, age, and alpha curvature and
+    boundary-normal-gradient contributions.
 
-        Q = D_Z.T @ D_Z
-          + D_age.T @ D_age
-          + D_alpha.T @ D_alpha.
-
-    The operator is symmetric positive semidefinite. Constant populations
-    and populations linear in any one physical SSP coordinate have zero
-    curvature.
+    The operator is symmetric positive semidefinite. A spatially uniform
+    population remains an exact null mode. Linear SSP-coordinate fields are
+    no longer null modes because a nonzero linear slope has a nonzero
+    derivative at the finite SSP-library boundaries.
 
     Parameters
     ----------
@@ -1140,19 +1153,21 @@ def _ssp_smoothness_hessian(umetals: np.ndarray, uages: np.ndarray,
     Returns
     -------
     Q : ndarray
-        Dense curvature Hessian with shape ``(P, P)``, where
+        Dense SSP regularisation Hessian with shape ``(P, P)``, where
 
             P = n_metals * n_ages * n_alphas.
 
-        Population indexing follows C order,
+        Population indexing follows C-order,
 
             (metallicity, age, alpha).
 
     Raises
     ------
     ValueError
-        If any coordinate array is empty, contains non-finite values, or is
-        not strictly increasing.
+        If any SSP coordinate array is empty, contains non-finite values,
+        or is not strictly increasing.
+    RuntimeError
+        If an invalid regularisation stencil is generated.
 
     Examples
     --------
@@ -1163,20 +1178,29 @@ def _ssp_smoothness_hessian(umetals: np.ndarray, uages: np.ndarray,
     >>> Q.shape
     (315, 315)
     """
-    umetals = np.asarray(umetals, dtype=np.float64).ravel(order="C")
-    uages = np.asarray(uages, dtype=np.float64).ravel(order="C")
-    ualphas = np.asarray(ualphas, dtype=np.float64).ravel(order="C")
+    umetals = np.asarray(
+        umetals, dtype=np.float64).ravel(order="C")
+    uages = np.asarray(
+        uages, dtype=np.float64).ravel(order="C")
+    ualphas = np.asarray(
+        ualphas, dtype=np.float64).ravel(order="C")
 
-    for name, values in (("umetals", umetals),
-        ("uages", uages), ("ualphas", ualphas)):
+    for name, values in (
+        ("umetals", umetals),
+        ("uages", uages),
+        ("ualphas", ualphas),
+    ):
         if values.size == 0:
-            raise ValueError(f"{name} must not be empty.")
+            raise ValueError(
+                f"{name} must not be empty.")
 
         if np.any(~np.isfinite(values)):
-            raise ValueError(f"{name} contains non-finite values.")
+            raise ValueError(
+                f"{name} contains non-finite values.")
 
         if values.size > 1 and np.any(np.diff(values) <= 0.0):
-            raise ValueError(f"{name} must be strictly increasing.")
+            raise ValueError(
+                f"{name} must be strictly increasing.")
 
     n_metals = int(umetals.size)
     n_ages = int(uages.size)
@@ -1191,51 +1215,142 @@ def _ssp_smoothness_hessian(umetals: np.ndarray, uages: np.ndarray,
         return np.ravel_multi_index(
             (iz, ia, ialpha), shape, order="C")
 
-    def _add_stencil(p0, p1, p2, u0, u1, u2):
-        h0 = float(u1-u0)
-        h1 = float(u2-u1)
+    def _add_coefficients(indices, coeff):
+        idx = np.asarray(
+            indices, dtype=np.int64)
 
-        if h0 <= 0.0 or h1 <= 0.0:
-            raise ValueError('SSP coordinates must be strictly increasing.')
-
-        coeff = np.asarray((1.0/h0, -(1.0/h0+1.0/h1), 1.0/h1), dtype=np.float64)
+        coeff = np.asarray(
+            coeff, dtype=np.float64)
 
         coeff_norm = float(np.linalg.norm(coeff))
 
         if not np.isfinite(coeff_norm) or coeff_norm <= 0.0:
-            raise RuntimeError('Invalid SSP curvature stencil.')
+            raise RuntimeError(
+                "Invalid SSP regularisation stencil.")
 
         coeff /= coeff_norm
-        idx = np.asarray((p0, p1, p2), dtype=np.int64)
 
-        Q[np.ix_(idx, idx)] += np.outer(coeff, coeff)
+        Q[np.ix_(idx, idx)] += np.outer(
+            coeff, coeff)
 
-    # Metallicity curvature at fixed age and alpha.
+    def _add_curvature(p0, p1, p2, u0, u1, u2):
+        h0 = float(u1-u0)
+        h1 = float(u2-u1)
+
+        if h0 <= 0.0 or h1 <= 0.0:
+            raise ValueError(
+                "SSP coordinates must be strictly increasing.")
+
+        _add_coefficients(
+            (p0, p1, p2),
+            (
+                1.0/h0,
+                -(1.0/h0+1.0/h1),
+                1.0/h1,
+            ),
+        )
+
+    def _add_boundary(p0, p1, u0, u1):
+        h = float(u1-u0)
+
+        if h <= 0.0:
+            raise ValueError(
+                "SSP coordinates must be strictly increasing.")
+
+        _add_coefficients(
+            (p0, p1),
+            (-1.0/h, 1.0/h),
+        )
+
+    # ------------------------------------------------------------------
+    # Metallicity.
+    # ------------------------------------------------------------------
+    if n_metals >= 2:
+        for ia in range(n_ages):
+            for ialpha in range(n_alphas):
+                _add_boundary(
+                    _index(0, ia, ialpha),
+                    _index(1, ia, ialpha),
+                    umetals[0],
+                    umetals[1])
+
+                _add_boundary(
+                    _index(n_metals-2, ia, ialpha),
+                    _index(n_metals-1, ia, ialpha),
+                    umetals[-2],
+                    umetals[-1])
+
     if n_metals >= 3:
         for iz in range(1, n_metals-1):
             for ia in range(n_ages):
                 for ialpha in range(n_alphas):
-                    _add_stencil(_index(iz-1, ia, ialpha),
-                        _index(iz, ia, ialpha), _index(iz+1, ia, ialpha),
-                        umetals[iz-1], umetals[iz], umetals[iz+1])
+                    _add_curvature(
+                        _index(iz-1, ia, ialpha),
+                        _index(iz, ia, ialpha),
+                        _index(iz+1, ia, ialpha),
+                        umetals[iz-1],
+                        umetals[iz],
+                        umetals[iz+1])
 
-    # Age curvature at fixed metallicity and alpha.
+    # ------------------------------------------------------------------
+    # Age.
+    # ------------------------------------------------------------------
+    if n_ages >= 2:
+        for iz in range(n_metals):
+            for ialpha in range(n_alphas):
+                _add_boundary(
+                    _index(iz, 0, ialpha),
+                    _index(iz, 1, ialpha),
+                    uages[0],
+                    uages[1])
+
+                _add_boundary(
+                    _index(iz, n_ages-2, ialpha),
+                    _index(iz, n_ages-1, ialpha),
+                    uages[-2],
+                    uages[-1])
+
     if n_ages >= 3:
         for iz in range(n_metals):
             for ia in range(1, n_ages-1):
                 for ialpha in range(n_alphas):
-                    _add_stencil(_index(iz, ia-1, ialpha),
-                        _index(iz, ia, ialpha), _index(iz, ia+1, ialpha),
-                        uages[ia-1], uages[ia], uages[ia+1])
+                    _add_curvature(
+                        _index(iz, ia-1, ialpha),
+                        _index(iz, ia, ialpha),
+                        _index(iz, ia+1, ialpha),
+                        uages[ia-1],
+                        uages[ia],
+                        uages[ia+1])
 
-    # Alpha-enhancement curvature at fixed metallicity and age.
+    # ------------------------------------------------------------------
+    # Alpha enhancement.
+    # ------------------------------------------------------------------
+    if n_alphas >= 2:
+        for iz in range(n_metals):
+            for ia in range(n_ages):
+                _add_boundary(
+                    _index(iz, ia, 0),
+                    _index(iz, ia, 1),
+                    ualphas[0],
+                    ualphas[1])
+
+                _add_boundary(
+                    _index(iz, ia, n_alphas-2),
+                    _index(iz, ia, n_alphas-1),
+                    ualphas[-2],
+                    ualphas[-1])
+
     if n_alphas >= 3:
         for iz in range(n_metals):
             for ia in range(n_ages):
                 for ialpha in range(1, n_alphas-1):
-                    _add_stencil(_index(iz, ia, ialpha-1),
-                        _index(iz, ia, ialpha), _index(iz, ia, ialpha+1),
-                        ualphas[ialpha-1], ualphas[ialpha], ualphas[ialpha+1])
+                    _add_curvature(
+                        _index(iz, ia, ialpha-1),
+                        _index(iz, ia, ialpha),
+                        _index(iz, ia, ialpha+1),
+                        ualphas[ialpha-1],
+                        ualphas[ialpha],
+                        ualphas[ialpha+1])
 
     Q = 0.5*(Q+Q.T)
 
@@ -1875,6 +1990,8 @@ def streamActiveSetNNLS(
     tol_grad: float = 1e-8,
     max_iter: int = 5000,
     regularisation_scale: float = 1.0,
+    minimum_l2_at_zero: bool = True,
+    minimum_l2_rss_rtol: float = 1e-3,
     checkpoint_cb=None,
     checkpoint_every: int = 0,
 ):
@@ -1883,6 +2000,14 @@ def streamActiveSetNNLS(
     """
 
     regularisation_scale = float(regularisation_scale)
+    minimum_l2_at_zero = bool(minimum_l2_at_zero)
+    minimum_l2_rss_rtol = float(minimum_l2_rss_rtol)
+
+    if (not np.isfinite(minimum_l2_rss_rtol)
+        or minimum_l2_rss_rtol < 0.0):
+        raise ValueError('minimum_l2_rss_rtol must be nonnegative and finite.')
+
+    use_minimum_l2 = (minimum_l2_at_zero and regularisation_scale == 0.0)
     # Fixed numerical ridge. Keeping this constant across all working supports
     # ensures that every active-set iteration solves the same convex quadratic
     # program rather than changing the objective as the support changes.
@@ -1971,35 +2096,15 @@ def streamActiveSetNNLS(
     # characteristic scientific curvature relative to the data curvature.
     #
     # This normalization changes only the overall strength of Q_ssp. It
-    # does not alter its SSP-grid geometry or its linear null modes.
+    # does not alter its SSP-grid geometry or uniform null mode.
     # ------------------------------------------------------------------
-    zz, tt, aa = np.meshgrid(
-        umetals, uages, ualphas, indexing="ij")
-
     uniform_mode = np.ones(P, dtype=np.float64)
-    metal_mode = zz.ravel(order="C")
-    age_mode = tt.ravel(order="C")
-    alpha_mode = aa.ravel(order="C")
-
-    uniform_null = float(np.max(np.abs(
-        Q_ssp @ uniform_mode)))
-    metal_linear_null = float(np.max(np.abs(
-        Q_ssp @ metal_mode)))
-    age_linear_null = float(np.max(np.abs(
-        Q_ssp @ age_mode)))
-    alpha_linear_null = float(np.max(np.abs(
-        Q_ssp @ alpha_mode)))
-
-    print(
-        f"[MONO][smoothness] "
-        f"uniform_null={uniform_null:.3e} "
-        f"linear_null="
-        f"({metal_linear_null:.3e}, "
-        f"{age_linear_null:.3e}, "
-        f"{alpha_linear_null:.3e})",
-        flush=True)
-
+    uniform_null = float(np.max(np.abs(Q_ssp @ uniform_mode)))
     q_diag = np.diag(Q_ssp)
+
+    print(f"[MONO][smoothness] diag=[{np.min(q_diag):.3e}, "
+        f"{np.median(q_diag):.3e}, {np.max(q_diag):.3e}] "
+        f"uniform_null={uniform_null:.3e}", flush=True)
 
     smooth_diag = np.tile(q_diag, C) * (S_flat * S_flat)
     positive_smooth = smooth_diag[smooth_diag > 0.0]
@@ -2072,7 +2177,7 @@ def streamActiveSetNNLS(
         saved_reg_mode = resume_state.get(
             "scientific_regularisation_mode", "legacy_l2")
 
-        if saved_reg_mode != "ssp_first_difference":
+        if saved_reg_mode != SCIENTIFIC_REGULARISATION_MODE:
             raise ValueError(
                 "Cannot full-resume a checkpoint using a different scientific "
                 "regularisation model. Use warm_start='saved_x' instead.")
@@ -2156,7 +2261,7 @@ def streamActiveSetNNLS(
         "tol_grad": float(tol_grad),
         "tol_grad_rel": float(tol_grad_rel),
         "regularisation_scale": float(regularisation_scale),
-        "scientific_regularisation_mode": "ssp_first_difference",
+        "scientific_regularisation_mode": SCIENTIFIC_REGULARISATION_MODE,
         "smoothness_normalisation": float(smooth_norm),
         "effective_smoothness_scale": float(smooth_scale),
         "diag_level": int(diag_level),
@@ -2190,6 +2295,7 @@ def streamActiveSetNNLS(
             where=S_flat > 0.0)
         np.maximum(z, 0.0, out=z)
 
+    seed_population = None
     # Build a feasible initial state for the fixed orbit shape. The initial
     # amplitude is only a starting value; it is not held fixed by the solver.
     if has_hard_orbit_shape:
@@ -2451,7 +2557,7 @@ def streamActiveSetNNLS(
             "alpha_current": float(alpha_current),
             "ridge_current": float(ridge_current),
             "regularisation_scale": float(regularisation_scale),
-            "scientific_regularisation_mode": "ssp_first_difference",
+            "scientific_regularisation_mode": SCIENTIFIC_REGULARISATION_MODE,
             "hard_orbit_shape": bool(has_hard_orbit_shape),
             "orbit_constraint_mode": (
                 "equal_component_mass" if has_hard_orbit_shape else "none"),
@@ -2600,12 +2706,17 @@ def streamActiveSetNNLS(
         ATy_sub = ATy_scaled[active_idx].copy()
 
         return ATA_sub, ATy_sub, S_active
-    def _solve_reduced_active(active_idx, assembled=None):
+    def _solve_reduced_active(active_idx, assembled=None,
+        extra_hessian=None):
         """
         Assemble and solve the constrained reduced problem.
 
-        If ``assembled`` is supplied, use the provided reduced normal equations
-        instead of rereading the HyperCube.
+        If ``assembled`` is supplied, use the provided reduced normal
+        equations instead of rereading the HyperCube.
+
+        ``extra_hessian`` is an optional secondary Hessian in solver z-space.
+        It is used only by the post-convergence minimum-L2 solve when the
+        scientific regularisation is exactly zero.
         """
         active_idx = np.asarray(active_idx, dtype=np.int64)
         k_loc = int(active_idx.size)
@@ -2624,29 +2735,38 @@ def streamActiveSetNNLS(
             S_loc = np.asarray(S_loc, dtype=np.float64).ravel(order="C")
 
             if ATA_loc.shape != (k_loc, k_loc):
-                raise ValueError("Preassembled ATA shape is inconsistent with "
+                raise ValueError(
+                    "Preassembled ATA shape is inconsistent with "
                     "active_idx.")
 
             if ATy_loc.size != k_loc:
-                raise ValueError("Preassembled ATy size is inconsistent with "
+                raise ValueError(
+                    "Preassembled ATy size is inconsistent with "
                     "active_idx.")
 
             if S_loc.size != k_loc:
-                raise ValueError("Preassembled scaling size is inconsistent "
-                    "with active_idx.")
+                raise ValueError(
+                    "Preassembled scaling size is inconsistent with "
+                    "active_idx.")
 
         H_scientific_loc = _scientific_hessian_reduced(active_idx, S_loc)
-        ATA_scientific_loc = ATA_loc + H_scientific_loc
 
+        if extra_hessian is not None:
+            H_extra_loc = np.asarray(extra_hessian, dtype=np.float64, order="C")
+
+            if H_extra_loc.shape != (k_loc, k_loc):
+                raise ValueError(
+                    "extra_hessian shape is inconsistent with active_idx.")
+            H_scientific_loc = H_scientific_loc+H_extra_loc
+
+        ATA_scientific_loc = ATA_loc+H_scientific_loc
         numerical_ridge_loc = float(numerical_ridge)
 
         try:
             eigs_loc = np.linalg.eigvalsh(ATA_scientific_loc)
             emin_loc = float(eigs_loc[0])
             emax_loc = float(eigs_loc[-1])
-            cond_loc = (
-                emax_loc / emin_loc if emin_loc > 0.0 else np.inf
-            )
+            cond_loc = emax_loc/emin_loc if emin_loc > 0.0 else np.inf
         except np.linalg.LinAlgError:
             emin_loc = np.nan
             emax_loc = np.nan
@@ -2654,25 +2774,24 @@ def streamActiveSetNNLS(
 
         if has_hard_orbit_shape:
             z_raw_loc, info_loc = _orbit_hard_constraint_solve(
-                ATA_sub_reg=ATA_loc, ATy_sub=ATy_loc,
-                active_idx=active_idx, S_active=S_loc,
+                ATA_sub_reg=ATA_loc, ATy_sub=ATy_loc, active_idx=active_idx,
+                S_active=S_loc,
                 orbit_shape=np.asarray(orbit_shape, dtype=np.float64),
-                C=C, P=P,
-                numerical_ridge=numerical_ridge_loc,
-                scientific_hessian=H_scientific_loc,)
+                C=C, P=P, numerical_ridge=numerical_ridge_loc,
+                scientific_hessian=H_scientific_loc)
 
             if not info_loc["accepted"]:
-                return active_idx, None, info_loc, None, None, ATA_loc, \
-                    ATy_loc, S_loc, numerical_ridge_loc, cond_loc
+                return (active_idx, None, info_loc, None, None, ATA_loc,
+                    ATy_loc, S_loc, numerical_ridge_loc, cond_loc)
 
             z_loc = np.asarray(z_raw_loc, dtype=np.float64).copy()
             alpha_loc = float(info_loc["alpha"])
-            lambda_loc = np.asarray(info_loc["lambda_orbit"], dtype=np.float64
-                ).ravel(order="C")
+            lambda_loc = np.asarray(info_loc["lambda_orbit"],
+                dtype=np.float64).ravel(order="C")
 
         else:
-            ATA_reg_loc = (ATA_loc + H_scientific_loc
-                + numerical_ridge_loc * np.eye(k_loc, dtype=np.float64))
+            ATA_reg_loc = (ATA_loc+H_scientific_loc + numerical_ridge_loc*np.eye(
+                k_loc, dtype=np.float64))
 
             z_loc = _nnls_from_quadratic(ATA_reg_loc, ATy_loc,
                 x0=np.maximum(z[active_idx], 0.0), max_iter=10000, tol=1e-11)
@@ -2687,23 +2806,11 @@ def streamActiveSetNNLS(
             }
 
         info_loc = dict(info_loc)
-        info_loc["numerical_ridge"] = float(
-            numerical_ridge_loc)
-        info_loc["condition_number"] = float(
-            cond_loc)
+        info_loc["numerical_ridge"] = float(numerical_ridge_loc)
+        info_loc["condition_number"] = float(cond_loc)
 
-        return (
-            active_idx,
-            z_loc,
-            info_loc,
-            alpha_loc,
-            lambda_loc,
-            ATA_loc,
-            ATy_loc,
-            S_loc,
-            numerical_ridge_loc,
-            cond_loc,
-        )
+        return (active_idx, z_loc, info_loc, alpha_loc, lambda_loc, ATA_loc,
+            ATy_loc, S_loc, numerical_ridge_loc, cond_loc)
 
     def _prune_zero_support(
         z_vec: np.ndarray,
@@ -2745,6 +2852,132 @@ def streamActiveSetNNLS(
             z_vec[dropped] = 0.0
 
         return dropped
+
+    def _expand_minimum_l2_support(active_mask: np.ndarray,
+        reduced_gradient: np.ndarray, n_kkt_per_orbit: int = 8) -> np.ndarray:
+        """
+        Expand the raw NNLS support for the secondary minimum-L2 solve.
+
+        Retain the raw support, its direct SSP-grid neighbours, and the
+        inactive populations with the smallest physical-space constrained KKT
+        slack in each dynamical component.
+
+        Parameters
+        ----------
+        active_mask : ndarray
+            Raw converged active support with shape ``(C*P,)``.
+        reduced_gradient : ndarray
+            Full constrained reduced gradient in physical x-space.
+        n_kkt_per_orbit : int, optional
+            Maximum number of KKT-selected inactive populations added per
+            dynamical component.
+
+        Returns
+        -------
+        expanded : ndarray
+            Expanded candidate-support mask with shape ``(C*P,)``.
+
+        Raises
+        ------
+        ValueError
+            If supplied arrays have incorrect dimensions.
+
+        Examples
+        --------
+        Called internally after raw KKT convergence.
+        """
+        active_mask = np.asarray(active_mask, dtype=bool).ravel(order="C")
+        reduced_gradient = np.asarray(reduced_gradient,
+            dtype=np.float64).ravel(order="C")
+
+        if active_mask.size != C*P:
+            raise ValueError("active_mask has incorrect size.")
+        if reduced_gradient.size != C*P:
+            raise ValueError("reduced_gradient has incorrect size.")
+
+        expanded = active_mask.copy()
+        shape = (int(n_metals), int(n_ages), int(n_alphas))
+
+        offsets = ((-1, 0, 0), (1, 0, 0), (0, -1, 0),
+            (0, 1, 0), (0, 0, -1), (0, 0, 1))
+
+        # Direct physical SSP neighbours of the raw solution.
+        for jj in np.flatnonzero(active_mask):
+            cc = int(jj//P)
+            pp = int(jj % P)
+            iz, ia, ialpha = np.unravel_index(pp, shape, order="C")
+
+            for dz, dt, da in offsets:
+                jz = iz+dz
+                jt = ia+dt
+                ja = ialpha+da
+
+                if (jz < 0 or jz >= n_metals or jt < 0 or jt >= n_ages
+                    or ja < 0 or ja >= n_alphas):
+                    continue
+
+                qq = int(np.ravel_multi_index((jz, jt, ja), shape,
+                    order="C"))
+                kk = cc*P+qq
+
+                if not known_zero_flat[kk]:
+                    expanded[kk] = True
+
+        # Add the inactive populations closest to the raw NNLS KKT boundary.
+        # At the converged maximum-form NNLS solution:
+        #
+        #     x_j > 0  -> g_j = 0
+        #     x_j = 0  -> g_j <= 0.
+        #
+        # Therefore the largest inactive reduced gradients are the columns
+        # that can enter with the smallest first-order data penalty.
+        n_kkt_per_orbit = max(0, int(n_kkt_per_orbit))
+
+        for cc in range(C):
+            if has_hard_orbit_shape and orbit_shape[cc] <= 0.0:
+                continue
+
+            i0 = cc*P
+            i1 = i0+P
+
+            candidate = ~active_mask[i0:i1]
+            candidate &= ~known_zero_flat[i0:i1]
+
+            if not np.any(candidate) or n_kkt_per_orbit == 0:
+                continue
+
+            local = np.flatnonzero(candidate)
+            score = reduced_gradient[i0:i1][local]
+
+            finite = np.isfinite(score)
+            local = local[finite]
+            score = score[finite]
+
+            if local.size == 0:
+                continue
+
+            # Descending gradient: zero is the KKT boundary, while increasingly
+            # negative values are progressively more expensive to activate.
+            n_take = min(n_kkt_per_orbit, local.size)
+
+            if local.size > n_take:
+                select = np.argpartition(score, -n_take)[-n_take:]
+                local = local[select]
+                score = score[select]
+
+            order = np.argsort(score, kind="stable")[::-1]
+            local = local[order]
+
+            expanded[i0+local] = True
+
+        expanded[known_zero_flat] = False
+
+        if has_hard_orbit_shape and zero_shape_orbits.size > 0:
+            for cc in zero_shape_orbits:
+                i0 = int(cc)*P
+                expanded[i0:i0+P] = False
+
+        return expanded
 
     # --------------------------------------------------------------------------
     
@@ -3260,6 +3493,317 @@ def streamActiveSetNNLS(
     except Exception:
         final_it = 0
 
+
+    minimum_l2_gradient_x = None
+    if use_minimum_l2 and bool(stop_converged):
+        minimum_l2_gradient_x = np.divide(grad_total, S_flat,
+            out=np.full(CP, -np.inf, dtype=np.float64),
+            where=S_flat > 0.0)
+    minimum_l2_used = False
+    minimum_l2_raw_residual = None
+    minimum_l2_final_residual = None
+    minimum_l2_raw_norm = None
+    minimum_l2_final_norm = None
+    minimum_l2_strength = 0.0
+    minimum_l2_raw_active = None
+    minimum_l2_expanded_active = None
+    minimum_l2_final_active = None
+
+    if use_minimum_l2 and bool(stop_converged) and np.any(active):
+        # ------------------------------------------------------------------
+        # Lexicographic minimum-L2 solution.
+        #
+        # The primary constrained NNLS problem has already converged. The
+        # following stage selects the least-concentrated physical coefficient
+        # vector whose data residual remains within minimum_l2_rss_rtol of
+        # that raw optimum.
+        #
+        # Assemble the expanded-support normal equations exactly once. Every
+        # L2 trial, including its data objective, is then evaluated entirely
+        # in this reduced space. No additional full HyperCube ATAz operation
+        # is required by the L2 stage.
+        # ------------------------------------------------------------------
+        minimum_l2_max_trials = 5
+        minimum_l2_refine = 3
+
+        z_raw = np.asarray(z, dtype=np.float64).copy()
+        raw_active_idx = np.flatnonzero(active).astype(np.int64)
+        minimum_l2_raw_active = int(raw_active_idx.size)
+
+        # Expand the converged raw support by one direct neighbour along
+        # metallicity, age, and alpha within each dynamical component.
+        #
+        # Keep this candidate support fixed throughout the continuation so
+        # initially zero neighbours remain available to enter the solution.
+        l2_support = _expand_minimum_l2_support(active,
+            minimum_l2_gradient_x, n_kkt_per_orbit=8)
+
+        l2_active_idx = np.flatnonzero(l2_support).astype(np.int64)
+
+        minimum_l2_expanded_active = int(l2_active_idx.size)
+        n_l2_added = int(np.count_nonzero(l2_support & ~active))
+
+        print(f"[MONO][minimum-L2] raw_active={minimum_l2_raw_active} "
+            f"expanded_active={minimum_l2_expanded_active} "
+            f"added={n_l2_added} rss_rtol={minimum_l2_rss_rtol:.3e}", flush=True)
+
+        if l2_active_idx.size > max_active:
+            raise RuntimeError('Minimum-L2 expanded support exceeds max_active: '
+                f"{l2_active_idx.size} > {max_active}.")
+
+        print(f"[MONO][minimum-L2] raw_active={minimum_l2_raw_active} "
+            f"expanded_active={minimum_l2_expanded_active} "
+            f"rss_rtol={minimum_l2_rss_rtol:.3e}", flush=True)
+
+        # This is the only additional HyperCube Gram-matrix assembly required
+        # by the complete minimum-L2 stage.
+        ATA_l2, ATy_l2, S_l2 = _assemble_reduced(l2_active_idx)
+
+        assembled_l2 = (ATA_l2, ATy_l2, S_l2)
+
+        # Embed the raw converged solution into the expanded reduced support.
+        # Since l2_active_idx contains the original active support, this is
+        # exactly the same physical solution represented in reduced space.
+        z_raw_l2 = z_raw[l2_active_idx].copy()
+
+        # Evaluate the raw data objective using the same reduced normal
+        # equations that will be used for every L2 trial.
+        data_objective_raw = _data_quad_obj(ATA_l2, ATy_l2, z_raw_l2)
+
+        residual_objective_raw = (data_objective_raw+0.5*yty)
+
+        minimum_l2_raw_residual = float(residual_objective_raw)
+
+        # Physical-space norm on the reduced support. Since all coefficients
+        # outside this support are zero in the raw solution, this is exactly
+        # the full ||x||_2.
+        x_raw_l2 = S_l2*z_raw_l2
+        minimum_l2_raw_norm = float(np.linalg.norm(x_raw_l2))
+        residual_limit = residual_objective_raw * (1.0+minimum_l2_rss_rtol)
+
+        # Physical L2 objective:
+        #
+        #     0.5 * beta * x.T @ x
+        #
+        # with x = S*z, hence
+        #
+        #     H_L2,z = beta * diag(S**2).
+        #
+        # Normalize the secondary curvature by its median positive diagonal
+        # so the continuation parameter is dimensionless.
+        l2_diag = S_l2*S_l2
+
+        positive_l2_diag = l2_diag[l2_diag > 0.0]
+
+        if positive_l2_diag.size == 0:
+            l2_norm = 1.0
+        else:
+            l2_norm = float(np.median(positive_l2_diag))
+
+        # Store the best solution only in reduced coordinates during the
+        # continuation. Construct a full CP vector only once, when committing
+        # the selected solution.
+        best_z_l2 = z_raw_l2.copy()
+        best_alpha = float(alpha_current)
+        best_lambda = np.asarray(lambda_orbit_current, dtype=np.float64).copy()
+
+        best_residual = float(residual_objective_raw)
+        best_l2_norm = float(minimum_l2_raw_norm)
+        best_strength = 0.0
+
+        lower_strength = None
+        upper_strength = None
+
+        def _minimum_l2_trial(strength):
+            effective_strength = strength/l2_norm
+            H_l2 = np.diag(effective_strength*l2_diag)
+
+            active_idx_trial, z_trial_l2, info_trial, alpha_trial,\
+                lambda_trial, _, _, _, _, _ = _solve_reduced_active(
+                l2_active_idx, assembled=assembled_l2, extra_hessian=H_l2)
+
+            if z_trial_l2 is None or not info_trial["accepted"]:
+                return None
+
+            if not np.array_equal(active_idx_trial, l2_active_idx):
+                raise RuntimeError('Minimum-L2 reduced solve changed the '
+                    'candidate support ordering.')
+
+            z_trial_l2 = np.asarray(z_trial_l2, dtype=np.float64).ravel(
+                order="C")
+            data_objective_trial = _data_quad_obj(ATA_l2, ATy_l2,
+                z_trial_l2)
+            residual_objective_trial = data_objective_trial+0.5*yty
+            x_norm_trial = float(np.linalg.norm(S_l2*z_trial_l2))
+            residual_relative = ((residual_objective_trial
+                - residual_objective_raw)/max(residual_objective_raw, 1e-300))
+
+            return {
+                "z": z_trial_l2,
+                "alpha": float(alpha_trial),
+                "lambda": np.asarray(lambda_trial, dtype=np.float64).copy(),
+                "residual": float(residual_objective_trial),
+                "relative": float(residual_relative),
+                "norm": float(x_norm_trial),
+            }
+
+        def _accept_minimum_l2_trial(result, strength):
+            nonlocal best_z_l2, best_alpha, best_lambda, best_residual,\
+                best_l2_norm, best_strength
+
+            best_z_l2 = result["z"].copy()
+            best_alpha = float(result["alpha"])
+            best_lambda = result["lambda"].copy()
+            best_residual = float(result["residual"])
+            best_l2_norm = float(result["norm"])
+            best_strength = float(strength)
+
+        # Start at the requested RSS scale. If this is too strong, search
+        # downward; if acceptable, search upward until the RSS limit is crossed.
+        trial_strength = max(1e-12, minimum_l2_rss_rtol)
+        result = _minimum_l2_trial(trial_strength)
+
+        if result is None:
+            acceptable = False
+            residual_relative = np.inf
+            norm_ratio = 1.0
+        else:
+            acceptable = result["residual"] <= residual_limit
+            residual_relative = result["relative"]
+            norm_ratio = result["norm"]/max(minimum_l2_raw_norm, 1e-300)
+
+        print(f"[MONO][minimum-L2] trial= 0 "
+            f"strength={trial_strength:.3e} "
+            f"dRSS/RSS={residual_relative:.3e} "
+            f"||x||/||x0||={norm_ratio:.6e}", flush=True)
+
+        if acceptable:
+            lower_strength = float(trial_strength)
+            _accept_minimum_l2_trial(result, trial_strength)
+
+            for l2_iter in range(1, minimum_l2_max_trials):
+                trial_strength *= 10.0
+                result = _minimum_l2_trial(trial_strength)
+
+                if result is None:
+                    acceptable = False
+                    residual_relative = np.inf
+                    norm_ratio = 1.0
+                else:
+                    acceptable = result["residual"] <= residual_limit
+                    residual_relative = result["relative"]
+                    norm_ratio = (result["norm"]
+                        / max(minimum_l2_raw_norm, 1e-300))
+
+                print(f"[MONO][minimum-L2] trial={l2_iter:2d} "
+                    f"strength={trial_strength:.3e} "
+                    f"dRSS/RSS={residual_relative:.3e} "
+                    f"||x||/||x0||={norm_ratio:.6e}", flush=True)
+
+                if acceptable:
+                    lower_strength = float(trial_strength)
+                    _accept_minimum_l2_trial(result, trial_strength)
+                else:
+                    upper_strength = float(trial_strength)
+                    break
+
+        else:
+            upper_strength = float(trial_strength)
+
+            for l2_iter in range(1, minimum_l2_max_trials):
+                trial_strength *= 0.1
+                result = _minimum_l2_trial(trial_strength)
+
+                if result is None:
+                    acceptable = False
+                    residual_relative = np.inf
+                    norm_ratio = 1.0
+                else:
+                    acceptable = result["residual"] <= residual_limit
+                    residual_relative = result["relative"]
+                    norm_ratio = (result["norm"]
+                        / max(minimum_l2_raw_norm, 1e-300))
+
+                print(f"[MONO][minimum-L2] trial={l2_iter:2d} "
+                    f"strength={trial_strength:.3e} "
+                    f"dRSS/RSS={residual_relative:.3e} "
+                    f"||x||/||x0||={norm_ratio:.6e}", flush=True)
+
+                if acceptable:
+                    lower_strength = float(trial_strength)
+                    _accept_minimum_l2_trial(result, trial_strength)
+                    break
+
+                upper_strength = float(trial_strength)
+
+        # Refine the acceptable/unacceptable boundary logarithmically.
+        if (lower_strength is not None and upper_strength is not None
+            and upper_strength > lower_strength):
+            for l2_iter in range(minimum_l2_refine):
+                trial_strength = float(np.sqrt(
+                    lower_strength*upper_strength))
+                result = _minimum_l2_trial(trial_strength)
+
+                if result is None:
+                    upper_strength = float(trial_strength)
+                    continue
+
+                print(f"[MONO][minimum-L2] refine={l2_iter:2d} "
+                    f"strength={trial_strength:.3e} "
+                    f"dRSS/RSS={result['relative']:.3e}", flush=True)
+
+                if result["residual"] <= residual_limit:
+                    lower_strength = float(trial_strength)
+                    _accept_minimum_l2_trial(result, trial_strength)
+                else:
+                    upper_strength = float(trial_strength)
+
+        elif lower_strength is None:
+            print("[MONO][minimum-L2] WARNING: no acceptable nonzero L2 "
+                "strength found.", flush=True)
+
+        elif upper_strength is None:
+            print("[MONO][minimum-L2] WARNING: RSS boundary not bracketed; "
+                f"strongest tested strength={lower_strength:.3e}", flush=True)
+
+        # ------------------------------------------------------------------
+        # Commit the selected lexicographic solution.
+        #
+        # This is the only point at which the reduced minimum-L2 solution is
+        # expanded back into the complete CP coefficient vector.
+        # ------------------------------------------------------------------
+        if best_strength > 0.0:
+            z[:] = 0.0
+            z[l2_active_idx] = best_z_l2
+
+            active[:] = False
+
+            z_scale_l2 = max(1.0, float(np.max(np.abs(z))))
+            l2_positive_tol = (1e-12*z_scale_l2)
+
+            active[z > l2_positive_tol] = True
+            z[~active] = 0.0
+
+            alpha_current = float(best_alpha)
+            lambda_orbit_current = (best_lambda.copy())
+
+            minimum_l2_used = True
+
+        minimum_l2_strength = float(best_strength)
+        minimum_l2_final_residual = float(best_residual)
+        minimum_l2_final_norm = float(best_l2_norm)
+        minimum_l2_final_active = int(np.count_nonzero(active))
+
+        residual_relative = ((best_residual - residual_objective_raw) / max(
+            residual_objective_raw, 1e-300))
+
+        norm_reduction = (1.0- best_l2_norm / max(minimum_l2_raw_norm, 1e-300))
+
+        print(f"[MONO][minimum-L2] accepted={minimum_l2_used} "
+            f"strength={best_strength:.6e} dRSS/RSS={residual_relative:.6e} "
+            f"norm_reduction={norm_reduction:.3%} "
+            f"active={np.count_nonzero(active)}", flush=True)
+
     # Final objective summary in the solver's own scaled space.
     x_final = _current_x_from_z(z)
     x_final_cp = x_final.reshape(C, P)
@@ -3267,35 +3811,41 @@ def streamActiveSetNNLS(
     curvature_raw = 0.5*float(np.sum((x_final_cp @ Q_ssp)*x_final_cp))
     smooth_objective = smooth_scale*curvature_raw
 
-    same_as_seed = (final_population[positive_shape_orbits]
-        == seed_population[positive_shape_orbits])
-    print('[MONO][seed-vs-final] dominant population indices:', flush=True)
-    for cc in positive_shape_orbits:
-        cc = int(cc)
-        print(f"  component={cc:3d} seed={seed_population[cc]:3d} "
-            f"final={final_population[cc]:3d} "
-            f"same={bool(final_population[cc] == seed_population[cc])}",
+    if seed_population is not None:
+        same_as_seed = (final_population[positive_shape_orbits]
+            == seed_population[positive_shape_orbits])
+        print('[MONO][seed-vs-final] dominant population indices:', flush=True)
+        for cc in positive_shape_orbits:
+            cc = int(cc)
+            print(f"  component={cc:3d} seed={seed_population[cc]:3d} "
+                f"final={final_population[cc]:3d} "
+                f"same={bool(final_population[cc] == seed_population[cc])}",
+                flush=True)
+
+        print(f"[MONO][seed-vs-final] same={np.count_nonzero(same_as_seed)}/"
+            f"{positive_shape_orbits.size} ({np.mean(same_as_seed):.1%})",
+            flush=True)
+    elif resume_state:
+        print("[MONO][seed-vs-final] unavailable for full-resume run",
             flush=True)
 
-    print(f"[MONO][seed-vs-final] same={np.count_nonzero(same_as_seed)}/"
-        f"{positive_shape_orbits.size} ({np.mean(same_as_seed):.1%})",
-        flush=True)
-    ATAz_final = _compute_ATAz_scaled(z)
-
-    data_objective = (0.5 * float(np.dot(z, ATAz_final))
-        - float(np.dot(ATy_scaled, z)))
+    if minimum_l2_used:
+        residual_objective = float(minimum_l2_final_residual)
+        data_objective = (residual_objective-0.5*yty)
+    else:
+        ATAz_final = _compute_ATAz_scaled(z)
+        data_objective = (0.5 * float(np.dot(z, ATAz_final))
+            - float(np.dot(ATy_scaled, z)))
+        residual_objective = data_objective+0.5*yty
+    
     scientific_regularisation_objective = _scientific_objective_x(x_final)
-
     numerical_ridge_objective = 0.5 * float(ridge_current) * float(np.dot(z, z))
-
     # Scientific objective actually being optimized conceptually
     scientific_objective = data_objective + scientific_regularisation_objective
     total_objective = scientific_objective + numerical_ridge_objective
-
     # Report the scientific regularization strength relative to the actual
     # residual objective. Unlike data_objective, residual_objective includes
     # the constant 0.5*y.T@y and is therefore 0.5*||A*x-y||^2.
-    residual_objective = data_objective+0.5*yty
     smooth_to_residual = (scientific_regularisation_objective/
         max(residual_objective, 1e-300))
     # Get fitted wavelength pixels
@@ -3329,13 +3879,14 @@ def streamActiveSetNNLS(
 
     oL1 = (orbit_resid_l1 if orbit_resid_l1 is not None else float('nan'))
     oLInf = (orbit_resid_linf if orbit_resid_linf is not None else float('nan'))
-    print(f"[MONO][final] stop={stop_reason} category={stop_category} "
-        f"converged={stop_converged} iter="
+    print(f"[MONO][final] primary_stop={stop_reason} "
+        f"primary_converged={stop_converged} iter="
         f"{((stop_iter + 1) if stop_iter is not None else 0)}/"
-        f"{max_iter} active={int(np.count_nonzero(active))}/"
-        f"{int(max_active)} data_obj={data_objective:.3e} "
-        f"total_obj={total_objective:.3e} alpha={alpha_current:.6e} "
-        f"orbit_L1={oL1:.3e} orbit_Linf={oLInf:.3e}", flush=True)
+        f"{max_iter} active={int(np.count_nonzero(active))}/{int(max_active)} "
+        f"minimum_L2={minimum_l2_used} "
+        f"data_obj={data_objective:.3e} total_obj={total_objective:.3e} "
+        f"alpha={alpha_current:.6e} orbit_L1={oL1:.3e} "
+        f"orbit_Linf={oLInf:.3e}", flush=True)
 
     _emit_diag({
         "kind": "objective_summary",
@@ -3352,7 +3903,7 @@ def streamActiveSetNNLS(
         "numerical_ridge_objective": float(numerical_ridge_objective),
         "total_objective": float(total_objective),
         "scientific_regularisation": float(regularisation_scale),
-        "scientific_regularisation_mode": "ssp_first_difference",
+        "scientific_regularisation_mode": SCIENTIFIC_REGULARISATION_MODE,
         "smoothness_normalisation": float(smooth_norm),
         "effective_smoothness_scale": float(smooth_scale),
         "numerical_ridge": float(ridge_current),
@@ -3363,7 +3914,8 @@ def streamActiveSetNNLS(
         "orbit_target": orbit_target.tolist(),
         "orbit_resid": orbit_deficit.tolist(),
         "alpha": float(alpha_current) if has_hard_orbit_shape else None,
-        "orbit_shape": orbit_shape.tolist() if orbit_shape is not None else None,
+        "orbit_shape": orbit_shape.tolist() if orbit_shape is not None else \
+            None,
         "orbit_prior_present": bool(has_hard_orbit_shape),
         "orbit_constraint_mode": (
             "equal_component_mass" if has_hard_orbit_shape else "none"),
@@ -3376,6 +3928,17 @@ def streamActiveSetNNLS(
         "n_active_final": int(np.count_nonzero(active)),
         "max_active": int(max_active),
         "stop_details": dict(stop_details),
+        "minimum_l2_used": bool(minimum_l2_used),
+        "minimum_l2_strength": float(minimum_l2_strength),
+        "minimum_l2_rss_rtol": (float(minimum_l2_rss_rtol)
+            if use_minimum_l2 else None),
+        "minimum_l2_raw_residual": minimum_l2_raw_residual,
+        "minimum_l2_final_residual": minimum_l2_final_residual,
+        "minimum_l2_raw_norm": minimum_l2_raw_norm,
+        "minimum_l2_final_norm": minimum_l2_final_norm,
+        "minimum_l2_raw_active": minimum_l2_raw_active,
+        "minimum_l2_expanded_active": minimum_l2_expanded_active,
+        "minimum_l2_final_active": minimum_l2_final_active,
     })
     _emit_diag({
         "kind": "final_solution",
