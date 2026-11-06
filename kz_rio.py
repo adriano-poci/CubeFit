@@ -93,8 +93,6 @@ def main():
             [-1.26, -0.96, -0.66, -0.35, -0.25, 0.06, 0.15, 0.26],
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 12.5, 13.0, 13.5, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6])
-    if 'gen' in propDict['runSwitch']:
-        propDict['cpu_processes'] = 8
     # propDict['validationPath'] = str(curdir/args.galaxy/
     #     'hypercube_3_00.h5')
     # propDict['runTag'] = 'datafit.w.lambda2e-5_stat_SSPoffset'
