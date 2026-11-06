@@ -120,6 +120,8 @@ v2.4:   Added `apertures` to `plot_best_worst_spectrum_fits_stacked` and
             the best/worst spaxel selection for spectral plots. 9 October 2026
 v2.5:   Improving hypercube chunking for more efficient reads, and let the
             readers derive the chunks directly in `genCubeFit`. 13 October 2026
+v2.6:   Use `pcolormesh` in `loadCubeFit` instead of `imshow` to account for
+            non-uniform SSP library sampling. 4 November 2026
 """
 
 # need to set up the logger before any other imports
@@ -202,7 +204,7 @@ def _worker_compute_tile(h5_path, s0, s1, x_cp64):
             Y   += np.tensordot(A64, xblk, axes=([1, 2], [0, 1])) # (dS,L)
     return s0, Y
 
-#------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 def _MWProp(prop, aperMass):
     """
@@ -221,6 +223,28 @@ def _MWProp(prop, aperMass):
     mwP = np.ma.sum((aperMass/np.ma.sum(aperMass, axis=1)[:, np.newaxis])*\
         prop[np.newaxis, :], axis=1)
     return mwP
+
+# ------------------------------------------------------------------------------
+
+def _sspEdges(values):
+    values = np.asarray(values, dtype=np.float64).ravel()
+
+    if values.size == 0:
+        raise ValueError("SSP coordinate array is empty.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("SSP coordinate array contains non-finite values.")
+    if values.size > 1 and np.any(np.diff(values) <= 0.0):
+        raise ValueError("SSP coordinates must be strictly increasing.")
+
+    if values.size == 1:
+        return np.array([values[0]-0.5, values[0]+0.5], dtype=np.float64)
+
+    edges = np.empty(values.size+1, dtype=np.float64)
+    edges[1:-1] = 0.5*(values[:-1]+values[1:])
+    edges[0] = values[0]-0.5*(values[1]-values[0])
+    edges[-1] = values[-1]+0.5*(values[-1]-values[-2])
+
+    return edges
 
 # ------------------------------------------------------------------------------
 
@@ -2972,7 +2996,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     full=False, slope=1.30, IMF='KB', iso='pad', weighting='luminosity',
     lOrder=4, rescale=False, specRange=None, lsf=False, band='r', smask=None,
     method='fsf', varIMF=False, source='ppxf', redraw=False,
-    pplots=['sfh', 'spec', 'mw', 'proj', 'circ_alpha', 'atlas'], **kwargs):
+    pplots=['sfh', 'spec', 'mw', 'proj', 'circ_alpha', 'atlas', 'radial'],
+    **kwargs):
     """
     Load the CubeFit data for a given galaxy and model path.
     """
@@ -3059,10 +3084,13 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     dataMax = np.max(INF['dataMax'])
     rLogMin, rLogMax = par['rLogMin'], par['rLogMax']
     nMom = INF['kin']['nMom']
-    grid = np.array(INF['bins'][0]['grid'], dtype=int).T.ravel()-1
-    nbins = np.max(grid).astype(int)+1
-    ss = np.where(grid >= 0)[0]
-    GRIDS = grid[ss]
+    metalEdges = _sspEdges(umetals)
+    ageEdges = _sspEdges(uages)
+    alphaEdges = _sspEdges(ualphas)
+    # grid = np.array(INF['bins'][0]['grid'], dtype=int).T.ravel()-1
+    # nbins = np.max(grid).astype(int)+1
+    # ss = np.where(grid >= 0)[0]
+    # GRIDS = grid[ss]
 
     oDict = cu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
     binFN = oDict['binFN']
@@ -3987,10 +4015,11 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                         ha='right', color=POT.pgreen, transform=ax.transAxes,
                         rotation=0, path_effects=[
                         PathEffects.withStroke(linewidth=1.5, foreground='k')])
-                cnt = ax.imshow(np.ma.log10(coSFH[:, :, ali]),
-                    extent=[minT, maxT, minZ, maxZ],
-                    aspect='auto', interpolation='none', origin='lower',
+                cnt = ax.pcolormesh(ageEdges, metalEdges,
+                    np.ma.log10(coSFH[:, :, ali]), shading='flat',
                     cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
+                ax.set_xlim(ageEdges[0], ageEdges[-1])
+                ax.set_ylim(metalEdges[0], metalEdges[-1])
                 if not ax.get_subplotspec().is_last_row():
                     ax.set_xticklabels([])
                 if not ax.get_subplotspec().is_first_col():
@@ -4006,10 +4035,11 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                         transform=ax.transAxes, path_effects=[
                         PathEffects.withStroke(linewidth=1.5, foreground='k')])
                 ax = fig.add_subplot(gs[1, ali])
-                ax.imshow(np.ma.log10(laSFH[:, :, ali]),
-                    extent=[minT, maxT, minZ, maxZ],
-                    aspect='auto', interpolation='none', origin='lower',
+                ax.pcolormesh(ageEdges, metalEdges,
+                    np.ma.log10(laSFH[:, :, ali]), shading='flat',
                     cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
+                ax.set_xlim(ageEdges[0], ageEdges[-1])
+                ax.set_ylim(metalEdges[0], metalEdges[-1])
                 if not ax.get_subplotspec().is_last_row():
                     ax.set_xticklabels([])
                 if not ax.get_subplotspec().is_first_col():
@@ -4020,10 +4050,11 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
                         foreground='k')])
                 ax = fig.add_subplot(gs[2, ali])
-                ax.imshow(np.ma.log10(boSFH[:, :, ali]),
-                    extent=[minT, maxT, minZ, maxZ],
-                    aspect='auto', interpolation='none', origin='lower',
+                ax.pcolormesh(ageEdges, metalEdges, 
+                    np.ma.log10(boSFH[:, :, ali]), shading='flat',
                     cmap=moncmapr, norm=Normalize(vmin=wmin, vmax=wmax))
+                ax.set_xlim(ageEdges[0], ageEdges[-1])
+                ax.set_ylim(metalEdges[0], metalEdges[-1])
                 if not ax.get_subplotspec().is_last_row():
                     ax.set_xticklabels([])
                 if not ax.get_subplotspec().is_first_col():
@@ -4081,10 +4112,12 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                             transform=ax.transAxes, rotation=0,
                             path_effects=[PathEffects.withStroke(linewidth=1.5,
                                 foreground='k')])
-                    cnt = ax.imshow(np.log10(diskSFH[:, :, ali]),
-                        extent=[minT, maxT, minZ, maxZ],
-                        aspect='auto', interpolation='none', origin='lower',
+                    
+                    cnt = ax.pcolormesh(ageEdges, metalEdges,
+                        np.ma.log10(diskSFH[:, :, ali]), shading='flat',
                         cmap=moncmapr, norm=Normalize(vmin=dbmin, vmax=dbmax))
+                    ax.set_xlim(ageEdges[0], ageEdges[-1])
+                    ax.set_ylim(metalEdges[0], metalEdges[-1])
                     if not ax.get_subplotspec().is_last_row():
                         ax.set_xticklabels([])
                     if not ax.get_subplotspec().is_first_col():
@@ -4101,10 +4134,11 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                             transform=ax.transAxes,
                             path_effects=[PathEffects.withStroke(linewidth=1.5, foreground='k')])
                     ax = fig.add_subplot(gs[1, ali])
-                    ax.imshow(np.log10(bulgeSFH[:, :, ali]),
-                        extent=[minT, maxT, minZ, maxZ],
-                        aspect='auto', interpolation='none', origin='lower',
+                    ax.pcolormesh(ageEdges, metalEdges,
+                        np.ma.log10(bulgeSFH[:, :, ali]), shading='flat',
                         cmap=moncmapr, norm=Normalize(vmin=dbmin, vmax=dbmax))
+                    ax.set_xlim(ageEdges[0], ageEdges[-1])
+                    ax.set_ylim(metalEdges[0], metalEdges[-1])
                     if not ax.get_subplotspec().is_last_row():
                         ax.set_xticklabels([])
                     if not ax.get_subplotspec().is_first_col():
@@ -4175,9 +4209,9 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 ax = fig2.add_subplot(gs2[0, pi])
                 # arr shape (nMetals, nAlphas) -> transpose for imshow so
                 # y=alpha
-                im = ax.imshow(np.log10(np.ma.masked_invalid(arr.T)),
-                    extent=[minZ, maxZ, minA, maxA],
-                    aspect='auto', origin='lower', cmap=moncmapr,
+                plotArr = np.ma.masked_less_equal(arr.T, 0.0)
+                im = ax.pcolormesh(metalEdges, alphaEdges, np.ma.log10(plotArr),
+                    shading='flat', cmap=moncmapr,
                     norm=Normalize(vmin=vmin2, vmax=vmax2))
                 lT = ax.text(1e-2, 1e-2, title, va='bottom', ha='left',
                     color=POT.pgreen, transform=ax.transAxes)
@@ -4185,6 +4219,8 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     foreground='k')])
                 if pi > 0:
                     ax.set_yticklabels([])
+                ax.set_xlim(metalEdges[0], metalEdges[-1])
+                ax.set_ylim(alphaEdges[0], alphaEdges[-1])
 
             BIG2 = fig2.add_subplot(gs2[:])
             BIG2.set_frame_on(False)
@@ -4232,11 +4268,11 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 ax = fig3.add_subplot(gs3[pi, 0])
                 # arr shape (nMetals, nAlphas) -> transpose for imshow so
                 # y=alpha
-                im = ax.imshow(np.log10(np.compress(mask, chemSFH,
-                    axis=1).sum(axis=1).T),
-                    extent=[minZ, maxZ, minA, maxA],
-                    aspect='auto', origin='lower',
-                    cmap=moncmapr, norm=Normalize(vmin=vmin3, vmax=vmax3))
+                arr = np.compress(mask, chemSFH, axis=1).sum(axis=1).T
+                plotArr = np.ma.masked_less_equal(arr, 0.0)
+                im = ax.pcolormesh(metalEdges, alphaEdges, np.ma.log10(plotArr),
+                    shading='flat', cmap=moncmapr,
+                    norm=Normalize(vmin=vmin3, vmax=vmax3))
                 lT = ax.text(1e-2, 1e-2, labels[pi], va='bottom', ha='left',
                     color=POT.pgreen, transform=ax.transAxes)
                 lT.set_path_effects([PathEffects.withStroke(linewidth=1.5,
@@ -4285,26 +4321,26 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             gs4 = gridspec.GridSpec(2, 2, wspace=0.0, hspace=0.0)
             ax = fig4.add_subplot(gs4[2])
             # arr shape (nMetals, nAlphas) -> transpose for imshow so y=alpha
-            im = ax.imshow(np.log10(metalAlpha),
-                extent=[minZ, maxZ, minA, maxA],
-                aspect='auto', origin='lower',
-                cmap=moncmapr, norm=Normalize(vmin=vmin4, vmax=vmax4))
+            plotArr = np.ma.masked_less_equal(metalAlpha, 0.0)
+            im = ax.pcolormesh(metalEdges, alphaEdges, np.ma.log10(plotArr),
+                shading='flat', cmap=moncmapr,
+                norm=Normalize(vmin=vmin4, vmax=vmax4))
             ax.set_xlabel(r'$[Z/H]$')
             ax.set_ylabel(r'$[\alpha/Fe]$')
             ax = fig4.add_subplot(gs4[0])
             # (nMetal, nAge) -> (nAge, nMetal)
-            im = ax.imshow(np.log10(metalAge),
-                extent=[minZ, maxZ, minT, maxT],
-                aspect='auto', origin='lower',
-                cmap=moncmapr, norm=Normalize(vmin=vmin4, vmax=vmax4))
+            plotArr = np.ma.masked_less_equal(metalAge, 0.0)
+            im = ax.pcolormesh(metalEdges, ageEdges, np.ma.log10(plotArr),
+                shading='flat', cmap=moncmapr,
+                norm=Normalize(vmin=vmin4, vmax=vmax4))
             ax.set_xticklabels([])
             ax.set_ylabel(rf"$t\ [{UTS.gyr}]$")
             ax = fig4.add_subplot(gs4[3])
             # (nAge, nAlpha) -> (nAlpha, nAge)
-            im = ax.imshow(np.log10(ageAlpha),
-                extent=[minT, maxT, minA, maxA],
-                aspect='auto', origin='lower',
-                cmap=moncmapr, norm=Normalize(vmin=vmin4, vmax=vmax4))
+            plotArr = np.ma.masked_less_equal(ageAlpha, 0.0)
+            im = ax.pcolormesh(ageEdges, alphaEdges, np.ma.log10(plotArr),
+                shading='flat', cmap=moncmapr,
+                norm=Normalize(vmin=vmin4, vmax=vmax4))
             ax.set_yticklabels([])
             ax.set_xlabel(rf"$t\ [{UTS.gyr}]$")
 

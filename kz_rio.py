@@ -89,48 +89,25 @@ def main():
     if args.ncomp is not None:
         propDict['nCuts'] = args.ncomp
     if propDict['nCuts'] > 50:
-        propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
-            [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
+        propDict['sspIdx'] = (
+            [-1.26, -0.96, -0.66, -0.35, -0.25, 0.06, 0.15, 0.26],
+            [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 12.5, 13.0, 13.5, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6])
-    if propDict['nCuts'] == 3:
-        propDict['regularisation_scale'] = 0.0
-        # propDict['validationPath'] = str(curdir/args.galaxy/
-        #     'hypercube_3_00.h5')
-        # propDict['runTag'] = 'datafit.w.lambda2e-5_stat_SSPoffset'
-        # propDict['validationError'] = 'stat'
-        # propDict['streaming'] = False
-        # propDict['runTag'] = 'monolithic'
-        ############################ SSP library to emulate real fit
-        # propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
-        #     [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
-        #     [-0.2, 0.0, 0.2, 0.4, 0.6])
-        # propDict['runTag'] = '5e-6_SSPoffset'
-        # propDict['regularisation_scale'] = 5e-6
-        ############################ SSP library to generate mock-data fit
-        # propDict['sspIdx'] = ([-1.79, -1.26, -0.6, -0.25, 0.0, 0.15, 0.26],
-        #     [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
-        #     [0.0, 0.2, 0.4])
-        propDict['warm'] = 'zeros'
-    elif propDict['nCuts'] == 20:
-        propDict['regularisation_scale'] = 0.0
-        # propDict['validationPath'] = str(curdir/args.galaxy/
-        #     'hypercube_3_00_5e-6_SSPoffset.h5')
-        # propDict['runTag'] = 'stat_Coffset_SSPoffset'
-        # propDict['validationError'] = 'stat'
-        # propDict['streaming'] = False
-        ############################ SSP library to emulate real fit
-        propDict['sspIdx'] = ([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
-            [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
-            [-0.2, 0.0, 0.2, 0.4, 0.6])
-        # propDict['runTag'] = '5e-7'
-        ############################ SSP library to generate mock-data fit
-        # propDict['sspIdx'] = ([-1.79, -1.26, -0.6, -0.25, 0.0, 0.15, 0.26],
-        #     [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
-        #     [0.0, 0.4])
-        # propDict['regularisation_scale'] = 0.0
-        propDict['warm'] = 'zeros'
-        propDict['spectraPicks'] = [1363, 1116, 1998,1039][::-1]
-
+    if 'gen' in propDict['runSwitch']:
+        propDict['cpu_processes'] = 8
+    # propDict['validationPath'] = str(curdir/args.galaxy/
+    #     'hypercube_3_00.h5')
+    # propDict['runTag'] = 'datafit.w.lambda2e-5_stat_SSPoffset'
+    # propDict['validationError'] = 'stat'
+    # propDict['streaming'] = False
+    # propDict['runTag'] = 'monolithic'
+    # propDict['sspIdx'] = [[], [], []]
+    ############################ SSP library to generate mock-data fit
+    # propDict['sspIdx'] = ([-1.79, -1.26, -0.6, -0.25, 0.0, 0.15, 0.26],
+    #     [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
+    #     [0.0, 0.2, 0.4])
+        # propDict['warm'] = 'saved_x'
+    propDict['spectraPicks'] = [1363, 1116, 1998,1039][::-1]
     print(propDict)
 
     try:

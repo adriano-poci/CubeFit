@@ -33,9 +33,13 @@ def props(galaxy, **kwargs):
             smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],
             warm='zeros', cpu_processes=12, blas_threads=4,
             orbitWeights=True, regularisation_scale=0.0,
-            sspIdx=([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
-            [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
+            sspIdx=([-1.26, -0.96, -0.66, -0.35, -0.25, 0.06, 0.15, 0.26],
+            [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 12.5, 13.0, 13.5, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6]), **kwargs)
+            # # old SSP
+            # sspIdx=([-1.49, -0.96, -0.66, -0.3, 0.06, 0.15, 0.26],
+            # [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
+            # [-0.2, 0.0, 0.2, 0.4, 0.6]), **kwargs)
     elif 'FCC170' in galaxy:
         propDict = dict(galaxy='FCC170', mPath='hd170', SN=100, nCuts=15,
             lOrder=0, specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI',
@@ -43,8 +47,8 @@ def props(galaxy, **kwargs):
             smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],
             warm='zeros', cpu_processes=10, blas_threads=4,
             orbitWeights=True, regularisation_scale=0.0,
-            sspIdx=([-1.5, -1.0, -0.6, -0.3, 0.0, 0.15, 0.26],
-            [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
+            sspIdx=([-1.26, -0.96, -0.66, -0.35, -0.25, 0.06, 0.15, 0.26],
+            [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 12.5, 13.0, 13.5, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6]), **kwargs)
     else:
         raise ValueError(f"Unknown galaxy '{galaxy}'")

@@ -574,6 +574,107 @@ def _worker_ATAz_from_tuple(args):
 
 # ------------------------------------------------------------------------------
 
+def _worker_build_products(h5_path: str, batch: list, keep_idx, C: int,
+    P: int):
+    """
+    Compute partial A.T@y and column energies for spatial tiles.
+
+    HyperCube reads follow the physical HDF5 component/population chunks,
+    avoiding materialisation of the complete (Sblk,C,P,L) model tile.
+
+    Parameters
+    ----------
+    h5_path : str
+        HyperCube HDF5 path.
+    batch : list
+        Spatial ``(s0,s1)`` tile ranges assigned to this worker.
+    keep_idx : ndarray or None
+        Wavelength indices retained by the spectral mask.
+    C : int
+        Number of dynamical components.
+    P : int
+        Number of SSP populations per component.
+
+    Returns
+    -------
+    ATy_loc : ndarray
+        Partial unscaled A.T@y vector with shape ``(C*P,)``.
+    D_loc : ndarray
+        Partial physical column energies with shape ``(C,P)``.
+    n_tiles : int
+        Number of spatial tiles processed.
+
+    Raises
+    ------
+    RuntimeError
+        If the HyperCube dimensions are inconsistent with ``C`` or ``P``.
+
+    Examples
+    --------
+    Called internally by ``solve_streaming_nnls``.
+    """
+    CP = int(C*P)
+    ATy_loc = np.zeros(CP, dtype=np.float64)
+    D_loc = np.zeros((C, P), dtype=np.float64)
+
+    with open_h5(h5_path, role="reader") as f:
+        DC = f["/DataCube"]
+        M = f["/HyperCube/models"]
+
+        if int(M.shape[1]) != C or int(M.shape[2]) != P:
+            raise RuntimeError("HyperCube dimensions are inconsistent with "
+                f"C={C}, P={P}: {M.shape}.")
+
+        C_chunk = int(M.chunks[1]) if M.chunks else 1
+        P_chunk = int(M.chunks[2]) if M.chunks else P
+
+        for s0, s1 in batch:
+            Y = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
+
+            if keep_idx is not None:
+                Y = Y[:, keep_idx]
+
+            for c0 in range(0, C, C_chunk):
+                c1 = min(c0+C_chunk, C)
+
+                for p0 in range(0, P, P_chunk):
+                    p1 = min(p0+P_chunk, P)
+
+                    slab = np.asarray(M[s0:s1, c0:c1, p0:p1, :],
+                        dtype=np.float32, order="C")
+
+                    if keep_idx is not None:
+                        slab = slab[:, :, :, keep_idx]
+
+                    # Sum over spatial and wavelength dimensions:
+                    #
+                    #     ATy[c,p] = sum_s,l A[s,c,p,l] y[s,l]
+                    #     D[c,p]   = sum_s,l A[s,c,p,l]^2
+                    #
+                    # Accumulate in float64 even though the HyperCube itself
+                    # is read as float32.
+                    ATy_blk = np.einsum("scpl,sl->cp", slab, Y,
+                        dtype=np.float64, optimize=True)
+                    D_blk = np.einsum("scpl,scpl->cp", slab, slab,
+                        dtype=np.float64, optimize=True)
+
+                    ATy_loc.reshape(C, P)[c0:c1, p0:p1] += ATy_blk
+                    D_loc[c0:c1, p0:p1] += D_blk
+
+                    del slab
+
+    return ATy_loc, D_loc, int(len(batch))
+
+# ------------------------------------------------------------------------------
+
+def _worker_build_products_from_tuple(args):
+    """
+    Tuple wrapper for the parallel HyperCube build worker.
+    """
+    return _worker_build_products(*args)
+
+# ------------------------------------------------------------------------------
+
 @dataclass
 class MPConfig:
     processes: int = 2
@@ -4511,17 +4612,7 @@ def solve_streaming_nnls(
             raise ValueError("x0 has wrong size")
         x = x0.reshape(C, P).copy()
 
-    # ---------------------------- block tiling -------------------------
-    if block_size is None:
-        # heuristic: aim for ~CP / (8 * processes) cols per block (bounded)
-        block_size = max(16, int(min(256, max(16, CP // max(1, cfg.processes * 8)))))
-    block_size = int(block_size)
-    n_blocks = int(math.ceil(CP / block_size))
-    blocks = [(i * block_size, min(CP, (i + 1) * block_size)) for i in range(n_blocks)]
-
     verbose = getattr(cfg, "verbose", True)
-    print(f"[BC-FUSED] blocks={n_blocks}, block_size={block_size}, "
-        f"processes={cfg.processes}", flush=True)
 
     # ------------------ persistent masks: known_zero & seed masks --------------
     known_zero = _get_known_zero_mask(h5_path, C, P)
@@ -4553,12 +4644,12 @@ def solve_streaming_nnls(
 
             if ok:
                 cache_hit = True
-                print(f"[BC-FUSED] cache hit: {cache_path}", flush=True)
+                print(f"[MONO][build] cache hit: {cache_path}", flush=True)
             else:
                 cache_npz.close()
                 cache_npz = None
         except Exception as _e:
-            print(f"[BC-FUSED] cache load failed: {_e}", flush=True)
+            print(f"[MONO][build] cache load failed: {_e}", flush=True)
             cache_hit = False
             if cache_npz is not None:
                 try:
@@ -4568,7 +4659,8 @@ def solve_streaming_nnls(
                 cache_npz = None
 
     if cache_hit:
-        print("[BC-FUSED] reusing cached build products", flush=True)
+        print("[MONO][build] reusing cached ATy and column energies",
+            flush=True)
 
         ATy_flat = np.asarray(cache_npz["ATy_flat"], dtype=np.float64).copy()
         D_tot = np.asarray(cache_npz["D_tot"], dtype=np.float64).copy()
@@ -4581,81 +4673,60 @@ def solve_streaming_nnls(
             pass
 
     else:
-        print("[BC-FUSED]", flush=True)
+        # ------------------------------------------------------------------
+        # Parallel HyperCube build.
+        #
+        # Compute the two global quantities required by the monolithic solver:
+        #
+        #     ATy_flat = A.T @ y
+        #     D_tot    = diag(A.T @ A)
+        #
+        # Spatial tiles are distributed across persistent worker processes.
+        # Each worker streams only the physical HDF5 (C,P) chunks required for
+        # its tiles, avoiding a complete (Sblk,C,P,L) model-tile allocation.
+        # ------------------------------------------------------------------
+        n_workers = max(1, min(int(cfg.processes), len(s_ranges)))
+        batches = [[] for _ in range(n_workers)]
 
-        # D_tot per column (C,P)
+        for ii, tile in enumerate(s_ranges):
+            batches[ii % n_workers].append(tile)
+
+        worker_args = [(h5_path, batch, keep_idx, C, P)
+            for batch in batches if batch]
+
+        print(f"[MONO][build] constructing ATy and column energies: "
+            f"tiles={len(s_ranges)} workers={len(worker_args)}", flush=True)
+
+        build_t0 = time.perf_counter()
+        ATy_flat = np.zeros(CP, dtype=np.float64)
         D_tot = np.zeros((C, P), dtype=np.float64)
 
-        # ---------- single streaming pass: build ATy_flat & D_tot -------
-        ATy_flat = np.zeros((CP,), dtype=np.float64)
-        with open_h5(h5_path, role="reader") as f:
-            DC = f["/DataCube"]
-            M = f["/HyperCube/models"]
-            try:
-                M.id.set_chunk_cache(cfg.dset_slots, cfg.dset_bytes,
-                    cfg.dset_w0)
-            except Exception:
-                pass
+        ctx = mp.get_context("spawn")
 
-            tile_iter = s_ranges
-            if verbose and (len(s_ranges) > 1):
-                tile_iter = tqdm(s_ranges, desc=f"[BC-FUSED] tiles",
-                    disable=not verbose)
+        with ProcessPoolExecutor(max_workers=len(worker_args),
+            mp_context=ctx, initializer=_init_worker,
+            initargs=(cfg.blas_threads,)) as build_executor:
 
-            for (s0, s1) in tile_iter:
-                Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
-                if keep_idx is not None:
-                    Yt = Yt[:, keep_idx]
-                Sblk = s1 - s0
-                Lk = Yt.shape[1]
+            results = build_executor.map(
+                _worker_build_products_from_tuple, worker_args)
 
-                # accumulate prediction for diagnostics (warm-start)
-                yhat_tile = np.zeros((Sblk, Lk), dtype=np.float64)
+            iterator = results
 
-                # read model tile (Sblk, C, P, Lk)
-                M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64,
-                    order="C")
-                if keep_idx is not None:
-                    M_tile = M_tile[:, :, :, keep_idx]
+            if verbose:
+                iterator = tqdm(results, total=len(worker_args),
+                    desc="[MONO] build", dynamic_ncols=True)
 
-                # compute D_tot contributions (per-column energy)
-                # sum over Sblk and wavelength dims
-                # M_tile: (Sblk, C, P, Lk)
-                D_tot += np.sum(M_tile * M_tile, axis=(0, 3))
+            tiles_done = 0
 
-                # build A2_tile once for ATy accumulation
-                A2_tile = M_tile.transpose(0, 3, 1, 2).reshape(Sblk * Lk, CP)
-                y_flat = Yt.reshape(-1)
+            for ATy_loc, D_loc, n_tiles_loc in iterator:
+                ATy_flat += ATy_loc
+                D_tot += D_loc
+                tiles_done += int(n_tiles_loc)
 
-                # accumulate ATy (uses data y, not residual)
-                ATy_flat += A2_tile.T @ y_flat
+        build_elapsed = time.perf_counter()-build_t0
 
-                # diagnostics (same as before)
-                try:
-                    yf_norm = (float(np.linalg.norm(y_flat)) if y_flat.size > 0
-                        else 0.0)
-                    yhatf_norm = (float(np.linalg.norm(yhat_tile)) if
-                        yhat_tile.size > 0 else 0.0)
-                    r_norm = (
-                        float(np.linalg.norm(y_flat - yhat_tile.reshape(-1)))
-                        if y_flat.size > 0 else 0.0)
-
-                    nnans = int(np.count_nonzero(~np.isfinite(y_flat)))
-                    nnans += int(np.count_nonzero(~np.isfinite(yhat_tile)))
-                    nnans += int(np.count_nonzero(
-                        ~np.isfinite(y_flat - yhat_tile.reshape(-1))))
-
-                    print(f"[BC-FUSED][tile s={s0}:{s1}] Sblk={Sblk} Lk={Lk} "
-                        f"||y||={yf_norm:.3e} " + (
-                            f"||yhat||={yhatf_norm:.3e} "
-                            if yhatf_norm > 0.0 else "")
-                        + f"||r||={r_norm:.3e} nonfinite_vals={nnans}",
-                        flush=True)
-                except Exception as _e:
-                    print('[BC-FUSED][tile diag] error while computing tile '   
-                        'diagnostics:', _e, flush=True)
-
-        # ------------------------ end streaming --------------------------
+        print(f"[MONO][build] finished: tiles={tiles_done} "
+            f"elapsed={build_elapsed:.1f}s", flush=True)
 
         # Exact global physical column energy.
         col_energy = D_tot.copy()
@@ -4680,12 +4751,12 @@ def solve_streaming_nnls(
         E_pos = col_energy[col_energy > 0.0]
         S_pos = inv_sqrt_energy[inv_sqrt_energy > 0.0]
 
-        print("[BC-FUSED] exact column-energy scaling:",
+        print("[MONO][build] exact column-energy scaling:",
             f"E[min/median/max]={np.min(E_pos):.6e}/"
             f"{np.median(E_pos):.6e}/{np.max(E_pos):.6e}",
             f"E_range={np.max(E_pos) / np.min(E_pos):.6e}", flush=True)
 
-        print("[BC-FUSED] exact S scaling:",
+        print("[MONO][build] exact S scaling:",
             f"S[min/median/max]={np.min(S_pos):.6e}/"
             f"{np.median(S_pos):.6e}/{np.max(S_pos):.6e}",
             f"S_range={np.max(S_pos) / np.min(S_pos):.6e}", flush=True)
@@ -4698,9 +4769,9 @@ def solve_streaming_nnls(
                     keep_idx=keep_idx_sig,
                     S=int(S), L=int(L), C=int(C), P=int(P),
                     s_tile=int(s_tile), apply_mask=int(bool(cfg.apply_mask)))
-                print(f"[BC-FUSED] cache saved: {cache_path}", flush=True)
+                print(f"[MONO][build] cache saved: {cache_path}", flush=True)
             except Exception as _e:
-                print(f"[BC-FUSED] cache save failed: {_e}", flush=True)
+                print(f"[MONO][build] cache save failed: {_e}", flush=True)
 
     # DIAGNOSTIC: report S statistics (helps find extreme scalings)
     S_sample = inv_sqrt_energy_flat
@@ -4717,7 +4788,7 @@ def solve_streaming_nnls(
         print(f"[DIAG] error printing S stats: {_e}", flush=True)
 
     # run streaming active-set NNLS (monolithic) using persistent executor
-    print('[BC-FUSED][MONO] starting streaming active-set NNLS (mono)',
+    print('[MONO] starting streaming active-set NNLS (mono)',
         flush=True)
 
     # --------------------------
@@ -4840,8 +4911,7 @@ def solve_streaming_nnls(
             checkpoint_cb=_checkpoint_cb, checkpoint_every=checkpoint_every)
 
         x = x_flat_unscaled.reshape(C, P).copy()
-        print("[BC-FUSED][MONO] finished streaming active-set NNLS",
-            flush=True)
+        print("[MONO] finished streaming active-set NNLS", flush=True)
 
         best_x = x.copy()
         best_proxy = np.inf
@@ -4864,18 +4934,18 @@ def solve_streaming_nnls(
         x_min = float(np.min(x_flat)) if x_flat.size else 0.0
         D_tot_finite = np.isfinite(D_tot)
         dpos = float(np.sum(D_tot[D_tot_finite]))
-        print(f"[BC-FUSED][after-blocks] x_l1={x_l1:.3e} max={x_max:.3e} "
+        print(f"[MONO][solution] x_l1={x_l1:.3e} max={x_max:.3e} "
             f"min={x_min:.3e} nonzero={x_nonzero}/{x_flat.size} "
             f"sparsity={x_sparsity:.3f} D_tot_sum={dpos:.3e}", flush=True)
 
         # check for non-finite in x
         nbad = int(np.count_nonzero(~np.isfinite(x_flat)))
         if nbad:
-            print(f"[BC-FUSED][after-blocks] WARNING: non-finite entries in x: "
+            print(f"[MONO][solution] WARNING: non-finite entries in x: "
                 f"{nbad}", flush=True)
 
     except Exception as _e:
-        print("[BC-FUSED][after-blocks] diag error:", _e, flush=True)
+        print("[MONO][solution] diag error:", _e, flush=True)
     # --- end after-blocks diagnostics ---
 
     # The monolithic active-set solution is authoritative. The exact residual
@@ -4903,26 +4973,26 @@ def solve_streaming_nnls(
         x_sum = float(np.sum(x_flat))
         x_norm = float(np.linalg.norm(x_flat)) if x_flat.size else 0.0
 
-        print("=== [BC-FUSED][summary] ===", flush=True)
-        print(f"[BC-FUSED][summary] elapsed_total={elapsed:.1f}s", flush=True)
-        print(f"[BC-FUSED][summary] data_proxy={data_proxy:.3e} rmse="
+        print("=== [MONO][summary] ===", flush=True)
+        print(f"[MONO][summary] elapsed_total={elapsed:.1f}s", flush=True)
+        print(f"[MONO][summary] data_proxy={data_proxy:.3e} rmse="
             f"{rmse_curr if np.isfinite(rmse_curr) else float('nan'):.3e}",
             flush=True)
-        print(f"[BC-FUSED][summary] best_proxy={best_proxy:.3e}", flush=True)
-        print(f"[BC-FUSED][summary] x_sum={x_sum:.3e} x_norm={x_norm:.3e} "
+        print(f"[MONO][summary] best_proxy={best_proxy:.3e}", flush=True)
+        print(f"[MONO][summary] x_sum={x_sum:.3e} x_norm={x_norm:.3e} "
             f"nonzero={x_nonzero}/{x_flat.size} nonfinite={x_nonfinite}",
             flush=True)
-        print(f"[BC-FUSED][summary] D_tot diag med/min/max = {D_median:.3e} / "
+        print(f"[MONO][summary] D_tot diag med/min/max = {D_median:.3e} / "
             f"{D_min:.3e} / {D_max:.3e}", flush=True)
 
         # sanity checks that likely indicate major numerical problems
         if x_nonzero == 0:
-            print("[BC-FUSED][summary] ALERT: x is entirely zero!", flush=True)
+            print("[MONO][summary] ALERT: x is entirely zero!", flush=True)
         if x_nonfinite > 0:
-            print("[BC-FUSED][summary] ALERT: non-finite elements in x!",
+            print("[MONO][summary] ALERT: non-finite elements in x!",
                 flush=True)
         if not np.isfinite(data_proxy) or data_proxy <= 0.0:
-            print("[BC-FUSED][summary] ALERT: data_proxy non-finite or <= 0.0",
+            print("[MONO][summary] ALERT: data_proxy non-finite or <= 0.0",
                 flush=True)
 
         # show top contributors (per-orbit totals)
@@ -4930,7 +5000,7 @@ def solve_streaming_nnls(
             s_full = np.sum(best_x, axis=1)  # per-orbit
             top_idx = np.argsort(s_full)[::-1][:10]
             top_vals = s_full[top_idx]
-            print("[BC-FUSED][summary] top orbits (index:mass): " + ", ".join(
+            print("[MONO][summary] top orbits (index:mass): " + ", ".join(
                 [f"{int(i)}:{v:.3e}" for i, v in zip(top_idx.tolist(),
                 top_vals.tolist())]), flush=True)
         except Exception:
@@ -4977,9 +5047,9 @@ def solve_streaming_nnls(
         except Exception as _e:
             print("[DIAG][orbit_weights] diagnostic failed:", _e, flush=True)
 
-        print("=== [BC-FUSED][final-summary] end ===", flush=True)
+        print("=== [MONO][final-summary] end ===", flush=True)
     except Exception as _e:
-        print("[BC-FUSED][final-summary] error:", _e, flush=True)
+        print("[MONO][final-summary] error:", _e, flush=True)
     # --- end final summary diagnostics ---
 
     # final diagnostics
