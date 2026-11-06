@@ -9,7 +9,7 @@ done
 curdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QUEUE="planet"
 NodeMem=150
-nCPU=2
+nCPU=40
 
 memPerCPU=$(echo "scale=2; $NodeMem*0.99 / $nCPU" | bc)
 #memPerCPU=$(echo "scale=2; 110.0 / $nCPU" | bc)

@@ -126,8 +126,8 @@ def main():
     #     'hypercube_3_00.h5')
     # propDict['runTag'] = 'datafit.w.lambda2e-5_stat_SSPoffset'
     # propDict['validationError'] = 'stat'
-    propDict['streaming'] = False
-    propDict['runTag'] = 'monolithic'
+    # propDict['streaming'] = False
+    # propDict['runTag'] = 'monolithic'
     # propDict['sspIdx'] = [[], [], []]
     ############################ SSP library to generate mock-data fit
     # propDict['sspIdx'] = ([-1.79, -1.26, -0.6, -0.25, 0.0, 0.15, 0.26],
