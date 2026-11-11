@@ -533,7 +533,7 @@ def _homogenise_ticks(ax, *, nbins: int = 4) -> None:
 
 def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     max_points: int | None = 5000, save_path: str | None = None,
-    show: bool = False, figsize: tuple[float, float] = (22.0, 10.5),
+    show: bool = False, figsize: tuple[float, float] = (22.0, 14.0),
 ) -> list[dict]:
     """
     Plot diagnostics for the exact constrained KKT active-set solver.
@@ -546,13 +546,17 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     The panels show:
 
     1. Full-space KKT convergence relative to tolerance.
-    2. Data, regularisation, constraint, and ridge gradient magnitudes.
-    3. Number and fraction of unresolved inactive dual violations.
-    4. Working and strictly positive support sizes.
-    5. Promotion survival and zero-return behaviour.
-    6. Fitted common component mass and hard-constraint stationarity.
-    7. Per-iteration and cumulative runtime.
-    8. Current solver state and final objective summary.
+    2. KKT convergence rate and short-term progress.
+    3. Data, regularisation, constraint, and ridge gradient magnitudes.
+    4. Number and severity of unresolved inactive dual violations.
+    5. Working and strictly positive support sizes.
+    6. Fraction of the working set carrying positive coefficients.
+    7. KKT-promotion, zero-drop, and net support-change behaviour.
+    8. Equality-constraint feasibility when emitted by the solver.
+    9. Common-amplitude and constraint-stationarity stability.
+    10. Objective evolution when emitted per iteration.
+    11. Per-iteration and cumulative runtime.
+    12. Current solver state and final objective summary.
 
     Parameters
     ----------
@@ -648,8 +652,33 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
             axis.semilogy(x_values[valid],
                 np.maximum(y_values[valid], eps), label=label, **kwargs)
         else:
-            axis.plot(x_values[valid], y_values[valid], label=label,
-                **kwargs)
+            axis.plot(x_values[valid], y_values[valid], label=label, **kwargs)
+
+    def _rolling_median(values: np.ndarray, window: int = 5) -> np.ndarray:
+        """Return a finite-value rolling median."""
+        values = np.asarray(values, dtype=np.float64)
+        output = np.full_like(values, np.nan)
+
+        if values.size == 0:
+            return output
+
+        window = max(1, min(int(window), values.size))
+
+        for ii in range(window-1, values.size):
+            local = values[ii-window+1:ii+1]
+            local = local[np.isfinite(local)]
+
+            if local.size:
+                output[ii] = float(np.median(local))
+
+        return output
+
+    def _unavailable(axis, text: str) -> None:
+        """Mark a diagnostic panel as unavailable."""
+        axis.text(0.5, 0.5, text, transform=axis.transAxes,
+            ha="center", va="center", fontsize=9, color="0.35")
+        axis.set_xticks([])
+        axis.set_yticks([])
 
     def _fmt_sci(value: float) -> str:
         """Return compact scientific-notation mathtext."""
@@ -687,8 +716,8 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     # Merge records by outer iteration.
     #
     # KKT is the pre-promotion state. kkt_promotion describes the exact
-    # support transition committed from that state. We deliberately do not
-    # copy final_solution.x into the merged records because it can be huge.
+    # support transition committed from that state. final_solution.x is
+    # deliberately excluded because it can be very large.
     # ------------------------------------------------------------------
     merged_by_iter = {}
     setup_records = []
@@ -750,16 +779,29 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     grad_dual = _series(merged, "max_grad_dual")
     kkt_violation = _series(merged, "kkt_violation")
 
-    kkt_ratio = np.divide(
-        kkt_violation, tol, out=np.full_like(tol, np.nan), where=tol > 0.0)
+    kkt_ratio = np.divide(kkt_violation, tol,
+        out=np.full_like(tol, np.nan), where=tol > 0.0)
+    active_ratio = np.divide(np.abs(grad_active), tol,
+        out=np.full_like(tol, np.nan), where=tol > 0.0)
+    dual_ratio = np.divide(np.maximum(grad_dual, 0.0), tol,
+        out=np.full_like(tol, np.nan), where=tol > 0.0)
 
-    active_ratio = np.divide(
-        np.abs(grad_active), tol, out=np.full_like(tol, np.nan),
-        where=tol > 0.0)
+    # ------------------------------------------------------------------
+    # KKT progress.
+    #
+    # Positive values mean that KKT/tol decreased during the iteration.
+    # Zero means no progress and negative values mean regression.
+    # ------------------------------------------------------------------
+    kkt_progress = np.full_like(kkt_ratio, np.nan)
 
-    dual_ratio = np.divide(
-        np.maximum(grad_dual, 0.0), tol, out=np.full_like(tol, np.nan),
-        where=tol > 0.0)
+    if kkt_ratio.size > 1:
+        valid = (np.isfinite(kkt_ratio[:-1]) & np.isfinite(kkt_ratio[1:])
+            & (kkt_ratio[:-1] > 0.0) & (kkt_ratio[1:] > 0.0))
+        inds = np.flatnonzero(valid)+1
+        kkt_progress[inds] = np.log10(
+            kkt_ratio[:-1][valid]/kkt_ratio[1:][valid])
+
+    rolling_kkt_progress = _rolling_median(kkt_progress, 5)
 
     # ------------------------------------------------------------------
     # Gradient decomposition.
@@ -777,21 +819,27 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     n_zero_free = _series(merged, "n_zero_free")
     n_violators = _series(merged, "n_dual_violators")
 
-    violator_fraction = np.divide(
-        n_violators, n_zero_free, out=np.full_like(n_violators, np.nan),
-        where=n_zero_free > 0.0)
+    support_efficiency = np.divide(n_positive, n_active,
+        out=np.full_like(n_positive, np.nan), where=n_active > 0.0)
 
     # ------------------------------------------------------------------
     # Exact KKT-promotion outcomes.
+    #
+    # Do not interpret n_zero_dropped as failed promotions unless the solver
+    # explicitly guarantees that semantic. It is therefore shown directly as
+    # zero-dropped support. Net support change is obtained independently from
+    # n_active_after - n_active.
     # ------------------------------------------------------------------
     n_promoted = _series(merged, "promotion_n_promoted")
     n_dropped = _series(merged, "promotion_n_zero_dropped")
     n_active_after = _series(merged, "promotion_n_active_after")
 
-    retained = n_promoted-n_dropped
-    retention_fraction = np.divide(
-        retained, n_promoted, out=np.full_like(retained, np.nan),
-        where=n_promoted > 0.0)
+    support_change = np.subtract(n_active_after, n_active,
+        out=np.full_like(n_active_after, np.nan),
+        where=np.isfinite(n_active_after) & np.isfinite(n_active))
+
+    promotion_survival = np.divide(support_change, n_promoted,
+        out=np.full_like(support_change, np.nan), where=n_promoted > 0.0)
 
     # ------------------------------------------------------------------
     # Constraint and amplitude state.
@@ -799,6 +847,62 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     alpha = _series(merged, "alpha", "promotion_alpha")
     constraint_dot_lambda = _series(merged, "constraint_dot_lambda")
     ridge = _series(merged, "ridge")
+
+    alpha_reference = _latest_finite(alpha)
+    alpha_relative = np.divide(alpha-alpha_reference, abs(alpha_reference),
+        out=np.full_like(alpha, np.nan),
+        where=np.isfinite(alpha_reference) and alpha_reference != 0.0)
+
+    constraint_ratio = np.divide(np.abs(constraint_dot_lambda), tol,
+        out=np.full_like(constraint_dot_lambda, np.nan), where=tol > 0.0)
+
+    # ------------------------------------------------------------------
+    # Primal equality-constraint feasibility.
+    #
+    # These are optional until the solver emits them on each KKT record.
+    # Several aliases are accepted so this plotter remains tolerant of naming
+    # changes.
+    # ------------------------------------------------------------------
+    orbit_resid_linf = _series(merged, "orbit_resid_linf",
+        "constraint_resid_linf", "orbit_Linf")
+    orbit_resid_rel_linf = _series(merged, "orbit_resid_rel_linf")
+    orbit_resid_l2 = _series(merged, "orbit_resid_l2",
+        "constraint_resid_l2", "orbit_L2")
+
+    constraint_scale = np.abs(alpha)
+
+    orbit_resid_linf_relative = orbit_resid_rel_linf.copy()
+    orbit_resid_l2_relative = np.divide(
+        orbit_resid_l2, constraint_scale,
+        out=np.full_like(orbit_resid_l2, np.nan),
+        where=np.isfinite(constraint_scale) & (constraint_scale > 0.0))
+
+    # ------------------------------------------------------------------
+    # Objective history.
+    #
+    # These arrays are populated automatically once the corresponding values
+    # are emitted on each KKT record. Current files containing only the final
+    # objective_summary remain fully supported.
+    # ------------------------------------------------------------------
+    data_objective = _series(merged, "data_objective")
+    regularisation_objective = _series(merged,
+        "scientific_regularisation_objective", "regularisation_objective")
+    scientific_objective = _series(merged, "scientific_objective")
+    ridge_objective = _series(merged, "numerical_ridge_objective")
+    total_objective = _series(merged, "total_objective")
+
+    objective_progress = np.full_like(total_objective, np.nan)
+
+    if total_objective.size > 1:
+        previous = total_objective[:-1]
+        current = total_objective[1:]
+        valid = (np.isfinite(previous) & np.isfinite(current)
+            & (np.abs(previous) > 0.0))
+        inds = np.flatnonzero(valid)+1
+        objective_progress[inds] = (
+            (previous[valid]-current[valid])/np.abs(previous[valid]))
+
+    rolling_objective_progress = _rolling_median(objective_progress, 5)
 
     # ------------------------------------------------------------------
     # Runtime.
@@ -813,35 +917,31 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     if elapsed.size > 1:
         iter_time[1:] = np.diff(elapsed)
 
-    rolling_time = np.full_like(iter_time, np.nan)
-    window = min(5, iter_time.size)
-
-    for ii in range(window-1, iter_time.size):
-        values = iter_time[ii-window+1:ii+1]
-        values = values[np.isfinite(values)]
-
-        if values.size:
-            rolling_time[ii] = float(np.median(values))
+    rolling_time = _rolling_median(iter_time, 5)
 
     # ------------------------------------------------------------------
     # Figure layout.
     # ------------------------------------------------------------------
     fig = plt.figure(figsize=figsize)
-    grid = gridspec.GridSpec(2, 4, figure=fig)
+    grid = gridspec.GridSpec(3, 4, figure=fig)
 
     axes = {
         "kkt": fig.add_subplot(grid[0, 0]),
-        "gradients": fig.add_subplot(grid[0, 1]),
-        "violators": fig.add_subplot(grid[0, 2]),
-        "support": fig.add_subplot(grid[0, 3]),
-        "promotion": fig.add_subplot(grid[1, 0]),
-        "constraint": fig.add_subplot(grid[1, 1]),
-        "runtime": fig.add_subplot(grid[1, 2]),
-        "status": fig.add_subplot(grid[1, 3]),
+        "kkt_progress": fig.add_subplot(grid[0, 1]),
+        "gradients": fig.add_subplot(grid[0, 2]),
+        "violators": fig.add_subplot(grid[0, 3]),
+        "support": fig.add_subplot(grid[1, 0]),
+        "efficiency": fig.add_subplot(grid[1, 1]),
+        "promotion": fig.add_subplot(grid[1, 2]),
+        "feasibility": fig.add_subplot(grid[1, 3]),
+        "constraint": fig.add_subplot(grid[2, 0]),
+        "objective": fig.add_subplot(grid[2, 1]),
+        "runtime": fig.add_subplot(grid[2, 2]),
+        "status": fig.add_subplot(grid[2, 3]),
     }
 
     # ------------------------------------------------------------------
-    # Panel 1: the actual convergence certificate.
+    # Panel 1: full-space convergence certificate.
     # ------------------------------------------------------------------
     axis = axes["kkt"]
 
@@ -861,7 +961,24 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 2: what currently dominates the gradient scale?
+    # Panel 2: KKT convergence rate.
+    # ------------------------------------------------------------------
+    axis = axes["kkt_progress"]
+
+    axis.axhline(0.0, color="black", linestyle=":", lw=0.8)
+    _plot_finite(axis, iterations, kkt_progress, "Per iteration",
+        lw=0.9, alpha=0.45)
+    _plot_finite(axis, iterations, rolling_kkt_progress,
+        "5-iteration median", lw=1.7)
+
+    axis.set_title("KKT progress rate")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel(r"$\log_{10}(K_{k-1}/K_k)$")
+    _homogenise_ticks(axis)
+    axis.legend(fontsize=8, loc="best")
+
+    # ------------------------------------------------------------------
+    # Panel 3: gradient decomposition.
     # ------------------------------------------------------------------
     axis = axes["gradients"]
 
@@ -881,35 +998,35 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 3: unresolved full-space dual violations.
+    # Panel 4: unresolved dual violations and their severity.
     # ------------------------------------------------------------------
     axis = axes["violators"]
 
     _plot_finite(axis, iterations, n_violators, "Violating columns", lw=1.7)
-    axis.set_title("Unresolved dual violations")
+    axis.set_title("Inactive-set violations")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel("Columns")
+    axis.set_ylabel("Violating columns")
+    axis.set_ylim(bottom=0.0)
     _homogenise_ticks(axis)
 
-    axis_fraction = axis.twinx()
-    _plot_finite(axis_fraction, iterations, 100.0*violator_fraction,
-        "Violating fraction", lw=1.2, linestyle="--")
-    axis_fraction.set_ylabel("Zero/free columns [%]")
-    axis_fraction.set_ylim(bottom=0.0)
-    _homogenise_ticks(axis_fraction)
+    axis_severity = axis.twinx()
+    _plot_finite(axis_severity, iterations, dual_ratio,
+        "Worst violation / tol", positive_log=True, lw=1.3, linestyle="--")
+    axis_severity.axhline(1.0, color="black", linestyle=":", lw=0.9)
+    axis_severity.set_ylabel("Worst dual / tolerance")
+    _homogenise_ticks(axis_severity)
 
     lines1, labels1 = axis.get_legend_handles_labels()
-    lines2, labels2 = axis_fraction.get_legend_handles_labels()
+    lines2, labels2 = axis_severity.get_legend_handles_labels()
     axis.legend(lines1+lines2, labels1+labels2, fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 4: support evolution.
+    # Panel 5: support evolution.
     # ------------------------------------------------------------------
     axis = axes["support"]
 
     _plot_finite(axis, iterations, n_active, "Working support", lw=1.6)
-    _plot_finite(axis, iterations, n_positive, "Positive coefficients",
-        lw=1.4)
+    _plot_finite(axis, iterations, n_positive, "Positive coefficients", lw=1.4)
 
     setup_C = _finite_scalar(setup, "C")
 
@@ -924,47 +1041,89 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     axis.legend(fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 5: do promoted KKT violators survive the exact re-solve?
+    # Panel 6: global working-set efficiency.
+    # ------------------------------------------------------------------
+    axis = axes["efficiency"]
+
+    _plot_finite(axis, iterations, 100.0*support_efficiency,
+        "Positive / working", lw=1.7)
+
+    axis.set_ylim(0.0, 105.0)
+    axis.set_title("Working-set efficiency")
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel("Positive support [%]")
+    _homogenise_ticks(axis)
+    axis.legend(fontsize=8, loc="best")
+
+    # ------------------------------------------------------------------
+    # Panel 7: support transition after each promotion/re-solve.
     # ------------------------------------------------------------------
     axis = axes["promotion"]
 
     _plot_finite(axis, iterations, n_promoted, "Promoted", lw=1.4)
-    _plot_finite(axis, iterations, retained, "Retained after solve", lw=1.6)
-    _plot_finite(axis, iterations, n_dropped, "Returned to zero", lw=1.2)
+    _plot_finite(axis, iterations, n_dropped, "Zero-dropped", lw=1.3)
+    _plot_finite(axis, iterations, support_change, "Net support change", lw=1.6)
 
-    axis.set_title("KKT-promotion outcome")
+    axis.axhline(0.0, color="black", linestyle=":", lw=0.8)
+    axis.set_title("Active-set turnover")
     axis.set_xlabel("Iteration")
     axis.set_ylabel("Columns")
     _homogenise_ticks(axis)
 
-    axis_retention = axis.twinx()
-    _plot_finite(axis_retention, iterations, 100.0*retention_fraction,
-        "Retention", lw=1.1, linestyle="--")
-    axis_retention.set_ylim(0.0, 105.0)
-    axis_retention.set_ylabel("Retention [%]")
-    _homogenise_ticks(axis_retention)
+    axis_survival = axis.twinx()
+    _plot_finite(axis_survival, iterations, 100.0*promotion_survival,
+        "Net gain / promoted", lw=1.1, linestyle="--")
+    axis_survival.set_ylabel("Net gain / promoted [%]")
+    _homogenise_ticks(axis_survival)
 
     lines1, labels1 = axis.get_legend_handles_labels()
-    lines2, labels2 = axis_retention.get_legend_handles_labels()
+    lines2, labels2 = axis_survival.get_legend_handles_labels()
     axis.legend(lines1+lines2, labels1+labels2, fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 6: hard-constraint health and fitted common mass.
+    # Panel 8: primal equality-constraint feasibility.
+    # ------------------------------------------------------------------
+    axis = axes["feasibility"]
+    has_constraint_history = (
+        np.any(np.isfinite(orbit_resid_linf_relative))
+        or np.any(np.isfinite(orbit_resid_l2_relative))
+    )
+
+    if has_constraint_history:
+        _plot_finite(axis, iterations, orbit_resid_linf_relative,
+            r"$\|Cx-d\|_\infty/|\alpha|$", positive_log=True, lw=1.6)
+        _plot_finite(axis, iterations, orbit_resid_l2_relative,
+            r"$\|Cx-d\|_2/|\alpha|$", positive_log=True, lw=1.3)
+
+        axis.set_xlabel("Iteration")
+        axis.set_ylabel("Relative residual")
+        _homogenise_ticks(axis)
+        axis.legend(fontsize=8, loc="best")
+    else:
+        _unavailable(axis,
+            "Per-iteration primal constraint\nresidual not emitted")
+
+    axis.set_title("Hard-constraint feasibility")
+
+    # ------------------------------------------------------------------
+    # Panel 9: common-amplitude and constraint-stationarity stability.
     # ------------------------------------------------------------------
     axis = axes["constraint"]
 
-    _plot_finite(axis, iterations, alpha, r"Common mass $\alpha$", lw=1.6)
-    axis.set_title("Hard-constraint health")
+    _plot_finite(axis, iterations, 1e6*alpha_relative,
+        r"$10^6(\alpha-\alpha_{\rm final})/\alpha_{\rm final}$", lw=1.5)
+
+    axis.axhline(0.0, color="black", linestyle=":", lw=0.8)
+    axis.set_title("Amplitude / stationarity")
     axis.set_xlabel("Iteration")
-    axis.set_ylabel(r"$\alpha$")
+    axis.set_ylabel(r"$\Delta\alpha/\alpha$ [ppm]")
     _homogenise_ticks(axis)
 
     axis_constraint = axis.twinx()
-    _plot_finite(axis_constraint, iterations,
-        np.abs(constraint_dot_lambda),
-        r"$|\mathbf{1}^{T}\lambda|$", positive_log=True, lw=1.3)
-
-    axis_constraint.set_ylabel("Amplitude-KKT residual")
+    _plot_finite(axis_constraint, iterations, constraint_ratio,
+        "Amplitude KKT / tol", positive_log=True, lw=1.3, linestyle="--")
+    axis_constraint.axhline(1.0, color="black", linestyle=":", lw=0.8)
+    axis_constraint.set_ylabel("Stationarity / tolerance")
     _homogenise_ticks(axis_constraint)
 
     lines1, labels1 = axis.get_legend_handles_labels()
@@ -972,14 +1131,56 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     axis.legend(lines1+lines2, labels1+labels2, fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 7: computational health.
+    # Panel 10: objective evolution.
+    # ------------------------------------------------------------------
+    axis = axes["objective"]
+    has_objective_history = (
+        np.any(np.isfinite(total_objective))
+        or np.any(np.isfinite(scientific_objective))
+        or np.any(np.isfinite(data_objective))
+    )
+
+    if has_objective_history:
+        reference = _latest_finite(total_objective)
+
+        if np.isfinite(reference):
+            relative_objective = np.divide(
+                total_objective-reference, max(abs(reference), eps),
+                out=np.full_like(total_objective, np.nan),
+                where=np.isfinite(total_objective))
+            _plot_finite(axis, iterations, relative_objective,
+                r"$(\Phi-\Phi_{\rm final})/|\Phi_{\rm final}|$", lw=1.6)
+
+        axis.axhline(0.0, color="black", linestyle=":", lw=0.8)
+        axis.set_xlabel("Iteration")
+        axis.set_ylabel("Relative objective")
+        _homogenise_ticks(axis)
+
+        axis_progress = axis.twinx()
+        _plot_finite(axis_progress, iterations,
+            rolling_objective_progress, "5-iteration improvement",
+            lw=1.2, linestyle="--")
+        axis_progress.axhline(0.0, color="black", linestyle=":", lw=0.7)
+        axis_progress.set_ylabel("Fractional improvement")
+        _homogenise_ticks(axis_progress)
+
+        lines1, labels1 = axis.get_legend_handles_labels()
+        lines2, labels2 = axis_progress.get_legend_handles_labels()
+        axis.legend(lines1+lines2, labels1+labels2, fontsize=8, loc="best")
+    else:
+        _unavailable(axis,
+            "Per-iteration objective\nhistory not emitted")
+
+    axis.set_title("Objective evolution")
+
+    # ------------------------------------------------------------------
+    # Panel 11: computational health.
     # ------------------------------------------------------------------
     axis = axes["runtime"]
 
     _plot_finite(axis, iterations, iter_time, "Iteration time", lw=1.0,
         alpha=0.55)
-    _plot_finite(axis, iterations, rolling_time, "5-iteration median",
-        lw=1.7)
+    _plot_finite(axis, iterations, rolling_time, "5-iteration median", lw=1.7)
 
     axis.set_title("Runtime health")
     axis.set_xlabel("Iteration")
@@ -997,7 +1198,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     axis.legend(lines1+lines2, labels1+labels2, fontsize=8, loc="best")
 
     # ------------------------------------------------------------------
-    # Panel 8: current solver state.
+    # Panel 12: current solver state.
     # ------------------------------------------------------------------
     axis = axes["status"]
     axis.set_axis_off()
@@ -1008,10 +1209,12 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     latest_violators = _latest_finite(n_violators)
     latest_support = _latest_finite(n_active)
     latest_positive = _latest_finite(n_positive)
+    latest_efficiency = _latest_finite(support_efficiency)
     latest_alpha = _latest_finite(alpha)
     latest_ridge = _latest_finite(ridge)
     latest_time = _latest_finite(elapsed)
-    latest_retention = _latest_finite(retention_fraction)
+    latest_support_change = _latest_finite(support_change)
+    latest_constraint_linf = _latest_finite(orbit_resid_linf_relative)
 
     latest_record = merged[-1]
     best_col = _finite_scalar(latest_record, "best_dual_col")
@@ -1052,13 +1255,21 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         else "Support: n/a",
     ]
 
+    if np.isfinite(latest_efficiency):
+        lines.append(f"Working-set efficiency: "
+            f"{100.0*latest_efficiency:.1f}%")
+
     if np.isfinite(setup_C) and setup_C > 0.0 and np.isfinite(latest_positive):
         lines.append(
             f"Positive / component: {latest_positive/setup_C:.2f}")
 
-    if np.isfinite(latest_retention):
-        lines.append(f"Last promotion retention: "
-            f"{100.0*latest_retention:.1f}%")
+    if np.isfinite(latest_support_change):
+        lines.append(f"Last net support change: "
+            f"{latest_support_change:+.0f}")
+
+    if np.isfinite(latest_constraint_linf):
+        lines.append(f"Constraint Linf / alpha: "
+            f"{latest_constraint_linf:.3e}")
 
     if np.isfinite(best_col) and best_col >= 0.0:
         lines.extend([
@@ -1081,8 +1292,8 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     final_reg = _finite_scalar(
         final_record, "scientific_regularisation_objective")
     final_scientific = _finite_scalar(final_record, "scientific_objective")
-    final_ridge_obj = _finite_scalar(final_record,
-        "numerical_ridge_objective")
+    final_ridge_obj = _finite_scalar(
+        final_record, "numerical_ridge_objective")
     final_total = _finite_scalar(final_record, "total_objective")
     final_orbit_linf = _finite_scalar(final_record, "orbit_resid_linf")
 
@@ -1103,7 +1314,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
             lines.append(f"orbit Linf: {final_orbit_linf:.3e}")
 
     axis.text(0.04, 0.97, "\n".join(lines), transform=axis.transAxes,
-        ha="left", va="top", fontsize=9.5,
+        ha="left", va="top", fontsize=9.0,
         bbox=dict(boxstyle="round", fc="white", alpha=0.90))
 
     axis.set_title("Current solver state")
@@ -1113,9 +1324,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
     # ------------------------------------------------------------------
     setup_P = _finite_scalar(setup, "P")
     setup_reg = _finite_scalar(setup, "regularisation_scale")
-    setup_smooth = _finite_scalar(setup, "effective_smoothness_scale")
     setup_batch = _finite_scalar(setup, "kkt_promote_batch")
-    setup_ridge = _finite_scalar(setup, "numerical_ridge")
 
     title_parts = [
         "CubeFit exact constrained active-set diagnostics",
@@ -1126,8 +1335,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         title_parts.append(f"C={int(setup_C)}, P={int(setup_P)}")
 
     if np.isfinite(setup_reg):
-        title_parts.append(
-            rf"$\eta={_fmt_sci(setup_reg)}$")
+        title_parts.append(rf"$\eta={_fmt_sci(setup_reg)}$")
 
     if np.isfinite(setup_batch):
         title_parts.append(f"KKT batch={int(setup_batch)}")
@@ -1154,23 +1362,24 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
         if name == "status":
             continue
 
-        axis.xaxis.set_major_locator(
-            mticker.MaxNLocator(nbins=5, integer=True))
-        axis.xaxis.set_major_formatter(
-            mticker.FuncFormatter(_fmt_compact))
-        axis.tick_params(axis="x", which="major", labelsize=9)
-        axis.xaxis.labelpad = 2
-        axis.yaxis.labelpad = 2
+        if axis.get_xticks().size:
+            axis.xaxis.set_major_locator(
+                mticker.MaxNLocator(nbins=5, integer=True))
+            axis.xaxis.set_major_formatter(
+                mticker.FuncFormatter(_fmt_compact))
+            axis.tick_params(axis="x", which="major", labelsize=9)
+            axis.xaxis.labelpad = 2
+            axis.yaxis.labelpad = 2
 
-    # Also format the secondary y axes created by twinx().
+    # Also format secondary y axes created by twinx().
     for axis in fig.axes:
         if axis not in axes.values():
             axis.tick_params(axis="y", which="major", labelsize=8)
             axis.yaxis.labelpad = 2
 
     fig.suptitle(" | ".join(title_parts), fontsize=11, y=0.995)
-    fig.subplots_adjust(left=0.055, right=0.955, bottom=0.075, top=0.925,
-        hspace=0.30, wspace=0.38)
+    fig.subplots_adjust(left=0.05, right=0.96, bottom=0.055, top=0.94,
+        hspace=0.38, wspace=0.42)
 
     if save_path:
         fig.savefig(save_path, dpi=175, bbox_inches="tight",
@@ -1187,9 +1396,9 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
 
 def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
     oDict, otypes, rM, lZMSign, lXMSign, lLMSign, save_path=None,
-    cmap="inferno", bin_threshold=20, n_circ_bins=15, render_n_age=120,
-    render_n_metal=80, sigma_age=0.45, sigma_metal=0.35,
-    density_floor=5e-5):
+    cmap="inferno", bin_threshold=20, n_circ_bins=15, render_n_age=180,
+    render_n_metal=120, smoothing_age=0.4, smoothing_metal=0.20,
+    density_floor=1e-6):
     """
     Plot the complete fitted component-by-population CubeFit solution.
 
@@ -1253,10 +1462,12 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
         Horizontal resolution of each age-metallicity plane.
     render_n_metal : int, optional
         Vertical resolution of each age-metallicity plane.
-    sigma_age : float, optional
-        Gaussian rendering width in Gyr.
-    sigma_metal : float, optional
-        Gaussian rendering width in dex.
+    smoothing_age : float, optional
+        Fraction of the age range to use as the standard deviation for the
+        Gaussian smoothing in the age direction.
+    smoothing_metal : float, optional
+        Fraction of the metallicity range to use as the standard deviation for
+        the Gaussian smoothing in the metallicity direction.
     density_floor : float, optional
         Fraction of each panel's peak rendered density below which pixels are
         made transparent.
@@ -1304,8 +1515,6 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
     n_circ_bins = int(n_circ_bins)
     render_n_age = int(render_n_age)
     render_n_metal = int(render_n_metal)
-    sigma_age = float(sigma_age)
-    sigma_metal = float(sigma_metal)
     density_floor = float(density_floor)
 
     if bin_threshold < 1:
@@ -1314,8 +1523,6 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
         raise ValueError("n_circ_bins must be positive.")
     if render_n_age < 16 or render_n_metal < 16:
         raise ValueError("Rendering dimensions must be at least 16.")
-    if sigma_age <= 0.0 or sigma_metal <= 0.0:
-        raise ValueError("Gaussian rendering widths must be positive.")
     if density_floor < 0.0 or density_floor >= 1.0:
         raise ValueError("density_floor must lie in [0, 1).")
 
@@ -1503,32 +1710,80 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
     family_bounds = display_family_bounds
 
     # ------------------------------------------------------------------
-    # Render every component-alpha pair as an independent continuous
+    # Render each component-alpha plane as a sampling-aware continuous
     # age-metallicity density field.
+    #
+    # Each SSP is smoothed on a scale set by its own physical Voronoi-cell
+    # dimensions. This preserves the original atlas appearance without
+    # imposing a fixed smoothing scale across the non-uniform SSP library.
     # ------------------------------------------------------------------
-    age_min = float(np.min(uages))
-    age_max = float(np.max(uages))
-    metal_min = float(np.min(umetals))
-    metal_max = float(np.max(umetals))
+    def _cell_edges(values):
+        values = np.asarray(values, dtype=np.float64).ravel(order="C")
+
+        if values.size == 1:
+            return np.array([values[0]-0.5, values[0]+0.5],
+                dtype=np.float64)
+
+        edges = np.empty(values.size+1, dtype=np.float64)
+        edges[1:-1] = 0.5*(values[:-1]+values[1:])
+        edges[0] = values[0]-0.5*(values[1]-values[0])
+        edges[-1] = values[-1]+0.5*(values[-1]-values[-2])
+
+        return edges
+
+    smoothing_age = float(smoothing_age)
+    smoothing_metal = float(smoothing_metal)
+
+    if smoothing_age <= 0.0 or smoothing_metal <= 0.0:
+        raise ValueError("SSP smoothing fractions must be positive.")
+
+    age_edges = _cell_edges(uages)
+    metal_edges = _cell_edges(umetals)
+
+    age_min = float(age_edges[0])
+    age_max = float(age_edges[-1])
+    metal_min = float(metal_edges[0])
+    metal_max = float(metal_edges[-1])
     age_width = age_max-age_min
 
-    age_render = np.linspace(age_min, age_max, render_n_age)
-    metal_render = np.linspace(metal_min, metal_max, render_n_metal)
+    age_render = np.linspace(age_min, age_max, render_n_age,
+        dtype=np.float64)
+    metal_render = np.linspace(metal_min, metal_max, render_n_metal,
+        dtype=np.float64)
 
-    age_kernel = np.exp(-0.5*((age_render[:, None]-uages[None, :])
-        / sigma_age)**2)
-    metal_kernel = np.exp(-0.5*((metal_render[:, None]-umetals[None, :])
-        / sigma_metal)**2)
+    age_cell_width = np.diff(age_edges)
+    metal_cell_width = np.diff(metal_edges)
 
-    # Normalise each kernel column to unit integral on the rendered grid.
-    age_norm = np.trapezoid(age_kernel, age_render, axis=0)
-    metal_norm = np.trapezoid(metal_kernel, metal_render, axis=0)
-    age_kernel /= np.maximum(age_norm[None, :], 1e-300)
-    metal_kernel /= np.maximum(metal_norm[None, :], 1e-300)
+    sigma_age = smoothing_age*age_cell_width
+    sigma_metal = smoothing_metal*metal_cell_width
 
-    rendered = np.full(
+    # Each SSP gets its own Gaussian kernel because the physical SSP sampling
+    # is non-uniform. Every kernel is separately normalised to unit integral,
+    # so smoothing changes only the visual distribution, never SSP mass.
+    age_kernel = np.empty((render_n_age, nAges), dtype=np.float64)
+    metal_kernel = np.empty((render_n_metal, nMetals), dtype=np.float64)
+
+    for tt in range(nAges):
+        age_kernel[:, tt] = np.exp(-0.5*((age_render-uages[tt])
+            / sigma_age[tt])**2)
+
+        norm = float(np.trapezoid(age_kernel[:, tt], age_render))
+
+        if norm > 0.0:
+            age_kernel[:, tt] /= norm
+
+    for mm in range(nMetals):
+        metal_kernel[:, mm] = np.exp(-0.5*((metal_render-umetals[mm])
+            / sigma_metal[mm])**2)
+
+        norm = float(np.trapezoid(metal_kernel[:, mm], metal_render))
+
+        if norm > 0.0:
+            metal_kernel[:, mm] /= norm
+
+    rendered_density = np.zeros(
         (display_C, nAlphas, render_n_metal, render_n_age),
-        np.nan, dtype=np.float64)
+        dtype=np.float64)
 
     positive_density = []
 
@@ -1541,8 +1796,8 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
 
             density = metal_kernel @ weights @ age_kernel.T
 
-            # Numerical integration should recover the complete population
-            # fraction carried by this component-alpha panel.
+            # Explicitly restore the exact fitted mass in this component-alpha
+            # plane after finite-grid Gaussian truncation.
             panel_mass = float(np.sum(weights))
             rendered_mass = float(np.trapezoid(
                 np.trapezoid(density, age_render, axis=1),
@@ -1551,30 +1806,48 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
             if rendered_mass > 0.0:
                 density *= panel_mass/rendered_mass
 
-            peak = float(np.max(density))
+            rendered_density[cc, aa] = density
 
-            if peak <= 0.0:
-                continue
+            positive = density[density > 0.0]
 
-            # The floor determines only the visible edge of the blob. Pixels
-            # outside it are genuinely transparent rather than being painted
-            # at the minimum colour.
-            visible = density >= density_floor*peak
-
-            log_density = np.full_like(density, np.nan)
-            log_density[visible] = np.log10(density[visible])
-            rendered[cc, aa] = log_density
-            positive_density.append(density[visible])
+            if positive.size:
+                positive_density.append(positive)
 
     if not positive_density:
         raise RuntimeError("No positive population density available to plot.")
 
+    # Use one global absolute visibility threshold. Do not threshold each panel
+    # relative to its own peak: that can visually suppress substantial mass in
+    # broad, low-density panels.
     positive_density = np.concatenate(positive_density)
-    log_positive = np.log10(positive_density)
+    global_peak = float(np.max(positive_density))
+    visibility_limit = density_floor*global_peak
+
+    rendered = np.full_like(rendered_density, np.nan)
+
+    visible = rendered_density >= visibility_limit
+    rendered[visible] = np.log10(rendered_density[visible])
+
+    visible_density = rendered_density[visible]
+
+    if visible_density.size == 0:
+        raise RuntimeError("Density floor removed all rendered populations.")
+
+    log_positive = np.log10(visible_density)
     sfh_min = float(np.min(log_positive))
     wmin = max(sfh_min, -12.0)
     wmax = float(np.max(log_positive))
 
+    rendered_mass_total = 0.0
+
+    for cc in range(display_C):
+        for aa in range(nAlphas):
+            rendered_mass_total += float(np.trapezoid(
+                np.trapezoid(rendered_density[cc, aa], age_render, axis=1),
+                metal_render))
+
+    print(f"SFH atlas mass conservation: "
+        f"{rendered_mass_total:.16f}")
     print(f"SFH atlas limits: {wmin:.2f} ({sfh_min:.2f}) to {wmax:.2f}")
 
     # ------------------------------------------------------------------
@@ -1607,7 +1880,7 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
             x1 = (aa+1)*age_width
 
             ax_pop.imshow(image, cmap=cmap_obj, norm=norm, origin="lower",
-                interpolation="bilinear", aspect="auto",
+                interpolation="none", aspect="auto",
                 extent=(x0, x1, y1, y0), rasterized=True)
 
     ax_pop.set_facecolor("black")
@@ -1631,10 +1904,11 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
     for aa in range(1, nAlphas):
         ax_pop.axvline(aa*age_width, color="black", lw=1.0)
 
-    age_locator = mticker.MaxNLocator(nbins=5)
-    base_ticks = age_locator.tick_values(age_min, age_max)
-    base_ticks = base_ticks[(base_ticks >= age_min)
-        & (base_ticks <= age_max)]
+    age_locator = mticker.MaxNLocator(nbins=4)
+    base_ticks = age_locator.tick_values(
+        float(np.min(uages)), float(np.max(uages)))
+    base_ticks = base_ticks[(base_ticks >= np.min(uages))
+        & (base_ticks <= np.max(uages))]
 
     age_ticks = []
     age_labels = []
@@ -1644,7 +1918,7 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
         age_labels.extend([f"{age:g}" for age in base_ticks])
 
     ax_pop.set_xticks(age_ticks)
-    ax_pop.set_xticklabels(age_labels)
+    ax_pop.set_xticklabels(age_labels, fontsize=8)
     ax_pop.set_xlabel(r"$t\ [{\rm Gyr}]$")
     ax_pop.set_yticks([])
 
@@ -2216,8 +2490,7 @@ def plot_population_radial_profiles(arSOL, umetals, uages, ualphas, intData,
 
     nFamilies = len(families)
 
-    family_radial_mass = np.zeros(
-        (nFamilies, nRad), dtype=np.float64)
+    family_radial_mass = np.zeros((nFamilies, nRad), dtype=np.float64)
 
     mean_age = np.full(
         (nFamilies, nRad), np.nan, dtype=np.float64)
@@ -2233,12 +2506,9 @@ def plot_population_radial_profiles(arSOL, umetals, uages, ualphas, intData,
     sigma_alpha = np.full(
         (nFamilies, nRad), np.nan, dtype=np.float64)
 
-    component_properties = (
-        component_age, component_metal, component_alpha)
-    family_means = (
-        mean_age, mean_metal, mean_alpha)
-    family_sigmas = (
-        sigma_age, sigma_metal, sigma_alpha)
+    component_properties = (component_age, component_metal, component_alpha)
+    family_means = (mean_age, mean_metal, mean_alpha)
+    family_sigmas = (sigma_age, sigma_metal, sigma_alpha)
 
     # ------------------------------------------------------------------
     # Intrinsic dynamical-mass weighting.
@@ -2259,20 +2529,16 @@ def plot_population_radial_profiles(arSOL, umetals, uages, ualphas, intData,
         for prop, mean, sigma in zip(
             component_properties, family_means, family_sigmas):
 
-            numerator = np.sum(
-                weights*prop[family, None], axis=0)
+            numerator = np.sum(weights*prop[family, None], axis=0)
 
-            mean[ff] = np.divide(
-                numerator, family_radial_mass[ff],
+            mean[ff] = np.divide(numerator, family_radial_mass[ff],
                 out=np.full(nRad, np.nan, dtype=np.float64),
                 where=family_radial_mass[ff] > 0.0)
 
-            variance = np.sum(
-                weights*(prop[family, None]-mean[ff, None, :])**2,
+            variance = np.sum(weights*(prop[family, None]-mean[ff, None, :])**2,
                 axis=0)
 
-            sigma[ff] = np.sqrt(np.divide(
-                variance, family_radial_mass[ff],
+            sigma[ff] = np.sqrt(np.divide(variance, family_radial_mass[ff],
                 out=np.full(nRad, np.nan, dtype=np.float64),
                 where=family_radial_mass[ff] > 0.0))
 
@@ -2284,8 +2550,7 @@ def plot_population_radial_profiles(arSOL, umetals, uages, ualphas, intData,
         raise RuntimeError("Orbital-family radial binning does not conserve "
             "intrinsic dynamical mass.")
 
-    family_mass_fraction = np.divide(
-        family_radial_mass,
+    family_mass_fraction = np.divide(family_radial_mass,
         np.sum(family_radial_mass, axis=0)[None, :],
         out=np.zeros_like(family_radial_mass),
         where=np.sum(family_radial_mass, axis=0)[None, :] > 0.0)

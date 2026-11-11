@@ -335,13 +335,9 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     w8Str = f"{weighting[0].upper()}W"
     tag = f"_SN{int(SN):02d}_{iso}_{IMF}{slope:.2f}_{w8Str}"
     # Filenames
-    kin = pDir/galaxy/f"kinematics_SN{SN:02d}.xz"
     pfs = pDir/galaxy/f"pixels_SN{SN:02d}.xz"
-    sfs =  pDir/galaxy/f"selection_SN{SN:02d}_{tEnd}.xz"
     vbSpec = pDir/galaxy/f"voronoi_SN{SN:02d}_{tEnd}.xz"
-    mlfn = pDir/galaxy/f"ML{tag}.xz"
     infn = bDir/'infil.xz'
-    gfn = curdir/'obsData'/f"{galaxy}.xz"
 
     INF = cu.Load.lzma(infn)
     PA = INF['angle'][0]
@@ -381,9 +377,7 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         raise RuntimeError(f"No binned spectra.\n{'': <4s}{vbSpec}")
 
     warm_start = kwargs.pop('warm', 'zeros')
-    regularisation_scale = float(kwargs.pop('regularisation_scale', 1.0))
-    if (not np.isfinite(regularisation_scale)) or (regularisation_scale < 0.0):
-        raise ValueError("regularisation_scale must be nonnegative and finite.")
+    runnerKwargs = dict(kwargs.pop('runnerKwargs', {}))
 
 
     with logger.capture_all_output():
@@ -717,12 +711,10 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     ###########################################
     # Multi-processing Batched Streaming NNLS #
     ###########################################
-    x_global, stats = runner.solve_all_mp_batched(x0=x0,
-        # orbit_weights=None, # or None for “free” fit
-        orbit_weights=cWeights,
-        processes=best_processes, blas_threads=best_blas,
-        warm_start=warm_start, regularisation_scale=regularisation_scale,
-        streaming=kwargs.pop('streaming', True))
+    streaming = runnerKwargs.pop('streaming', True)
+    x_global, stats = runner.solve_all_mp_batched(x0=x0, orbit_weights=cWeights,
+        processes=best_processes, blas_threads=best_blas, warm_start=warm_start,
+        streaming=streaming, **runnerKwargs)
 
     xPath = hdf5Dir/hdf5Path.name.replace('hypercube', 'x')
     logger.log("[Pipeline] Writing final /X_global to ...")

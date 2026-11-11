@@ -1,0 +1,636 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[margin=20mm,headheight=14pt]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,longtable,tabularx,array}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{framed}
+\usepackage{needspace}
+
+\definecolor{navy}{HTML}{17365D}
+\definecolor{blue}{HTML}{2F5597}
+\definecolor{lightblue}{HTML}{EAF1F8}
+\definecolor{lightgray}{HTML}{F3F4F6}
+\definecolor{darkgray}{HTML}{4B5563}
+\definecolor{green}{HTML}{2E6B57}
+\definecolor{red}{HTML}{9B2C2C}
+\definecolor{amber}{HTML}{8A5A00}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue,pdftitle={CubeFit Solver Maintenance Handbook}}
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{CubeFit Solver Maintenance Handbook}
+\rhead{Snapshot: 6 Nov 2026}
+\cfoot{\thepage}
+\titleformat{\section}{\Large\bfseries\color{navy}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\bfseries\color{blue}}{\thesubsection}{0.7em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries\color{green}}{\thesubsubsection}{0.7em}{}
+\setlist[itemize]{leftmargin=1.5em,itemsep=2pt,topsep=3pt}
+\setlist[enumerate]{leftmargin=1.7em,itemsep=2pt,topsep=3pt}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\file}[1]{\texttt{#1}}
+\newcommand{\risk}[1]{\textcolor{red}{\textbf{#1}}}
+\newcommand{\safe}[1]{\textcolor{green}{\textbf{#1}}}
+\newcommand{\warn}[1]{\textcolor{amber}{\textbf{#1}}}
+\newenvironment{maintnote}{\begin{leftbar}\small\color{darkgray}}{\end{leftbar}}
+\newenvironment{notebox}{\begin{leftbar}\small\color{navy}}{\end{leftbar}}
+\lstdefinestyle{py}{language=Python,basicstyle=\ttfamily\footnotesize,keywordstyle=\color{blue}\bfseries,commentstyle=\color{green},stringstyle=\color{red},showstringspaces=false,breaklines=true,frame=single,rulecolor=\color{lightgray},backgroundcolor=\color{lightgray},columns=fullflexible,keepspaces=true,mathescape=true}
+\lstset{style=py}
+
+\begin{document}
+\begin{titlepage}
+\centering
+\vspace*{25mm}
+{\Huge\bfseries\color{navy} CubeFit Solver Maintenance Handbook\par}
+\vspace{6mm}
+{\Large Offline guide to the streamed active-set NNLS and literal monolithic reference solver\par}
+\vspace{14mm}
+{\large Based on the 6 November 2026 code snapshot\par}
+\vfill
+\begin{minipage}{0.84\textwidth}
+\colorbox{lightblue}{\parbox{0.94\linewidth}{\vspace{3mm}\textbf{Purpose.} This is a maintenance manual for changing the solver without having to rediscover its mathematical contract. It maps code segments to equations, state transitions, performance costs, invariants, diagnostics, and downstream consequences. It is intentionally explicit about what may be changed locally and what has system-wide effects.\vspace{3mm}}}
+\end{minipage}
+\vfill
+{\small Primary sources: \file{kz\_fitSpec.py}, \file{pipeline\_runner.py}, \file{streaming\_nnls\_constrained.py}.\par}
+{\small Line numbers in this handbook refer to the 2026-11-06 uploaded snapshots and will drift after edits.\par}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+\section{How to use this handbook}
+\begin{notebox}
+\textbf{Status convention.} This handbook distinguishes the current code from proposed maintenance work. Function names, diagnostics, environment variables, cache behavior, and solver branches described as existing have been checked against the solver snapshot used for this handbook. Suggested checks are manual procedures unless explicitly identified as implemented code.
+\end{notebox}
+
+The solver is easiest to maintain if every proposed edit is classified before code is changed. There are six classes:
+\begin{enumerate}
+\item \textbf{Scientific objective}: changes what solution is preferred (SSP smoothness, minimum-$L_2$ redistribution).
+\item \textbf{Feasibility constraints}: changes what solutions are allowed (non-negativity, known-zero columns, equal component mass).
+\item \textbf{Search/active-set policy}: changes how the optimizer discovers the solution without changing the intended objective.
+\item \textbf{Numerical stabilization}: changes conditioning or tolerances and can accidentally become scientific regularization if made too large.
+\item \textbf{I/O and parallelism}: should not change the mathematical answer except at floating-point reduction order.
+\item \textbf{Diagnostics/reporting}: should never mutate solver state.
+\end{enumerate}
+
+\begin{maintnote}
+\textbf{Maintenance rule:} write down which class an edit belongs to. If it belongs to more than one, treat it as a scientific change and rerun the full validation suite. Never tune a performance problem by silently changing the objective or KKT tolerances.
+\end{maintnote}
+
+\section{The two solver paths are different programs}
+\subsection{Dispatch path}
+The top-level call in \file{kz\_fitSpec.py} passes \code{streaming=kwargs.pop('streaming', True)} to \code{PipelineRunner.solve\_all\_mp\_batched}. In the current snapshot this is around lines 713--723. The runner then branches (around lines 481--492):
+\begin{lstlisting}
+if streaming:
+    x_solver, stats = solve_streaming_nnls(...)
+else:
+    x_solver, stats = monolithicNNLS(...)
+\end{lstlisting}
+
+\subsection{Production path: \code{streaming=True}}
+This is the scalable production algorithm:
+\[
+\boxed{\text{build global products} \rightarrow \text{scaled streamed active-set solve} \rightarrow \text{optional minimum-}L_2}
+\]
+It uses column-energy scaling, reduced Gram matrices, exact full-space KKT gradients, hard orbit constraints, checkpoint/resume, scientific SSP regularization when requested, and optional minimum-$L_2$ redistribution at zero scientific regularization.
+
+\subsection{Reference path: \code{streaming=False}}
+\code{monolithicNNLS} (starting around line 4193) materializes literal $A$ and $y$ and solves the raw physical-space problem. Its docstring explicitly states that it uses no scientific regularization, column scaling, streamed normal equations, support heuristics, or reduced active-set machinery. \code{regularisation\_scale} is accepted for API compatibility and deleted/ignored.
+
+For unconstrained orbit fits it calls SciPy NNLS. With orbit constraints it forms $A^{\mathsf T}A$ and $A^{\mathsf T}y$ once and solves a convex QP with OSQP:
+\[
+\min_{x\ge 0}\;\frac{1}{2}x^{\mathsf T}A^{\mathsf T}Ax-(A^{\mathsf T}y)^{\mathsf T}x,
+\]
+subject to equal total coefficient mass among participating components.
+
+\begin{maintnote}
+\textbf{Critical diagnostic use:} if a feature appears in both \code{streaming=True} and \code{streaming=False} results, it cannot be blamed on the production active-set machinery, minimum-$L_2$, column scaling, or scientific regularization in the streamed solver. The reference path is deliberately independent.
+\end{maintnote}
+
+\section{Mathematical contract of the production solver}
+\subsection{Variables and scaling}
+Let $A$ be the physical HyperCube design matrix after wavelength masking, $y$ the observed data, and $x\ge0$ the physical SSP coefficients. The production solver uses a diagonal column scaling
+\[
+S_j = \frac{1}{\sqrt{A_j^{\mathsf T}A_j}}, \qquad x = Sz.
+\]
+The scaled data columns therefore have approximately unit energy. The cached build products are
+\[
+A^{\mathsf T}y, \qquad D_j=A_j^{\mathsf T}A_j, \qquad S_j=D_j^{-1/2}.
+\]
+The scaled linear term is
+\[
+b_z = S(A^{\mathsf T}y).
+\]
+
+\subsection{Data objective}
+In $z$ space the data quadratic is
+\[
+\phi_{\rm data}(z)=\frac{1}{2}z^{\mathsf T}(SA^{\mathsf T}AS)z-(SA^{\mathsf T}y)^{\mathsf T}z.
+\]
+The physical residual objective used for reporting is
+\[
+\phi_{\rm RSS}=\frac{1}{2}\lVert Ax-y\rVert_2^2=\phi_{\rm data}+\frac{1}{2}y^{\mathsf T}y.
+\]
+
+\subsection{Scientific SSP smoothness}
+The current regularizer is a template-coordinate-aware ND second-difference curvature operator over the SSP grid ordered as
+\[
+(\mathrm{metallicity},\mathrm{age},\alpha),
+\]
+flattened in C order. \code{\_ssp\_smoothness\_hessian} starts around line 1186.
+
+For each axis it uses physical SSP coordinate spacing, interior second-difference stencils, and a zero-normal-gradient (Neumann) boundary closure. The penalty for one component is
+\[
+\phi_{\rm smooth}(x_c)=\frac{1}{2}s_{\rm smooth}x_c^{\mathsf T}Q_{\rm SSP}x_c.
+\]
+The uniform population field is an exact null mode. Linear fields are not null because the finite-library boundary derivative is penalized.
+
+The user parameter \code{regularisation\_scale} is normalized by the median positive diagonal curvature in solver $z$ space so that it is dimensionless relative to unit-energy data columns.
+
+\subsection{Numerical ridge}
+A fixed ridge of $10^{-12}$ is retained for numerical conditioning. It is not the scientific regularizer. Its objective is
+\[
+\phi_{\rm ridge}=\frac12\lambda_{\rm num}\lVert z\rVert_2^2.
+\]
+Do not increase it casually: once it becomes non-negligible relative to data curvature it becomes a scientific prior in practice.
+
+\subsection{Hard orbit constraint}
+When \code{orbit\_weights} is supplied, positive entries select participating dynamical components. Their relative amplitudes are already encoded in the HyperCube. The solver therefore enforces equal total physical coefficient mass:
+\[
+\sum_{p=1}^{P}x_{c,p}=\alpha \quad \text{for every participating component }c,
+\]
+with one fitted global amplitude $\alpha\ge0$. Since $x=Sz$, the reduced constraint is
+\[
+\sum_{j\in c}S_jz_j=\alpha.
+\]
+The constrained reduced solve is implemented by \code{\_orbit\_hard\_constraint\_solve} (around line 1641), using null-space elimination through \code{\_solve\_equal\_mass\_nullspace} (around line 1462).
+
+\section{End-to-end production flow}
+\begin{longtable}{p{0.06\textwidth}p{0.25\textwidth}p{0.57\textwidth}}
+\toprule
+\textbf{Step} & \textbf{Code region} & \textbf{What it does}\\
+\midrule\endhead
+1 & \code{kz\_fitSpec.genCubeFit} & Constructs/opens the HyperCube, resolves parallelism, chooses warm start, passes orbit weights, regularization scale, and streaming switch.\\
+2 & \code{PipelineRunner.solve\_all\_mp\_batched} & Resolves \code{x0}/saved-x/resume semantics; constructs \code{MPConfig}; dispatches production or reference solver.\\
+3 & \code{solve\_streaming\_nnls} metadata & Reads $S,L,C,P$, mask, HDF5 chunk-derived spatial tile size, known-zero mask, and cache signature.\\
+4 & build/cache & Loads or constructs $A^{\mathsf T}y$, $D=\operatorname{diag}(A^{\mathsf T}A)$, and $S=D^{-1/2}$. The current uncached build is parallel and chunk-streamed.\\
+5 & executor & Creates a persistent spawn-based process pool for reduced Gram and full-gradient workers.\\
+6 & \code{streamActiveSetNNLS} setup & Builds SSP smoothness Hessian, validates resume metadata, initializes hard constraints, tolerances, and state.\\
+7 & initialization/resume & Establishes a feasible active support and constrained state, or restores a complete checkpoint.\\
+8 & outer KKT loop & Computes exact full-space gradient $SA^{\mathsf T}ASz-b_z$, adds scientific/ridge/constraint terms, checks KKT conditions, promotes violating columns, and re-solves the reduced constrained problem.\\
+9 & convergence & Stops when positive-active stationarity and zero/inactive dual feasibility are satisfied within tolerance.\\
+10 & optional minimum-$L_2$ & Only when scientific regularization is exactly zero and the option is enabled; expands support and finds a lower-$\lVert x\rVert_2$ solution inside an RSS tolerance.\\
+11 & final diagnostics & Reports residual/RMSE, curvature, smoothness ratio, orbit constraint residuals, support size, and minimum-$L_2$ status.\\
+12 & persistence & Runner writes authoritative $X_{\rm global}$; tracker checkpoints permit full resume.\\
+\bottomrule
+\end{longtable}
+
+\section{Global build: what is cached and why}
+\subsection{Current uncached build}
+\code{solve\_streaming\_nnls} starts around line 4523. On a cache miss it partitions spatial tiles over workers and calls \code{\_worker\_build\_products}. Each worker streams physical HDF5 $(C,P)$ chunks and accumulates
+\[
+(A^{\mathsf T}y)_{c,p}=\sum_{s=1}^{S}\sum_{\ell=1}^{L}A_{s,c,p,\ell}y_{s,\ell},
+\qquad
+D_{c,p}=\sum_{s=1}^{S}\sum_{\ell=1}^{L}A_{s,c,p,\ell}^2.
+\]
+The parent reduces partial arrays. This stage is mathematically embarrassingly parallel; only floating-point summation order changes with worker count.
+
+\subsection{Cache contract}
+The sidecar \code{.bcfused.npz} currently stores at least \code{ATy\_flat}, \code{D\_tot}, \code{inv\_sqrt\_energy\_flat}, the known-zero mask, mask indices, dimensions, tile size, and mask mode. A cache hit is valid only when the geometry/mask signature matches.
+
+\subsection{Safe and unsafe modifications}
+\begin{itemize}
+\item \safe{Safe}: change batching, worker count, chunk traversal, float32 read buffers, progress reporting, executor lifetime.
+\item \warn{Requires numerical comparison}: change accumulation order, BLAS implementation, or accumulation dtype.
+\item \risk{Scientific/mathematical change}: floor/cap $D$, alter $S$, normalize by anything other than exact column energy, or compute $A^{\mathsf T}y$ in a differently weighted data space.
+\end{itemize}
+
+\section{Reduced normal equations}
+\code{\_assemble\_reduced(active\_idx)} (around line 2775) constructs only the active Gram matrix
+\[
+G_{\mathcal A}=(AS)_{\mathcal A}^{\mathsf T}(AS)_{\mathcal A}
+\]
+by distributing spatial tile batches to \code{\_worker\_reduced}. The reduced linear term is deliberately sliced from the canonical global vector:
+\[
+b_{\mathcal A}=(SA^{\mathsf T}y)_{\mathcal A}.
+\]
+This is an important invariant: the reduced solve and outer KKT gradient must optimize the same objective.
+
+\begin{maintnote}
+If you ever recompute reduced $A^{\mathsf T}y$ independently, compare it against \code{ATy\_scaled[active\_idx]}. A mismatch means the reduced optimizer and the full-space KKT test are solving different problems; convergence diagnostics then become meaningless.
+\end{maintnote}
+
+\section{The constrained reduced solver}
+\subsection{Hessian composition}
+For an active support, the effective Hessian is conceptually
+\[
+H = G_{\mathcal A}+H_{\rm scientific}+\lambda_{\rm num}I+H_{\rm secondary},
+\]
+where \code{H\_secondary} is normally zero and is used by the post-convergence minimum-$L_2$ stage.
+
+\subsection{Equality constraints}
+The hard orbit solver builds one equality per participating component, with the fitted common mass $\alpha$. It solves equality constraints by null-space elimination rather than an indefinite saddle-point KKT matrix. The reduced null-space Hessian is solved by Cholesky where possible and symmetric eigendecomposition when necessary.
+
+\subsection{Non-negativity}
+The hard-constraint routine has an inner active/fixed-zero process. Negative coefficients are removed subject to preserving at least one free variable per constrained component. Dual feasibility is then checked so variables fixed at zero can re-enter when required by KKT conditions.
+
+\subsection{What to change for what outcome}
+\begin{longtable}{p{0.27\textwidth}p{0.28\textwidth}p{0.35\textwidth}}
+\toprule
+\textbf{Desired outcome} & \textbf{Primary segment} & \textbf{Likely consequences}\\
+\midrule\endhead
+More robust equality solve & \code{\_solve\_equal\_mass\_nullspace} & Changes numerical linear algebra only if objective/constraints remain identical; validate equality and stationarity residuals.\\
+Different orbit prior & \code{\_orbit\_hard\_constraint\_solve} and caller setup & Scientific feasibility change; affects multipliers, KKT reduced gradient, initialization, resume compatibility, and reference solver.\\
+Allow unequal component masses & Constraint matrix/ \code{constraint\_shape} & Major scientific change; must update reference solver and all orbit diagnostics.\\
+Stronger numerical conditioning & \code{numerical\_ridge} & Can bias coefficients toward lower $\lVert z\rVert_2$; treat as scientific if not negligible.\\
+Different SSP smoothness & \code{\_ssp\_smoothness\_hessian} and normalization & Scientific objective change; affects reduced Hessian, full gradient, objective reporting, resume compatibility.\\
+\bottomrule
+\end{longtable}
+
+\section{Exact full-space gradient and KKT convergence}
+\subsection{Why \code{ATAz} exists}
+The solver cannot store the complete production Gram matrix cheaply. Instead \code{\_compute\_ATAz\_scaled(z)} calls \code{\_worker\_ATAz} to compute the exact full-space quantity
+\[
+SA^{\mathsf T}ASz.
+\]
+Each worker performs a forward pass $v=A(Sz)$ and a transpose pass $A^{\mathsf T}v$ over its spatial tiles. This is one of the dominant production costs because it streams the HyperCube twice for each new accepted $z$.
+
+\subsection{Gradient composition}
+The full reduced/KKT gradient combines:
+\[
+g_{\rm data}=SA^{\mathsf T}ASz-SA^{\mathsf T}y,
+\]
+plus the scientific regularization gradient, numerical ridge gradient, and the orbit-multiplier contribution for constrained fits.
+
+\subsection{KKT meaning}
+For non-negative variables, the intended convergence conditions are:
+\begin{itemize}
+\item positive active coefficients: stationarity, $g_j\approx0$ after equality-multiplier correction;
+\item zero/inactive coefficients: dual feasibility, $g_j\ge0$ (again in the constrained reduced-gradient sense);
+\item hard orbit equalities: component-mass residuals within tolerance.
+\end{itemize}
+The current stop reason \code{kkt\_stationary} means those conditions are satisfied within the solver tolerance; it does not mean the solution is unique.
+
+\subsection{Tolerance chain}
+The outer tolerance is scale-aware. Changing \code{tol\_grad}, \code{tol\_grad\_rel}, or the scale reference changes both stopping and which inactive columns count as KKT violators. Therefore a looser tolerance can produce a smaller active set and an earlier stop; a tighter tolerance can trigger more expensive full-gradient/reduced solves.
+
+\begin{maintnote}
+\textbf{Do not tune KKT tolerance to obtain a prettier SFH.} KKT tolerances are numerical optimality criteria, not sparsity or smoothness controls. If the scientific aim is a less sparse solution, use an explicit secondary objective such as minimum-$L_2$ and report its RSS allowance.
+\end{maintnote}
+
+\section{Promotion and active-set growth}
+After an exact gradient is available, the solver constructs eligibility masks that exclude known-zero columns, forbidden orbit components, and already-active columns. Genuine KKT violators are ranked and admitted in a bounded batch (currently up to \code{min(32,C)} in the setup).
+
+The important conceptual separation is:
+\begin{itemize}
+\item \textbf{eligibility}: mathematical KKT violation;
+\item \textbf{ranking}: heuristic choice of which eligible columns to try first;
+\item \textbf{acceptance}: result of re-solving the complete constrained reduced problem.
+\end{itemize}
+Changing ranking should not redefine mathematical eligibility.
+
+\subsection{If you want faster convergence}
+Possible levers, in increasing risk order:
+\begin{enumerate}
+\item improve candidate ranking without changing the KKT-violation filter;
+\item increase promotion batch size moderately, trading fewer full-gradient passes for larger reduced Grams;
+\item improve reduced-Gram caching/reuse;
+\item alter KKT tolerances only if the required numerical accuracy itself is being changed.
+\end{enumerate}
+
+\subsection{If you want a denser final solution}
+Do not simply enlarge the active set and stop. NNLS naturally admits sparse optima. A denser support requires a defined secondary criterion (the current minimum-$L_2$ stage is one such criterion) or a scientific regularizer.
+
+\section{Minimum-L2 redistribution at zero scientific regularization}
+\subsection{When it runs}
+At the start of \code{streamActiveSetNNLS}:
+\begin{lstlisting}
+use_minimum_l2 = (minimum_l2_at_zero and regularisation_scale == 0.0)
+\end{lstlisting}
+It runs only after the primary active-set solver has converged and only if the scientific regularization scale is exactly zero.
+
+\subsection{What it means}
+The primary NNLS solution $x_0$ is first obtained. The support is then expanded intelligently. On that fixed expanded support, the solver searches a secondary $L_2$ strength and selects a solution with lower $\lVert x\rVert_2$ provided
+\[
+\frac{\mathrm{RSS}(x)-\mathrm{RSS}(x_0)}{\mathrm{RSS}(x_0)}\le \texttt{minimum\_l2\_rss\_rtol}.
+\]
+This is a lexicographic idea: preserve the data fit within a declared tolerance, then prefer a lower-$L_2$ solution.
+
+\subsection{Cost model}
+The expensive part is the one-time expanded-support reduced Gram assembly. The geometric and refinement trials reuse that matrix; they do not require repeated full HyperCube \code{ATAz} passes.
+
+\subsection{Maintenance levers}
+\begin{longtable}{p{0.28\textwidth}p{0.26\textwidth}p{0.36\textwidth}}
+\toprule
+\textbf{Parameter/code} & \textbf{Effect} & \textbf{Risk/trickle-on}\\
+\midrule\endhead
+\code{minimum\_l2\_rss\_rtol} & Permits more/less degradation in RSS & Scientific trade-off. Larger values allow stronger redistribution and usually denser/lower-norm solutions.\\
+Support expansion & Determines which currently-zero SSPs can participate & Can dominate the attainable density; also controls reduced Gram cost. Must respect known-zero/orbit feasibility.\\
+Initial trial strength & Starting point for geometric search & Mostly runtime; should not change accepted optimum if bracketing/refinement remains adequate.\\
+Number of trials/refinements & Search resolution/cost & More trials improve boundary localization but increase dense reduced-solve cost, not HyperCube passes.\\
+Secondary Hessian definition & Defines what ``minimum'' means & Major scientific change ($L_2$ vs another secondary norm/prior).\\
+\bottomrule
+\end{longtable}
+
+\section{Initialization, warm starts, and resume}
+\subsection{Runner semantics}
+\code{PipelineRunner.solve\_all\_mp\_batched} distinguishes:
+\begin{itemize}
+\item explicit \code{x0}: use coefficients but fresh solver state;
+\item \code{saved\_x}: newest physical solution, fresh solver state;
+\item \code{resume}: restore matched full checkpoint if available, otherwise fall back to saved $x$;
+\item \code{zeros}: fresh zero state.
+\end{itemize}
+
+\subsection{Full resume compatibility}
+A full checkpoint stores active mask, orbit multipliers, fitted amplitude, numerical ridge, regularization scale/mode, hard-constraint mode, orbit shape, iteration, phase, and stop metadata. The solver refuses full resume when the scientific regularization model, regularization scale, or orbit-constraint mode is incompatible.
+
+\subsection{Maintenance rule}
+If you change the mathematical meaning of any persistent state variable, either:
+\begin{enumerate}
+\item bump the resume compatibility identifier/mode and reject old full resumes; or
+\item write an explicit migration that proves the old state has the same mathematical meaning.
+\end{enumerate}
+Falling back to \code{saved\_x} is safer than pretending an incompatible full state can be resumed.
+
+\section{Known-zero columns}
+\code{\_get\_known\_zero\_mask} marks columns that cannot contribute. They are excluded during initialization, resume cleanup, active-set promotion, and support expansion. If a positive constrained component has all SSPs known-zero, the hard orbit constraint is infeasible and the solver raises.
+
+Any new support-generation logic must end with the equivalent of
+\begin{lstlisting}
+candidate &= ~known_zero_flat
+\end{lstlisting}
+and must also respect zero-weight orbit exclusions.
+
+\section{Performance anatomy}
+\subsection{Dominant operations}
+\begin{longtable}{p{0.27\textwidth}p{0.20\textwidth}p{0.43\textwidth}}
+\toprule
+\textbf{Operation} & \textbf{Scaling} & \textbf{Why it costs}\\
+\midrule\endhead
+Initial build & full HyperCube once & Reads all model columns to form $A^{\mathsf T}y$ and column energies; cacheable.\\
+Exact \code{ATAz} & roughly two full streams per accepted state & Forward $A(Sz)$ plus transpose $A^{\mathsf T}v$; often production bottleneck.\\
+Reduced Gram & $\mathcal{O}(N_{\rm data}k^2)$ compute on $k$ active columns & Cheap for small support; expensive once $k\gtrsim10^3$ in the minimum-$L_2$ expansion.\\
+Null-space constrained solve & dense algebra in active dimension & Usually secondary to HyperCube I/O until support is large.\\
+Checkpoint/reporting & small & Should never dominate unless written excessively.\\
+\bottomrule
+\end{longtable}
+
+\subsection{Performance changes that should preserve science}
+\begin{itemize}
+\item chunk-aware HDF5 reads;
+\item process batching over spatial tiles;
+\item persistent executors;
+\item float32 model read buffers with float64 accumulation;
+\item caching immutable global products;
+\item reusing reduced Gram matrices when the support is unchanged;
+\item avoiding redundant final \code{ATAz} when the exact value for the same $z$ is already cached.
+\end{itemize}
+
+\section{Modification map: where to edit for a desired outcome}
+\begin{longtable}{p{0.25\textwidth}p{0.30\textwidth}p{0.35\textwidth}}
+\toprule
+\textbf{Goal} & \textbf{Edit here} & \textbf{Also audit}\\
+\midrule\endhead
+Change SSP smoothness geometry & \code{\_ssp\_smoothness\_hessian} & smoothness normalization, full gradient, reduced Hessian, objective reporting, resume mode string, manual checks of null modes/boundaries.\\
+Change smoothness strength convention & \code{smooth\_norm}/\code{smooth\_scale} setup & documentation, parameter interpretation, old checkpoint compatibility.\\
+Remove boundary attraction/repulsion & boundary stencils in $Q_{\rm SSP}$ & manual null-mode checks, synthetic boundary solutions, condition number.\\
+Change hard orbit constraint & \code{\_orbit\_hard\_constraint\_solve} and setup & monolithic reference solver, multipliers in KKT gradient, initialization, checkpoint state, orbit diagnostics.\\
+Change convergence strictness & KKT tolerance construction & promotion eligibility, runtime, final support, regression objective values.\\
+Promote more columns per iteration & \code{kkt\_promote\_batch}/ranking & reduced Gram size, memory, number of full \code{ATAz} passes.\\
+Reduce production I/O & workers/build/\code{ATAz}/reduced assembly & manual numerical-equivalence checks; never alter weighting/scaling silently.\\
+Make zero-reg solution less sparse & minimum-$L_2$ support expansion and RSS tolerance & runtime, support size, RSS degradation, interpretation of final solution.\\
+Disable redistribution & pass/implement \code{minimum\_l2\_at\_zero=False} & final solution becomes raw primary NNLS; diagnostics/plots should identify this.\\
+Change warm-start behavior & runner + initialization/resume & feasibility, seed bias diagnostics, checkpoint compatibility.\\
+Change reference solver & \code{monolithicNNLS} & preserve its independence; do not import production heuristics if it is to remain a reference.\\
+\bottomrule
+\end{longtable}
+
+\section{Trickle-on effects: examples}
+\subsection{Example A: loosen KKT tolerance}
+Immediate effect: fewer columns qualify as materially violating and convergence can occur sooner. Secondary effects: fewer reduced solves, fewer full \code{ATAz} passes, smaller support, possibly different degenerate NNLS representative. It does \emph{not} explicitly smooth the SFH. Validation: compare objective/RMSE, KKT ratios, support, orbit residuals, and reference-solver discrepancy.
+
+\subsection{Example B: increase promotion batch}
+Immediate effect: more KKT violators enter each reduced problem. Secondary effects: larger $k\times k$ Gram matrices and denser linear algebra, but potentially fewer expensive full-gradient iterations. Scientific objective is unchanged if eligibility and exact reduced re-solve are unchanged. Validation: converged objective and KKT state should agree within numerical tolerance.
+
+\subsection{Example C: change \texorpdfstring{$Q_{\rm SSP}$}{Q SSP}}
+Immediate effect: different scientific prior. Secondary effects: different reduced Hessians, different full gradients, different promotion order, different final support, different checkpoint compatibility, and different smoothness objective diagnostics. This is not a local plotting-style change; it changes the fit.
+
+\subsection{Example D: increase minimum-\texorpdfstring{$L_2$}{L2} RSS tolerance}
+Immediate effect: allows a larger data-fit degradation to obtain a lower-norm solution. Secondary effects: typically more redistributed mass and larger final active support. It does not alter the raw primary NNLS convergence, only the accepted post-convergence representative.
+
+\section{Manual validation protocol after maintenance}
+\subsection{Tier 0: static invariant checks}
+These are manual checks to perform before expensive fits; they are not names of an existing automated test suite:
+\begin{enumerate}
+\item SSP dimensions satisfy $n_Z n_t n_\alpha=P$.
+\item $Q_{\rm SSP}$ is symmetric and positive semidefinite to numerical tolerance.
+\item $Q_{\rm SSP}\mathbf{1}\approx0$ for the current Neumann design.
+\item known-zero mask size is $CP$ and no forbidden column is active.
+\item cache signature rejects mismatched dimensions/mask.
+\end{enumerate}
+
+\subsection{Tier 1: tiny synthetic/reference comparison}
+Use $C=3$ or another tractable case and compare \code{streaming=True} with \code{streaming=False} at zero scientific regularization and minimum-$L_2$ disabled. Check:
+\begin{itemize}
+\item residual/RMSE agreement;
+\item hard component-mass equality;
+\item non-negativity;
+\item KKT stationarity/dual feasibility;
+\item no known-zero coefficients become positive.
+\end{itemize}
+Do not require coefficient-by-coefficient identity in a degenerate NNLS problem; compare objective and feasibility first.
+
+\subsection{Tier 2: representative production-path comparison}
+For a representative $C=20$ case record:
+\begin{itemize}
+\item number of outer iterations and full \code{ATAz} evaluations;
+\item raw/final active support;
+\item RMSE and residual objective;
+\item smoothness objective and ratio (if regularized);
+\item minimum-$L_2$ strength, $\Delta\mathrm{RSS}/\mathrm{RSS}$, and norm reduction (if used);
+\item orbit $L_1/L_\infty$ constraint residuals;
+\item elapsed build, reduced assembly, and total time.
+\end{itemize}
+
+\subsection{Tier 3: production-size smoke run}
+Before committing an algorithmic change to $C=109$, verify cache behavior, worker memory, filesystem contention, checkpoint/resume, and one or two outer iterations. A full production rerun should be the last test, not the first.
+
+\section{Diagnostic interpretation cheat sheet}
+\begin{longtable}{p{0.30\textwidth}p{0.60\textwidth}}
+\toprule
+\textbf{Diagnostic} & \textbf{Interpretation}\\
+\midrule\endhead
+\code{[MONO][smoothness] uniform\_null} & Should be near machine precision for the current operator. Large values indicate a broken curvature Hessian.\\
+\code{active\_stat} & Stationarity error on positive active variables after constrained-gradient correction.\\
+\code{dual} & Worst zero/inactive dual-feasibility violation. Positive violation above tolerance means another column should enter.\\
+\code{tol} & Scale-aware KKT threshold for the current solve.\\
+\code{orbit\_L1/Linf} & Hard equality residuals; should remain tiny relative to component mass.\\
+\code{smooth/residual} & Scientific smoothness objective divided by actual residual objective. Useful for understanding whether regularization is dynamically significant.\\
+\code{minimum-L2 $\Delta\mathrm{RSS}/\mathrm{RSS}$} & Data-fit price paid for lower coefficient norm. Must be below configured tolerance for acceptance.\\
+\code{minimum-L2 norm\_reduction} & How much the coefficient $L_2$ norm was reduced relative to the raw converged solution.\\
+\code{ATAz worker read/forward/transpose} & Separates storage bandwidth from contraction cost in exact full-gradient passes.\\
+\bottomrule
+\end{longtable}
+
+\section{Common failure modes and first checks}
+\subsection{Solution suddenly hugs SSP boundaries}
+Check, in order: scientific regularization scale and $Q$ boundary closure; whether minimum-$L_2$ is active; SSP spectral degeneracy; reference \code{streaming=False} result; known-zero masks; scaling extremes. If the reference solution also hugs boundaries, the production active-set machinery is not the root cause.
+
+\subsection{Solution is unexpectedly smooth at zero regularization}
+First establish the path. On \code{streaming=True}, check whether minimum-$L_2$ was accepted. On \code{streaming=False}, there is no minimum-$L_2$ or scientific regularization; apparent smoothness then comes from the raw constrained least-squares solution or downstream visualization.
+
+\subsection{Converges with implausibly tiny support}
+Inspect KKT tolerance, dual violation, promotion eligibility, max-active limits, known-zero mask, and whether constrained components retain support. Compare objective to reference. Do not infer a bug from sparsity alone: NNLS optima can be sparse.
+
+\subsection{Resume gives undefined or inconsistent diagnostics}
+Check whether the variable is initialization-only (for example seed-population diagnostics). Full-resume paths must either restore such state or explicitly mark the diagnostic unavailable; they must not assume fresh-start variables exist.
+
+\subsection{Runtime explodes}
+Identify the stage first: uncached build, \code{ATAz}, reduced Gram, or minimum-$L_2$ expanded support. Optimize the actual dominant stage rather than changing solver tolerances blindly.
+
+\section{Code ownership map}
+\begin{longtable}{p{0.31\textwidth}p{0.59\textwidth}}
+\toprule
+\textbf{Function} & \textbf{Responsibility}\\
+\midrule\endhead
+\code{genCubeFit} & Workflow inputs, HyperCube construction, orbit weights, warm start, solver dispatch parameters.\\
+\code{PipelineRunner.solve\_all\_mp\_batched} & Warm-start/resume policy, reader/tracker lifecycle, production/reference branch, final persistence.\\
+\code{solve\_streaming\_nnls} & Production orchestration, mask/tiles, cache/build, scaling, executor, checkpoint callback, final summary.\\
+\code{\_worker\_build\_products} & Parallel $A^{\mathsf T}y$ and column-energy accumulation.\\
+\code{streamActiveSetNNLS} & Scientific/numerical objective, active-set state machine, KKT convergence, promotion, minimum-$L_2$, final objective.\\
+\code{\_worker\_reduced} & Chunk-aware reduced Gram accumulation.\\
+\code{\_worker\_ATAz} & Exact full-space $SA^{\mathsf T}ASz$ evaluation.\\
+\code{\_ssp\_smoothness\_hessian} & SSP-grid scientific curvature operator.\\
+\code{\_orbit\_hard\_constraint\_solve} & Reduced nonnegative equal-mass constrained QP.\\
+\code{\_solve\_equal\_mass\_nullspace} & Equality elimination and dense reduced linear algebra.\\
+\code{monolithicNNLS} & Independent literal-$A$ unregularized reference solution.\\
+\bottomrule
+\end{longtable}
+
+\section{Before editing a segment: dependency checklist}
+\subsection{If editing the objective}
+Update all of: reduced Hessian, full-space gradient, objective diagnostics, parameter validation, checkpoint compatibility, and documentation. Decide whether the reference solver should remain raw/unregularized or mirror the new objective; usually it should remain independent.
+
+\subsection{If editing constraints}
+Update all of: initialization feasibility, reduced solver, multiplier recovery, KKT constrained gradient, promotion eligibility, resume state, reference solver constraints, and orbit residual diagnostics.
+
+\subsection{If editing active-set logic}
+Preserve: exact KKT eligibility, known-zero exclusions, at least one support variable per constrained component, rollback after rejected proposals, and authoritative committed state. Validate final objective against the old implementation.
+
+\subsection{If editing parallel I/O}
+Preserve: exact mask, exact data weighting, column order ($C$-major/$P$-minor), float64 accumulation, and reduction shapes. Compare cached products from old/new implementations directly.
+
+\section{Snapshot-specific notes and technical debt}
+\begin{itemize}
+\item The production orchestrator docstring contains legacy ``fused/block-coordinate'' language even though the authoritative solve is the monolithic streamed active-set path. Keep terminology aligned with actual behavior.
+\item The cache filename still uses the legacy \code{.bcfused.npz} name. Renaming is cosmetic but invalidates/requires migration of existing caches.
+\item Diagnostic sample code before the production solve materializes a full first-tile model array in float64. It is diagnostic, not mathematical; it can be disabled or made chunk-aware if startup memory becomes problematic.
+\item Line numbers in this handbook are snapshot-specific. Function names and mathematical contracts are the stable anchors.
+\end{itemize}
+
+\section{One-page decision guide}
+\begin{longtable}{p{0.30\textwidth}p{0.60\textwidth}}
+\toprule
+\textbf{Observation} & \textbf{First action}\\
+\midrule\endhead
+Fit is wrong in both solver paths & Inspect data/HyperCube/orbit constraint/model degeneracy before production active-set logic.\\
+Only production path differs & Inspect scaling, active-set/KKT, scientific regularization, minimum-$L_2$, cache correctness.\\
+Zero-reg production is too sparse & Confirm raw KKT convergence; then tune explicit minimum-$L_2$ policy, not KKT tolerance.\\
+Regularized solution piles on boundaries & Inspect $Q_{\rm SSP}$ boundary closure and strength normalization; compare zero-reg/reference.\\
+Runtime dominated before solver starts & Inspect uncached global build and filesystem concurrency.\\
+Runtime dominated each iteration & Inspect \code{ATAz} worker read/forward/transpose timings.\\
+Runtime dominated after convergence & Inspect minimum-$L_2$ expanded support and reduced Gram dimension.\\
+Resume behaves differently & Compare full-resume state compatibility; test saved-$x$ fresh-state path separately.\\
+Constraint residual grows & Stop: audit reduced hard-constraint solve and state commit before changing tolerances.\\
+Plots look smoother than coefficients & Audit plotting/interpolation; do not modify solver until raw coefficient arrays are compared.\\
+\bottomrule
+\end{longtable}
+
+\section{Appendix A: compact pseudocode}
+\begin{lstlisting}
+# kz_fitSpec
+x_global = runner.solve_all_mp_batched(..., streaming=True)
+
+# solve_streaming_nnls
+read dimensions/mask/chunks
+known_zero = get_known_zero_mask()
+if valid cache:
+    load ATy, D, S
+else:
+    parallel stream HyperCube -> ATy, D
+    $S=D^{-1/2}$
+    cache products
+create persistent executor
+x = streamActiveSetNNLS(...)
+write/report authoritative x
+
+# streamActiveSetNNLS
+build Q_ssp and smooth_scale
+restore checkpoint OR establish feasible constrained initial state
+while iteration < max_iter:
+    ATAz = exact streamed $SA^{\mathsf T}ASz$
+    gradient = data + smoothness + ridge + constraint multipliers
+    if KKT satisfied:
+        converged = True
+        break
+    choose genuine inactive KKT violators
+    assemble reduced Gram on expanded support
+    solve complete constrained reduced NNLS
+    commit only accepted feasible state
+    checkpoint
+
+if converged and regularisation_scale == 0 and minimum_l2_at_zero:
+    expand support intelligently
+    assemble one expanded reduced Gram
+    search secondary $L_2$ strength subject to RSS tolerance
+    commit best acceptable lower-norm state
+
+report residual, RMSE, smoothness, constraints, support, $L_2$ status
+\end{lstlisting}
+
+\section{Appendix B: equations at a glance}
+\begin{align*}
+D_j &= A_j^{\mathsf T}A_j, & S_j&=D_j^{-1/2}, & x&=Sz,\\
+b_z &= SA^{\mathsf T}y, & G&=SA^{\mathsf T}AS,\\
+\phi_{\rm data}(z)&=\tfrac{1}{2}z^{\mathsf T}Gz-b_z^{\mathsf T}z,\\
+\phi_{\rm RSS}(x)&=\tfrac{1}{2}\lVert Ax-y\rVert_2^2,\\
+\phi_{\rm smooth}(x)&=\tfrac{1}{2}s_{\rm smooth}\sum_c x_c^{\mathsf T}Q_{\rm SSP}x_c,\\
+\phi_{\rm ridge}(z)&=\tfrac{1}{2}\lambda_{\rm num}\lVert z\rVert_2^2,\\
+\sum_{p=1}^{P}x_{c,p}&=\alpha \quad (c\text{ participating}),\\
+\Delta_{L_2}&=\frac{\mathrm{RSS}(x_{L_2})-\mathrm{RSS}(x_0)}{\mathrm{RSS}(x_0)}.
+\end{align*}
+
+\section{Appendix C: update log template}
+Copy this block into the handbook source whenever the solver changes:
+\begin{lstlisting}
+Date:
+Code version / commit:
+Changed functions:
+Change class: objective | constraints | search | numerical | I/O | diagnostics
+Reason:
+Mathematical contract before:
+Mathematical contract after:
+Expected downstream effects:
+Tier-0 tests:
+Tier-1 reference comparison:
+$C=20$ regression:
+Production smoke test:
+Known caveats:
+\end{lstlisting}
+
+\vfill
+\begin{center}\small\color{darkgray}
+This handbook describes the 2026-11-06 CubeFit solver snapshot. Treat the equations and invariants as the durable specification; treat line numbers as navigation hints only.
+\end{center}
+\end{document}

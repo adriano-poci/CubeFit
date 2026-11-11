@@ -85,6 +85,8 @@ v1.27:  Added `streaming` keyword to `PipelineRunner.solve_all_mp_batched` to
 v1.28:  Stop persisting `known_zero_mask` in
             `PipelineRunner.solve_all_mp_batched` as it is now derived directly.
             6 October 2026 
+v1.29:  Persist pure-KKT solution in `PipelineRunner.solve_all_mp_batched`. 11
+            November 2026
 """
 
 from __future__ import annotations
@@ -364,10 +366,10 @@ class PipelineRunner:
         blas_threads=12,
         orbit_weights=None,
         x0=None,
-        warm_start="zeros",  # zeros, saved_x, or resume
-        regularisation_scale=1.0,
+        warm_start="zeros",
         tracker_mode="on",
         streaming=True,
+        **solver_kwargs,
     ):
 
         # ---------------- Warm-start ----------------
@@ -478,18 +480,18 @@ class PipelineRunner:
         cfg = MPConfig(processes=int(processes), blas_threads=int(blas_threads),
             apply_mask=bool(reader_apply_mask), verbose=True)
 
+        solver_kwargs.setdefault('monolithic_max_active', 2000)
         try:
             with logger.capture_all_output():
                 if streaming:
                     x_solver, stats = solve_streaming_nnls(self.h5_path, cfg,
-                        orbit_weights=orbit_weights, x0=x0_effective,
-                        resume_state=resume_state_effective, tracker=tracker,
-                        monolithic_max_active=2000,
-                        regularisation_scale=regularisation_scale)
+                        orbit_weights=orbit_weights,
+                        x0=x0_effective, resume_state=resume_state_effective,
+                        tracker=tracker, **solver_kwargs)
                 else:
                     x_solver, stats = monolithicNNLS(self.h5_path, cfg,
                         orbit_weights=orbit_weights, x0=x0_effective,
-                        regularisation_scale=regularisation_scale)
+                        **solver_kwargs)
 
         finally:
             try:
@@ -502,10 +504,16 @@ class PipelineRunner:
                 except Exception:
                     pass
 
+        pure_kkt_x = stats.pop("pure_kkt_x", None)
+        if pure_kkt_x is not None:
+            H5Manager(self.h5_path).write_pure_kkt(pure_kkt_x)
+            vprint("[Pipeline] Wrote /X_global_pure_kkt.")
+
         vprint("[Pipeline] Writing final /X_global to main HDF5...")
         with open_h5(self.h5_path, role="writer") as f_wr:
 
-            assert x_solver.ndim == 2, "Xcp must be (C, P) before writing /X_global"
+            assert x_solver.ndim == 2, \
+                'Xcp must be (C, P) before writing /X_global'
 
             if "/X_global" in f_wr:
                 del f_wr["/X_global"]
@@ -520,7 +528,6 @@ class PipelineRunner:
             "[Pipeline] ===================================================")
         logger.log(f"[Pipeline] Multi-process solve complete:, "
             f"processes={processes}, blas_threads={blas_threads}.")
-        logger.log(f"[Pipeline] Regularisation scale: {regularisation_scale}.")
         logger.log(
             '[Pipeline] ---------------------------------------------------')
         logger.log("[Pipeline] Final elapsed time: "

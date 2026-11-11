@@ -7,22 +7,25 @@ while getopts ":g:" arg; do
 done
 
 curdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QUEUE="planet"
-NodeMem=150
-nCPU=40
+QUEUE="cbass"
+NodeMem=124
+nCPU=20
 
 memPerCPU=$(echo "scale=2; $NodeMem*0.99 / $nCPU" | bc)
-#memPerCPU=$(echo "scale=2; 110.0 / $nCPU" | bc)
-# memPerCPU=10
-printf "Running ${nCPU} cores on ${QUEUE},\n using ${memPerCPU} GB per core.\n\n"
+buildCPU=$(echo $((nCPU<16 ? nCPU : 16)))
+# Should eventually become 8 cores, 2 BLAS
+printf "Running ${nCPU} cores on ${QUEUE},\n using ${memPerCPU} GB per core.\n"
+printf "Building with ${buildCPU} cores.\n"
 
 printf "Running on galaxy ${galax}.\n\n"
-jobidGen=$(addqueue --sbatch --requeue --serial -n "1x2" -q "${QUEUE}" \
-    -m "${memPerCPU}" -c "gen_${galax}" -g "CubeFit${galax}" \
-    -o "${curdir}/log.log" "${curdir}/kz_run.py" -- --galaxy "${galax}" \
-    --run-switch 'gen' | sed -n 's/.*Submitted batch job \([0-9]\+\).*/\1/p')
-printf "Submitted gen job with ID: ${jobidGen}\n"
-jobidFit=$(addqueue --sbatch --requeue --serial --runafter "$jobidGen" \
+# jobidGen=$(addqueue --sbatch --requeue --serial -n "1x${buildCPU}" \
+#     -q "${QUEUE}" -m "${memPerCPU}" -c "gen_${galax}" -g "CubeFit${galax}" \
+#     -o "${curdir}/log.log" "${curdir}/kz_run.py" -- --galaxy "${galax}" \
+#     --run-switch 'gen' --redraw | \
+#     sed -n 's/.*Submitted batch job \([0-9]\+\).*/\1/p')
+# printf "Submitted gen job with ID: ${jobidGen}\n"
+# jobidFit=$(addqueue --sbatch --requeue --serial --runafter "$jobidGen" \
+jobidFit=$(addqueue --sbatch --requeue --serial \
     -n "1x${nCPU}" -q "${QUEUE}" -m "${memPerCPU}" -c "fit_${galax}" \
     -g "CubeFit${galax}" -o "${curdir}/log.log" "${curdir}/kz_run.py" -- \
     --galaxy "${galax}" --run-switch 'fit' | \

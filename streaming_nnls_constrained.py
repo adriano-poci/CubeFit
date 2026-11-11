@@ -220,6 +220,8 @@ v2.9:   Changed `_ssp_smoothness_hessian` from first-difference regularisation
 v2.10:  Added post-convergence minimum-L2 redistribution with targeted support
             expansion for less sparse solutions when `regularisation_scale=0`. 3
             November 2026
+v2.11:  Output the pure-KKT unregularised solution before L2 minimisation. 11
+            November 2026
 """
 
 from __future__ import annotations, print_function
@@ -2092,7 +2094,7 @@ def streamActiveSetNNLS(
     max_iter: int = 5000,
     regularisation_scale: float = 1.0,
     minimum_l2_at_zero: bool = True,
-    minimum_l2_rss_rtol: float = 1e-3,
+    minimum_l2_rss_rtol: float = 1e-4,
     checkpoint_cb=None,
     checkpoint_every: int = 0,
 ):
@@ -3344,12 +3346,51 @@ def streamActiveSetNNLS(
             best_dual_col = -1
             best_dual_value = -np.inf
 
+        # --------------------------------------------------------------
+        # Per-iteration objective and primal-constraint diagnostics.
+        #
+        # ATAz has already been computed for the current committed state,
+        # so all objective terms below are cheap scalar/vector operations.
+        # No additional HyperCube pass is required.
+        # --------------------------------------------------------------
+        data_objective_iter = float(data_objective_current)
+        residual_objective_iter = data_objective_iter + 0.5 * float(yty)
+        scientific_regularisation_objective_iter = _scientific_objective_x(
+            x_current)
+        numerical_ridge_objective_iter = (0.5 * float(ridge_current) * float(np.dot(z, z)))
+        scientific_objective_iter = (data_objective_iter
+            + scientific_regularisation_objective_iter)
+        total_objective_iter = (scientific_objective_iter
+            + numerical_ridge_objective_iter)
+        smooth_to_residual_iter = (scientific_regularisation_objective_iter
+            / max(residual_objective_iter, 1e-300))
 
+        if has_hard_orbit_shape:
+            orbit_mass_iter, orbit_target_iter, orbit_deficit_iter = \
+                _orbit_mass_and_deficit(z, alpha_value=alpha_current)
+            orbit_resid_l1_iter = float(np.sum(np.abs(orbit_deficit_iter)))
+            orbit_resid_l2_iter = float(np.linalg.norm(orbit_deficit_iter))
+            orbit_resid_linf_iter = float(np.max(np.abs(orbit_deficit_iter)))
+            orbit_resid_rel_linf_iter = float(orbit_resid_linf_iter
+                / max(abs(float(alpha_current)), 1.0))
+        else:
+            orbit_mass_iter = np.sum(x_current.reshape(C, P), axis=1)
+            orbit_target_iter = np.zeros((C,), dtype=np.float64)
+            orbit_deficit_iter = orbit_target_iter - orbit_mass_iter
+
+            orbit_resid_l1_iter = None
+            orbit_resid_l2_iter = None
+            orbit_resid_linf_iter = None
+            orbit_resid_rel_linf_iter = None
         if diag_level >= 1 and ((it % diag_stride) == 0):
             _emit_diag({
                 "kind": "kkt",
                 "source": "streamActiveSetNNLS",
                 "iter": int(it + 1),
+
+                # ------------------------------------------------------
+                # KKT convergence.
+                # ------------------------------------------------------
                 "tol": float(tol_here),
                 "positive_tol": float(positive_tol),
                 "n_working_active": int(np.count_nonzero(active)),
@@ -3363,27 +3404,56 @@ def streamActiveSetNNLS(
                     np.max(np.abs(grad_regularisation))),
                 "max_grad_numerical_ridge": float(
                     np.max(np.abs(grad_numerical_ridge))),
-                "max_grad_constraint": float(
-                    np.max(np.abs(constraint_gradient))),
+                "max_grad_constraint": float(np.max(np.abs(
+                    constraint_gradient))),
                 "kkt_violation": float(kkt_violation),
                 "kkt_tol": float(kkt_tol),
                 "active_ok": bool(active_ok),
                 "dual_ok": bool(dual_ok),
                 "support_stationary": bool(support_stationary),
+
+                # ------------------------------------------------------
+                # Worst inactive KKT violation.
+                # ------------------------------------------------------
                 "best_dual_col": int(best_dual_col),
                 "best_dual_value": float(best_dual_value),
                 "best_dual_orbit": (int(best_dual_col // P)
                     if best_dual_col >= 0 else -1),
                 "best_dual_population": (int(best_dual_col % P)
                     if best_dual_col >= 0 else -1),
-                "ridge": float(ridge_current),
-                "alpha": (float(alpha_current)
-                    if has_hard_orbit_shape else None),
-                "constraint_dot_lambda": (
-                    float(np.dot(constraint_shape, lambda_orbit_current))
-                    if has_hard_orbit_shape else None),
                 "n_dual_violators": int(dual_violators.size),
                 "kkt_promote_batch": int(kkt_promote_batch),
+
+                # ------------------------------------------------------
+                # Current constrained state.
+                # ------------------------------------------------------
+                "ridge": float(ridge_current),
+                "alpha": (float(alpha_current) if has_hard_orbit_shape
+                    else None),
+                "constraint_dot_lambda": (float(np.dot(constraint_shape,
+                        lambda_orbit_current,))
+                    if has_hard_orbit_shape else None),
+
+                # ------------------------------------------------------
+                # Primal equality-constraint feasibility.
+                # ------------------------------------------------------
+                "orbit_resid_l1": orbit_resid_l1_iter,
+                "orbit_resid_l2": orbit_resid_l2_iter,
+                "orbit_resid_linf": orbit_resid_linf_iter,
+                "orbit_resid_rel_linf": orbit_resid_rel_linf_iter,
+
+                # ------------------------------------------------------
+                # Objective decomposition.
+                # ------------------------------------------------------
+                "data_objective": float(data_objective_iter),
+                "residual_objective": float(residual_objective_iter),
+                "scientific_regularisation_objective": float(
+                    scientific_regularisation_objective_iter),
+                "scientific_objective": float(scientific_objective_iter),
+                "numerical_ridge_objective": float(
+                    numerical_ridge_objective_iter),
+                "total_objective": float(total_objective_iter),
+                "smooth_to_residual": float(smooth_to_residual_iter),
             })
 
         print(f"[MONO][iter {it + 1}] "
@@ -3594,7 +3664,9 @@ def streamActiveSetNNLS(
     except Exception:
         final_it = 0
 
-
+    pure_kkt_x = None
+    if bool(stop_converged):
+        pure_kkt_x = _current_x_from_z(z).copy()
     minimum_l2_gradient_x = None
     if use_minimum_l2 and bool(stop_converged):
         minimum_l2_gradient_x = np.divide(grad_total, S_flat,
@@ -3625,7 +3697,7 @@ def streamActiveSetNNLS(
         # is required by the L2 stage.
         # ------------------------------------------------------------------
         minimum_l2_max_trials = 5
-        minimum_l2_refine = 3
+        minimum_l2_refine = 5
 
         z_raw = np.asarray(z, dtype=np.float64).copy()
         raw_active_idx = np.flatnonzero(active).astype(np.int64)
@@ -4078,6 +4150,7 @@ def streamActiveSetNNLS(
         "converged": bool(stop_converged),
         "iterations": (
             int(stop_iter+1) if stop_iter is not None else None),
+        "pure_kkt_x": pure_kkt_x,
     }
 
     return S_flat*z, final_stats
@@ -4528,11 +4601,10 @@ def solve_streaming_nnls(
     x0: Optional[np.ndarray] = None,
     resume_state: Optional[dict] = None,
     tracker: Optional[object] = None,
-    block_size: Optional[int] = None,
     monolithic_max_active: int = 1000,
-    regularisation_scale: float = 1.0,
     cache_path: str | None = None,
     reuse_cache: bool = True,
+    **active_set_kwargs,
 ):
     """
     Fused single-pass block-coordinate NNLS solver (BLAS-friendly).
@@ -4619,7 +4691,7 @@ def solve_streaming_nnls(
     known_zero_orbit = np.all(known_zero, axis=1)
 
     best_x = x.copy()
-    best_proxy = np.inf
+    best_proxy = np.inf 
 
     if cache_path is None:
         cache_path = f"{h5_path}.bcfused.npz"
@@ -4900,21 +4972,28 @@ def solve_streaming_nnls(
         # `streamActiveSetNNLS` handles active-set management, block-wise
         # reduced Hessian solves, and orbit-mass constraints.
         # ----------------------------------------------------------------------
+        active_set_kwargs.setdefault('max_active', monolithic_max_active)
+        active_set_kwargs.setdefault('tol_grad', 1e-8,)
+        active_set_kwargs.setdefault('max_iter', 5 * monolithic_max_active,)
+        active_set_kwargs.setdefault('regularisation_scale', 1.0)
+
         x_flat_unscaled, mono_stats = streamActiveSetNNLS(h5_path=h5_path,
             s_ranges=s_ranges, keep_idx=keep_idx, ATy_flat=ATy_flat,
             inv_sqrt_energy_flat=inv_sqrt_energy_flat, C=C, P=P,
             executor=executor, cfg=cfg, orbit_weights=orbit_weights,
             known_zero_mask=known_zero, x0_flat=x.ravel(order="C"),
-            resume_state=resume_state, max_active=monolithic_max_active,
-            tol_grad=1e-8, max_iter=5 * monolithic_max_active,
-            regularisation_scale=regularisation_scale,
-            checkpoint_cb=_checkpoint_cb, checkpoint_every=checkpoint_every)
+            resume_state=resume_state,
+            checkpoint_cb=_checkpoint_cb, checkpoint_every=checkpoint_every,
+            **active_set_kwargs)
 
         x = x_flat_unscaled.reshape(C, P).copy()
         print("[MONO] finished streaming active-set NNLS", flush=True)
 
         best_x = x.copy()
         best_proxy = np.inf
+        pure_kkt_x = mono_stats.pop("pure_kkt_x", None)
+        if pure_kkt_x is not None:
+            pure_kkt_x = np.asarray(pure_kkt_x, dtype=np.float64).reshape(C, P)
 
     finally:
         try:
@@ -5103,8 +5182,8 @@ def solve_streaming_nnls(
     stats = dict(
         elapsed_sec=elapsed,
         rmse_proxy_best=float(best_proxy),
-        regularisation_scale=float(regularisation_scale),
         known_zero_mask=known_zero.copy(),
+        pure_kkt_x=pure_kkt_x
     )
 
     return best_x, stats

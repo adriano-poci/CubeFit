@@ -37,6 +37,8 @@ v1.7:   Added `ssp_*` properties to persist SSP library metadata in the HDF5
             file in `populate_from_arrays`. 5 October 2026
 v1.8:   Added defensive removal of stale `/HyperCube` data on detection of
             incompatible array dimensions. 6 October 2026 
+v1.9:   Added `write_pure_kkt` to `H5Manager` to persist the unregularised KKT
+            solution before L2 minimisation. 11 November 2026
 
 
 HDF5 manager for CubeFit.
@@ -1550,6 +1552,19 @@ class H5Manager:
 
         # Return basic dims
         return (P, T, L)
+
+    # --------------------------------------------------------------------------
+    def write_pure_kkt(self, x: np.ndarray) -> None:
+        """Persist the converged physical solution before minimum-L2."""
+        x = np.asarray(x, dtype=np.float64)
+        with open_h5(self.base_path, role="writer") as f:
+            if "/X_global_pure_kkt" in f:
+                del f["/X_global_pure_kkt"]
+            ds = f.create_dataset("/X_global_pure_kkt", data=x,
+                compression=self.compression, compression_opts=self.clevel,
+                shuffle=self.shuffle)
+            ds.attrs["layout"] = "C_P"
+            ds.attrs["P"] = x.shape[1]
 
 # --------------------------------------------------------------------------- #
 # Convenience wrappers

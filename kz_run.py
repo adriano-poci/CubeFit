@@ -115,17 +115,17 @@ def main():
 
     if args.ncomp is not None:
         propDict['nCuts'] = args.ncomp
+    if 'gen' in propDict['runSwitch']:
+        propDict['cpu_processes'] = 8
     if propDict['nCuts'] > 50:
         propDict['sspIdx'] = (
             [-1.26, -0.96, -0.66, -0.35, -0.25, 0.06, 0.15, 0.26],
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 12.5, 13.0, 13.5, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6])
-    if 'gen' in propDict['runSwitch']:
-        propDict['cpu_processes'] = 8
-    # propDict['validationPath'] = str(curdir/args.galaxy/
-    #     'hypercube_3_00.h5')
-    # propDict['runTag'] = 'datafit.w.lambda2e-5_stat_SSPoffset'
-    # propDict['validationError'] = 'stat'
+    propDict['validationPath'] = str(curdir/args.galaxy/
+        'hypercube_3_00_SSPoffset.h5')
+    propDict['validationError'] = 'stat'
+    propDict['runTag'] = 'stat.SSPoffset'
     # propDict['streaming'] = False
     # propDict['runTag'] = 'monolithic'
     # propDict['sspIdx'] = [[], [], []]
@@ -133,7 +133,10 @@ def main():
     # propDict['sspIdx'] = ([-1.79, -1.26, -0.6, -0.25, 0.0, 0.15, 0.26],
     #     [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
     #     [0.0, 0.2, 0.4])
-        # propDict['warm'] = 'saved_x'
+    propDict['warm'] = 'resume'
+    propDict['runnerKwargs']['regularisation_scale'] = 0.0
+    propDict['runnerKwargs']['minimum_l2_at_zero'] = True
+    propDict['runnerKwargs']['minimum_l2_rss_rtol'] = 1e-4
     print(propDict)
 
     _configure_solver_environment(args, propDict)
