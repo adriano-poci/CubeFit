@@ -222,6 +222,12 @@ v2.10:  Added post-convergence minimum-L2 redistribution with targeted support
             November 2026
 v2.11:  Output the pure-KKT unregularised solution before L2 minimisation. 11
             November 2026
+v2.12:  Added population tying for poorly observed dynamical components while
+            retaining their original spatial and kinematic model contributions;
+        Solve tied populations in a reduced component space and expand solutions
+            back to the original component layout;
+        Added chunk-aware HyperCube operations for tied population fitting.
+            13 November 2026
 """
 
 from __future__ import annotations, print_function
@@ -316,21 +322,23 @@ def _support_stats_1d(vec: np.ndarray) -> dict:
 
 # ------------------------------------------------------------------------------
 
-def _worker_reduced(
-    h5_path: str,
-    batch: list,
-    keep_idx,
-    active_idx: np.ndarray,
-    S_active: np.ndarray,
-    CP: int,
-    P: int,
-):
+def _worker_reduced(h5_path: str, batch: list, keep_idx,
+    active_idx: np.ndarray, S_active: np.ndarray, CP: int, P: int,
+    component_slot=None, C_physical=None):
     """
-    Compute a partial reduced Gram matrix using storage-chunk-aware reads.
+    Compute a partial tied reduced Gram matrix with chunk-aware HDF5 reads.
 
-    Requested columns are grouped by the physical HDF5 ``(C, P)`` chunk
-    containing them. Each intersected model chunk is read once per spatial
-    tile, and all requested columns are extracted from that in-memory slab.
+    Active solver columns refer to fitted dynamical components. Each fitted
+    column is the sum of the corresponding physical HyperCube columns,
+
+        A_fit[g, p] = sum_c A_phys[c, p],
+
+    for all physical components ``c`` mapped to fitted component ``g``.
+
+    Physical column requests are grouped by their native HDF5 ``(C, P)``
+    chunks. Each required model chunk is therefore read only once per spatial
+    tile, while all physical columns contained in that chunk are accumulated
+    into their appropriate fitted active columns.
 
     Parameters
     ----------
@@ -341,18 +349,22 @@ def _worker_reduced(
     keep_idx : ndarray or None
         Wavelength indices retained by the spectral mask.
     active_idx : ndarray
-        Global active column indices in C-major, P-minor order.
+        Active fitted-column indices in C-major, P-minor order.
     S_active : ndarray
         Column scalings corresponding to ``active_idx``.
     CP : int
-        Total number of model columns.
+        Total number of fitted model columns.
     P : int
-        Number of stellar-population columns per component.
+        Number of SSP populations per fitted component.
+    component_slot : ndarray, optional
+        Fitted-component index associated with each physical component.
+    C_physical : int, optional
+        Number of physical components in the stored HyperCube.
 
     Returns
     -------
     ATA_loc : ndarray
-        Partial reduced Gram matrix.
+        Partial scaled reduced Gram matrix with shape ``(k, k)``.
     ATy_loc : None
         Retained for API compatibility. The canonical global ``ATy_scaled``
         vector is used by the caller.
@@ -360,89 +372,115 @@ def _worker_reduced(
     Raises
     ------
     ValueError
-        If the support indices or scalings are inconsistent.
+        If active indices, scalings, or component mappings are inconsistent.
+    RuntimeError
+        If the stored HyperCube dimensions are inconsistent with the supplied
+        physical component mapping.
 
     Examples
     --------
     Called internally by ``streamActiveSetNNLS``.
     """
-    del CP
-
     active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
     S_active = np.asarray(S_active, dtype=np.float64).ravel(order="C")
-
     k = int(active_idx.size)
 
     if S_active.size != k:
         raise ValueError(f"S_active has size {S_active.size}; expected {k}.")
+    if np.any(active_idx < 0) or np.any(active_idx >= CP):
+        raise ValueError("active_idx contains invalid fitted-column indices.")
+    if CP % P != 0:
+        raise ValueError(f"CP={CP} is inconsistent with P={P}.")
 
-    ATA_loc = np.zeros((k, k), dtype=np.float64)
-
-    cc_arr = active_idx // P
+    C_fit = CP//P
+    gg_arr = active_idx//P
     pp_arr = active_idx % P
+    ATA_loc = np.zeros((k, k), dtype=np.float64)
 
     with open_h5(h5_path, role="reader") as f:
         M = f["/HyperCube/models"]
 
-        if M.chunks is None:
-            C_chunk = 1
-            P_chunk = P
+        if M.ndim != 4:
+            raise RuntimeError(
+                f"Expected four-dimensional HyperCube; received {M.shape}.")
+
+        C_disk = int(M.shape[1])
+        if int(M.shape[2]) != P:
+            raise RuntimeError(
+                f"HyperCube P={M.shape[2]} does not match P={P}.")
+
+        if C_physical is None:
+            C_physical = C_disk
         else:
-            C_chunk = int(M.chunks[1])
-            P_chunk = int(M.chunks[2])
+            C_physical = int(C_physical)
 
-        # Group requested columns by their physical HDF5 C/P chunk.
-        groups = {}
+        if C_physical != C_disk:
+            raise RuntimeError(f"HyperCube C={C_disk} does not match physical "
+                f"C={C_physical}.")
 
-        for jj, (cc, pp) in enumerate(zip(cc_arr, pp_arr)):
-            key = (
-                int(cc // C_chunk),
-                int(pp // P_chunk),
-            )
-            groups.setdefault(key, []).append(jj)
+        if component_slot is None:
+            component_slot = np.arange(C_physical, dtype=np.int64)
+        else:
+            component_slot = np.asarray(component_slot,
+                dtype=np.int64).ravel(order="C")
 
+        if component_slot.size != C_physical:
+            raise ValueError(f"component_slot has size {component_slot.size}; "
+                f"expected {C_physical}.")
+        if np.any(component_slot < 0) or np.any(component_slot >= C_fit):
+            raise ValueError(
+                "component_slot contains invalid fitted-component indices.")
+
+        if M.chunks is None:
+            C_chunk, P_chunk = 1, P
+        else:
+            C_chunk, P_chunk = int(M.chunks[1]), int(M.chunks[2])
+
+        # Map physical column requests onto native HDF5 (C, P) chunks.
+        requests = {}
+        for jj, (gg, pp) in enumerate(zip(gg_arr, pp_arr)):
+            members = np.flatnonzero(component_slot == gg)
+            if members.size == 0:
+                raise RuntimeError(
+                    f"Fitted component {gg} has no physical members.")
+
+            p_chunk_id = int(pp)//P_chunk
+            for cc in members:
+                cc = int(cc)
+                key = (cc//C_chunk, p_chunk_id)
+                requests.setdefault(key, []).append((jj, cc, int(pp)))
+
+        # Read each required physical chunk once per spatial tile.
         for s0, s1 in batch:
-            L_keep = (int(keep_idx.size) if keep_idx is not None
-                else int(M.shape[3]))
-            rows = int(s1 - s0) * L_keep
+            L_keep = int(keep_idx.size) if keep_idx is not None else M.shape[3]
+            A_act = np.zeros(((s1-s0)*L_keep, k), dtype=np.float64)
 
-            A_act = np.empty((rows, k), dtype=np.float64, order="C")
+            for (c_id, p_id), chunk_requests in requests.items():
+                c0, p0 = c_id*C_chunk, p_id*P_chunk
+                c1 = min(c0+C_chunk, C_physical)
+                p1 = min(p0+P_chunk, P)
 
-            for (cblock, pblock), jj_list in groups.items():
-                c0 = cblock * C_chunk
-                c1 = min(c0 + C_chunk, M.shape[1])
-                p0 = pblock * P_chunk
-                p1 = min(p0 + P_chunk, M.shape[2])
-
-                slab = np.asarray(M[s0:s1, c0:c1, p0:p1, :], dtype=np.float32,
-                    order="C")
-
+                slab = np.asarray(M[s0:s1, c0:c1, p0:p1, :],
+                    dtype=np.float32, order="C")
                 if keep_idx is not None:
                     slab = slab[:, :, :, keep_idx]
 
-                for jj in jj_list:
-                    lc = int(cc_arr[jj] - c0)
-                    lp = int(pp_arr[jj] - p0)
-
-                    A_act[:, jj] = S_active[jj] * slab[:, lc, lp, :].reshape(-1)
+                for jj, cc, pp in chunk_requests:
+                    lc, lp = cc-c0, pp-p0
+                    A_act[:, jj] += S_active[jj]*slab[:, lc, lp, :].reshape(-1)
 
                 del slab
 
-            ATA_loc += A_act.T @ A_act
+            ATA_loc += A_act.T@A_act
+            del A_act
+
     return ATA_loc, None
 
 # ------------------------------------------------------------------------------
 
-def _worker_ATAz(
-    h5_path: str,
-    batch: list,
-    keep_idx,
-    z: np.ndarray,
-    CP: int,
-    S_flat: np.ndarray,
-    C: int,
-    P: int,
-):
+def _worker_ATAz(h5_path: str, batch: list, keep_idx, z: np.ndarray, CP: int,
+    S_flat: np.ndarray, C: int, P: int, component_slot=None,
+    C_physical=None):
     """
     Compute the exact quantity A^T A (S z) for a batch of tiles, but with
     much lower peak memory than the original implementation.
@@ -514,49 +552,31 @@ def _worker_ATAz(
         Lk = int(keep_idx.size) if keep_idx is not None else int(M.shape[3])
 
         for s0, s1 in batch:
-            Sblk = s1 - s0
+            Sblk = s1-s0
             v = np.zeros((Sblk, Lk), dtype=np.float64)
 
-            # First pass: v = A @ (S z).
-            for c0 in range(0, C, C_chunk):
-                c1 = min(c0 + C_chunk, C)
-
+            # v = A_group @ z.
+            for cc in range(C_physical):
+                gg = component_slot[cc]
                 for p0 in range(0, P, P_chunk):
-                    p1 = min(p0 + P_chunk, P)
-
-                    t0 = time.perf_counter()
-                    slab = np.asarray(M[s0:s1, c0:c1, p0:p1, :],
-                        dtype=np.float32, order="C")
+                    p1 = min(p0+P_chunk, P)
+                    slab = np.asarray(M[s0:s1, cc, p0:p1, :], dtype=np.float32)
                     if keep_idx is not None:
-                        slab = slab[:, :, :, keep_idx]
-                    t_read += time.perf_counter() - t0
+                        slab = slab[:, :, keep_idx]
+                    v += np.tensordot(slab, z_cp[gg, p0:p1], axes=([1], [0]))
 
-                    t0 = time.perf_counter()
-                    v += np.tensordot(slab, z_cp[c0:c1, p0:p1],
-                        axes=([1, 2], [0, 1]))
-                    t_forward += time.perf_counter() - t0
-                    del slab
-
-            # Second pass: g = A.T @ v.
-            for c0 in range(0, C, C_chunk):
-                c1 = min(c0 + C_chunk, C)
-
+            # A_group.T @ v.
+            partial_cp = partial.reshape(C, P)
+            scale_cp = S_flat.reshape(C, P)
+            for cc in range(C_physical):
+                gg = component_slot[cc]
                 for p0 in range(0, P, P_chunk):
-                    p1 = min(p0 + P_chunk, P)
-
-                    t0 = time.perf_counter()
-                    slab = np.asarray(M[s0:s1, c0:c1, p0:p1, :],
-                        dtype=np.float32, order="C")
+                    p1 = min(p0+P_chunk, P)
+                    slab = np.asarray(M[s0:s1, cc, p0:p1, :], dtype=np.float32)
                     if keep_idx is not None:
-                        slab = slab[:, :, :, keep_idx]
-                    t_read += time.perf_counter() - t0
-
-                    t0 = time.perf_counter()
-                    g_blk = np.tensordot(slab, v, axes=([0, 3], [0, 1]))
-                    t_transpose += time.perf_counter() - t0
-
-                    scale_blk = S_flat.reshape(C, P)[c0:c1, p0:p1]
-                    partial.reshape(C, P)[c0:c1, p0:p1] += scale_blk * g_blk
+                        slab = slab[:, :, keep_idx]
+                    g = np.tensordot(slab, v, axes=([0, 2], [0, 1]))
+                    partial_cp[gg, p0:p1] += scale_cp[gg, p0:p1]*g
 
                     del slab
 
@@ -577,58 +597,135 @@ def _worker_ATAz_from_tuple(args):
 # ------------------------------------------------------------------------------
 
 def _worker_build_products(h5_path: str, batch: list, keep_idx, C: int,
-    P: int):
+    P: int, component_slot=None, C_fit=None):
     """
-    Compute partial A.T@y and column energies for spatial tiles.
+    Compute grouped A.T@y and exact grouped column energies for spatial tiles.
 
-    HyperCube reads follow the physical HDF5 component/population chunks,
-    avoiding materialisation of the complete (Sblk,C,P,L) model tile.
+    The dominant HyperCube pass follows the native physical HDF5 component and
+    population chunks. Physical A.T@y values and column energies are
+    accumulated directly into their fitted component groups.
+
+    For a tied fitted component ``g``, whose physical members are ``c``, the
+    effective model column is
+
+        A_g,p = sum_c A_c,p.
+
+    Linearity means its data product requires no additional model pass,
+
+        A_g,p.T @ y = sum_c A_c,p.T @ y.
+
+    Its column energy additionally requires the physical-component cross
+    terms,
+
+        ||A_g,p||^2
+            = sum_c ||A_c,p||^2
+            + 2*sum_{c<d} A_c,p.T @ A_d,p.
+
+    These cross terms are computed only for non-singleton tied groups by
+    forming one memory-bounded grouped column at a time. The resulting
+    products therefore correspond exactly to the reduced tied design matrix
+    without materializing that matrix.
 
     Parameters
     ----------
     h5_path : str
         HyperCube HDF5 path.
     batch : list
-        Spatial ``(s0,s1)`` tile ranges assigned to this worker.
+        Spatial ``(s0, s1)`` tile ranges assigned to this worker.
     keep_idx : ndarray or None
         Wavelength indices retained by the spectral mask.
     C : int
-        Number of dynamical components.
+        Number of physical dynamical components in the HyperCube.
     P : int
-        Number of SSP populations per component.
+        Number of SSP populations per physical component.
+    component_slot : ndarray, optional
+        Fitted-component index associated with each physical component, with
+        shape ``(C,)``. If None, every physical component is independent.
+    C_fit : int, optional
+        Number of independent fitted components. If None, defaults to ``C``.
 
     Returns
     -------
     ATy_loc : ndarray
-        Partial unscaled A.T@y vector with shape ``(C*P,)``.
+        Partial grouped ``A.T@y`` vector with shape ``(C_fit*P,)``.
     D_loc : ndarray
-        Partial physical column energies with shape ``(C,P)``.
+        Partial exact grouped column energies with shape ``(C_fit, P)``.
     n_tiles : int
-        Number of spatial tiles processed.
+        Number of spatial tiles processed by this worker.
 
     Raises
     ------
     RuntimeError
-        If the HyperCube dimensions are inconsistent with ``C`` or ``P``.
+        If the HyperCube dimensions, component mapping, or fitted component
+        count are inconsistent.
 
     Examples
     --------
-    Called internally by ``solve_streaming_nnls``.
+    Called internally by ``solve_streaming_nnls`` through
+    ``_worker_build_products_from_tuple``.
     """
-    CP = int(C*P)
-    ATy_loc = np.zeros(CP, dtype=np.float64)
-    D_loc = np.zeros((C, P), dtype=np.float64)
+    C = int(C)
+    P = int(P)
+
+    if component_slot is None:
+        component_slot = np.arange(C, dtype=np.int64)
+    else:
+        component_slot = np.asarray(
+            component_slot, dtype=np.int64).ravel(order="C")
+
+    if C_fit is None:
+        C_fit = C
+
+    C_fit = int(C_fit)
+
+    if C <= 0 or P <= 0 or C_fit <= 0:
+        raise RuntimeError(
+            f"Invalid build dimensions: C={C}, P={P}, C_fit={C_fit}.")
+
+    if component_slot.size != C:
+        raise RuntimeError(
+            f"component_slot has size {component_slot.size}; expected {C}.")
+
+    if np.any(component_slot < 0) or np.any(component_slot >= C_fit):
+        raise RuntimeError(
+            "component_slot contains invalid fitted-component indices.")
+
+    # Every fitted component must contain at least one physical component.
+    group_counts = np.bincount(component_slot, minlength=C_fit)
+
+    if group_counts.size != C_fit or np.any(group_counts == 0):
+        missing = np.flatnonzero(group_counts == 0)
+        raise RuntimeError(
+            f"Fitted component groups without physical members: "
+            f"{missing.tolist()}.")
+
+    # Only these groups require the additional cross-term calculation.
+    tied_groups = [np.flatnonzero(component_slot == gg)
+        for gg in np.flatnonzero(group_counts > 1)]
+
+    ATy_loc = np.zeros((C_fit, P), dtype=np.float64)
+    D_loc = np.zeros((C_fit, P), dtype=np.float64)
 
     with open_h5(h5_path, role="reader") as f:
         DC = f["/DataCube"]
         M = f["/HyperCube/models"]
 
+        if M.ndim != 4:
+            raise RuntimeError(
+                f"Expected four-dimensional HyperCube; received {M.shape}.")
+
         if int(M.shape[1]) != C or int(M.shape[2]) != P:
-            raise RuntimeError("HyperCube dimensions are inconsistent with "
+            raise RuntimeError(
+                "HyperCube dimensions are inconsistent with "
                 f"C={C}, P={P}: {M.shape}.")
 
         C_chunk = int(M.chunks[1]) if M.chunks else 1
         P_chunk = int(M.chunks[2]) if M.chunks else P
+
+        # Cross-term construction uses float64 grouped columns. Bound this
+        # independently of the native HDF5 population chunk to keep aggregate
+        # worker memory modest on high-process-count nodes.
+        P_cross = min(P_chunk, 16)
 
         for s0, s1 in batch:
             Y = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
@@ -636,8 +733,16 @@ def _worker_build_products(h5_path: str, batch: list, keep_idx, C: int,
             if keep_idx is not None:
                 Y = Y[:, keep_idx]
 
+            # ----------------------------------------------------------
+            # Main physical pass.
+            #
+            # Preserve native HDF5 C/P chunk access. ATy is linear in the
+            # physical columns, while the diagonal energy contribution is
+            # accumulated before the tied-group cross-term correction below.
+            # ----------------------------------------------------------
             for c0 in range(0, C, C_chunk):
                 c1 = min(c0+C_chunk, C)
+                slots = component_slot[c0:c1]
 
                 for p0 in range(0, P, P_chunk):
                     p1 = min(p0+P_chunk, P)
@@ -648,24 +753,103 @@ def _worker_build_products(h5_path: str, batch: list, keep_idx, C: int,
                     if keep_idx is not None:
                         slab = slab[:, :, :, keep_idx]
 
-                    # Sum over spatial and wavelength dimensions:
-                    #
-                    #     ATy[c,p] = sum_s,l A[s,c,p,l] y[s,l]
-                    #     D[c,p]   = sum_s,l A[s,c,p,l]^2
-                    #
-                    # Accumulate in float64 even though the HyperCube itself
-                    # is read as float32.
-                    ATy_blk = np.einsum("scpl,sl->cp", slab, Y,
-                        dtype=np.float64, optimize=True)
-                    D_blk = np.einsum("scpl,scpl->cp", slab, slab,
+                    aty = np.einsum("scpl,sl->cp", slab, Y,
                         dtype=np.float64, optimize=True)
 
-                    ATy_loc.reshape(C, P)[c0:c1, p0:p1] += ATy_blk
-                    D_loc[c0:c1, p0:p1] += D_blk
+                    energy = np.einsum("scpl,scpl->cp", slab, slab,
+                        dtype=np.float64, optimize=True)
 
-                    del slab
+                    # C_chunk is normally small. np.add.at is important here
+                    # because multiple physical components in the same chunk
+                    # may map onto the same fitted component.
+                    np.add.at(ATy_loc[:, p0:p1], slots, aty)
 
-    return ATy_loc, D_loc, int(len(batch))
+                    np.add.at(D_loc[:, p0:p1], slots, energy)
+
+                    del slab, aty, energy
+
+            # ----------------------------------------------------------
+            # Exact tied-group energy correction.
+            #
+            # The main pass has already accumulated
+            #
+            #     sum_c ||A_c,p||^2.
+            #
+            # For each non-singleton group compute
+            #
+            #     ||sum_c A_c,p||^2 - sum_c ||A_c,p||^2,
+            #
+            # which is exactly the missing pairwise cross-term contribution.
+            # ----------------------------------------------------------
+            for members in tied_groups:
+                gg = int(component_slot[members[0]])
+
+                for p0 in range(0, P, P_cross):
+                    p1 = min(p0+P_cross, P)
+
+                    grouped = np.zeros((s1-s0, p1-p0, Y.shape[1]),
+                        dtype=np.float64)
+
+                    physical_energy = np.zeros(p1-p0, dtype=np.float64)
+
+                    for cc in members:
+                        cc = int(cc)
+
+                        slab = np.asarray(M[s0:s1, cc, p0:p1, :],
+                            dtype=np.float32, order="C")
+
+                        if keep_idx is not None:
+                            grouped += slab[:, :, keep_idx]
+
+                            physical_energy += np.einsum("spl,spl->p",
+                                slab[:, :, keep_idx], slab[:, :, keep_idx],
+                                dtype=np.float64, optimize=True)
+                        else:
+                            grouped += slab
+
+                            physical_energy += np.einsum("spl,spl->p",
+                                slab, slab, dtype=np.float64, optimize=True)
+
+                        del slab
+
+                    grouped_energy = np.einsum("spl,spl->p", grouped,
+                        grouped, dtype=np.float64, optimize=True)
+
+                    correction = grouped_energy-physical_energy
+
+                    # Roundoff can make a mathematically non-negative grouped
+                    # energy correction slightly negative. Do not clip the
+                    # correction itself: negative cross terms are physically
+                    # legitimate. The final grouped energy is checked below.
+                    D_loc[gg, p0:p1] += correction
+
+                    del grouped, physical_energy, grouped_energy, correction
+
+            del Y
+
+    # The effective grouped column energy must itself be non-negative. Allow
+    # only floating-point-scale excursions below zero.
+    energy_scale = max(1.0, float(np.max(np.abs(D_loc))) if D_loc.size else 1.0)
+    negative_tol = 100.0*np.finfo(np.float64).eps*energy_scale
+
+    if np.any(D_loc < -negative_tol):
+        idx = np.argwhere(D_loc < -negative_tol)[0]
+        raise RuntimeError(
+            "Grouped column energy became materially negative at "
+            f"(component={int(idx[0])}, population={int(idx[1])}): "
+            f"{D_loc[tuple(idx)]:.6e}.")
+
+    D_loc[D_loc < 0.0] = 0.0
+
+    if not np.all(np.isfinite(ATy_loc)):
+        raise RuntimeError(
+            "Grouped A.T@y contains non-finite values.")
+
+    if not np.all(np.isfinite(D_loc)):
+        raise RuntimeError(
+            "Grouped column energy contains non-finite values.")
+
+    return ATy_loc.ravel(order="C"), D_loc, int(len(batch))
 
 # ------------------------------------------------------------------------------
 
@@ -2135,6 +2319,8 @@ def streamActiveSetNNLS(
     P: int,
     *,
     executor,
+    component_slot: np.ndarray,
+    C_physical: int,
     cfg: MPConfig,
     orbit_weights: Optional[np.ndarray] = None,
     known_zero_mask: Optional[np.ndarray] = None,
@@ -2181,6 +2367,16 @@ def streamActiveSetNNLS(
         if (not np.isfinite(ref)) or (ref <= 0.0):
             return float(max(1.0, fallback))
         return ref
+
+
+    component_slot = np.asarray(component_slot, dtype=np.int64).ravel(order="C")
+    C_physical = int(C_physical)
+
+    if component_slot.size != C_physical:
+        raise ValueError('component_slot has inconsistent physical dimensions.')
+    if np.any(component_slot < 0) or np.any(component_slot >= C):
+        raise ValueError(
+            "component_slot contains invalid fitted-component indices.")
 
     CP = int(C * P)
     orbit_of_col = (np.arange(CP, dtype=np.int64) // P).astype(np.int64)
@@ -2808,8 +3004,8 @@ def streamActiveSetNNLS(
 
         ATAz = np.zeros((CP,), dtype=np.float64)
 
-        worker_args = [(h5_path, batch, keep_idx, x_cand, CP, S_flat, C, P)
-            for batch in batches if len(batch) > 0]
+        worker_args = [(h5_path, batch, keep_idx, x_cand, CP, S_flat, C, P,
+            component_slot, C_physical) for batch in batches if len(batch) > 0]
         it = executor.map(_worker_ATAz_from_tuple, worker_args)
 
         for r in tqdm(it, total=len(worker_args), desc="[MONO] ATAz tiles",
@@ -2833,8 +3029,7 @@ def streamActiveSetNNLS(
         reduced linear term. This guarantees that the reduced solve and the
         outer KKT gradient optimize exactly the same objective.
         """
-        active_idx = np.asarray(
-            active_idx, dtype=np.int64).ravel(order="C")
+        active_idx = np.asarray(active_idx, dtype=np.int64).ravel(order="C")
 
         k = int(active_idx.size)
         S_active = S_flat[active_idx]
@@ -2847,8 +3042,8 @@ def streamActiveSetNNLS(
         for i, tile in enumerate(s_ranges):
             batches[i % n_workers].append(tile)
 
-        futures = [executor.submit(_worker_reduced, h5_path,
-                batch, keep_idx, active_idx, S_active, CP, P)
+        futures = [executor.submit(_worker_reduced, h5_path, batch, keep_idx,
+                active_idx, S_active, CP, P, component_slot, C_physical)
             for batch in batches if batch]
 
         for future in as_completed(futures):
@@ -4687,24 +4882,47 @@ def solve_streaming_nnls(
     if keep_idx is not None:
         Lk_guess = int(keep_idx.size)
 
-    s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
-    CP = int(C * P)
+    s_ranges = [(s0, min(S, s0+s_tile)) for s0 in range(0, S, s_tile)]
 
+    # Physical HyperCube dimensions and population-tying reduction.
     C_physical = C
+    CP_physical = C_physical*P
     component_donor = _canon_component_donor(component_donor, C_physical)
     anchors = np.flatnonzero(component_donor == np.arange(C_physical))
-    C_fit = anchors.size
+    C_fit = int(anchors.size)
 
     anchor_slot = np.full(C_physical, -1, dtype=np.int64)
-    anchor_slot[anchors] = np.arange(C_fit)
+    anchor_slot[anchors] = np.arange(C_fit, dtype=np.int64)
     component_slot = anchor_slot[component_donor]
+
+    if np.any(component_slot < 0):
+        raise RuntimeError("Invalid component donor reduction.")
 
     print(f"[MONO] population tying: {C_physical} physical -> "
         f"{C_fit} independent components", flush=True)
 
-    # ---------------------------- orbit prior --------------------------
-    orbit_shape_outer = None
-    orbit_shape_outer = _canon_orbit_weights(orbit_weights, C=C, P=P)
+    # Preserve the physical prior for final diagnostics, then reduce the solver.
+    orbit_shape_outer = _canon_orbit_weights(
+        orbit_weights, C=C_physical, P=P)
+
+    if orbit_weights is not None:
+        orbit_weights_physical = np.asarray(
+            orbit_weights, dtype=np.float64).ravel(order="C")
+        if orbit_weights_physical.size == CP_physical:
+            orbit_weights_physical = orbit_weights_physical.reshape(
+                C_physical, P).sum(axis=1)
+        if orbit_weights_physical.size != C_physical:
+            raise ValueError("orbit_weights has incompatible physical dimensions.")
+
+        orbit_weights = np.empty(C_fit, dtype=np.float64)
+        for gg in range(C_fit):
+            orbit_weights[gg] = np.sum(
+                orbit_weights_physical[component_slot == gg])
+
+    # Everything below this point is in reduced solver space unless explicitly
+    # labelled physical.
+    C = C_fit
+    CP = C*P
 
     # ---------------------------- diagnostics --------------------------
     diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
@@ -4726,9 +4944,10 @@ def solve_streaming_nnls(
             "source": "solve_streaming_nnls",
             "S": int(S),
             "L": int(L),
-            "C": int(C),
+            "C_physical": int(C_physical),
+            "C_fit": int(C),
             "P": int(P),
-            "CP": int(CP),
+            "CP_fit": int(CP),
             "keep_idx": int(keep_idx.size) if keep_idx is not None else None,
             "s_tile": int(s_tile),
             "n_ranges": int(len(s_ranges)),
@@ -4741,19 +4960,20 @@ def solve_streaming_nnls(
     )
 
     # ---------------------------- initial x ----------------------------
+    # Public warm starts remain physical (C_physical, P); retain anchor rows.
     if x0 is None:
         x = np.zeros((C, P), dtype=np.float64)
     else:
         x0 = np.asarray(x0, dtype=np.float64).ravel(order="C")
-        if x0.size != CP:
-            raise ValueError("x0 has wrong size")
-        x = x0.reshape(C, P).copy()
+        if x0.size != CP_physical:
+            raise ValueError(f"x0 has size {x0.size}; expected {CP_physical}.")
+        x = x0.reshape(C_physical, P)[anchors].copy()
+
+    if resume_state and C != C_physical:
+        raise ValueError('Full-state resume is incompatible with component '
+            'tying; use warm_start=\'saved_x\' or a fresh solve.')
 
     verbose = getattr(cfg, "verbose", True)
-
-    # ------------------ persistent masks: known_zero & seed masks --------------
-    known_zero = _get_known_zero_mask(h5_path, C, P)
-    known_zero_orbit = np.all(known_zero, axis=1)
 
     best_x = x.copy()
     best_proxy = np.inf 
@@ -4772,8 +4992,11 @@ def solve_streaming_nnls(
             cache_npz = np.load(cache_path, allow_pickle=False)
 
             ok = (int(cache_npz["S"]) == int(S) and int(cache_npz["L"]) == int(L)
-                and int(cache_npz["C"]) == int(C)
+                and int(cache_npz["C_physical"]) == int(C_physical)
+                and int(cache_npz["C_fit"]) == int(C)
                 and int(cache_npz["P"]) == int(P)
+                and np.array_equal(np.asarray(cache_npz["component_donor"],
+                    dtype=np.int64), component_donor)
                 and int(cache_npz["s_tile"]) == int(s_tile)
                 and int(cache_npz["apply_mask"]) == int(bool(cfg.apply_mask))
                 and np.array_equal(np.asarray(
@@ -4828,8 +5051,8 @@ def solve_streaming_nnls(
         for ii, tile in enumerate(s_ranges):
             batches[ii % n_workers].append(tile)
 
-        worker_args = [(h5_path, batch, keep_idx, C, P)
-            for batch in batches if batch]
+        worker_args = [(h5_path, batch, keep_idx, C_physical, P, component_slot,
+            C_fit) for batch in batches if batch]
 
         print(f"[MONO][build] constructing ATy and column energies: "
             f"tiles={len(s_ranges)} workers={len(worker_args)}", flush=True)
@@ -4872,12 +5095,6 @@ def solve_streaming_nnls(
         if np.any(~np.isfinite(col_energy)):
             raise RuntimeError("Column energy contains non-finite values.")
 
-        zero_energy = col_energy <= 0.0
-        if np.any(zero_energy & ~known_zero):
-            bad = np.argwhere(zero_energy & ~known_zero)
-            raise RuntimeError("Found non-positive column energies for columns "
-                f"that are not known-zero. First entries: {bad[:10].tolist()}")
-
         inv_sqrt_energy = np.zeros_like(col_energy, dtype=np.float64)
 
         positive = col_energy > 0.0
@@ -4901,14 +5118,27 @@ def solve_streaming_nnls(
         if cache_path:
             try:
                 np.savez_compressed(cache_path, ATy_flat=ATy_flat,
-                    inv_sqrt_energy_flat=inv_sqrt_energy_flat,
-                    D_tot=D_tot, known_zero=known_zero,
+                    inv_sqrt_energy_flat=inv_sqrt_energy_flat, D_tot=D_tot,
                     keep_idx=keep_idx_sig,
-                    S=int(S), L=int(L), C=int(C), P=int(P),
+                    S=int(S), L=int(L), C_physical=int(C_physical),
+                    C_fit=int(C), P=int(P), component_donor=component_donor,
                     s_tile=int(s_tile), apply_mask=int(bool(cfg.apply_mask)))
                 print(f"[MONO][build] cache saved: {cache_path}", flush=True)
             except Exception as _e:
                 print(f"[MONO][build] cache save failed: {_e}", flush=True)
+
+    # Structural zeros refer to the actual grouped solver columns.
+    known_zero = D_tot <= 0.0
+    known_zero_orbit = np.all(known_zero, axis=1)
+
+    if ATy_flat.size != CP or D_tot.shape != (C, P):
+        raise RuntimeError('Grouped solver products have inconsistent '
+            f"dimensions: ATy={ATy_flat.size}, D={D_tot.shape}, "
+            f"expected CP={CP}, C={C}, P={P}.")
+
+    if inv_sqrt_energy_flat.size != CP:
+        raise RuntimeError('Column scaling has size '
+            f"{inv_sqrt_energy_flat.size}; expected {CP}.")
 
     # DIAGNOSTIC: report S statistics (helps find extreme scalings)
     S_sample = inv_sqrt_energy_flat
@@ -4939,57 +5169,11 @@ def solve_streaming_nnls(
         mp_context=ctx, initializer=_init_worker, initargs=(cfg.blas_threads,))
     # `initargs` must be one-lement tuple
 
-    # DIAGNOSTICS: place immediately before the monolithic call
-    with open_h5(h5_path, role="reader") as f:
-        # small sample: first tile only (fast)
-        s0, s1 = s_ranges[0]
-        DC = f["/DataCube"]
-        M  = f["/HyperCube/models"]
-        Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
-        if keep_idx is not None:
-            Yt = Yt[:, keep_idx]
-        M_tile = np.asarray(M[s0:s1, :, :, :], dtype=np.float64, order="C")
-        if keep_idx is not None:
-            M_tile = M_tile[:, :, :, keep_idx]
-
-    # 1) D_tot sanity
-    D_sample = np.sum(M_tile * M_tile, axis=(0, 3))
-    print('[DIAG] sample D_tot (per-column) stats: min/max/median = '
-        f"{D_sample.min():.4e}/{D_sample.max():.4e}/{np.median(D_sample):.4e}",
-        flush=True)
-
-    # 2) ATy from streaming vs manual for the same tile
-    A2_tile = M_tile.transpose(0, 3, 1, 2).reshape((s1 - s0) * Yt.shape[1], CP)
-    ATy_tile_stream = A2_tile.T @ Yt.reshape(-1)
-    ATy_tile_manual = np.zeros_like(ATy_tile_stream)
-    # compute by summing per-column norm & dot to detect transpose/reshape errors
-    for col in range(min(10, ATy_tile_stream.size)):
-        ATy_tile_manual[col] = np.dot(A2_tile[:, col], Yt.reshape(-1))
-    print('[DIAG] ATy_tile difference (first 10 cols) maxabs = '
-        f"{float(np.max(np.abs(ATy_tile_stream[:10] - ATy_tile_manual[:10]))):.4e}", flush=True)
-
-    # 3) compare scaled vs unscaled reduced-worker ATA/ATy for a tiny active set
-    # pick first k columns as "active"
-    k = min(6, CP)
-    active_idx = np.arange(k, dtype=np.int64)
-    S_flat = np.asarray(inv_sqrt_energy_flat, dtype=np.float64).ravel()
-    S_active = S_flat[active_idx]
-    # Build scaled A2 like reduced worker
-    A2_small = np.empty((A2_tile.shape[0], k), dtype=np.float64)
-    for j, gcol in enumerate(active_idx):
-        cc = int(gcol // P)
-        p = int(gcol % P)
-        A2_small[:, j] = M_tile[:, cc, p, :].reshape(-1)
-    A2_small *= S_active[None, :]
-    ATA_sub_local = A2_small.T @ A2_small
-    ATy_sub_local = A2_small.T @ Yt.reshape(-1)
-    print(f"[DIAG] ATA_sub_local shape, ATy_sub_local[0:6]: {ATA_sub_local.shape} {ATy_sub_local[:6]}", flush=True)
-
     checkpoint_every = int(os.environ.get("CUBEFIT_SOLVER_CHECKPOINT_EVERY",
         "50"))
 
     latest_ckpt = {
-        "x": np.asarray(x, dtype=np.float64).ravel(order="C").copy(),
+        "x": x[component_slot].ravel(order="C").copy(),
         "stats": {
             "iter": 0,
             "max_iter": 0,
@@ -5004,8 +5188,10 @@ def solve_streaming_nnls(
     def _checkpoint_cb(x_vec: np.ndarray, stats: dict) -> None:
         nonlocal checkpoint_error_logged
 
-        latest_ckpt["x"] = np.asarray(x_vec, dtype=np.float64).ravel(
-            order="C").copy()
+        x_fit_ckpt = np.asarray(x_vec, dtype=np.float64).reshape(C, P)
+        x_physical_ckpt = x_fit_ckpt[component_slot]
+
+        latest_ckpt["x"] = x_physical_ckpt.ravel(order="C").copy()
         latest_ckpt["stats"] = dict(stats)
 
         if tracker is None:
@@ -5045,20 +5231,27 @@ def solve_streaming_nnls(
         x_flat_unscaled, mono_stats = streamActiveSetNNLS(h5_path=h5_path,
             s_ranges=s_ranges, keep_idx=keep_idx, ATy_flat=ATy_flat,
             inv_sqrt_energy_flat=inv_sqrt_energy_flat, C=C, P=P,
-            executor=executor, cfg=cfg, orbit_weights=orbit_weights,
-            known_zero_mask=known_zero, x0_flat=x.ravel(order="C"),
-            resume_state=resume_state,
-            checkpoint_cb=_checkpoint_cb, checkpoint_every=checkpoint_every,
-            **active_set_kwargs)
+            executor=executor, component_slot=component_slot,
+            C_physical=C_physical, cfg=cfg, orbit_weights=orbit_weights,
+            known_zero_mask=known_zero,x0_flat=x.ravel(order="C"),
+            resume_state=resume_state,checkpoint_cb=_checkpoint_cb,
+            checkpoint_every=checkpoint_every, **active_set_kwargs)
 
-        x = x_flat_unscaled.reshape(C, P).copy()
         print("[MONO] finished streaming active-set NNLS", flush=True)
+
+        x_fit = x_flat_unscaled.reshape(C, P).copy()
+        x = x_fit[component_slot].copy()
 
         best_x = x.copy()
         best_proxy = np.inf
         pure_kkt_x = mono_stats.pop("pure_kkt_x", None)
         if pure_kkt_x is not None:
             pure_kkt_x = np.asarray(pure_kkt_x, dtype=np.float64).reshape(C, P)
+            pure_kkt_x = pure_kkt_x[component_slot].copy()
+
+        mono_stats["component_donor"] = component_donor.copy()
+        mono_stats["n_components_physical"] = int(C_physical)
+        mono_stats["n_components_fit"] = int(C_fit)
 
     finally:
         try:
@@ -5160,7 +5353,7 @@ def solve_streaming_nnls(
 
                 print("[DIAG][orbit_weights]", flush=True,)
 
-                for cc in range(C):
+                for cc in range(C_physical):
                     st = _support_stats_1d(best_x[cc, :])
                     resid = float(s_full[cc] - s_proj[cc])
                     ratio = float(s_full[cc] / max(s_proj[cc], 1e-30))
@@ -5244,12 +5437,15 @@ def solve_streaming_nnls(
             f"first_values={x_final_flat[neg[:10]].tolist()}")
     elapsed = time.perf_counter() - t0
 
-    stats = dict(
+    stats = dict(mono_stats)
+    stats.update(
         elapsed_sec=elapsed,
         rmse_proxy_best=float(best_proxy),
-        known_zero_mask=known_zero.copy(),
-        pure_kkt_x=pure_kkt_x
-    )
+        component_donor=component_donor.copy(),
+        n_components_physical=int(C_physical),
+        n_components_fit=int(C),
+        known_zero_mask=known_zero[component_slot].copy(),
+        pure_kkt_x=pure_kkt_x)
 
     return best_x, stats
 

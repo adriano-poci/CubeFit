@@ -87,6 +87,8 @@ v1.28:  Stop persisting `known_zero_mask` in
             6 October 2026 
 v1.29:  Persist pure-KKT solution in `PipelineRunner.solve_all_mp_batched`. 11
             November 2026
+v1.30:  Pass population component tying through to the streaming solver while
+            retaining physical solution shapes and warm starts. 13 November 2026
 """
 
 from __future__ import annotations
@@ -375,6 +377,34 @@ class PipelineRunner:
         # ---------------- Warm-start ----------------
         N_expected = int(self.nComp * self.nPop)
 
+        component_donor = solver_kwargs.get("component_donor", None)
+        has_component_ties = False
+
+        if component_donor is not None:
+            donor = np.asarray(
+                component_donor, dtype=np.int64).ravel(order="C")
+
+            if donor.size != self.nComp:
+                raise ValueError(
+                    f"component_donor has size {donor.size}; "
+                    f"expected {self.nComp}.")
+
+            if np.any(donor < 0) or np.any(donor >= self.nComp):
+                raise ValueError(
+                    "component_donor contains invalid component indices.")
+
+            has_component_ties = np.any(
+                donor != np.arange(self.nComp, dtype=np.int64))
+
+        if has_component_ties and not streaming:
+            raise NotImplementedError(
+                "Population tying is supported only by the streaming solver.")
+
+        if has_component_ties and warm_start == "resume":
+            raise ValueError(
+                "Full-state resume is incompatible with population tying; "
+                "use warm_start='saved_x' instead.")
+        
         x0_effective = None
         resume_state_effective = None
 

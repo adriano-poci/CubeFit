@@ -140,10 +140,9 @@ def main():
         #     [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
         #     [0.0, 0.2, 0.4])
         propDict['warm'] = 'zeros'
-        propDict['runTag'] = 'stat.SSPoffset'
+        propDict['runTag'] = 'SSPoffset'
         propDict['runnerKwargs']['minimum_l2_at_zero'] = False
         propDict['runnerKwargs']['regularisation_scale'] = 0.0
-        propDict['spectraPicks'] = [1363, 1116, 1998, 1039][::-1]
     print(propDict)
 
     _configure_solver_environment(args, propDict)

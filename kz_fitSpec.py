@@ -122,6 +122,8 @@ v2.5:   Improving hypercube chunking for more efficient reads, and let the
             readers derive the chunks directly in `genCubeFit`. 13 October 2026
 v2.6:   Use `pcolormesh` in `loadCubeFit` instead of `imshow` to account for
             non-uniform SSP library sampling. 4 November 2026
+v2.7:   Added population observability mapping before fitting and pass component
+            tying information to the solver. 13 November 2026
 """
 
 # need to set up the logger before any other imports
@@ -342,6 +344,10 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     INF = cu.Load.lzma(infn)
     PA = INF['angle'][0]
 
+    dataMax = float(np.max(INF['dataMax']))
+    FWHM = min(INF['orblib']['psfs'][pj].computeRe(plot=False)[1]*2.0
+        for pj in range(INF['orblib']['nAP']))
+
     xpix, ypix, sele, pixs = cu.Load.lzma(pfs)
     # saur, goods = cu.Load.lzma(sfs)
     # del saur
@@ -445,6 +451,17 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     NOrbs, inds, energs, I2s, I3s, regs, types, weights, lcuts =\
         cu.Read.orbits(nnOrb)
+    # Recover the intrinsic phase-space coordinates used by the decomposition.
+    _, _, _, _, LZD, _, _, _, _ = tiim.linDensity(
+        galaxy, mPath, bSol=list(fpd.values()), plot=False)
+    rM = np.asarray(LZD["rM"], dtype=np.float64)
+    lZMSign = np.asarray(LZD["lZMSign"], dtype=np.float64)
+    lXMSign = np.asarray(LZD["lXMSign"], dtype=np.float64)
+    lLMSign = np.asarray(LZD["lLMSign"], dtype=np.float64)
+    if not (rM.size == lZMSign.size == lXMSign.size == lLMSign.size == NOrbs):
+        raise RuntimeError(
+            "linDensity phase-space coordinates are inconsistent with the "
+            "orbit library.")
     cWeights = np.array([
         np.ma.sum(oDict['weights'][f"{comp:{pred}d}"]) for comp in nzComp])
 
@@ -696,26 +713,27 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     if not np.all(np.isin(otypes, [0, 1, 2])):
         raise RuntimeError(
             f"Invalid intrinsic orbital types: {np.unique(otypes)}.")
-    if "upscale" in warm_start:
+    # Population observability is part of the fitted model definition.
+    popMap = cu.population_observability_map(
+        str(hdf5Path), aperMass, nzComp, pred, oDict, otypes, rM,
+        lZMSign, lXMSign, lLMSign, FWHM, dataMax)
+
+    component_donor = np.asarray(popMap["donor"], dtype=np.int64)
+    runnerKwargs["component_donor"] = component_donor
+
+    # Prepare only explicit non-runner warm starts here. saved_x remains a
+    # physical solution and is reduced to anchor components by the solver.
+    x0 = None
+
+    if warm_start is not None and "upscale" in warm_start:
         logger.log("[Pipeline] Using upscaled solution as warm start.")
 
         x0 = cu.constrainUpscaledSolution(
             str(hdf5Path).replace(
                 "hypercube", "x").replace(str(nComp), str(3)),
-            str(hdf5Path),
-            otypes,
-            orbit_weights=cWeights,
-        )
+            str(hdf5Path), otypes, orbit_weights=cWeights)
 
         warm_start = None
-    else:
-        x0 = None
-
-    popMap = cu.population_observability_map(str(hdf5Path), aperMass,
-        nzComp, pred, oDict, otypes, rM, lZMSign, lXMSign, lLMSign,
-        FWHM, dataMax)
-    component_donor = np.asarray(popMap["donor"], dtype=np.int64)
-    runnerKwargs["component_donor"] = component_donor
     print("\nPopulation tying map")
     print(" comp donor      R    lambda   aper.frac   E.frac   reason")
     for cc in range(nComp):
