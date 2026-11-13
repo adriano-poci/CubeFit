@@ -12,11 +12,11 @@
 #SBATCH -D "/data/phys-gal-dynamics/phys2603/muse"
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_2Fit.log" --open-mode=append
-#SBATCH -p medium
+#SBATCH -p short
 #SBATCH --qos=priority
 
 #SBATCH --job-name="CubeFit_2Fit"
-#SBATCH --time=0-48:00
+#SBATCH --time=0-12:00
 #SBATCH --cpus-per-task=48
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

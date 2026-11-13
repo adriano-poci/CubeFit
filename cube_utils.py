@@ -6411,3 +6411,360 @@ def hypercube_hot(archive_path, remove_archive=True, overwrite=False,
     return h5_path
 
 # ------------------------------------------------------------------------------
+
+def population_observability_map(
+    h5_path: str,
+    aperMass: np.ndarray,
+    nzComp: np.ndarray,
+    pred: str,
+    oDict: dict,
+    otypes: np.ndarray,
+    rM: np.ndarray,
+    lZMSign: np.ndarray,
+    lXMSign: np.ndarray,
+    lLMSign: np.ndarray,
+    FWHM: float,
+    dataMax: float,
+    *,
+    min_aper_fraction: float = 1e-3,
+    min_energy_fraction: float = 1e-3,
+    use_radius_fov: bool = True,
+) -> dict:
+    """
+    Classify dynamical components by stellar-population observability.
+
+    The classification combines intrinsic phase-space location, projected
+    aperture leverage, and the actual spectral leverage of each component in
+    the existing HyperCube. Poorly observable components are assigned to a
+    robustly observable donor belonging to the same intrinsic orbital family.
+
+    HyperCube leverage is measured from ``/HyperCube/col_energy``. For
+    component ``c``,
+
+    ``E_c = sum_p ||A[c, p]||_2^2``.
+
+    The component energy fraction is then
+
+    ``E_c / sum_j E_j``.
+
+    The aperture and HyperCube energy fractions are independent diagnostics:
+    the former measures projected dynamical mass in the fitted apertures,
+    while the latter measures the actual strength of the component in the
+    spectral fitting problem.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to the existing CubeFit HyperCube HDF5 file.
+    aperMass : ndarray
+        Projected component masses in the fitted apertures, with shape
+        ``(nSpat, C)``.
+    nzComp : ndarray
+        Original one-based decomposition component numbers, with shape
+        ``(C,)``.
+    pred : str
+        Integer formatting specification used for decomposition dictionary
+        keys.
+    oDict : dict
+        Dynamical decomposition dictionary containing ``wheres`` and
+        ``weights``.
+    otypes : ndarray
+        Intrinsic component orbital types. Values are 0 for z-tubes, 1 for
+        x-tubes, and 2 for boxes.
+    rM : ndarray
+        Intrinsic radius of every Schwarzschild orbit.
+    lZMSign : ndarray
+        Signed z-axis circularity of every Schwarzschild orbit.
+    lXMSign : ndarray
+        Signed x-axis circularity of every Schwarzschild orbit.
+    lLMSign : ndarray
+        Total-angular-momentum circularity of every Schwarzschild orbit.
+    FWHM : float
+        Minimum effective PSF FWHM in arcseconds.
+    dataMax : float
+        Characteristic radial extent of the fitted data in arcseconds.
+    min_aper_fraction : float, optional
+        Minimum fraction of total fitted-aperture component mass required for
+        a component to be considered to have adequate projected leverage.
+        Default is ``1e-3``.
+    min_energy_fraction : float, optional
+        Minimum fraction of total HyperCube column energy required for a
+        component to be considered to have adequate spectral leverage.
+        Default is ``1e-3``.
+    use_radius_fov : bool, optional
+        If True, classify components with weighted intrinsic radius larger
+        than ``dataMax`` as outside the nominal field of view. This remains a
+        geometric diagnostic; low HyperCube energy is the direct spectral
+        leverage test. Default is True.
+
+    Returns
+    -------
+    result : dict
+        Dictionary containing donor assignments and observability
+        diagnostics. Important entries are ``donor``, ``bad``, ``anchor``,
+        ``unresolved``, ``outside``, ``low_aper``, ``low_energy``,
+        ``radius``, ``circularity``, ``aper_fraction``,
+        ``energy_fraction``, and ``energy_relative_family``.
+
+    Raises
+    ------
+    ValueError
+        If component dimensions are inconsistent, thresholds are invalid, or
+        no valid orbit weights are available for a component.
+    RuntimeError
+        If the HyperCube or its column-energy dataset is unavailable or
+        inconsistent with the decomposition.
+
+    Examples
+    --------
+    >>> pop_map = population_observability_map(
+    ...     h5_path, aperMass, nzComp, pred, oDict, otypes, rM,
+    ...     lZMSign, lXMSign, lLMSign, FWHM, dataMax)
+    >>> bad_components = nzComp[pop_map["bad"]]
+    """
+    nzComp = np.asarray(nzComp, dtype=np.int64).ravel()
+    otypes = np.asarray(otypes, dtype=np.int64).ravel()
+    rM = np.asarray(rM, dtype=np.float64).ravel()
+    lZMSign = np.asarray(lZMSign, dtype=np.float64).ravel()
+    lXMSign = np.asarray(lXMSign, dtype=np.float64).ravel()
+    lLMSign = np.asarray(lLMSign, dtype=np.float64).ravel()
+
+    C = int(nzComp.size)
+
+    if C == 0:
+        raise ValueError("nzComp is empty.")
+
+    if otypes.size != C:
+        raise ValueError(
+            f"otypes has size {otypes.size}; expected {C}.")
+
+    if not np.all(np.isin(otypes, (0, 1, 2))):
+        raise ValueError(
+            f"Invalid orbital types: {np.unique(otypes)}.")
+
+    if not (rM.size == lZMSign.size == lXMSign.size == lLMSign.size):
+        raise ValueError(
+            "Orbit radius and circularity arrays have inconsistent sizes.")
+
+    if FWHM <= 0.0 or not np.isfinite(FWHM):
+        raise ValueError("FWHM must be finite and positive.")
+
+    if dataMax <= 0.0 or not np.isfinite(dataMax):
+        raise ValueError("dataMax must be finite and positive.")
+
+    if min_aper_fraction < 0.0:
+        raise ValueError("min_aper_fraction must be non-negative.")
+
+    if min_energy_fraction < 0.0:
+        raise ValueError("min_energy_fraction must be non-negative.")
+
+    aperMass = np.ma.asarray(aperMass, dtype=np.float64)
+
+    if aperMass.ndim != 2 or aperMass.shape[1] != C:
+        raise ValueError(
+            "aperMass must have shape (nSpat, C); "
+            f"received {aperMass.shape}, expected second dimension {C}.")
+
+    # --------------------------------------------------------------
+    # Intrinsic phase-space coordinates of each dynamical component.
+    # --------------------------------------------------------------
+    radius = np.full(C, np.nan, dtype=np.float64)
+    circ = np.full(C, np.nan, dtype=np.float64)
+
+    circularities = (lZMSign, lXMSign, lLMSign)
+
+    for cc, component in enumerate(nzComp):
+        key = f"{component:{pred}d}"
+
+        if key not in oDict["wheres"] or key not in oDict["weights"]:
+            raise ValueError(f"Component {component} is absent from oDict.")
+
+        mask = np.asarray(oDict["wheres"][key], dtype=bool)
+        weight = np.asarray(oDict["weights"][key], dtype=np.float64)
+
+        if mask.size != rM.size or weight.size != rM.size:
+            raise ValueError(
+                f"Component {component} orbit arrays are inconsistent "
+                "with rM.")
+
+        lam = circularities[int(otypes[cc])]
+
+        valid = (
+            mask
+            & np.isfinite(weight)
+            & (weight > 0.0)
+            & np.isfinite(rM)
+            & np.isfinite(lam)
+        )
+
+        if not np.any(valid):
+            raise ValueError(f"Component {component} has no valid "
+                'positive-weight orbits.')
+
+        w = weight[valid]
+        radius[cc] = np.average(rM[valid], weights=w)
+        circ[cc] = np.average(lam[valid], weights=w)
+
+    # --------------------------------------------------------------
+    # Projected aperture leverage.
+    # --------------------------------------------------------------
+    aper_signal = np.asarray(np.ma.sum(aperMass, axis=0).filled(0.0),
+        dtype=np.float64)
+
+    aper_total = float(np.sum(aper_signal))
+
+    if not np.isfinite(aper_total) or aper_total <= 0.0:
+        raise ValueError(
+            "Total projected aperture mass is not finite and positive.")
+
+    aper_fraction = aper_signal / aper_total
+
+    # --------------------------------------------------------------
+    # Actual spectral leverage from the existing HyperCube.
+    #
+    # col_energy[c,p] = ||A[c,p]||^2.
+    # --------------------------------------------------------------
+    with open_h5(h5_path, role="reader") as f:
+        if "/HyperCube/models" not in f:
+            raise RuntimeError(
+                "Missing /HyperCube/models.")
+
+        models = f["/HyperCube/models"]
+
+        if int(models.shape[1]) != C:
+            raise RuntimeError(
+                "HyperCube component dimension does not match the "
+                f"decomposition: {models.shape[1]} != {C}.")
+
+        if "/HyperCube/col_energy" not in f:
+            raise RuntimeError(
+                "Missing /HyperCube/col_energy. Run the solver once to "
+                "generate the column-energy products.")
+
+        col_energy = np.asarray(f["/HyperCube/col_energy"][...],
+            dtype=np.float64)
+
+    if col_energy.ndim != 2 or col_energy.shape[0] != C:
+        raise RuntimeError(
+            "/HyperCube/col_energy has inconsistent shape "
+            f"{col_energy.shape}; expected ({C}, P).")
+
+    if np.any(~np.isfinite(col_energy)):
+        raise RuntimeError(
+            "/HyperCube/col_energy contains non-finite values.")
+
+    if np.any(col_energy < 0.0):
+        raise RuntimeError(
+            "/HyperCube/col_energy contains negative values.")
+
+    component_energy = np.sum(col_energy, axis=1)
+    energy_total = float(np.sum(component_energy))
+
+    if not np.isfinite(energy_total) or energy_total <= 0.0:
+        raise RuntimeError(
+            "Total HyperCube column energy is not finite and positive.")
+
+    energy_fraction = component_energy / energy_total
+
+    # Family-relative energy is useful diagnostically because the three
+    # orbital families can have systematically different amplitudes.
+    energy_relative_family = np.full(
+        C, np.nan, dtype=np.float64)
+
+    for family in (0, 1, 2):
+        family_idx = np.flatnonzero(otypes == family)
+
+        if family_idx.size == 0:
+            continue
+
+        positive = component_energy[family_idx]
+        positive = positive[np.isfinite(positive) & (positive > 0.0)]
+
+        if positive.size == 0:
+            continue
+
+        reference = float(np.median(positive))
+
+        if reference > 0.0:
+            energy_relative_family[family_idx] = (
+                component_energy[family_idx] / reference)
+
+    # --------------------------------------------------------------
+    # Classification.
+    # --------------------------------------------------------------
+    unresolved = radius < float(FWHM)
+
+    if use_radius_fov:
+        outside = radius > float(dataMax)
+    else:
+        outside = np.zeros(C, dtype=bool)
+
+    low_aper = aper_fraction < float(min_aper_fraction)
+    low_energy = energy_fraction < float(min_energy_fraction)
+
+    # PSF confusion is intrinsically non-identifiable.
+    #
+    # For the outer/weak case, require actual low spectral leverage rather
+    # than declaring every geometrically outer component unusable.
+    bad = unresolved | low_energy | (outside & low_aper)
+
+    anchor = ~bad
+
+    # --------------------------------------------------------------
+    # Donor assignment.
+    #
+    # Donors must be robust anchors in the same orbital family. There are
+    # therefore no donor chains.
+    # --------------------------------------------------------------
+    donor = np.arange(C, dtype=np.int64)
+
+    for cc in np.flatnonzero(bad):
+        candidates = np.flatnonzero(anchor & (otypes == otypes[cc]))
+
+        if candidates.size == 0:
+            raise RuntimeError('No observable donor exists for component '
+                f"{nzComp[cc]} in orbital family {otypes[cc]}.")
+
+        candidate_radius = radius[candidates]
+        candidate_circ = circ[candidates]
+
+        log_radius = np.log10(np.maximum(candidate_radius, 1e-300))
+        log_target_radius = np.log10(max(radius[cc], 1e-300))
+
+        rscale = max(float(np.ptp(log_radius)), 1e-12)
+        lscale = max(float(np.ptp(candidate_circ)), 1e-12)
+
+        phase_distance = (((log_radius - log_target_radius) / rscale) ** 2
+            + ((candidate_circ - circ[cc]) / lscale) ** 2)
+
+        # Prefer stronger anchors when two phase-space neighbours are
+        # otherwise comparable. This is deliberately a weak penalty:
+        # phase-space locality remains the primary donor criterion.
+        candidate_energy = np.maximum(energy_fraction[candidates], 1e-300)
+        strongest_energy = float(np.max(candidate_energy))
+
+        leverage_penalty = (0.10 * np.log10(strongest_energy / candidate_energy
+            ) ** 2)
+
+        distance = phase_distance + leverage_penalty
+
+        donor[cc] = candidates[int(np.argmin(distance))]
+
+    return {
+        "donor": donor,
+        "bad": bad,
+        "anchor": anchor,
+        "unresolved": unresolved,
+        "outside": outside,
+        "low_aper": low_aper,
+        "low_energy": low_energy,
+        "radius": radius,
+        "circularity": circ,
+        "aper_signal": aper_signal,
+        "aper_fraction": aper_fraction,
+        "component_energy": component_energy,
+        "energy_fraction": energy_fraction,
+        "energy_relative_family": energy_relative_family,
+    }
+
+# ------------------------------------------------------------------------------

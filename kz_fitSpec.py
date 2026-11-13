@@ -652,61 +652,87 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         raise RuntimeError("Invalid runSwitch")
 
 
-    if 'upscale' in warm_start:
+
+    # --------------------------------------------------------------
+    # Intrinsic dynamical component types.
+    # --------------------------------------------------------------
+    if "componentTypes" in oDict:
+        componentTypes = np.asarray(oDict["componentTypes"], dtype=np.int64)
+
+        if componentTypes.size < np.max(nzComp):
+            raise RuntimeError(
+                "Stored componentTypes is inconsistent with nzComp.")
+
+        otypes = componentTypes[nzComp - 1]
+
+    elif oDict["cuts"] and len(oDict["cuts"]) > 0:
+        componentTypes = np.full(nzComp.size, -1, dtype=np.int64)
+
+        for ii, component in enumerate(nzComp):
+            key = f"{component:{pred}d}"
+            mask = np.asarray(oDict["wheres"][key], dtype=bool)
+            orbitTypes = np.unique(types[mask])
+
+            if orbitTypes.size != 1:
+                raise RuntimeError(
+                    f"Component {component} contains orbital types "
+                    f"{orbitTypes.tolist()}.")
+
+            if orbitTypes[0] == 3:
+                componentTypes[ii] = 0
+            elif orbitTypes[0] == 1:
+                componentTypes[ii] = 1
+            elif orbitTypes[0] == 4:
+                componentTypes[ii] = 2
+            else:
+                raise RuntimeError(
+                    f"Component {component} contains unsupported orbital "
+                    f"type {orbitTypes[0]}.")
+
+        otypes = componentTypes
+    else:
+        otypes = copy(nzComp) - 1
+
+    if not np.all(np.isin(otypes, [0, 1, 2])):
+        raise RuntimeError(
+            f"Invalid intrinsic orbital types: {np.unique(otypes)}.")
+    if "upscale" in warm_start:
         logger.log("[Pipeline] Using upscaled solution as warm start.")
-        # ------------------------------------
-        # upscaled solution from the hypercube
-        # ------------------------------------
-        if 'componentTypes' in oDict:
-            componentTypes = np.asarray(
-                oDict['componentTypes'], dtype=np.int64)
-            if componentTypes.size < np.max(nzComp):
-                raise RuntimeError(
-                    "Stored componentTypes is inconsistent with nzComp.")
 
-            otypes = componentTypes[nzComp - 1]
-            if not np.all(np.isin(otypes, [0, 1, 2])):
-                raise RuntimeError(
-                    f"Invalid intrinsic orbital types: {np.unique(otypes)}.")
-        elif oDict['cuts'] and len(oDict['cuts']) > 0:
-            componentTypes = np.full(nzComp.size, -1, dtype=np.int64)
-
-            for ii, component in enumerate(nzComp):
-                key = f"{component:{pred}d}"
-                mask = np.asarray(oDict['wheres'][key], dtype=bool)
-                orbitTypes = np.unique(types[mask])
-
-                if orbitTypes.size != 1:
-                    raise RuntimeError(
-                        f"Component {component} contains orbital types "
-                        f"{orbitTypes.tolist()}.")
-
-                if orbitTypes[0] == 3:
-                    componentTypes[ii] = 0
-                elif orbitTypes[0] == 1:
-                    componentTypes[ii] = 1
-                elif orbitTypes[0] == 4:
-                    componentTypes[ii] = 2
-                else:
-                    raise RuntimeError(
-                        f"Component {component} contains unsupported orbital "
-                        f"type {orbitTypes[0]}.")
-
-            otypes = componentTypes
-            if not np.all(np.isin(otypes, [0, 1, 2])):
-                raise RuntimeError(
-                    f"Invalid intrinsic orbital types: {np.unique(otypes)}.")
-
-        else:
-            otypes = copy(nzComp) - 1
         x0 = cu.constrainUpscaledSolution(
-            str(hdf5Path).replace('hypercube', 'x').replace(str(nComp), str(3)),
+            str(hdf5Path).replace(
+                "hypercube", "x").replace(str(nComp), str(3)),
             str(hdf5Path),
-            otypes, orbit_weights=cWeights)
+            otypes,
+            orbit_weights=cWeights,
+        )
 
         warm_start = None
     else:
         x0 = None
+
+    popMap = cu.population_observability_map(str(hdf5Path), aperMass,
+        nzComp, pred, oDict, otypes, rM, lZMSign, lXMSign, lLMSign,
+        FWHM, dataMax)
+    component_donor = np.asarray(popMap["donor"], dtype=np.int64)
+    runnerKwargs["component_donor"] = component_donor
+    print("\nPopulation tying map")
+    print(" comp donor      R    lambda   aper.frac   E.frac   reason")
+    for cc in range(nComp):
+        reason = []
+        if popMap["unresolved"][cc]:
+            reason.append("PSF")
+        if popMap["outside"][cc]:
+            reason.append("FoV")
+        if popMap["low_aper"][cc]:
+            reason.append("low-M")
+        if popMap["low_energy"][cc]:
+            reason.append("low-E")
+        print(f"{nzComp[cc]:5d} {nzComp[component_donor[cc]]:5d} "
+            f"{popMap['radius'][cc]:7.2f} {popMap['circularity'][cc]:+7.3f} "
+            f"{popMap['aper_fraction'][cc]:10.3e} "
+            f"{popMap['energy_fraction'][cc]:9.3e} "
+            f"{','.join(reason) if reason else 'good'}")
 
     ###########################################
     # Multi-processing Batched Streaming NNLS #
@@ -3031,6 +3057,10 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         del VB
     else:
         raise RuntimeError(f"No binned spectra.\n{'': <4s}{vbSpec}")
+    dataMax = float(np.max(INF['dataMax']))
+    FWHM = min(
+        INF['orblib']['psfs'][pj].computeRe(plot=False)[1]*2.0
+        for pj in range(INF['orblib']['nAP']))
 
     xpix, ypix, sele, pixs = cu.Load.lzma(pfs)
     # saur,goods = cu.Load.lzma(sfs)
@@ -4538,11 +4568,6 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                 lXMSign=lXMSign, lLMSign=lLMSign, save_path=figDir/
                 f"chemodynamical_atlas_{nComp:{pred}d}_i{proj}{tag}_"
                 f"{lOrder:02d}.png", cmap=moncmapr, **kwargsAtlas)
-            # atlas = plot_integral_population_atlas(arSOL, umetals, uages,
-            #     ualphas, nzComp, pred, oDict, energs, I2s, I3s,
-            #     save_path=figDir/
-            #     f"chemodynamical_atlas_{nComp:{pred}d}_i{proj}{tag}_{lOrder:02d}.png",
-            #     cmap=moncmapr)
             plt.close('all')
         except Exception as e:
             print(f"[ERROR] Could not make chemo-dynamical atlas: {e}")

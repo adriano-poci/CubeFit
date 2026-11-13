@@ -838,6 +838,57 @@ def _canon_orbit_weights(orbit_weights, C: int, P: int) -> np.ndarray | None:
 
 # ------------------------------------------------------------------------------
 
+def _canon_component_donor(component_donor, C: int) -> np.ndarray:
+    """
+    Validate and canonicalize component population ties.
+
+    Parameters
+    ----------
+    component_donor : array-like or None
+        Zero-based donor component for each physical component. Anchors point
+        to themselves. None leaves all components independent.
+    C : int
+        Number of physical dynamical components.
+
+    Returns
+    -------
+    donor : ndarray
+        Canonical donor indices with shape ``(C,)``.
+
+    Raises
+    ------
+    ValueError
+        If the mapping has incorrect dimensions, invalid indices, or cycles.
+
+    Examples
+    --------
+    >>> _canon_component_donor([0, 0, 2], 3)
+    array([0, 0, 2])
+    """
+    if component_donor is None:
+        return np.arange(C, dtype=np.int64)
+
+    donor = np.asarray(component_donor, dtype=np.int64).ravel().copy()
+    if donor.size != C:
+        raise ValueError(f"component_donor has size {donor.size}; expected {C}.")
+    if np.any(donor < 0) or np.any(donor >= C):
+        raise ValueError("component_donor contains invalid component indices.")
+
+    canonical = np.empty(C, dtype=np.int64)
+    for cc in range(C):
+        current = cc
+        visited = set()
+        while donor[current] != current:
+            if current in visited:
+                raise ValueError("component_donor contains a donor cycle.")
+            visited.add(current)
+            current = int(donor[current])
+        canonical[cc] = current
+
+    return canonical
+
+# ------------------------------------------------------------------------------
+
 def _get_known_zero_mask(h5_path: str, C: int, P: int) -> np.ndarray:
     """
     Return the structural zero-energy exclusion mask for the solver.
@@ -4617,6 +4668,8 @@ def solve_streaming_nnls(
     """
     t0 = time.perf_counter()
 
+    component_donor = active_set_kwargs.pop("component_donor", None)
+
     # ---------------------------- metadata -----------------------------
     with open_h5(h5_path, role="reader") as f:
         S, L = map(int, f["/DataCube"].shape)
@@ -4636,6 +4689,18 @@ def solve_streaming_nnls(
 
     s_ranges = [(s0, min(S, s0 + s_tile)) for s0 in range(0, S, s_tile)]
     CP = int(C * P)
+
+    C_physical = C
+    component_donor = _canon_component_donor(component_donor, C_physical)
+    anchors = np.flatnonzero(component_donor == np.arange(C_physical))
+    C_fit = anchors.size
+
+    anchor_slot = np.full(C_physical, -1, dtype=np.int64)
+    anchor_slot[anchors] = np.arange(C_fit)
+    component_slot = anchor_slot[component_donor]
+
+    print(f"[MONO] population tying: {C_physical} physical -> "
+        f"{C_fit} independent components", flush=True)
 
     # ---------------------------- orbit prior --------------------------
     orbit_shape_outer = None

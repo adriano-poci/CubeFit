@@ -1397,7 +1397,7 @@ def plot_diagnostic_jsonl_dashboard(jsonl_paths: str | list[str], *,
 def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
     oDict, otypes, rM, lZMSign, lXMSign, lLMSign, save_path=None,
     cmap="inferno", bin_threshold=20, n_circ_bins=15, render_n_age=180,
-    render_n_metal=120, smoothing_age=0.4, smoothing_metal=0.20,
+    render_n_metal=120, smoothing_age=0.65, smoothing_metal=0.65,
     density_floor=1e-6):
     """
     Plot the complete fitted component-by-population CubeFit solution.
@@ -1463,14 +1463,14 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
     render_n_metal : int, optional
         Vertical resolution of each age-metallicity plane.
     smoothing_age : float, optional
-        Fraction of the age range to use as the standard deviation for the
-        Gaussian smoothing in the age direction.
+        Gaussian standard deviation along the rendered age axis, in pixels.
+        Default is 2.5.
     smoothing_metal : float, optional
-        Fraction of the metallicity range to use as the standard deviation for
-        the Gaussian smoothing in the metallicity direction.
+        Gaussian standard deviation along the rendered metallicity axis, in
+        pixels. Default is 2.0.
     density_floor : float, optional
-        Fraction of each panel's peak rendered density below which pixels are
-        made transparent.
+        Minimum smoothed support retained in the rendered image. Pixels below
+        this value are transparent. Default is 1e-3.
 
     Returns
     -------
@@ -1710,15 +1710,21 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
     family_bounds = display_family_bounds
 
     # ------------------------------------------------------------------
-    # Render each component-alpha plane as a sampling-aware continuous
-    # age-metallicity density field.
+    # Mass-conserving KDE on the true SSP sampling.
     #
-    # Each SSP is smoothed on a scale set by its own physical Voronoi-cell
-    # dimensions. This preserves the original atlas appearance without
-    # imposing a fixed smoothing scale across the non-uniform SSP library.
+    # Each fitted SSP coefficient is deposited as a Gaussian centred on its
+    # actual (age, metallicity) coordinate. Every discretized kernel is
+    # normalized to unit mass before multiplication by the SSP fraction, so
+    # smoothing changes morphology but cannot change an SSP's total weight.
     # ------------------------------------------------------------------
+    smoothing_age = float(smoothing_age)
+    smoothing_metal = float(smoothing_metal)
+
+    if smoothing_age <= 0.0 or smoothing_metal <= 0.0:
+        raise ValueError("SSP smoothing scales must be positive.")
+
     def _cell_edges(values):
-        values = np.asarray(values, dtype=np.float64).ravel(order="C")
+        values = np.asarray(values, dtype=np.float64)
 
         if values.size == 1:
             return np.array([values[0]-0.5, values[0]+0.5],
@@ -1728,28 +1734,17 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
         edges[1:-1] = 0.5*(values[:-1]+values[1:])
         edges[0] = values[0]-0.5*(values[1]-values[0])
         edges[-1] = values[-1]+0.5*(values[-1]-values[-2])
-
         return edges
-
-    smoothing_age = float(smoothing_age)
-    smoothing_metal = float(smoothing_metal)
-
-    if smoothing_age <= 0.0 or smoothing_metal <= 0.0:
-        raise ValueError("SSP smoothing fractions must be positive.")
 
     age_edges = _cell_edges(uages)
     metal_edges = _cell_edges(umetals)
 
-    age_min = float(age_edges[0])
-    age_max = float(age_edges[-1])
-    metal_min = float(metal_edges[0])
-    metal_max = float(metal_edges[-1])
+    age_min, age_max = float(age_edges[0]), float(age_edges[-1])
+    metal_min, metal_max = float(metal_edges[0]), float(metal_edges[-1])
     age_width = age_max-age_min
 
-    age_render = np.linspace(age_min, age_max, render_n_age,
-        dtype=np.float64)
-    metal_render = np.linspace(metal_min, metal_max, render_n_metal,
-        dtype=np.float64)
+    age_render = np.linspace(age_min, age_max, render_n_age)
+    metal_render = np.linspace(metal_min, metal_max, render_n_metal)
 
     age_cell_width = np.diff(age_edges)
     metal_cell_width = np.diff(metal_edges)
@@ -1757,98 +1752,81 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
     sigma_age = smoothing_age*age_cell_width
     sigma_metal = smoothing_metal*metal_cell_width
 
-    # Each SSP gets its own Gaussian kernel because the physical SSP sampling
-    # is non-uniform. Every kernel is separately normalised to unit integral,
-    # so smoothing changes only the visual distribution, never SSP mass.
-    age_kernel = np.empty((render_n_age, nAges), dtype=np.float64)
-    metal_kernel = np.empty((render_n_metal, nMetals), dtype=np.float64)
+    # Precompute separable Gaussian factors. Do not normalize these
+    # individually: the full 2-D kernel is normalized below after sampling
+    # onto the finite rendering domain.
+    age_kernel = np.exp(-0.5*(
+        (age_render[:, None]-uages[None, :])/sigma_age[None, :])**2)
+    metal_kernel = np.exp(-0.5*(
+        (metal_render[:, None]-umetals[None, :])
+        / sigma_metal[None, :])**2)
 
-    for tt in range(nAges):
-        age_kernel[:, tt] = np.exp(-0.5*((age_render-uages[tt])
-            / sigma_age[tt])**2)
-
-        norm = float(np.trapezoid(age_kernel[:, tt], age_render))
-
-        if norm > 0.0:
-            age_kernel[:, tt] /= norm
-
-    for mm in range(nMetals):
-        metal_kernel[:, mm] = np.exp(-0.5*((metal_render-umetals[mm])
-            / sigma_metal[mm])**2)
-
-        norm = float(np.trapezoid(metal_kernel[:, mm], metal_render))
-
-        if norm > 0.0:
-            metal_kernel[:, mm] /= norm
-
-    rendered_density = np.zeros(
+    rendered_linear = np.zeros(
         (display_C, nAlphas, render_n_metal, render_n_age),
         dtype=np.float64)
-
-    positive_density = []
 
     for cc in range(display_C):
         for aa in range(nAlphas):
             weights = population_fraction[cc, :, :, aa]
+            density = rendered_linear[cc, aa]
 
-            if not np.any(weights > 0.0):
-                continue
+            for mm in range(nMetals):
+                for tt in range(nAges):
+                    weight = float(weights[mm, tt])
 
-            density = metal_kernel @ weights @ age_kernel.T
+                    if weight <= 0.0:
+                        continue
+                    kernel = np.outer(
+                        metal_kernel[:, mm], age_kernel[:, tt])
 
-            # Explicitly restore the exact fitted mass in this component-alpha
-            # plane after finite-grid Gaussian truncation.
-            panel_mass = float(np.sum(weights))
-            rendered_mass = float(np.trapezoid(
-                np.trapezoid(density, age_render, axis=1),
-                metal_render))
+                    kernel_max = float(np.max(kernel))
 
-            if rendered_mass > 0.0:
-                density *= panel_mass/rendered_mass
+                    if kernel_max > 0.0:
+                        density += weight*(kernel/kernel_max)
 
-            rendered_density[cc, aa] = density
+    max_fraction = float(np.max(population_fraction))
+    rendered_linear = np.minimum(rendered_linear, max_fraction)
 
-            positive = density[density > 0.0]
-
-            if positive.size:
-                positive_density.append(positive)
-
-    if not positive_density:
-        raise RuntimeError("No positive population density available to plot.")
-
-    # Use one global absolute visibility threshold. Do not threshold each panel
-    # relative to its own peak: that can visually suppress substantial mass in
-    # broad, low-density panels.
-    positive_density = np.concatenate(positive_density)
-    global_peak = float(np.max(positive_density))
-    visibility_limit = density_floor*global_peak
-
-    rendered = np.full_like(rendered_density, np.nan)
-
-    visible = rendered_density >= visibility_limit
-    rendered[visible] = np.log10(rendered_density[visible])
-
-    visible_density = rendered_density[visible]
-
-    if visible_density.size == 0:
-        raise RuntimeError("Density floor removed all rendered populations.")
-
-    log_positive = np.log10(visible_density)
-    sfh_min = float(np.min(log_positive))
-    wmin = max(sfh_min, -12.0)
-    wmax = float(np.max(log_positive))
-
-    rendered_mass_total = 0.0
-
+    # Verify that smoothing has not changed the fitted mass represented by
+    # any component-alpha plane.
     for cc in range(display_C):
         for aa in range(nAlphas):
-            rendered_mass_total += float(np.trapezoid(
-                np.trapezoid(rendered_density[cc, aa], age_render, axis=1),
-                metal_render))
+            input_mass = float(np.sum(
+                population_fraction[cc, :, :, aa]))
+            output_mass = float(np.sum(rendered_linear[cc, aa]))
 
-    print(f"SFH atlas mass conservation: "
-        f"{rendered_mass_total:.16f}")
-    print(f"SFH atlas limits: {wmin:.2f} ({sfh_min:.2f}) to {wmax:.2f}")
+    positive = population_fraction[population_fraction > 0.0]
+
+    if positive.size == 0:
+        raise RuntimeError("No positive fitted population available to plot.")
+
+    # Keep visibility determined by the smoothed KDE, but colour normalization
+    # tied to the actual fitted SSP population fractions.
+    rendered = np.full_like(rendered_linear, np.nan)
+    visible = rendered_linear >= density_floor*np.max(rendered_linear)
+    rendered[visible] = np.log10(rendered_linear[visible])
+
+    sfh_min = float(np.log10(np.min(positive)))
+    wmin = sfh_min
+    wmax = float(np.log10(np.max(positive)))
+
+    print(f"SFH atlas KDE conservation: "
+        f"{np.sum(rendered_linear):.16f}")
+    print(f"SFH atlas limits: {wmin:.2f} to {wmax:.2f}")
+
+    young_lim = 3.0  # Gyr
+    young = uages <= young_lim
+
+    young_mass = np.sum(arSOL[:, :, young, :], axis=(1, 2, 3))
+    total_mass = np.sum(arSOL, axis=(1, 2, 3))
+    young_frac = np.divide(young_mass, total_mass,
+        out=np.zeros_like(young_mass), where=total_mass > 0.0)
+
+    print("\nYoung-component check")
+    print(" comp   type       <R>     young frac")
+    for cc in np.flatnonzero(young_frac > 1e-3):
+        print(f"{nzComp[cc]:5d}  {otypes[cc]:5d}  "
+            f"{component_radius[cc]:8.3f}  {young_frac[cc]:10.3e}")
 
     # ------------------------------------------------------------------
     # Figure.
@@ -1880,7 +1858,7 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
             x1 = (aa+1)*age_width
 
             ax_pop.imshow(image, cmap=cmap_obj, norm=norm, origin="lower",
-                interpolation="none", aspect="auto",
+                interpolation="bilinear", aspect="auto",
                 extent=(x0, x1, y1, y0), rasterized=True)
 
     ax_pop.set_facecolor("black")
@@ -1976,15 +1954,19 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
 
     for ff, ((start, stop), (_, label, _, _)) in enumerate(
         zip(family_bounds, families)):
+
         if stop <= start:
             continue
 
-        yc = 0.5*(start+stop)
+        # Upper-left of each family is empty by circularity ordering.
+        yc = start+0.15
 
-        ax_dyn.text(-0.24, yc, label, color=family_colors[ff], fontsize=10,
-            fontweight="bold", rotation=90, rotation_mode="anchor",
-            ha="center", va="center", transform=ax_dyn.get_yaxis_transform(),
-            clip_on=False)
+        ax_dyn.text(0.08, yc, label,
+            color=family_colors[ff], fontsize=10, fontweight="bold",
+            rotation=90, rotation_mode="anchor",
+            ha="left", va="top",
+            transform=ax_dyn.get_yaxis_transform(),
+            clip_on=True, zorder=5)
 
     fig.subplots_adjust(left=0.055, right=0.96, bottom=0.07, top=0.92)
 
@@ -1996,7 +1978,7 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
     cax = POT.attachAxis(ax_pop, "right", 0.025)
     cb = plt.colorbar(mappable, cax=cax, orientation="vertical")
 
-    cax.text(0.5, 0.5, r"$\log_{10}$ Population Density", va="center",
+    cax.text(0.5, 0.5, r"$\log_{10}$ Population Fraction", va="center",
         ha="center", rotation=270.0, color=POT.pgreen,
         transform=cax.transAxes, path_effects=[
             PathEffects.withStroke(linewidth=1.5, foreground="k")])
@@ -2036,11 +2018,11 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
         "display_dynamical_weight": display_orbit_weight,
         "display_mass_fraction": dynamical_mass_fraction,
         "population_fraction": population_fraction,
-        "rendered_population_density": rendered,
+        "rendered_population_fraction": rendered,
         "age_render": age_render,
         "metal_render": metal_render,
-        "sigma_age": sigma_age,
-        "sigma_metal": sigma_metal,
+        "smoothing_age": smoothing_age,
+        "smoothing_metal": smoothing_metal,
         "density_floor": density_floor,
         "wmin": wmin,
         "wmax": wmax,
