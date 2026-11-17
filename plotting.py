@@ -54,6 +54,8 @@ v2.2:   Moved `plot_chemodynamical_atlas` here;
             `plot_chemodynamical_atlas`;
         Added `plot_population_radial_profiles` to produce intrinsic weighted
             radial profiles of the SFH. 3 November 2026
+v2.3:   Added direct `/X_global` physical population projections and pure-KKT
+            versus minimum-L2 population comparison diagnostics. 17 November 2026
 
 """
 
@@ -66,7 +68,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patheffects as PathEffects
 from matplotlib import colormaps, gridspec
 from matplotlib.collections import LineCollection
-from matplotlib.colors import Normalize
+from matplotlib import colors as mcolors
 import matplotlib.ticker as mticker
 
 from CubeFit.logger import get_logger
@@ -1840,7 +1842,7 @@ def plot_chemodynamical_atlas(arSOL, umetals, uages, ualphas, nzComp, pred,
 
     cmap_obj = colormaps[cmap].copy()
     cmap_obj.set_bad((0.0, 0.0, 0.0, 0.0))
-    norm = Normalize(vmin=wmin, vmax=wmax)
+    norm = mcolors.Normalize(vmin=wmin, vmax=wmax)
 
     # One logical vertical unit per dynamical row. Within that unit the
     # complete metallicity range is represented continuously.
@@ -2607,6 +2609,471 @@ def plot_population_radial_profiles(arSOL, umetals, uages, ualphas, intData,
         "sigma_alpha": sigma_alpha,
         "valid_component": valid_component,
         "intrinsic_mass": total_intrinsic_mass,
+    }
+
+# ------------------------------------------------------------------------------
+
+def plot_x_global_projections(h5_path: str, save_path=None,
+    compare_dset="/X_global_pure_kkt", cmap="inferno", log_floor=1e-6,
+    show=False):
+    """
+    Plot physical population projections directly from ``/X_global``.
+
+    The final physical ``(C, P)`` solution is projected into global SSP and
+    component-population spaces without requiring ``/ModelCube`` or reading
+    ``/HyperCube/models``.
+
+    If ``compare_dset`` exists, the comparison solution is analysed against
+    ``/X_global``. This is intended primarily for comparing the stored raw
+    zero-regularisation KKT solution with the accepted minimum-L2 solution.
+
+    Parameters
+    ----------
+    h5_path : str
+        CubeFit HDF5 file containing ``/X_global`` and SSP coordinates.
+    save_path : str or pathlib.Path, optional
+        Main figure output path. The comparison figure uses the same stem with
+        ``_comparison`` appended. Default is None.
+    compare_dset : str or None, optional
+        HDF5 dataset to compare with ``/X_global``. Default is
+        ``"/X_global_pure_kkt"``. Missing datasets are silently ignored.
+    cmap : str, optional
+        Matplotlib colormap. Default is ``"inferno"``.
+    log_floor : float, optional
+        Smallest displayed fraction relative to each projection group's
+        maximum positive bin. Default is ``1e-6``.
+    show : bool, optional
+        Display figures interactively. Default is False.
+
+    Returns
+    -------
+    out : dict
+        Final-solution projections, component properties, and comparison
+        diagnostics when ``compare_dset`` is available.
+
+    Raises
+    ------
+    RuntimeError
+        If required HDF5 datasets are absent or the solution has zero mass.
+    ValueError
+        If solution or SSP dimensions are inconsistent.
+
+    Examples
+    --------
+    >>> out = plot_x_global_projections(
+    ...     "hypercube_109_00.h5",
+    ...     save_path="x_global_projections.png")
+    """
+    from CubeFit.hdf5_manager import open_h5
+
+    log_floor = float(log_floor)
+    if not 0.0 < log_floor < 1.0:
+        raise ValueError("log_floor must lie strictly between zero and one.")
+
+    required = ("/X_global", "/SSPMetals", "/SSPAges", "/SSPAlphas")
+
+    with open_h5(h5_path, role="reader", swmr=True) as f:
+        missing = [name for name in required if name not in f]
+        if missing:
+            raise RuntimeError(f"Missing required datasets: {missing}.")
+
+        X = np.asarray(f["/X_global"][...], dtype=np.float64)
+        metals = np.asarray(
+            f["/SSPMetals"][...], dtype=np.float64).ravel(order="C")
+        ages = np.asarray(
+            f["/SSPAges"][...], dtype=np.float64).ravel(order="C")
+        alphas = np.asarray(
+            f["/SSPAlphas"][...], dtype=np.float64).ravel(order="C")
+
+        X_compare = None
+        if compare_dset is not None and compare_dset in f:
+            X_compare = np.asarray(f[compare_dset][...], dtype=np.float64)
+
+    P = int(metals.size*ages.size*alphas.size)
+
+    def _physical_solution(values, name):
+        values = np.asarray(values, dtype=np.float64)
+
+        if values.ndim == 1:
+            if values.size % P != 0:
+                raise ValueError(
+                    f"{name} size {values.size} is incompatible with P={P}.")
+            values = values.reshape(values.size//P, P)
+        elif values.ndim != 2:
+            raise ValueError(f"{name} must have shape (C, P) or (C*P,).")
+
+        if values.shape[1] != P:
+            raise ValueError(
+                f"{name} P={values.shape[1]}; SSP grid requires P={P}.")
+        if np.any(~np.isfinite(values)):
+            raise ValueError(f"{name} contains non-finite values.")
+        if np.any(values < 0.0):
+            raise ValueError(f"{name} contains negative coefficients.")
+
+        return values
+
+    X = _physical_solution(X, "/X_global")
+    C = int(X.shape[0])
+    pop_shape = (metals.size, ages.size, alphas.size)
+
+    if X_compare is not None:
+        X_compare = _physical_solution(X_compare, compare_dset)
+        if X_compare.shape != X.shape:
+            raise ValueError(
+                f"{compare_dset} shape {X_compare.shape}; expected {X.shape}.")
+
+    def _project(values):
+        solution = values.reshape((C,)+pop_shape, order="C")
+        total = float(np.sum(solution))
+
+        if not np.isfinite(total) or total <= 0.0:
+            raise RuntimeError("Population solution has no positive mass.")
+
+        frac = solution/total
+        age_metal = np.sum(frac, axis=(0, 3))
+        age_alpha = np.sum(frac, axis=(0, 1))
+        metal_alpha = np.sum(frac, axis=(0, 2))
+        age_dist = np.sum(frac, axis=(0, 1, 3))
+        comp_age = np.sum(frac, axis=(1, 3))
+        comp_metal = np.sum(frac, axis=(2, 3))
+        comp_alpha = np.sum(frac, axis=(1, 2))
+        comp_mass = np.sum(frac, axis=(1, 2, 3))
+
+        return {
+            "solution": solution,
+            "total_mass": total,
+            "fraction": frac,
+            "age_metallicity": age_metal,
+            "age_alpha": age_alpha,
+            "metallicity_alpha": metal_alpha,
+            "age_distribution": age_dist,
+            "component_age": comp_age,
+            "component_metallicity": comp_metal,
+            "component_alpha": comp_alpha,
+            "component_mass_fraction": comp_mass,
+        }
+
+    final = _project(X)
+
+    zz, tt, aa = np.meshgrid(metals, ages, alphas, indexing="ij")
+    arSOL = final["solution"]
+    component_mass = np.sum(arSOL, axis=(1, 2, 3))
+
+    mean_age = np.divide(
+        np.sum(arSOL*tt[None, :, :, :], axis=(1, 2, 3)), component_mass,
+        out=np.full(C, np.nan, dtype=np.float64), where=component_mass > 0.0)
+    mean_metal = np.divide(
+        np.sum(arSOL*zz[None, :, :, :], axis=(1, 2, 3)), component_mass,
+        out=np.full(C, np.nan, dtype=np.float64), where=component_mass > 0.0)
+    mean_alpha = np.divide(
+        np.sum(arSOL*aa[None, :, :, :], axis=(1, 2, 3)), component_mass,
+        out=np.full(C, np.nan, dtype=np.float64), where=component_mass > 0.0)
+
+    def _edges(values):
+        values = np.asarray(values, dtype=np.float64)
+        if values.size == 1:
+            return np.array(
+                [values[0]-0.5, values[0]+0.5], dtype=np.float64)
+
+        edges = np.empty(values.size+1, dtype=np.float64)
+        edges[1:-1] = 0.5*(values[:-1]+values[1:])
+        edges[0] = values[0]-0.5*(values[1]-values[0])
+        edges[-1] = values[-1]+0.5*(values[-1]-values[-2])
+        return edges
+
+    def _log_norm(arrays):
+        positive = np.concatenate([
+            value[value > 0.0].ravel() for value in arrays
+            if np.any(value > 0.0)])
+
+        if positive.size == 0:
+            raise RuntimeError("No positive projected population mass exists.")
+
+        vmax = float(np.max(positive))
+        vmin = max(vmax*log_floor, float(np.min(positive)))
+        return mcolors.LogNorm(vmin=vmin, vmax=vmax)
+
+    age_edges = _edges(ages)
+    metal_edges = _edges(metals)
+    alpha_edges = _edges(alphas)
+    comp_edges = np.arange(C+1, dtype=np.float64)-0.5
+
+    # SSP and component projections deliberately use independent scales.
+    ssp_norm = _log_norm((
+        final["age_metallicity"], final["age_alpha"],
+        final["metallicity_alpha"]))
+    comp_norm = _log_norm((
+        final["component_age"], final["component_metallicity"],
+        final["component_alpha"]))
+
+    fig = plt.figure(figsize=(13.0, 10.0))
+    gs = fig.add_gridspec(3, 3, height_ratios=(1.0, 1.0, 0.72),
+        hspace=0.32, wspace=0.30)
+
+    ax_am = fig.add_subplot(gs[0, 0])
+    ax_aa = fig.add_subplot(gs[0, 1])
+    ax_za = fig.add_subplot(gs[0, 2])
+    ax_ca = fig.add_subplot(gs[1, 0])
+    ax_cz = fig.add_subplot(gs[1, 1])
+    ax_prop = fig.add_subplot(gs[1, 2])
+    ax_age = fig.add_subplot(gs[2, :])
+
+    mesh_ssp = ax_am.pcolormesh(
+        age_edges, metal_edges, final["age_metallicity"], cmap=cmap,
+        norm=ssp_norm, shading="flat")
+    ax_am.set_xlabel(r"Age [Gyr]")
+    ax_am.set_ylabel(r"$[Z/H]$")
+    ax_am.set_title(r"Age--metallicity")
+
+    ax_aa.pcolormesh(
+        age_edges, alpha_edges, final["age_alpha"].T, cmap=cmap,
+        norm=ssp_norm, shading="flat")
+    ax_aa.set_xlabel(r"Age [Gyr]")
+    ax_aa.set_ylabel(r"$[\alpha/{\rm Fe}]$")
+    ax_aa.set_title(r"Age--$\alpha$")
+
+    ax_za.pcolormesh(
+        metal_edges, alpha_edges, final["metallicity_alpha"].T, cmap=cmap,
+        norm=ssp_norm, shading="flat")
+    ax_za.set_xlabel(r"$[Z/H]$")
+    ax_za.set_ylabel(r"$[\alpha/{\rm Fe}]$")
+    ax_za.set_title(r"Metallicity--$\alpha$")
+
+    mesh_comp = ax_ca.pcolormesh(
+        age_edges, comp_edges, final["component_age"], cmap=cmap,
+        norm=comp_norm, shading="flat")
+    ax_ca.set_xlabel(r"Age [Gyr]")
+    ax_ca.set_ylabel("Component")
+    ax_ca.set_title("Component--age")
+
+    ax_cz.pcolormesh(
+        metal_edges, comp_edges, final["component_metallicity"], cmap=cmap,
+        norm=comp_norm, shading="flat")
+    ax_cz.set_xlabel(r"$[Z/H]$")
+    ax_cz.set_ylabel("Component")
+    ax_cz.set_title("Component--metallicity")
+
+    valid = component_mass > 0.0
+    size = np.zeros(C, dtype=np.float64)
+
+    if np.any(valid):
+        size[valid] = 15.0+135.0*np.sqrt(
+            component_mass[valid]/np.max(component_mass[valid]))
+
+    scatter = ax_prop.scatter(
+        mean_age[valid], mean_metal[valid], c=mean_alpha[valid],
+        s=size[valid], cmap=cmap, edgecolor="none", alpha=0.8)
+    ax_prop.set_xlabel(r"$\langle t\rangle$ [Gyr]")
+    ax_prop.set_ylabel(r"$\langle[Z/H]\rangle$")
+    ax_prop.set_title("Component population means")
+
+    cbar_prop = fig.colorbar(scatter, ax=ax_prop, pad=0.02)
+    cbar_prop.set_label(r"$\langle[\alpha/{\rm Fe}]\rangle$")
+
+    ax_age.stairs(
+        final["age_distribution"], age_edges, fill=True, alpha=0.35)
+    ax_age.plot(
+        ages, final["age_distribution"], marker="o", lw=1.0,
+        label="minimum-L2")
+
+    if X_compare is not None:
+        raw = _project(X_compare)
+        ax_age.plot(
+            ages, raw["age_distribution"], marker="s", lw=1.0,
+            linestyle="--", label="pure KKT")
+        ax_age.legend(frameon=False)
+    else:
+        raw = None
+
+    ax_age.set_xlabel(r"Age [Gyr]")
+    ax_age.set_ylabel("Global coefficient fraction")
+    ax_age.set_title("Global star-formation history")
+    ax_age.set_xlim(age_edges[0], age_edges[-1])
+
+    # Each heatmap row gets its own one-row colourbar.
+    cbar_ssp = fig.colorbar(
+        mesh_ssp, ax=(ax_am, ax_aa, ax_za), pad=0.015, fraction=0.025)
+    cbar_ssp.set_label("Global SSP coefficient fraction")
+
+    cbar_comp = fig.colorbar(
+        mesh_comp, ax=(ax_ca, ax_cz), pad=0.015, fraction=0.025)
+    cbar_comp.set_label("Component--SSP coefficient fraction")
+
+    fig.suptitle(
+        f"/X_global physical population projections: C={C}, P={P}",
+        fontsize=12, y=0.995)
+
+    comparison = None
+    comparison_figure = None
+
+    if raw is not None:
+        delta = X-X_compare
+        norm_final = float(np.linalg.norm(X))
+        norm_raw = float(np.linalg.norm(X_compare))
+        delta_l2 = float(np.linalg.norm(delta))
+        delta_l1 = float(np.sum(np.abs(delta)))
+
+        rel_l2 = delta_l2/max(norm_raw, 1e-300)
+        rel_l1 = delta_l1/max(float(np.sum(np.abs(X_compare))), 1e-300)
+        cosine = float(np.sum(X*X_compare)) \
+            / max(norm_final*norm_raw, 1e-300)
+
+        raw_nz = int(np.count_nonzero(X_compare > 0.0))
+        final_nz = int(np.count_nonzero(X > 0.0))
+
+        age_delta = (
+            final["age_distribution"]-raw["age_distribution"])
+        comp_delta = (
+            final["component_mass_fraction"]
+            - raw["component_mass_fraction"])
+
+        comp_delta_l2 = np.linalg.norm(delta, axis=1)
+        raw_comp_l2 = np.linalg.norm(X_compare, axis=1)
+        final_comp_l2 = np.linalg.norm(X, axis=1)
+        comp_cosine = np.divide(
+            np.sum(X*X_compare, axis=1), raw_comp_l2*final_comp_l2,
+            out=np.full(C, np.nan, dtype=np.float64),
+            where=(raw_comp_l2 > 0.0) & (final_comp_l2 > 0.0))
+
+        youngest = int(np.argmin(ages))
+        young_age = float(ages[youngest])
+        young_raw = float(raw["age_distribution"][youngest])
+        young_final = float(final["age_distribution"][youngest])
+        young_delta = young_final-young_raw
+
+        print("\nPure-KKT versus minimum-L2")
+        print(f"||x_KKT||_2          : {norm_raw:.8e}")
+        print(f"||x_minL2||_2        : {norm_final:.8e}")
+        print(f"norm reduction       : {1.0-norm_final/norm_raw:.6%}")
+        print(f"||dx||_2/||x_KKT||_2 : {rel_l2:.8e}")
+        print(f"||dx||_1/||x_KKT||_1 : {rel_l1:.8e}")
+        print(f"cosine similarity    : {cosine:.12f}")
+        print(f"positive support     : {raw_nz} -> {final_nz}")
+        print("")
+        print(f"youngest age         : {young_age:.3f} Gyr")
+        print(f"pure-KKT fraction    : {young_raw:.8e}")
+        print(f"minimum-L2 fraction  : {young_final:.8e}")
+        print(f"young fraction delta : {young_delta:+.8e}")
+
+        comparison_figure = plt.figure(figsize=(12.0, 8.5))
+        cgs = comparison_figure.add_gridspec(
+            2, 3, hspace=0.34, wspace=0.30)
+
+        ax = comparison_figure.add_subplot(cgs[0, 0])
+        ax.plot(ages, raw["age_distribution"], "o-", label="pure KKT")
+        ax.plot(ages, final["age_distribution"], "s--", label="minimum-L2")
+        ax.set_xlabel("Age [Gyr]")
+        ax.set_ylabel("Coefficient fraction")
+        ax.set_title("Global SFH")
+        ax.legend(frameon=False)
+
+        ax = comparison_figure.add_subplot(cgs[0, 1])
+        ax.bar(ages, age_delta, width=0.35*np.min(np.diff(ages)))
+        ax.axhline(0.0, color="0.4", lw=0.7)
+        ax.set_xlabel("Age [Gyr]")
+        ax.set_ylabel(r"$f_{\rm minL2}-f_{\rm KKT}$")
+        ax.set_title("Age redistribution")
+
+        ax = comparison_figure.add_subplot(cgs[0, 2])
+        delta_am = (
+            final["age_metallicity"]-raw["age_metallicity"])
+        vmax_delta = float(np.max(np.abs(delta_am)))
+        delta_norm = mcolors.TwoSlopeNorm(
+            vmin=-vmax_delta, vcenter=0.0, vmax=vmax_delta)
+        delta_mesh = ax.pcolormesh(
+            age_edges, metal_edges, delta_am, cmap="coolwarm",
+            norm=delta_norm, shading="flat")
+        ax.set_xlabel("Age [Gyr]")
+        ax.set_ylabel(r"$[Z/H]$")
+        ax.set_title(r"$\Delta$ age--metallicity")
+        comparison_figure.colorbar(delta_mesh, ax=ax, pad=0.02)
+
+        ax = comparison_figure.add_subplot(cgs[1, 0])
+        ax.plot(np.arange(C)+1, comp_delta, lw=0.9)
+        ax.axhline(0.0, color="0.4", lw=0.7)
+        ax.set_xlabel("Physical component")
+        ax.set_ylabel(r"$\Delta$ mass fraction")
+        ax.set_title("Component mass redistribution")
+
+        ax = comparison_figure.add_subplot(cgs[1, 1])
+        ax.semilogy(
+            np.arange(C)+1, np.maximum(comp_delta_l2, 1e-300), lw=0.9)
+        ax.set_xlabel("Physical component")
+        ax.set_ylabel(r"$||\Delta x_c||_2$")
+        ax.set_title("Component coefficient change")
+
+        ax = comparison_figure.add_subplot(cgs[1, 2])
+        good = np.isfinite(comp_cosine)
+        ax.plot(
+            np.arange(C)[good]+1, comp_cosine[good], ".", markersize=4)
+        ax.axhline(1.0, color="0.4", lw=0.7)
+        ax.set_xlabel("Physical component")
+        ax.set_ylabel("Cosine similarity")
+        ax.set_title("Component population similarity")
+        ax.set_ylim(min(0.95, np.nanmin(comp_cosine[good])-0.01), 1.002)
+
+        comparison_figure.suptitle(
+            "Pure KKT versus minimum-L2 population solution",
+            fontsize=12, y=0.995)
+
+        comparison = {
+            "X_pure_kkt": X_compare,
+            "delta": delta,
+            "relative_l2_change": rel_l2,
+            "relative_l1_change": rel_l1,
+            "cosine_similarity": cosine,
+            "raw_l2_norm": norm_raw,
+            "final_l2_norm": norm_final,
+            "norm_reduction": 1.0-norm_final/norm_raw,
+            "raw_positive_support": raw_nz,
+            "final_positive_support": final_nz,
+            "age_distribution_pure_kkt": raw["age_distribution"],
+            "age_distribution_delta": age_delta,
+            "component_mass_delta": comp_delta,
+            "component_delta_l2": comp_delta_l2,
+            "component_cosine_similarity": comp_cosine,
+            "youngest_age": young_age,
+            "young_fraction_pure_kkt": young_raw,
+            "young_fraction_minimum_l2": young_final,
+            "young_fraction_delta": young_delta,
+        }
+
+    if save_path is not None:
+        save_path = plp.Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=300, bbox_inches="tight",
+            pad_inches=0.03)
+
+        if comparison_figure is not None:
+            comparison_path = save_path.with_name(
+                f"{save_path.stem}_comparison{save_path.suffix}")
+            comparison_figure.savefig(
+                comparison_path, dpi=300, bbox_inches="tight",
+                pad_inches=0.03)
+
+    if show:
+        plt.show()
+
+    return {
+        "figure": fig,
+        "comparison_figure": comparison_figure,
+        "X_global": X,
+        "solution": arSOL,
+        "metals": metals,
+        "ages": ages,
+        "alphas": alphas,
+        "age_metallicity": final["age_metallicity"],
+        "age_alpha": final["age_alpha"],
+        "metallicity_alpha": final["metallicity_alpha"],
+        "age_distribution": final["age_distribution"],
+        "component_age": final["component_age"],
+        "component_metallicity": final["component_metallicity"],
+        "component_alpha": final["component_alpha"],
+        "component_mass_fraction": final["component_mass_fraction"],
+        "mean_age": mean_age,
+        "mean_metallicity": mean_metal,
+        "mean_alpha": mean_alpha,
+        "comparison": comparison,
     }
 
 # ------------------------------------------------------------------------------

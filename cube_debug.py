@@ -3819,3 +3819,340 @@ def diagnose_ssp_normalisation(h5_path: str, min_pop_fraction: float = 1e-6,
         pairwise=pairwise)
 
 # ------------------------------------------------------------------------------
+
+def diagnose_young_line_support(h5_path: str, n_apertures: int = 32,
+    continuum_order: int = 1, min_age_fraction: float = 1e-4,
+    s_tile: int = 8, save: str | None = None, show: bool = True) -> dict:
+    """
+    Test whether data require the non-continuum signature of young SSPs.
+
+    The diagnostic works before ``/ModelCube`` exists. It first reconstructs
+    the fitted young contribution in all apertures using only nonzero young
+    HyperCube columns. The apertures with the strongest young spectral power
+    are selected, and the complete fitted model is reconstructed only for
+    those apertures.
+
+    A multiplicative Legendre polynomial is then fitted to transform the
+    old-only fitted model into the full fitted model. The part of the young
+    contribution not reproduced by this continuum transformation is the
+    young population's line-sensitive spectral signature. Its support in the
+    observed data is measured directly.
+
+    No fitting is performed and no HDF5 datasets are modified.
+
+    Parameters
+    ----------
+    h5_path : str
+        Completed or partially completed CubeFit HDF5 file containing
+        ``/X_global`` and ``/HyperCube/models``.
+    n_apertures : int, optional
+        Number of strongest-young apertures used for the data-space test.
+        Default is 32.
+    continuum_order : int, optional
+        Multiplicative Legendre order removed from the young contribution.
+        Default is 1.
+    min_age_fraction : float, optional
+        Minimum global coefficient fraction for an age to count as occupied.
+        Default is ``1e-4``.
+    s_tile : int, optional
+        Number of selected apertures reconstructed per HyperCube read.
+        Default is 8.
+    save : str, optional
+        Diagnostic figure output path. Default is None.
+    show : bool, optional
+        Display the diagnostic figure. Default is True.
+
+    Returns
+    -------
+    result : dict
+        Age split, selected apertures, reconstructed models, continuum and
+        line-only young contributions, matched-filter statistics, and RSS
+        improvements.
+
+    Raises
+    ------
+    RuntimeError
+        If required datasets are absent or separated age groups are not found.
+    ValueError
+        If stored solution, SSP, or model dimensions are inconsistent.
+
+    Examples
+    --------
+    >>> out = diagnose_young_line_support(
+    ...     "hypercube_109_00.h5", n_apertures=32,
+    ...     continuum_order=1, save="young_line_support.png")
+    """
+    n_apertures = max(1, int(n_apertures))
+    continuum_order = int(continuum_order)
+    s_tile = max(1, int(s_tile))
+
+    if continuum_order < 0:
+        raise ValueError("continuum_order must be non-negative.")
+
+    required = ("/DataCube", "/HyperCube/models", "/X_global",
+        "/SSPAges", "/SSPMetals", "/SSPAlphas", "/Templates")
+
+    with open_h5(h5_path, role="reader", swmr=True) as f:
+        missing = [name for name in required if name not in f]
+        if missing:
+            raise RuntimeError(f"Missing required datasets: {missing}.")
+
+        H = f["/HyperCube/models"]
+        S, C, P, L = map(int, H.shape)
+
+        data = np.asarray(f["/DataCube"][...], dtype=np.float64)
+        X = _row_or_vec_to_CP(
+            np.asarray(f["/X_global"][...], dtype=np.float64), C, P)
+
+        ages = np.asarray(f["/SSPAges"][...], dtype=np.float64).ravel()
+        metals = np.asarray(f["/SSPMetals"][...], dtype=np.float64).ravel()
+        alphas = np.asarray(f["/SSPAlphas"][...], dtype=np.float64).ravel()
+        pop_shape = tuple(np.asarray(
+            f["/Templates"].attrs["pop_shape"], dtype=np.int64))
+
+        obs = np.asarray(f["/ObsPix"][...], dtype=np.float64).ravel() \
+            if "/ObsPix" in f else np.arange(L, dtype=np.float64)
+
+        mask = np.asarray(f["/Mask"][...], dtype=bool).ravel() \
+            if "/Mask" in f else np.ones(L, dtype=bool)
+
+        expected_shape = (metals.size, ages.size, alphas.size)
+        if pop_shape != expected_shape:
+            raise ValueError(
+                f"pop_shape={pop_shape}; expected {expected_shape}.")
+        if int(np.prod(pop_shape)) != P:
+            raise ValueError(
+                f"SSP shape {pop_shape} gives {np.prod(pop_shape)} "
+                f"populations; expected {P}.")
+        if data.shape != (S, L):
+            raise ValueError(
+                f"/DataCube has shape {data.shape}; expected {(S, L)}.")
+        if obs.size != L or mask.size != L:
+            raise ValueError("Wavelength or mask dimensions are inconsistent.")
+
+        pop_ages = np.broadcast_to(
+            ages[None, :, None], pop_shape).ravel(order="C")
+
+        age_mass = np.array([
+            np.sum(X[:, pop_ages == age]) for age in ages],
+            dtype=np.float64)
+        total_mass = float(np.sum(age_mass))
+
+        if total_mass <= 0.0 or not np.isfinite(total_mass):
+            raise RuntimeError("Fitted solution has zero population mass.")
+
+        age_fraction = age_mass/total_mass
+        occupied = age_fraction >= float(min_age_fraction)
+        occupied_idx = np.flatnonzero(occupied)
+
+        gaps = []
+        for lo, hi in zip(occupied_idx[:-1], occupied_idx[1:]):
+            if hi-lo > 1:
+                gaps.append((ages[hi]-ages[lo], int(lo), int(hi)))
+
+        if not gaps:
+            raise RuntimeError(
+                "No empty SSP-age gap separates young and old populations.")
+
+        _, young_hi, old_lo = max(gaps, key=lambda item: item[0])
+        age_split = 0.5*(ages[young_hi]+ages[old_lo])
+        young_pop = pop_ages < age_split
+        young_support = (X > 0.0) & young_pop[None, :]
+        support_c, support_p = np.nonzero(young_support)
+
+        if support_c.size == 0:
+            raise RuntimeError("No positive fitted young coefficients exist.")
+
+        # First reconstruct only the sparse young contribution. This is cheap
+        # because only fitted young (component, population) columns are read.
+        model_young = np.zeros((S, L), dtype=np.float64)
+
+        for cc in np.unique(support_c):
+            pp = np.sort(support_p[support_c == cc])
+            breaks = np.flatnonzero(np.diff(pp) > 1)+1
+
+            for group in np.split(pp, breaks):
+                p0, p1 = int(group[0]), int(group[-1])+1
+                weights = X[cc, p0:p1]
+
+                for s0 in range(0, S, 128):
+                    s1 = min(s0+128, S)
+                    slab = np.asarray(
+                        H[s0:s1, cc, p0:p1, :],
+                        dtype=np.float32, order="C")
+                    model_young[s0:s1] += np.tensordot(
+                        slab, weights, axes=([1], [0]))
+
+        young_power = np.sum(model_young[:, mask]**2, axis=1)
+        n_select = min(n_apertures, int(np.count_nonzero(young_power > 0.0)))
+
+        if n_select == 0:
+            raise RuntimeError("Young population has zero observed power.")
+
+        selected = np.argsort(young_power)[-n_select:]
+        selected = selected[np.argsort(young_power[selected])[::-1]]
+
+        # Reconstruct the complete fitted model only for selected apertures.
+        model_full = np.zeros((n_select, L), dtype=np.float64)
+        p_chunk = int(H.chunks[2]) if H.chunks is not None else P
+
+        for i0 in tqdm(
+            range(0, n_select, s_tile), desc="Selected full models"):
+            i1 = min(i0+s_tile, n_select)
+            inds = selected[i0:i1]
+
+            # HDF5 fancy indexing requires monotonically increasing indices.
+            order = np.argsort(inds)
+            inds_sorted = inds[order]
+            block = np.zeros((inds.size, L), dtype=np.float64)
+
+            for p0 in range(0, P, p_chunk):
+                p1 = min(p0+p_chunk, P)
+                slab = np.asarray(
+                    H[inds_sorted, :, p0:p1, :],
+                    dtype=np.float32, order="C")
+                local = np.tensordot(
+                    slab, X[:, p0:p1], axes=([1, 2], [0, 1]))
+                block[order] = local
+                del slab
+
+            model_full[i0:i1] = block
+
+    data_sel = data[selected]
+    young_sel = model_young[selected]
+    model_old = model_full-young_sel
+
+    fit_mask = mask & np.isfinite(obs)
+    obs_fit = obs[fit_mask]
+    span = float(np.ptp(obs_fit))
+
+    if span <= 0.0 or not np.isfinite(span):
+        raise RuntimeError("Fitted wavelength coordinate has zero extent.")
+
+    leg_x = np.full(L, np.nan, dtype=np.float64)
+    leg_x[fit_mask] = 2.0*(obs_fit-np.min(obs_fit))/span-1.0
+
+    continuum_young = np.zeros_like(young_sel)
+    line_young = np.zeros_like(young_sel)
+    continuum_model = model_old.copy()
+
+    correlation = np.full(n_select, np.nan, dtype=np.float64)
+    line_amplitude = np.full(n_select, np.nan, dtype=np.float64)
+    delta_rss_line = np.full(n_select, np.nan, dtype=np.float64)
+    line_fraction = np.full(n_select, np.nan, dtype=np.float64)
+
+    for ii in range(n_select):
+        good = fit_mask & np.isfinite(model_full[ii]) \
+            & np.isfinite(model_old[ii]) & np.isfinite(data_sel[ii]) \
+            & (model_old[ii] > 0.0)
+
+        if np.count_nonzero(good) < max(continuum_order+2, 8):
+            continue
+
+        V = np.polynomial.legendre.legvander(
+            leg_x[good], continuum_order)
+        ratio = model_full[ii, good]/model_old[ii, good]
+        coeff, *_ = np.linalg.lstsq(V, ratio, rcond=None)
+
+        smooth_full = model_old[ii, good]*(V@coeff)
+        continuum_model[ii, good] = smooth_full
+        continuum_young[ii, good] = smooth_full-model_old[ii, good]
+        line_young[ii, good] = model_full[ii, good]-smooth_full
+
+        line = line_young[ii, good]
+        residual = data_sel[ii, good]-smooth_full
+        line_power = float(np.dot(line, line))
+        young_norm = float(np.dot(young_sel[ii, good], young_sel[ii, good]))
+
+        if line_power <= 0.0:
+            continue
+
+        residual_power = float(np.dot(residual, residual))
+        correlation[ii] = np.dot(residual, line) \
+            / np.sqrt(max(residual_power*line_power, 1e-300))
+        line_amplitude[ii] = np.dot(residual, line)/line_power
+
+        rss_cont = residual_power
+        rss_full = float(np.sum(
+            (data_sel[ii, good]-model_full[ii, good])**2))
+        delta_rss_line[ii] = rss_cont-rss_full
+        line_fraction[ii] = np.sqrt(
+            line_power/max(young_norm, 1e-300))
+
+    good = np.isfinite(correlation)
+
+    print("\nYoung line-information support")
+    print(f"age split        : {age_split:.3f} Gyr")
+    print(f"young columns    : {support_c.size}/{C*P}")
+    print(f"apertures tested : {np.count_nonzero(good)}/{n_select}")
+    print(f"continuum order  : {continuum_order}")
+
+    if np.any(good):
+        print(f"median line frac : {np.median(line_fraction[good]):.5f}")
+        print(f"median corr      : {np.median(correlation[good]):+.5f}")
+        print(f"median amplitude : {np.median(line_amplitude[good]):+.5f}")
+        print(f"sum delta RSS    : {np.nansum(delta_rss_line):+.8e}")
+
+    # Sum the wavelength-by-wavelength preference over selected apertures.
+    delta_rss_lambda = np.zeros(L, dtype=np.float64)
+
+    for ii in range(n_select):
+        good_lambda = fit_mask & np.isfinite(continuum_model[ii]) \
+            & np.isfinite(model_full[ii]) & np.isfinite(data_sel[ii])
+
+        r_cont = data_sel[ii, good_lambda]-continuum_model[ii, good_lambda]
+        r_full = data_sel[ii, good_lambda]-model_full[ii, good_lambda]
+        delta_rss_lambda[good_lambda] += r_cont*r_cont-r_full*r_full
+
+    fig, axes = plt.subplots(2, 2, figsize=(10.0, 7.5))
+
+    ax = axes[0, 0]
+    ax.hist(correlation[good], bins=20, histtype="step")
+    ax.axvline(0.0, color="0.4", lw=0.7)
+    ax.set_xlabel("Residual--young-line correlation")
+    ax.set_ylabel("Apertures")
+    ax.set_title("Does the data prefer the young line signature?")
+
+    ax = axes[0, 1]
+    ax.hist(line_amplitude[good], bins=20, histtype="step")
+    ax.axvline(0.0, color="0.4", lw=0.7)
+    ax.axvline(1.0, color="0.4", lw=0.7, linestyle="--")
+    ax.set_xlabel("Best young-line amplitude")
+    ax.set_ylabel("Apertures")
+    ax.set_title("Required line strength")
+
+    ax = axes[1, 0]
+    ax.plot(obs[fit_mask], delta_rss_lambda[fit_mask], lw=0.8)
+    ax.axhline(0.0, color="0.4", lw=0.7)
+    ax.set_xlabel(r"$\log(\lambda)$")
+    ax.set_ylabel(r"$\Delta{\rm RSS}(\lambda)$")
+    ax.set_title("Where does the young line signature help?")
+
+    ax = axes[1, 1]
+    cumulative = np.cumsum(delta_rss_lambda[fit_mask])
+    ax.plot(obs[fit_mask], cumulative, lw=1.0)
+    ax.axhline(0.0, color="0.4", lw=0.7)
+    ax.set_xlabel(r"$\log(\lambda)$")
+    ax.set_ylabel(r"Cumulative $\Delta{\rm RSS}$")
+    ax.set_title("Cumulative young-line evidence")
+
+    fig.tight_layout()
+
+    if save is not None:
+        fig.savefig(save, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return dict(age_split=age_split, young_pop=young_pop,
+        young_support=young_support, selected_apertures=selected,
+        young_power=young_power, model_young=model_young,
+        model_full_selected=model_full, model_old_selected=model_old,
+        continuum_model=continuum_model, continuum_young=continuum_young,
+        line_young=line_young, line_fraction=line_fraction,
+        correlation=correlation, line_amplitude=line_amplitude,
+        delta_rss_line=delta_rss_line,
+        delta_rss_lambda=delta_rss_lambda)
+
+# ------------------------------------------------------------------------------
