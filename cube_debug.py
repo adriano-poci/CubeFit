@@ -3053,3 +3053,769 @@ def test_redundant_ssp_replacement(hypercube_path, x_path, error_cube,
     }
 
 # ------------------------------------------------------------------------------
+
+def diagnose_young_continuum_observed(h5_path: str, max_order: int = 4,
+    min_age_fraction: float = 1e-4, coeff_tol: float = 0.0,
+    s_tile: int = 128, clip_sigma: float = 3.5,
+    save: str | None = None, show: bool = True) -> dict:
+    """
+    Test young-population continuum substitution in observed HyperCube space.
+
+    The fitted age distribution is split at the largest empty gap between
+    occupied SSP ages. Only nonzero young fitted HyperCube columns are read to
+    reconstruct the exact observed young contribution. The old model is then
+
+        M_old = M_full - M_young.
+
+    Multiplicative Legendre polynomials are fitted independently in every
+    aperture to transform ``M_old`` into ``M_full``. This directly measures
+    whether smooth continuum freedom can reproduce the spatially and
+    kinematically convolved effect of the fitted young population.
+
+    A second polynomial is fitted to ``Data/M_old`` to compare the continuum
+    implied by the young population with that independently preferred by the
+    observations.
+
+    Parameters
+    ----------
+    h5_path : str
+        Completed CubeFit HDF5 file.
+    max_order : int, optional
+        Highest Legendre order to test. Default is 4.
+    min_age_fraction : float, optional
+        Minimum global coefficient fraction for an age to count as occupied.
+        Default is ``1e-4``.
+    coeff_tol : float, optional
+        Ignore young coefficients less than or equal to this value. Default is
+        zero, giving an exact reconstruction of all positive young weights.
+    s_tile : int, optional
+        Spatial apertures read per HyperCube slab. Default is 128.
+    clip_sigma : float, optional
+        MAD clipping threshold for the data-continuum fit. Default is 3.5.
+    save : str, optional
+        Diagnostic figure output path. Default is None.
+    show : bool, optional
+        Display the diagnostic figure. Default is True.
+
+    Returns
+    -------
+    result : dict
+        Age split, young-column support, reconstructed young and old models,
+        polynomial coefficients, shape recovery, data-fit recovery, and
+        continuum-agreement diagnostics.
+
+    Raises
+    ------
+    RuntimeError
+        If required datasets are absent or separated age groups are not found.
+    ValueError
+        If SSP, model, or solution dimensions are inconsistent.
+
+    Examples
+    --------
+    >>> out = diagnose_young_continuum_observed(
+    ...     "hypercube_109_00.h5", max_order=4,
+    ...     save="young_continuum_observed.png")
+    """
+    max_order = int(max_order)
+    s_tile = max(1, int(s_tile))
+    min_age_fraction = float(min_age_fraction)
+    coeff_tol = float(coeff_tol)
+    clip_sigma = float(clip_sigma)
+
+    if max_order < 0:
+        raise ValueError("max_order must be non-negative.")
+    if min_age_fraction <= 0.0:
+        raise ValueError("min_age_fraction must be positive.")
+    if coeff_tol < 0.0:
+        raise ValueError("coeff_tol must be non-negative.")
+    if clip_sigma <= 0.0:
+        raise ValueError("clip_sigma must be positive.")
+
+    required = ("/DataCube", "/ModelCube", "/HyperCube/models",
+        "/X_global", "/SSPAges", "/SSPMetals", "/SSPAlphas",
+        "/Templates")
+
+    with open_h5(h5_path, role="reader", swmr=True) as f:
+        missing = [name for name in required if name not in f]
+        if missing:
+            raise RuntimeError(f"Missing required datasets: {missing}.")
+
+        M = f["/HyperCube/models"]
+        S, C, P, L = map(int, M.shape)
+
+        data = np.asarray(f["/DataCube"][...], dtype=np.float64)
+        model_full = np.asarray(f["/ModelCube"][...], dtype=np.float64)
+        X = _row_or_vec_to_CP(
+            np.asarray(f["/X_global"][...], dtype=np.float64), C, P)
+
+        ages = np.asarray(f["/SSPAges"][...], dtype=np.float64).ravel()
+        metals = np.asarray(f["/SSPMetals"][...], dtype=np.float64).ravel()
+        alphas = np.asarray(f["/SSPAlphas"][...], dtype=np.float64).ravel()
+        pop_shape = tuple(np.asarray(
+            f["/Templates"].attrs["pop_shape"], dtype=np.int64))
+
+        obs = np.asarray(f["/ObsPix"][...], dtype=np.float64).ravel() \
+            if "/ObsPix" in f else np.arange(L, dtype=np.float64)
+
+        if "/Mask" in f:
+            mask = np.asarray(f["/Mask"][...], dtype=bool).ravel()
+        else:
+            mask = np.ones(L, dtype=bool)
+
+        expected_shape = (metals.size, ages.size, alphas.size)
+        if pop_shape != expected_shape:
+            raise ValueError(
+                f"pop_shape={pop_shape}; expected {expected_shape}.")
+        if int(np.prod(pop_shape)) != P:
+            raise ValueError(
+                f"SSP shape {pop_shape} gives {np.prod(pop_shape)} "
+                f"populations; expected {P}.")
+        if data.shape != (S, L) or model_full.shape != (S, L):
+            raise ValueError(
+                f"Data/model shapes are {data.shape}/{model_full.shape}; "
+                f"expected {(S, L)}.")
+        if obs.size != L or mask.size != L:
+            raise ValueError("Wavelength or mask dimensions are inconsistent.")
+
+        # Exact age associated with every flattened SSP population.
+        pop_ages = np.broadcast_to(
+            ages[None, :, None], pop_shape).ravel(order="C")
+
+        age_mass = np.array([
+            np.sum(X[:, pop_ages == age]) for age in ages],
+            dtype=np.float64)
+
+        total_mass = float(np.sum(age_mass))
+        if not np.isfinite(total_mass) or total_mass <= 0.0:
+            raise RuntimeError("Fitted solution has zero population mass.")
+
+        age_fraction = age_mass/total_mass
+        occupied = age_fraction >= min_age_fraction
+        occupied_idx = np.flatnonzero(occupied)
+
+        if occupied_idx.size < 2:
+            raise RuntimeError("Fewer than two fitted age bins are occupied.")
+
+        gaps = []
+        for lo, hi in zip(occupied_idx[:-1], occupied_idx[1:]):
+            if hi-lo > 1:
+                gaps.append((ages[hi]-ages[lo], int(lo), int(hi)))
+
+        if not gaps:
+            raise RuntimeError(
+                "No empty SSP-age gap separates young and old populations.")
+
+        _, young_hi, old_lo = max(gaps, key=lambda item: item[0])
+        age_split = 0.5*(ages[young_hi]+ages[old_lo])
+        young_pop = pop_ages < age_split
+
+        # Read only physical (component, population) columns that actually
+        # carry fitted young mass.
+        young_support = (X > coeff_tol) & young_pop[None, :]
+        support_c, support_p = np.nonzero(young_support)
+
+        if support_c.size == 0:
+            raise RuntimeError("No fitted young HyperCube columns are nonzero.")
+
+        young_components = np.unique(support_c)
+        young_populations = np.unique(support_p)
+        young_mass = float(np.sum(X[young_support]))
+        young_mass_fraction = young_mass/total_mass
+
+        print("\nObserved-space young-population continuum test")
+        print(f"occupied ages : {ages[occupied]}")
+        print(f"empty gap     : {ages[young_hi]:.3f} -- "
+            f"{ages[old_lo]:.3f} Gyr")
+        print(f"age split     : {age_split:.3f} Gyr")
+        print(f"young mass    : {100.0*young_mass_fraction:.3f}%")
+        print(f"components    : {young_components.size}/{C}")
+        print(f"populations   : {young_populations.size}/{P}")
+        print(f"active columns: {support_c.size}/{C*P}")
+
+        model_young = np.zeros((S, L), dtype=np.float64)
+
+        # Group requests by physical component. For each component read the
+        # smallest population range containing its nonzero young coefficients.
+        by_component = {}
+        for cc in young_components:
+            pp = support_p[support_c == cc]
+            by_component[int(cc)] = np.asarray(pp, dtype=np.int64)
+
+        for s0 in tqdm(range(0, S, s_tile), desc="Young observed model"):
+            s1 = min(s0+s_tile, S)
+
+            for cc, pp in by_component.items():
+                # Young age bins are contiguous in each metal/alpha block but
+                # need not form one global contiguous population interval.
+                # Group consecutive population indices to avoid useless reads.
+                breaks = np.flatnonzero(np.diff(pp) > 1)+1
+                groups = np.split(pp, breaks)
+
+                for group in groups:
+                    p0, p1 = int(group[0]), int(group[-1])+1
+                    slab = np.asarray(M[s0:s1, cc, p0:p1, :],
+                        dtype=np.float32, order="C")
+
+                    weights = X[cc, p0:p1]
+                    model_young[s0:s1] += np.tensordot(
+                        slab, weights, axes=([1], [0]))
+                    del slab
+
+    model_old = model_full-model_young
+
+    # Use only the wavelength support seen by the solver.
+    fit_mask = mask & np.isfinite(obs)
+    obs_fit = obs[fit_mask]
+
+    if obs_fit.size < max(max_order+2, 8):
+        raise RuntimeError("Too few fitted wavelengths for polynomial test.")
+
+    span = float(np.ptp(obs_fit))
+    if not np.isfinite(span) or span <= 0.0:
+        raise RuntimeError("Fitted wavelength coordinate has zero extent.")
+
+    leg_x = np.full(L, np.nan, dtype=np.float64)
+    leg_x[fit_mask] = 2.0*(obs_fit-np.min(obs_fit))/span-1.0
+
+    valid = fit_mask[None, :] & np.isfinite(data) \
+        & np.isfinite(model_full) & np.isfinite(model_old) \
+        & (model_old > 0.0)
+
+    # Match the symmetric fractional residual used by CubeFit diagnostics.
+    def _rss(mod):
+        denom = 0.5*(data+mod)
+        good = fit_mask[None, :] & np.isfinite(data) \
+            & np.isfinite(mod) & np.isfinite(denom) & (denom > 0.0)
+
+        positive = denom[good]
+        floor = max(float(np.percentile(positive, 1.0)*1e-6), 1e-30) \
+            if positive.size else 1e-30
+
+        resid = np.zeros_like(data)
+        resid[good] = (data[good]-mod[good]) \
+            / np.maximum(denom[good], floor)
+
+        return np.sum(resid*resid, axis=1)
+
+    rss_full = _rss(model_full)
+    rss_old = _rss(model_old)
+    young_gain = rss_old-rss_full
+
+    # Shape recovery is normalised by the exact observed young contribution.
+    young_power = np.sum(
+        np.where(fit_mask[None, :], model_young, 0.0)**2, axis=1)
+
+    model_coeff = {}
+    data_coeff = {}
+    shape_recovery = {}
+    data_recovery = {}
+    rss_substitute = {}
+    median_model_continuum = {}
+    median_data_continuum = {}
+
+    for order in range(max_order+1):
+        c_model = np.full((S, order+1), np.nan, dtype=np.float64)
+        c_data = np.full((S, order+1), np.nan, dtype=np.float64)
+        substitute = model_old.copy()
+        data_cont = np.full((S, L), np.nan, dtype=np.float64)
+        model_cont = np.full((S, L), np.nan, dtype=np.float64)
+
+        for s in range(S):
+            good = valid[s]
+            if np.count_nonzero(good) < max(order+2, 8):
+                continue
+
+            V = np.polynomial.legendre.legvander(leg_x[good], order)
+
+            # Direct substitution: can a polynomial reproduce the actual
+            # observed-space spectral effect supplied by the young SSPs?
+            ratio_model = model_full[s, good]/model_old[s, good]
+            cm, *_ = np.linalg.lstsq(V, ratio_model, rcond=None)
+            pc_model = V@cm
+
+            c_model[s] = cm
+            model_cont[s, good] = pc_model
+            substitute[s, good] = model_old[s, good]*pc_model
+
+            # Independently estimate the smooth correction preferred by data.
+            ratio_data = data[s, good]/model_old[s, good]
+            keep = np.isfinite(ratio_data)
+
+            for _ in range(5):
+                if np.count_nonzero(keep) < max(order+2, 8):
+                    break
+
+                cd, *_ = np.linalg.lstsq(
+                    V[keep], ratio_data[keep], rcond=None)
+                delta = ratio_data-V@cd
+                centre = np.median(delta[keep])
+                mad = 1.4826*np.median(np.abs(delta[keep]-centre))
+
+                if not np.isfinite(mad) or mad <= 0.0:
+                    break
+
+                new_keep = np.abs(delta-centre) <= clip_sigma*mad
+                if np.array_equal(new_keep, keep):
+                    break
+                keep = new_keep
+
+            if np.count_nonzero(keep) >= max(order+2, 8):
+                cd, *_ = np.linalg.lstsq(
+                    V[keep], ratio_data[keep], rcond=None)
+                c_data[s] = cd
+                data_cont[s, good] = V@cd
+
+        model_coeff[order] = c_model
+        data_coeff[order] = c_data
+        rss_substitute[order] = _rss(substitute)
+
+        shape_error = np.sum(np.where(fit_mask[None, :],
+            model_full-substitute, 0.0)**2, axis=1)
+
+        shape_recovery[order] = 1.0-np.divide(
+            shape_error, young_power, out=np.full(S, np.nan),
+            where=young_power > 0.0)
+
+        substitute_loss = rss_substitute[order]-rss_full
+        data_recovery[order] = 1.0-np.divide(
+            substitute_loss, young_gain, out=np.full(S, np.nan),
+            where=young_gain > 0.0)
+
+        median_model_continuum[order] = np.nanmedian(model_cont, axis=0)
+        median_data_continuum[order] = np.nanmedian(data_cont, axis=0)
+
+    # Weight aperture summaries by observed young spectral power. Apertures
+    # where the young solution has negligible effect should not dominate.
+    power_sum = float(np.nansum(young_power))
+    power_weight = young_power/power_sum if power_sum > 0.0 \
+        else np.zeros_like(young_power)
+
+    weighted_shape = np.full(max_order+1, np.nan, dtype=np.float64)
+    weighted_data = np.full(max_order+1, np.nan, dtype=np.float64)
+
+    print("\nPolynomial substitution")
+    print("order  shape.rec  data.rec   med.shape   med.data")
+    print("-"*54)
+
+    for order in range(max_order+1):
+        sr = shape_recovery[order]
+        dr = data_recovery[order]
+
+        gs = np.isfinite(sr) & (power_weight > 0.0)
+        gd = np.isfinite(dr) & (power_weight > 0.0)
+
+        if np.any(gs):
+            w = power_weight[gs]
+            weighted_shape[order] = np.sum(w*sr[gs])/np.sum(w)
+            med_s = np.median(sr[gs])
+        else:
+            med_s = np.nan
+
+        if np.any(gd):
+            w = power_weight[gd]
+            weighted_data[order] = np.sum(w*dr[gd])/np.sum(w)
+            med_d = np.median(dr[gd])
+        else:
+            med_d = np.nan
+
+        print(f"{order:5d} {weighted_shape[order]:10.3f} "
+            f"{weighted_data[order]:9.3f} {med_s:11.3f} {med_d:10.3f}")
+
+    fig, axes = plt.subplots(2, 2, figsize=(10.0, 7.5))
+
+    ax = axes[0, 0]
+    plot_fraction = np.where(age_fraction > 0.0, age_fraction, np.nan)
+    ax.plot(ages, plot_fraction, "o-")
+    ax.axvline(age_split, lw=0.8, color="0.4", linestyle="--")
+    ax.set_yscale("log")
+    ax.set_xlabel("SSP age [Gyr]")
+    ax.set_ylabel("Fitted coefficient fraction")
+    ax.set_title("Fitted age separation")
+
+    ax = axes[0, 1]
+    order = 1 if max_order >= 1 else 0
+    mc = median_model_continuum[order]
+    dc = median_data_continuum[order]
+    ax.plot(obs[fit_mask], mc[fit_mask], lw=1.0,
+        label="young SSP equivalent")
+    ax.plot(obs[fit_mask], dc[fit_mask], lw=1.0,
+        label="data preferred")
+    ax.axhline(1.0, lw=0.7, color="0.4")
+    ax.set_xlabel(r"$\log(\lambda)$")
+    ax.set_ylabel("Multiplicative correction")
+    ax.set_title(f"Order-{order} continuum shape")
+    ax.legend(frameon=False, fontsize=8)
+
+    ax = axes[1, 0]
+    orders = np.arange(max_order+1)
+    ax.plot(orders, weighted_shape, "o-", label="shape recovery")
+    ax.plot(orders, weighted_data, "s-", label="data-fit recovery")
+    ax.axhline(1.0, lw=0.7, color="0.4", linestyle="--")
+    ax.set_xlabel("Legendre order")
+    ax.set_ylabel("Young-power-weighted recovery")
+    ax.set_title("Observed-space substitution")
+    ax.set_xticks(orders)
+    ax.legend(frameon=False, fontsize=8)
+
+    ax = axes[1, 1]
+    if max_order >= 1:
+        sr = shape_recovery[1]
+        dr = data_recovery[1]
+        good = np.isfinite(sr) & np.isfinite(dr) & (young_power > 0.0)
+        size = 10.0+40.0*young_power[good] \
+            / max(float(np.max(young_power[good])), 1e-30)
+        ax.scatter(sr[good], dr[good], s=size, alpha=0.6)
+        ax.axvline(1.0, lw=0.7, color="0.4", linestyle="--")
+        ax.axhline(1.0, lw=0.7, color="0.4", linestyle="--")
+    ax.set_xlabel("Order-1 shape recovery")
+    ax.set_ylabel("Order-1 data-fit recovery")
+    ax.set_title("Aperture substitution")
+
+    fig.tight_layout()
+
+    if save is not None:
+        fig.savefig(save, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return dict(ages=ages, age_mass=age_mass, age_fraction=age_fraction,
+        occupied=occupied, age_split=age_split, young_pop=young_pop,
+        young_support=young_support, young_components=young_components,
+        young_populations=young_populations,
+        young_mass_fraction=young_mass_fraction,
+        model_young=model_young, model_old=model_old,
+        rss_full=rss_full, rss_old=rss_old,
+        rss_substitute=rss_substitute, model_coeff=model_coeff,
+        data_coeff=data_coeff, shape_recovery=shape_recovery,
+        data_recovery=data_recovery, weighted_shape=weighted_shape,
+        weighted_data=weighted_data,
+        median_model_continuum=median_model_continuum,
+        median_data_continuum=median_data_continuum)
+
+# ------------------------------------------------------------------------------
+
+def diagnose_ssp_normalisation(h5_path: str, min_pop_fraction: float = 1e-6,
+    save: str | None = None, show: bool = True) -> dict:
+    """
+    Diagnose normalization and shape degeneracy of occupied SSP templates.
+
+    The function identifies fitted SSP populations from ``/X_global`` and
+    compares their stored templates using raw normalization measures, optimal
+    constant rescaling, and first-order multiplicative Legendre rescaling.
+
+    It also compares the fitted young and old composite SSP spectra, using the
+    largest empty gap between occupied ages to define the two age groups.
+
+    No HyperCube data are read and no fit is performed.
+
+    Parameters
+    ----------
+    h5_path : str
+        Completed CubeFit HDF5 file.
+    min_pop_fraction : float, optional
+        Minimum fraction of total fitted coefficient mass required for an SSP
+        population to count as occupied. Default is ``1e-6``.
+    save : str, optional
+        Diagnostic figure output path. Default is None.
+    show : bool, optional
+        Display the diagnostic figure. Default is True.
+
+    Returns
+    -------
+    result : dict
+        Population coordinates, normalization metrics, pairwise comparisons,
+        and young/old composite-spectrum comparisons.
+
+    Raises
+    ------
+    RuntimeError
+        If required datasets are absent or no separated age groups exist.
+    ValueError
+        If SSP dimensions are inconsistent.
+
+    Examples
+    --------
+    >>> out = diagnose_ssp_normalisation(
+    ...     "hypercube_109_00.h5", save="ssp_normalisation.png")
+    """
+    min_pop_fraction = float(min_pop_fraction)
+    if min_pop_fraction <= 0.0:
+        raise ValueError("min_pop_fraction must be positive.")
+
+    required = ("/Templates", "/X_global", "/SSPAges", "/SSPMetals",
+        "/SSPAlphas", "/TemPix")
+
+    with open_h5(h5_path, role="reader", swmr=True) as f:
+        missing = [name for name in required if name not in f]
+        if missing:
+            raise RuntimeError(f"Missing required datasets: {missing}.")
+
+        templates = np.asarray(f["/Templates"][...], dtype=np.float64)
+        X_raw = np.asarray(f["/X_global"][...], dtype=np.float64)
+        ages = np.asarray(f["/SSPAges"][...], dtype=np.float64).ravel()
+        metals = np.asarray(f["/SSPMetals"][...], dtype=np.float64).ravel()
+        alphas = np.asarray(f["/SSPAlphas"][...], dtype=np.float64).ravel()
+        tem_pix = np.asarray(f["/TemPix"][...], dtype=np.float64).ravel()
+        pop_shape = tuple(np.asarray(
+            f["/Templates"].attrs["pop_shape"], dtype=np.int64))
+
+        if "/Mask" in f and "/ObsPix" in f:
+            obs = np.asarray(f["/ObsPix"][...], dtype=np.float64).ravel()
+            mask = np.asarray(f["/Mask"][...], dtype=bool).ravel()
+        else:
+            obs = mask = None
+
+    P, T = templates.shape
+    expected_shape = (metals.size, ages.size, alphas.size)
+
+    if pop_shape != expected_shape:
+        raise ValueError(
+            f"pop_shape={pop_shape}; expected {expected_shape}.")
+    if int(np.prod(pop_shape)) != P:
+        raise ValueError(
+            f"SSP shape {pop_shape} gives {np.prod(pop_shape)} "
+            f"populations; expected P={P}.")
+    if tem_pix.size != T:
+        raise ValueError(f"TemPix has size {tem_pix.size}; expected {T}.")
+    if X_raw.size % P != 0:
+        raise ValueError(
+            f"X_global size {X_raw.size} is not divisible by P={P}.")
+
+    C = X_raw.size//P
+    X = _row_or_vec_to_CP(X_raw, C, P)
+
+    # Recover exact physical coordinates of every flattened SSP.
+    iz, ia, ialpha = np.unravel_index(
+        np.arange(P), pop_shape, order="C")
+    pop_metal = metals[iz]
+    pop_age = ages[ia]
+    pop_alpha = alphas[ialpha]
+
+    # Integrated fitted coefficient assigned to each SSP.
+    pop_mass = np.sum(X, axis=0)
+    total_mass = float(np.sum(pop_mass))
+
+    if not np.isfinite(total_mass) or total_mass <= 0.0:
+        raise RuntimeError("Fitted solution has zero population mass.")
+
+    pop_fraction = pop_mass/total_mass
+    occupied = pop_fraction >= min_pop_fraction
+    occupied_idx = np.flatnonzero(occupied)
+
+    if occupied_idx.size < 2:
+        raise RuntimeError("Fewer than two SSP populations are occupied.")
+
+    # Infer young/old separation from occupied age bins.
+    age_mass = np.array([
+        np.sum(pop_mass[pop_age == age]) for age in ages],
+        dtype=np.float64)
+    age_fraction = age_mass/total_mass
+    occupied_age = age_fraction >= min_pop_fraction
+    occupied_age_idx = np.flatnonzero(occupied_age)
+
+    gaps = []
+    for lo, hi in zip(occupied_age_idx[:-1], occupied_age_idx[1:]):
+        if hi-lo > 1:
+            gaps.append((ages[hi]-ages[lo], int(lo), int(hi)))
+
+    if not gaps:
+        raise RuntimeError(
+            "No empty SSP-age gap separates young and old populations.")
+
+    _, young_hi, old_lo = max(gaps, key=lambda item: item[0])
+    age_split = 0.5*(ages[young_hi]+ages[old_lo])
+    young = pop_age < age_split
+    old = ~young
+
+    # Raw template normalization metrics.
+    template_mean = np.mean(templates, axis=1)
+    template_median = np.median(templates, axis=1)
+    template_sum = np.sum(templates, axis=1)
+    template_l2 = np.linalg.norm(templates, axis=1)
+
+    # Composite spectra use exactly the fitted SSP coefficients.
+    spec_full = pop_mass@templates
+    spec_young = pop_mass[young]@templates[young]
+    spec_old = pop_mass[old]@templates[old]
+
+    closure = np.linalg.norm(spec_full-spec_old-spec_young)
+    closure /= max(np.linalg.norm(spec_full), 1e-30)
+    if closure > 1e-12:
+        raise RuntimeError(
+            f"Composite spectral closure failed: {closure:.3e}.")
+
+    valid = np.isfinite(spec_full) & np.isfinite(spec_old) \
+        & np.isfinite(spec_young) & (spec_old > 0.0)
+
+    if np.count_nonzero(valid) < 8:
+        raise RuntimeError("Insufficient valid template wavelengths.")
+
+    # Legendre coordinate on the stored template wavelength grid.
+    tmin = float(np.min(tem_pix[valid]))
+    span = float(np.ptp(tem_pix[valid]))
+    if not np.isfinite(span) or span <= 0.0:
+        raise RuntimeError("Template wavelength grid has zero extent.")
+
+    leg_x = np.full(T, np.nan, dtype=np.float64)
+    leg_x[valid] = 2.0*(tem_pix[valid]-tmin)/span-1.0
+
+    # Fit a multiplicative polynomial mapping source -> target.
+    def _compare(source, target, order):
+        good = np.isfinite(source) & np.isfinite(target) & (source > 0.0)
+        V = np.polynomial.legendre.legvander(leg_x[good], order)
+        ratio = target[good]/source[good]
+        coeff, *_ = np.linalg.lstsq(V, ratio, rcond=None)
+
+        prediction = source[good]*(V@coeff)
+        delta = target[good]-prediction
+        signal = target[good]-source[good]
+
+        error = float(np.sum(delta*delta))
+        signal_power = float(np.sum(signal*signal))
+        target_power = float(np.sum(target[good]*target[good]))
+
+        recovery = 1.0-error/signal_power if signal_power > 0.0 else np.nan
+        rel_target_rms = np.sqrt(error/max(target_power, 1e-30))
+
+        return coeff, recovery, rel_target_rms
+
+    composite = {}
+    for order in (0, 1):
+        coeff, recovery, rel_rms = _compare(spec_old, spec_full, order)
+        composite[order] = dict(coeff=coeff, recovery=recovery,
+            relative_target_rms=rel_rms)
+
+    # Compare every occupied young SSP against every occupied old SSP.
+    young_idx = occupied_idx[young[occupied_idx]]
+    old_idx = occupied_idx[old[occupied_idx]]
+    pairwise = []
+
+    for py in young_idx:
+        for po in old_idx:
+            c0, r0, e0 = _compare(templates[po], templates[py], 0)
+            c1, r1, e1 = _compare(templates[po], templates[py], 1)
+
+            pairwise.append(dict(young=int(py), old=int(po),
+                young_age=float(pop_age[py]), old_age=float(pop_age[po]),
+                young_metal=float(pop_metal[py]),
+                old_metal=float(pop_metal[po]),
+                young_alpha=float(pop_alpha[py]),
+                old_alpha=float(pop_alpha[po]),
+                young_fraction=float(pop_fraction[py]),
+                old_fraction=float(pop_fraction[po]),
+                scale=float(c0[0]), recovery0=float(r0),
+                recovery1=float(r1), rel_rms0=float(e0),
+                rel_rms1=float(e1), slope=float(c1[1])))
+
+    print("\nOccupied SSP normalization diagnostic")
+    print(f"age split : {age_split:.3f} Gyr")
+    print(f"young SSPs: {young_idx.size}")
+    print(f"old SSPs  : {old_idx.size}")
+    print("")
+    print(" idx    age       Z   alpha      frac       mean     median")
+    print("-"*70)
+
+    for pp in occupied_idx:
+        print(f"{pp:4d} {pop_age[pp]:6.2f} {pop_metal[pp]:+7.3f} "
+            f"{pop_alpha[pp]:+7.3f} {pop_fraction[pp]:9.3e} "
+            f"{template_mean[pp]:9.3e} {template_median[pp]:9.3e}")
+
+    print("\nComposite old -> full")
+    print("order      scale       slope    recovery   rel.target.RMS")
+    print("-"*60)
+
+    c0 = composite[0]["coeff"]
+    print(f"{0:5d} {c0[0]:10.6f} {'--':>11s} "
+        f"{composite[0]['recovery']:11.6f} "
+        f"{composite[0]['relative_target_rms']:16.6e}")
+
+    c1 = composite[1]["coeff"]
+    print(f"{1:5d} {c1[0]:10.6f} {c1[1]:+11.6f} "
+        f"{composite[1]['recovery']:11.6f} "
+        f"{composite[1]['relative_target_rms']:16.6e}")
+
+    if pairwise:
+        best0 = max(pairwise, key=lambda d: d["recovery0"])
+        best1 = max(pairwise, key=lambda d: d["recovery1"])
+
+        print("\nBest occupied SSP matches")
+        print("         young old   y.age  o.age     scale   recovery")
+        print("-"*61)
+        print(f"order 0: {best0['young']:5d} {best0['old']:3d} "
+            f"{best0['young_age']:6.2f} {best0['old_age']:6.2f} "
+            f"{best0['scale']:9.5f} {best0['recovery0']:10.6f}")
+        print(f"order 1: {best1['young']:5d} {best1['old']:3d} "
+            f"{best1['young_age']:6.2f} {best1['old_age']:6.2f} "
+            f"{best1['scale']:9.5f} {best1['recovery1']:10.6f}")
+
+    fig, axes = plt.subplots(2, 2, figsize=(10.0, 7.5))
+
+    ax = axes[0, 0]
+    ax.scatter(pop_age[occupied_idx], template_mean[occupied_idx],
+        s=30+300.0*pop_fraction[occupied_idx])
+    ax.set_xlabel("SSP age [Gyr]")
+    ax.set_ylabel("Template mean")
+    ax.set_title("Stored template normalization")
+
+    ax = axes[0, 1]
+    ax.scatter(pop_age[occupied_idx], template_l2[occupied_idx],
+        s=30+300.0*pop_fraction[occupied_idx])
+    ax.set_xlabel("SSP age [Gyr]")
+    ax.set_ylabel(r"$||T_p||_2$")
+    ax.set_title("Template spectral norm")
+
+    ax = axes[1, 0]
+    norm = np.median(spec_full[valid])
+    norm = norm if np.isfinite(norm) and norm != 0.0 else 1.0
+
+    V0 = np.polynomial.legendre.legvander(leg_x[valid], 0)
+    V1 = np.polynomial.legendre.legvander(leg_x[valid], 1)
+    sub0 = spec_old[valid]*(V0@composite[0]["coeff"])
+    sub1 = spec_old[valid]*(V1@composite[1]["coeff"])
+
+    ax.plot(tem_pix[valid], spec_full[valid]/norm, lw=0.9, label="full")
+    ax.plot(tem_pix[valid], spec_old[valid]/norm, lw=0.9, label="old")
+    ax.plot(tem_pix[valid], sub0/norm, lw=0.9, label="old x constant")
+    ax.plot(tem_pix[valid], sub1/norm, lw=0.9, label="old x linear")
+    ax.set_xlabel(r"$\log(\lambda)$")
+    ax.set_ylabel("Normalised flux")
+    ax.set_title("Composite population spectra")
+    ax.legend(frameon=False, fontsize=8)
+
+    ax = axes[1, 1]
+    ratio = spec_full[valid]/spec_old[valid]
+    ax.plot(tem_pix[valid], ratio, lw=0.7, label="full / old")
+    ax.plot(tem_pix[valid], V0@composite[0]["coeff"], lw=1.0,
+        label="constant")
+    ax.plot(tem_pix[valid], V1@composite[1]["coeff"], lw=1.0,
+        label="linear")
+    ax.axhline(1.0, lw=0.7, color="0.4")
+    ax.set_xlabel(r"$\log(\lambda)$")
+    ax.set_ylabel("Multiplicative ratio")
+    ax.set_title("Continuum-equivalent young contribution")
+    ax.legend(frameon=False, fontsize=8)
+
+    fig.tight_layout()
+
+    if save is not None:
+        fig.savefig(save, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return dict(pop_age=pop_age, pop_metal=pop_metal,
+        pop_alpha=pop_alpha, pop_mass=pop_mass,
+        pop_fraction=pop_fraction, occupied=occupied,
+        age_fraction=age_fraction, age_split=age_split,
+        young_idx=young_idx, old_idx=old_idx,
+        template_mean=template_mean, template_median=template_median,
+        template_sum=template_sum, template_l2=template_l2,
+        spec_full=spec_full, spec_old=spec_old,
+        spec_young=spec_young, composite=composite,
+        pairwise=pairwise)
+
+# ------------------------------------------------------------------------------

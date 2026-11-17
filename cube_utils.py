@@ -6706,7 +6706,7 @@ def population_observability_map(
     #
     # For the outer/weak case, require actual low spectral leverage rather
     # than declaring every geometrically outer component unusable.
-    bad = unresolved | low_energy | (outside & low_aper)
+    bad = unresolved | (outside & low_aper)
 
     anchor = ~bad
 

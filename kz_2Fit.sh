@@ -17,7 +17,7 @@
 
 #SBATCH --job-name="CubeFit_2Fit"
 #SBATCH --time=0-12:00
-#SBATCH --cpus-per-task=48
+#SBATCH --cpus-per-task=32
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --mem=220G

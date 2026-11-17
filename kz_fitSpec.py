@@ -735,7 +735,9 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
         warm_start = None
     print("\nPopulation tying map")
-    print(" comp donor      R    lambda   aper.frac   E.frac   reason")
+    print(" comp donor  tied       R   lambda  aper.frac    E.frac  reason")
+    print("-"*78)
+
     for cc in range(nComp):
         reason = []
         if popMap["unresolved"][cc]:
@@ -746,10 +748,13 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             reason.append("low-M")
         if popMap["low_energy"][cc]:
             reason.append("low-E")
+
+        tied = component_donor[cc] != cc
         print(f"{nzComp[cc]:5d} {nzComp[component_donor[cc]]:5d} "
-            f"{popMap['radius'][cc]:7.2f} {popMap['circularity'][cc]:+7.3f} "
+            f"{'yes' if tied else 'no':>5s} {popMap['radius'][cc]:7.2f} "
+            f"{popMap['circularity'][cc]:+7.3f} "
             f"{popMap['aper_fraction'][cc]:10.3e} "
-            f"{popMap['energy_fraction'][cc]:9.3e} "
+            f"{popMap['energy_fraction'][cc]:10.3e} "
             f"{','.join(reason) if reason else 'good'}")
 
     ###########################################

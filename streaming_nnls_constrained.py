@@ -558,26 +558,42 @@ def _worker_ATAz(h5_path: str, batch: list, keep_idx, z: np.ndarray, CP: int,
             # v = A_group @ z.
             for cc in range(C_physical):
                 gg = component_slot[cc]
+
                 for p0 in range(0, P, P_chunk):
                     p1 = min(p0+P_chunk, P)
+
+                    t1 = time.perf_counter()
                     slab = np.asarray(M[s0:s1, cc, p0:p1, :], dtype=np.float32)
                     if keep_idx is not None:
                         slab = slab[:, :, keep_idx]
+                    t_read += time.perf_counter()-t1
+
+                    t1 = time.perf_counter()
                     v += np.tensordot(slab, z_cp[gg, p0:p1], axes=([1], [0]))
+                    t_forward += time.perf_counter()-t1
+                    del slab
 
             # A_group.T @ v.
             partial_cp = partial.reshape(C, P)
             scale_cp = S_flat.reshape(C, P)
+
             for cc in range(C_physical):
                 gg = component_slot[cc]
+
                 for p0 in range(0, P, P_chunk):
                     p1 = min(p0+P_chunk, P)
-                    slab = np.asarray(M[s0:s1, cc, p0:p1, :], dtype=np.float32)
+
+                    t1 = time.perf_counter()
+                    slab = np.asarray(M[s0:s1, cc, p0:p1, :],
+                        dtype=np.float32)
                     if keep_idx is not None:
                         slab = slab[:, :, keep_idx]
+                    t_read += time.perf_counter()-t1
+
+                    t1 = time.perf_counter()
                     g = np.tensordot(slab, v, axes=([0, 2], [0, 1]))
                     partial_cp[gg, p0:p1] += scale_cp[gg, p0:p1]*g
-
+                    t_transpose += time.perf_counter()-t1
                     del slab
 
     print(f"[ATAz worker {os.getpid()}] read={t_read:.1f}s "
@@ -2556,33 +2572,27 @@ def streamActiveSetNNLS(
         # case retain backward compatibility and accept the resume.
         if (has_hard_orbit_shape and "orbit_shape" in resume_state
             and resume_state["orbit_shape"] is not None):
-            saved_orbit_shape = np.asarray(
-                resume_state["orbit_shape"],
-                dtype=np.float64,
-            ).ravel(order="C")
+            saved_orbit_shape = np.asarray(resume_state["orbit_shape"],
+                dtype=np.float64).ravel(order="C")
+
+            tying_stored = "component_donor" in resume_state
 
             if saved_orbit_shape.size != C:
-                raise ValueError(
-                    "Cannot full-resume with an incompatible orbit_shape: "
-                    f"checkpoint size={saved_orbit_shape.size}, "
-                    f"requested size={C}. "
-                    "Use warm_start='saved_x' instead.")
+                if tying_stored:
+                    raise ValueError(
+                        "Tying-aware checkpoint has incompatible orbit_shape "
+                        f"size {saved_orbit_shape.size}; expected {C}.")
+            else:
+                if not np.all(np.isfinite(saved_orbit_shape)):
+                    raise ValueError(
+                        "Cannot full-resume from a checkpoint with non-finite "
+                        "orbit_shape values.")
 
-            if not np.all(np.isfinite(saved_orbit_shape)):
-                raise ValueError(
-                    "Cannot full-resume from a checkpoint with non-finite "
-                    "orbit_shape values. "
-                    "Use warm_start='saved_x' instead.")
-
-            if not np.allclose(
-                saved_orbit_shape,
-                np.asarray(orbit_shape, dtype=np.float64),
-                rtol=1e-12,
-                atol=1e-15,
-            ):
-                raise ValueError(
-                    "Cannot full-resume with different orbit_weights. "
-                    "Use warm_start='saved_x' instead.")
+                if not np.allclose(saved_orbit_shape, orbit_shape,
+                    rtol=1e-12, atol=1e-15):
+                    raise ValueError(
+                        "Cannot full-resume with different orbit_weights. "
+                        "Use warm_start='saved_x' instead.")
 
     needs_kkt_initialise = bool(x0_flat is not None and not resume_state)
 
@@ -4894,9 +4904,18 @@ def solve_streaming_nnls(
     anchor_slot = np.full(C_physical, -1, dtype=np.int64)
     anchor_slot[anchors] = np.arange(C_fit, dtype=np.int64)
     component_slot = anchor_slot[component_donor]
-
     if np.any(component_slot < 0):
         raise RuntimeError("Invalid component donor reduction.")
+    # A stored tying map is authoritative when present. Legacy checkpoints
+    # without tying metadata remain resumable under the current mapping.
+    if resume_state and "component_donor" in resume_state:
+        saved_donor = _canon_component_donor(
+            resume_state["component_donor"], C_physical)
+
+        if not np.array_equal(saved_donor, component_donor):
+            raise ValueError(
+                "Cannot full-resume with a different component_donor. "
+                "Use warm_start='saved_x' instead.")
 
     print(f"[MONO] population tying: {C_physical} physical -> "
         f"{C_fit} independent components", flush=True)
@@ -4968,10 +4987,6 @@ def solve_streaming_nnls(
         if x0.size != CP_physical:
             raise ValueError(f"x0 has size {x0.size}; expected {CP_physical}.")
         x = x0.reshape(C_physical, P)[anchors].copy()
-
-    if resume_state and C != C_physical:
-        raise ValueError('Full-state resume is incompatible with component '
-            'tying; use warm_start=\'saved_x\' or a fresh solve.')
 
     verbose = getattr(cfg, "verbose", True)
 
@@ -5207,7 +5222,9 @@ def solve_streaming_nnls(
                 "active": int(stats.get("active", -1)),
                 "stall_count": int(stats.get("stall_count", -1)),
             }
-
+        # Stamp the physical tying definition into new checkpoints. Absence
+        # remains valid for checkpoints written before population tying.
+        state["component_donor"] = component_donor.astype(np.int64).tolist()
         try:
             tracker.save_checkpoint(latest_ckpt["x"], state, block=True)
         except Exception as exc:

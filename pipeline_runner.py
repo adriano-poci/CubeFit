@@ -399,11 +399,6 @@ class PipelineRunner:
         if has_component_ties and not streaming:
             raise NotImplementedError(
                 "Population tying is supported only by the streaming solver.")
-
-        if has_component_ties and warm_start == "resume":
-            raise ValueError(
-                "Full-state resume is incompatible with population tying; "
-                "use warm_start='saved_x' instead.")
         
         x0_effective = None
         resume_state_effective = None
