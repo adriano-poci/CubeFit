@@ -5275,31 +5275,55 @@ def solve_streaming_nnls(h5_path: str, cfg: MPConfig,
 
             cached_spatial_digest = (str(cache_npz["spatial_mask_digest"])
                 if "spatial_mask_digest" in cache_npz.files else None)
-            ok = (int(cache_npz["S"]) == int(S) and int(cache_npz["L"]) == int(L)
-                and int(cache_npz["C_physical"]) == int(C_physical)
-                and int(cache_npz["P"]) == int(P)
-                and int(cache_npz["s_tile"]) == int(s_tile)
-                and int(cache_npz["apply_mask"]) == int(bool(cfg.apply_mask))
-                and np.array_equal(np.asarray(cache_npz["keep_idx"],
-                    dtype=np.int64), keep_idx_sig)
-                and str(cache_npz["error_digest"]) == error_digest
-                and (cached_spatial_digest == spatial_mask_digest or (
-                    cached_spatial_digest is None and np.all(spatial_mask))))
+            required = {"ATy_flat", "D_tot", "inv_sqrt_energy_flat", "keep_idx",
+                "error_digest", "S", "L", "C_physical", "P", "s_tile",
+                "apply_mask"}
+
+            ok = required.issubset(cache_npz.files)
+
+            if ok:
+                cached_ATy = cache_npz["ATy_flat"]
+                cached_D = cache_npz["D_tot"]
+                cached_scale = cache_npz["inv_sqrt_energy_flat"]
+
+                ok = (cached_ATy.size == build_C_fit*P
+                    and cached_D.shape == (build_C_fit, P)
+                    and cached_scale.size == build_C_fit*P
+                    and int(cache_npz["S"]) == int(S)
+                    and int(cache_npz["L"]) == int(L)
+                    and int(cache_npz["C_physical"]) == int(C_physical)
+                    and int(cache_npz["P"]) == int(P)
+                    and int(cache_npz["s_tile"]) == int(s_tile)
+                    and int(cache_npz["apply_mask"]) == int(bool(
+                        cfg.apply_mask))
+                    and np.array_equal(
+                        np.asarray(cache_npz["keep_idx"], dtype=np.int64),
+                        keep_idx_sig)
+                    and str(cache_npz["error_digest"]) == error_digest
+                    and (cached_spatial_digest == spatial_mask_digest or (
+                        cached_spatial_digest is None and np.all(spatial_mask)))
+                )
 
             if ok:
                 cache_hit = True
                 print(f"[MONO][build] cache hit: {cache_path}", flush=True)
             else:
+                print(f"[MONO][build] cache incompatible; rebuilding: "
+                    f"{cache_path}", flush=True)
                 cache_npz.close()
                 cache_npz = None
+
         except Exception as _e:
-            print(f"[MONO][build] cache load failed: {_e}", flush=True)
+            print(f"[MONO][build] cache load failed; rebuilding: {_e}",
+                flush=True)
             cache_hit = False
+
             if cache_npz is not None:
                 try:
                     cache_npz.close()
                 except Exception:
                     pass
+
                 cache_npz = None
 
     if cache_hit:
@@ -5310,12 +5334,6 @@ def solve_streaming_nnls(h5_path: str, cfg: MPConfig,
         D_tot = np.asarray(cache_npz["D_tot"], dtype=np.float64).copy()
         inv_sqrt_energy_flat = np.asarray(cache_npz["inv_sqrt_energy_flat"],
             dtype=np.float64).copy()
-        if ATy_flat.size != build_C_fit*P:
-            raise RuntimeError(
-                'Cached ATy has incompatible build-space dimensions.')
-        if D_tot.shape != (build_C_fit, P):
-            raise RuntimeError(
-                'Cached column energy has incompatible build-space dimensions.')
 
         try:
             cache_npz.close()
