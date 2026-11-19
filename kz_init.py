@@ -31,13 +31,14 @@ def props(galaxy, **kwargs):
             lOrder=0, specRange=[5100, 6650], full=True, lsf=True, iso='BaSTI',
             nProcs=1, band='F814W', runSwitch=None, kind='SMILES', cont=False,
             smask=[[5530, 5555], [6255, 6335], [7580, 7700], [8775, 9000]],
-            warm='resume', cpu_processes=4, blas_threads=2,
+            warm='resume', cpu_processes=8, blas_threads=2,
             orbitWeights=True, sspIdx=(
                 [-1.26, -0.96, -0.66, -0.35, -0.25, 0.06, 0.15, 0.26],
                 [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 12.5, 13.0, 13.5, 14.0],
                 [-0.2, 0.0, 0.2, 0.4, 0.6]), runnerKwargs=dict(
                 regularisation_scale=0.0, minimum_l2_at_zero=True,
-                minimum_l2_rss_rtol=1e-6), **kwargs)
+                minimum_l2_rss_rtol=1e-6,
+                spatial_mask = {'exclude_radius': 2.0}), **kwargs)
             # # old SSP
             # sspIdx=([-1.49, -0.96, -0.66, -0.3, 0.06, 0.15, 0.26],
             # [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
