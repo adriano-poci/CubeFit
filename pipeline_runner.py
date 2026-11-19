@@ -89,6 +89,11 @@ v1.29:  Persist pure-KKT solution in `PipelineRunner.solve_all_mp_batched`. 11
             November 2026
 v1.30:  Pass population component tying through to the streaming solver while
             retaining physical solution shapes and warm starts. 13 November 2026
+v1.31:  Added runtime spatial-mask handling and mask-aware checkpoint
+            compatibility, falling back to the saved physical solution when the
+            fitting region changes;
+        Added ErrorCube-aware checkpoint compatibility for statistically
+            weighted fits. 18 November 2026
 """
 
 from __future__ import annotations
@@ -376,6 +381,10 @@ class PipelineRunner:
 
         # ---------------- Warm-start ----------------
         N_expected = int(self.nComp * self.nPop)
+        spatial_mask = solver_kwargs.get("spatial_mask", None)
+        spatial_mask, spatial_mask_digest = cu.canonical_spatial_mask(
+            spatial_mask, self.nSpat)
+        solver_kwargs["spatial_mask"] = spatial_mask
 
         component_donor = solver_kwargs.get("component_donor", None)
         has_component_ties = False
@@ -445,34 +454,66 @@ class PipelineRunner:
                 x_resume, resume_state_effective = load_checkpoint(
                     sidecar, expected_size=N_expected)
 
-            if (x_resume is not None) and (resume_state_effective is not None):
+            resume_compatible = (x_resume is not None and
+                resume_state_effective is not None)
+
+            if resume_compatible:
+                with open_h5(self.h5_path, role="reader") as f:
+                    if "/ErrorCube" not in f:
+                        raise RuntimeError('Missing /ErrorCube; weighted '
+                            'CubeFit requires uncertainties.')
+
+                    error_digest = str(f["/ErrorCube"].attrs.get("digest", ""))
+
+                saved_digest = resume_state_effective.get("error_digest", None)
+
+                if not error_digest:
+                    raise RuntimeError('ErrorCube is missing its digest.')
+                resume_compatible = (saved_digest is not None
+                    and str(saved_digest) == error_digest)
+                
+                saved_spatial_digest = resume_state_effective.get(
+                    "spatial_mask_digest", None)
+                if saved_spatial_digest is not None:
+                    resume_compatible = (
+                        resume_compatible
+                        and str(saved_spatial_digest) == spatial_mask_digest)
+                elif not np.all(spatial_mask):
+                    resume_compatible = False
+
+            if resume_compatible:
                 x0_effective = x_resume
 
-                vprint(
-                    "[Pipeline] Full solver-state resume from "
-                    f"{sidecar}: "
+                vprint(f"[Pipeline] Full solver-state resume from {sidecar}: "
                     f"iter={resume_state_effective.get('iter', None)}, "
                     f"phase={resume_state_effective.get('phase', None)}, "
                     f"final={resume_state_effective.get('final', None)}.")
 
             else:
                 resume_state_effective = None
-                x0_effective, src_label, src_file = self._read_saved_x(
-                    N_expected)
 
-                if x0_effective is not None:
+                if x_resume is not None:
+                    x0_effective = x_resume
                     vprint(
-                        "[Pipeline] Full solver state unavailable; "
-                        f"falling back to saved x {src_label} "
-                        f"({src_file}; n={x0_effective.size}).")
+                        "[Pipeline] Checkpoint solver state is incompatible "
+                        "with the current fit mask or ErrorCube; using its "
+                        "physical x as a fresh warm start.")
                 else:
-                    vprint(
-                        "[Pipeline] No full checkpoint or saved x found; "
-                        "continuing without warm-start.")
+                    x0_effective, src_label, src_file = self._read_saved_x(
+                        N_expected)
+
+                    if x0_effective is not None:
+                        vprint(
+                            "[Pipeline] Full solver state unavailable; "
+                            f"falling back to saved x {src_label} "
+                            f"({src_file}; n={x0_effective.size}).")
+                    else:
+                        vprint(
+                            "[Pipeline] No full checkpoint or saved x found; "
+                            "continuing without warm-start.")
 
         elif warm_start == "zeros":
-            vprint(
-                "[Pipeline] Start mode: zeros; using fresh solver state.")
+            vprint('[Pipeline] Start mode: zeros; using fresh solver state.')
             x0_effective = np.zeros(N_expected, dtype=np.float64)
 
         else:

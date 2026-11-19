@@ -124,6 +124,14 @@ v2.6:   Use `pcolormesh` in `loadCubeFit` instead of `imshow` to account for
             non-uniform SSP library sampling. 4 November 2026
 v2.7:   Added population observability mapping before fitting and pass component
             tying information to the solver. 13 November 2026
+v2.8:   Added runtime spatial masking through runnerKwargs, including projected
+            radial exclusions based on aperture centres;
+        Added ErrorCube persistence and fit-provenance metadata. 18 November 2026
+v2.9:  Updated HyperCube construction settings for solve-optimised storage
+            chunking and improved parallel generation;
+        Improved parallel ModelCube reconstruction cache sizing and worker
+            thread controls, and record the correct reconstruction generator in
+            output metadata. 19 November 2026
 """
 
 # need to set up the logger before any other imports
@@ -384,7 +392,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     warm_start = kwargs.pop('warm', 'zeros')
     runnerKwargs = dict(kwargs.pop('runnerKwargs', {}))
-
+    continuum_enabled = bool(kwargs.get('cont', False))
+    spatial_mask_spec = runnerKwargs.pop("spatial_mask", None)
 
     with logger.capture_all_output():
         decDir, cDirs, _, nComp, teLL, lnGrid, histBinSize, _,\
@@ -399,6 +408,35 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     nSSP = int(np.prod((nMetals, nAges, nAlphas), dtype=int))
     pred = f"0{len(repr(nComp)):d}"
     nComp = int(nComp)
+
+    # Resolve spatial mask
+    if isinstance(spatial_mask_spec, dict):
+        allowed = {"exclude_radius", "centre"}
+        unknown = set(spatial_mask_spec)-allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown spatial_mask options: {sorted(unknown)}.")
+        if "exclude_radius" not in spatial_mask_spec:
+            raise ValueError(
+                "spatial_mask dictionary requires 'exclude_radius'.")
+        spatial_mask = cu.spatial_mask_from_radius(
+            xpix, ypix, binNum, nSpat,
+            exclude_radius=spatial_mask_spec["exclude_radius"],
+            centre=spatial_mask_spec.get("centre", (0.0, 0.0)))
+    else:
+        spatial_mask, _ = cu.canonical_spatial_mask(
+            spatial_mask_spec, nSpat)
+    spatial_mask, spatial_mask_digest = cu.canonical_spatial_mask(
+        spatial_mask, nSpat)
+    runnerKwargs["spatial_mask"] = spatial_mask
+    logger.log(
+        f"[CubeFit] Spatial fit mask: {np.count_nonzero(spatial_mask)}/"
+        f"{nSpat} apertures retained; "
+        f"{nSpat-np.count_nonzero(spatial_mask)} excluded.")
+    excluded = np.flatnonzero(~spatial_mask)
+    if excluded.size:
+        logger.log(f"[CubeFit] Spatial mask excludes apertures "
+            f"{excluded.tolist()}.")
 
     oDict = cu.Load.lzma(direc/f"decomp_{nCuts:d}.plt")
     binFN = oDict['binFN']
@@ -615,6 +653,20 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
         orbit_weights=cWeights,
         ssp_metals=umetals, ssp_ages=uages, ssp_alphas=ualphas,
         ssp_library=sspLibrary)
+    mgr.write_error_cube(statGrid)
+    with open_h5(hdf5Path, role="writer") as f:
+        f.attrs["fit.continuum.enabled"] = continuum_enabled
+        f.attrs["fit.continuum.mode"] = (
+            "legendre_division" if continuum_enabled else "none")
+        f.attrs["fit.continuum.order"] = (int(lOrder) if continuum_enabled
+            else -1)
+        f.attrs["fit.lsf.enabled"] = bool(lsf)
+        f.attrs["fit.template_weighting"] = str(weighting)
+        f.attrs["fit.template_norm.mode"] = (
+            "median_window" if "luminosity" in weighting else "none")
+        f.attrs["fit.template_norm.lambda_min_A"] = 5200.0
+        f.attrs["fit.template_norm.lambda_max_A"] = 5300.0
+        f.attrs["fit.ssp_library"] = sspLibrary
     mgr.ensure_rebin_and_resample()
 
     # The HDF5 file must exist before PipelineRunner opens it as a reader.
@@ -626,7 +678,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             '/HyperCube.')
         invalidate_done(hdf5Path)
 
-    nS, nC, nP = 128, 1, 360
+    # Fit-optimised chunks: full wavelength, moderate spatial/population slabs.
+    nS, nC, nP = 32, 1, 180
     biasVel = 0.0
     # --- Optional hard gate before any heavy work
     # Use small prefix slices if nothing is specified.
@@ -649,7 +702,8 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     with logger.capture_all_output():
         runner.build_hypercube(vel_bias_kms=biasVel, norm_mode="model",
             amp_mode="sum", S_chunk=nS, C_chunk=nC, P_chunk=nP,
-            processes=best_processes, blas_threads=best_blas, worker_S=8)
+            processes=best_processes, blas_threads=best_blas,
+            max_pending=2*best_processes)
     # even if runSwitch is fit only, we want to ensure the HyperCube
     # is built, so we don't return early here.
     # Should be zero-cost if already built
@@ -1043,7 +1097,8 @@ def _init_reconstruct_worker(
     os.environ["OMP_NUM_THREADS"] = str(int(blas_threads))
     os.environ["OPENBLAS_NUM_THREADS"] = str(int(blas_threads))
     os.environ["MKL_NUM_THREADS"] = str(int(blas_threads))
-    # os.environ["NUMEXPR_NUM_THREADS"] = str(int(blas_threads))
+    os.environ["BLIS_NUM_THREADS"] = str(int(blas_threads))
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
     # rdcc settings are applied per file handle inside the worker.
 
@@ -1133,7 +1188,7 @@ def reconstruct_modelcube_fast_parallel(
     s_chunk: int | None = None,
     out_dtype: str = "float64",
     rdcc_slots: int = 1_000_003,
-    rdcc_bytes: int = 8 * 1024**2,
+    rdcc_bytes: int = 64 * 1024**2,
     rdcc_w0: float = 0.90,
     n_workers: int | None = None,
     blas_threads_per_worker: int | None = None,
@@ -3413,7 +3468,7 @@ def loadCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             else:
                 reconstruct_modelcube_fast_parallel(h5_path=str(hdf5Path),
                     x_cp=x_global, s_chunk=None, out_dtype="float64",
-                    rdcc_slots=1_000_003, rdcc_bytes=8*1024**2,
+                    rdcc_slots=1_000_003, rdcc_bytes=64*1024**2,
                     rdcc_w0=0.90,
                     n_workers=builtins.min(best_processes, nTiles),
                     blas_threads_per_worker=best_blas)

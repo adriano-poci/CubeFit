@@ -34,6 +34,11 @@ v1.13:  Return `statGrid` from `_oneTimeSpec` to provide the errors of the
             rebinned spectra. 4 October 2026
 v1.14:  Added `hypercube_cold/hot` functions to compress/uncompress HDF5
             hypercubes using zstd or zlib. 31 October 2026
+v1.15:  Added runtime spatial-mask construction, canonicalisation, and contiguous
+            aperture-range generation for spatially restricted fits. 18 November
+            2026
+v1.16:  Added process and cgroup-v2 memory telemetry for monitoring large
+            HyperCube fitting operations. 19 November 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -41,7 +46,7 @@ from threadpoolctl import threadpool_info
 from typing import Any, Dict, Optional, Tuple, Sequence
 import numpy as np
 from tqdm import tqdm
-import os, glob, time, re, math, sys, builtins, warnings, traceback
+import os, glob, time, re, math, sys, builtins, warnings, traceback, hashlib
 import pathlib as plp
 import shutil
 import subprocess
@@ -89,7 +94,6 @@ def rReplace(s, old, new, occurrence):
 
 # ------------------------------------------------------------------------------
 
- 	
 def _deetExtr(fnKey):
     # temp = rReplace(fnKey, os.sep, keySep, 1).split(keySep)
     rstru = ''
@@ -291,6 +295,100 @@ def cpuset_count():
         return len(cores), ",".join(parts)
     except Exception:
         return None, None
+
+# ------------------------------------------------------------------------------
+
+def memory_telemetry() -> dict:
+    """
+    Return current process and cgroup-v2 memory telemetry in GiB.
+
+    Returns
+    -------
+    stats : dict
+        Current process RSS, process high-water RSS, and current, peak, and
+        maximum memory charged to the process cgroup.
+
+    Raises
+    ------
+    None
+        Unavailable Linux or cgroup-v2 fields are returned as NaN.
+
+    Examples
+    --------
+    >>> mem = memory_telemetry()
+    >>> print(mem["rss_gib"], mem["cgroup_current_gib"])
+    """
+    gib = float(1024**3)
+    out = {
+        "rss_gib": np.nan,
+        "rss_peak_gib": np.nan,
+        "cgroup_current_gib": np.nan,
+        "cgroup_peak_gib": np.nan,
+        "cgroup_max_gib": np.nan,
+    }
+
+    try:
+        with open("/proc/self/status", "r") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    out["rss_gib"] = float(line.split()[1])*1024.0/gib
+                elif line.startswith("VmHWM:"):
+                    out["rss_peak_gib"] = float(line.split()[1])*1024.0/gib
+    except (OSError, ValueError, IndexError):
+        pass
+
+    try:
+        with open("/proc/self/cgroup", "r") as fh:
+            entries = [line.strip().split(":", 2) for line in fh]
+
+        rel = next(fields[2] for fields in entries
+            if len(fields) == 3 and fields[0] == "0")
+        root = os.path.join("/sys/fs/cgroup", rel.lstrip("/"))
+
+        def _read_cgroup(name):
+            with open(os.path.join(root, name), "r") as fh:
+                value = fh.read().strip()
+            return np.inf if value == "max" else float(value)/gib
+
+        out["cgroup_current_gib"] = _read_cgroup("memory.current")
+        out["cgroup_max_gib"] = _read_cgroup("memory.max")
+
+        try:
+            out["cgroup_peak_gib"] = _read_cgroup("memory.peak")
+        except (OSError, ValueError):
+            pass
+    except (OSError, ValueError, IndexError, StopIteration):
+        pass
+
+    return out
+
+def log_memory(label: str) -> None:
+    """
+    Print compact process and cgroup memory telemetry.
+
+    Parameters
+    ----------
+    label : str
+        Description of the measured execution point.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    None
+
+    Examples
+    --------
+    >>> log_memory("before ATAz")
+    """
+    mem = memory_telemetry()
+    print(f"[MEM] {label}: RSS={mem['rss_gib']:.2f} GiB "
+        f"peakRSS={mem['rss_peak_gib']:.2f} GiB "
+        f"cgroup={mem['cgroup_current_gib']:.2f}/"
+        f"{mem['cgroup_max_gib']:.2f} GiB "
+        f"peak={mem['cgroup_peak_gib']:.2f} GiB", flush=True)
 
 # ------------------------------------------------------------------------------
 
@@ -2599,7 +2697,6 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     # Filenames
     logFile = spDir/f"fitSpec_{galaxy}.log"
 
-    lrb = spDir/'laDataFS.xz'
     tfn = spDir/f"templsFS{tag}.xz" # stored SSP grid
 
     gal = Load.lzma(gfn)
@@ -2683,13 +2780,7 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     wbin, hN, histBinSize, hArr = Read.apertureHist(apFile)
 
     # Data spectra
-    if lrb.is_file():
-        print('Reading binned data...')
-        outs = Load.lzma(lrb)
-        spLL = outs['spec']
-        laGrid = outs['data']
-        vScale = outs['vscale']
-    elif vbSpec.is_file():
+    if vbSpec.is_file():
         print('Generating binned data...')
         spLR = [lmin, lmax]
         dL = np.diff(spLR)/(nSpec-1)
@@ -2705,8 +2796,6 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             laGrid[:, qk] = laSpec
             statGrid[:, qk] = np.sqrt(np.maximum(laVar, 0.0))
         print('\n')
-        # outs = dict(data=laGrid, spec=spLL, vscale=vScale)
-        # Write.lzma(lrb, outs)
         print('Done.')
     else:
         raise RuntimeError('No binned spectra.')
@@ -2802,9 +2891,17 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
                     fill_value='extrapolate')
                 museLSF  = dLSFFunc(tPix)
                 milesLSF = mLSFFunc(tPix)
-                assert np.all(museLSF >= milesLSF),\
-                    'Data resolution better than templates resolution; '\
-                    'can not convolve.'
+                fitLSF = (tPix >= smin) & (tPix <= smax)
+                if np.any(~np.isfinite(museLSF[fitLSF])) or \
+                    np.any(~np.isfinite(milesLSF[fitLSF])):
+                    raise RuntimeError(
+                        "Non-finite LSF values inside the fitted range.")
+                deltaLSF = museLSF[fitLSF]-milesLSF[fitLSF]
+                if np.any(deltaLSF < 0.0):
+                    worst = float(np.min(deltaLSF))
+                    raise RuntimeError(
+                        "Data resolution is better than the SSP library "
+                        f"inside the fitted range by up to {-worst:.4f} A.")
                 outsideMask = np.where(museLSF < milesLSF)[0]
                 milesLSF[outsideMask] = museLSF[outsideMask]
                 # Just provide a non-negative convolution in regions outside of
@@ -2869,10 +2966,11 @@ def _oneTimeSpec(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
 
     if cont:
         print('Continuum subtracting...')
-        cLaGrid = legendre_detrend(spLL, laGrid, order=lOrder, scale=None,
-            axis=0, return_continuum=False) # continuum subtraction
+        cLaGrid, dataCont = legendre_detrend(spLL, laGrid, order=lOrder,
+            scale=None, axis=0, return_continuum=True)
         cLnGrid = legendre_detrend(teLL, np.atleast_2d(lnGrid),
             order=lOrder, scale=None, axis=0, return_continuum=False)
+        # statGrid = statGrid/np.abs(dataCont)
         print('Done.')
     else:
         cLaGrid = laGrid
@@ -6766,5 +6864,171 @@ def population_observability_map(
         "energy_fraction": energy_fraction,
         "energy_relative_family": energy_relative_family,
     }
+
+# ------------------------------------------------------------------------------
+
+def spatial_mask_from_radius(xpix: np.ndarray, ypix: np.ndarray,
+    binnum: np.ndarray, n_spat: int, exclude_radius: float,
+    centre=(0.0, 0.0)) -> np.ndarray:
+    """
+    Build an aperture mask excluding bins within a projected radius.
+
+    Aperture positions are the mean coordinates of their constituent spatial
+    pixels. The returned mask follows CubeFit mask semantics: ``True`` means
+    that the aperture is retained in the fit.
+
+    Parameters
+    ----------
+    xpix, ypix : ndarray
+        Spatial-pixel coordinates in arcsec.
+    binnum : ndarray
+        Zero-based spatial-bin index for each pixel.
+    n_spat : int
+        Number of spatial apertures.
+    exclude_radius : float
+        Radius in arcsec inside which aperture centres are excluded.
+    centre : sequence of float, optional
+        Spatial centre ``(x, y)`` in arcsec. Default is ``(0, 0)``.
+
+    Returns
+    -------
+    spatial_mask : ndarray
+        Boolean aperture mask with shape ``(n_spat,)``.
+
+    Raises
+    ------
+    ValueError
+        If dimensions, bin indices, centre, or radius are invalid.
+
+    Examples
+    --------
+    >>> mask = spatial_mask_from_radius(
+    ...     xpix, ypix, binNum, nSpat, exclude_radius=1.0)
+    """
+    xpix = np.asarray(xpix, dtype=np.float64).ravel(order="C")
+    ypix = np.asarray(ypix, dtype=np.float64).ravel(order="C")
+    binnum = np.asarray(binnum, dtype=np.int64).ravel(order="C")
+    n_spat = int(n_spat)
+    exclude_radius = float(exclude_radius)
+    centre = np.asarray(centre, dtype=np.float64).ravel(order="C")
+
+    if xpix.size != ypix.size or xpix.size != binnum.size:
+        raise ValueError(
+            "xpix, ypix, and binnum must have identical lengths.")
+    if centre.size != 2 or np.any(~np.isfinite(centre)):
+        raise ValueError("centre must contain two finite coordinates.")
+    if not np.isfinite(exclude_radius) or exclude_radius < 0.0:
+        raise ValueError("exclude_radius must be finite and non-negative.")
+    if np.any(binnum < 0) or np.any(binnum >= n_spat):
+        raise ValueError("binnum contains invalid spatial-bin indices.")
+
+    counts = np.bincount(binnum, minlength=n_spat).astype(np.float64)
+    if np.any(counts <= 0.0):
+        missing = np.flatnonzero(counts <= 0.0)
+        raise ValueError(
+            f"Spatial bins contain no pixels: {missing.tolist()}.")
+
+    xbin = np.bincount(binnum, weights=xpix, minlength=n_spat)/counts
+    ybin = np.bincount(binnum, weights=ypix, minlength=n_spat)/counts
+    radius = np.hypot(xbin-centre[0], ybin-centre[1])
+
+    return radius >= exclude_radius
+
+def canonical_spatial_mask(spatial_mask, n_spat: int
+    ) -> tuple[np.ndarray, str]:
+    """
+    Canonicalize a runtime spatial mask and return its deterministic digest.
+
+    Parameters
+    ----------
+    spatial_mask : array-like or None
+        Aperture mask with ``True`` meaning keep. None keeps all apertures.
+    n_spat : int
+        Number of spatial apertures.
+
+    Returns
+    -------
+    mask : ndarray
+        Canonical boolean mask with shape ``(n_spat,)``.
+    digest : str
+        SHA-256 digest of the canonical mask.
+
+    Raises
+    ------
+    ValueError
+        If the mask has the wrong size or excludes every aperture.
+
+    Examples
+    --------
+    >>> mask, digest = canonical_spatial_mask(None, 100)
+    """
+    n_spat = int(n_spat)
+
+    if spatial_mask is None:
+        mask = np.ones(n_spat, dtype=bool)
+    else:
+        mask = np.asarray(spatial_mask, dtype=bool).ravel(order="C")
+
+        if mask.size != n_spat:
+            raise ValueError(
+                f"spatial_mask has size {mask.size}; expected {n_spat}.")
+
+        mask = mask.copy()
+
+    if not np.any(mask):
+        raise ValueError("spatial_mask excludes every aperture.")
+
+    digest = hashlib.sha256(
+        np.ascontiguousarray(mask.astype(np.uint8)).tobytes()).hexdigest()
+
+    return mask, digest
+
+def spatial_mask_ranges(spatial_mask: np.ndarray,
+    s_tile: int) -> list[tuple[int, int]]:
+    """
+    Convert an aperture mask into contiguous chunk-limited HDF5 ranges.
+
+    Parameters
+    ----------
+    spatial_mask : ndarray
+        Boolean aperture mask with ``True`` meaning keep.
+    s_tile : int
+        Maximum number of consecutive apertures per returned range.
+
+    Returns
+    -------
+    ranges : list of tuple
+        Contiguous ``(s0, s1)`` ranges containing retained apertures only.
+
+    Raises
+    ------
+    ValueError
+        If the mask is empty or ``s_tile`` is invalid.
+
+    Examples
+    --------
+    >>> ranges = spatial_mask_ranges(mask, 128)
+    """
+    mask = np.asarray(spatial_mask, dtype=bool).ravel(order="C")
+    s_tile = int(s_tile)
+
+    if mask.size == 0 or not np.any(mask):
+        raise ValueError("spatial_mask contains no retained apertures.")
+    if s_tile <= 0:
+        raise ValueError("s_tile must be positive.")
+
+    keep = np.flatnonzero(mask)
+    breaks = np.flatnonzero(np.diff(keep) > 1)+1
+    runs = np.split(keep, breaks)
+    ranges = []
+
+    for run in runs:
+        start = int(run[0])
+        stop = int(run[-1])+1
+
+        for s0 in range(start, stop, s_tile):
+            ranges.append((s0, min(s0+s_tile, stop)))
+
+    return ranges
 
 # ------------------------------------------------------------------------------

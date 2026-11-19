@@ -17,7 +17,7 @@
 
 #SBATCH --job-name="CubeFit_2Fit"
 #SBATCH --time=0-12:00
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=48
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --mem=220G
@@ -30,10 +30,12 @@ module load foss/2023a
 module load Python/3.11.3-GCCcore-12.3.0
 
 # --- BLAS / OpenMP threading (per worker) ---
-export OMP_NUM_THREADS=4
-export OPENBLAS_NUM_THREADS=4
-export MKL_NUM_THREADS=4
+export OMP_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
+export MKL_NUM_THREADS=2
+export BLIS_NUM_THREADS=2
 export NUMEXPR_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
 export OMP_PROC_BIND=TRUE
 export OMP_PLACES=cores
 export OMP_DYNAMIC=FALSE

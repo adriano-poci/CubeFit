@@ -39,6 +39,8 @@ v1.8:   Added defensive removal of stale `/HyperCube` data on detection of
             incompatible array dimensions. 6 October 2026 
 v1.9:   Added `write_pure_kkt` to `H5Manager` to persist the unregularised KKT
             solution before L2 minimisation. 11 November 2026
+v1.10:  Added `write_error_cube` to `H5Manager` to persist the error cube for
+            the observations. 17 November 2026
 
 
 HDF5 manager for CubeFit.
@@ -939,7 +941,83 @@ class H5Manager:
         if semantic is not None:
             ds.attrs["semantic"] = semantic
         return ds
-    
+
+    def write_error_cube(self, errorcube: np.ndarray) -> str:
+        """
+        Persist the observational 1-sigma spectral uncertainties.
+
+        Parameters
+        ----------
+        errorcube : ndarray
+            Wavelength-major uncertainty array with shape ``(L, S)``.
+
+        Returns
+        -------
+        digest : str
+            SHA-256 digest identifying the stored uncertainty model.
+
+        Raises
+        ------
+        ValueError
+            If the array is inconsistent with ``/DataCube`` or contains
+            invalid uncertainties.
+
+        Examples
+        --------
+        >>> mgr.write_error_cube(statGrid)
+        """
+        sigma = np.ma.asarray(errorcube, dtype=np.float64)
+
+        with self._open_rw() as f:
+            if "/DataCube" not in f:
+                raise RuntimeError("Write /DataCube before /ErrorCube.")
+
+            S, L = map(int, f["/DataCube"].shape)
+
+            if sigma.shape != (L, S):
+                raise ValueError(
+                    f"errorcube has shape {sigma.shape}; expected {(L, S)}.")
+
+            sigma = np.asarray(np.ma.filled(sigma, np.nan), dtype=np.float64).T
+
+            if "/Mask" in f:
+                mask = np.asarray(f["/Mask"][...], dtype=bool).ravel()
+                if mask.size != L:
+                    raise ValueError(
+                        f"/Mask has size {mask.size}; expected {L}.")
+            else:
+                mask = np.ones(L, dtype=bool)
+
+            fitted_sigma = sigma[:, mask]
+            if np.any(~np.isfinite(fitted_sigma)):
+                raise ValueError(
+                    "errorcube contains non-finite fitted uncertainties.")
+            if np.any(fitted_sigma <= 0.0):
+                raise ValueError(
+                    "errorcube contains non-positive fitted uncertainties.")
+
+            # Masked wavelengths never enter the objective. Give them a valid
+            # inert value so /ErrorCube remains finite everywhere.
+            bad = ~np.isfinite(sigma) | (sigma <= 0.0)
+            sigma[:, ~mask] = np.where(bad[:, ~mask], 1.0, sigma[:, ~mask])
+
+            digest = hashlib.sha256(
+                np.ascontiguousarray(sigma).view(np.uint8)).hexdigest()
+
+            if "/ErrorCube" in f:
+                del f["/ErrorCube"]
+
+            ds = f.create_dataset("/ErrorCube", data=sigma, dtype="f8",
+                chunks=(min(32, S), L), compression=self.compression,
+                compression_opts=self.clevel, shuffle=self.shuffle)
+
+            ds.attrs["semantic"] = "observational 1-sigma uncertainty"
+            ds.attrs["weighting"] = "chi2: residual / sigma"
+            ds.attrs["digest"] = digest
+            f.attrs["error_cube_digest"] = digest
+
+        return digest
+
     def populate_from_arrays(
         self,
         *,

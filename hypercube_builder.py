@@ -33,6 +33,10 @@ v1.7:   Added parallelism to `build_hypercube`. 1 October 2026
 v1.8:   Re-worked parallelisation scheme to be more efficient;
         Persist energy in-place during the work to make the entire build
             resumable. 8 October 2026
+v1.9:   Improved HyperCube multiprocessing with bounded cross-tile work queuing
+            and periodic resumable writes;
+        Added solve-optimised HyperCube chunking support and completed worker
+            thread controls. 19 November 2026
 
 
 Hypercube builder (LOSVD convolution in log-λ, then rebin to observed grid)
@@ -53,7 +57,8 @@ from typing import Iterable, Optional, Dict, Any, List, Tuple
 import os, math, builtins, hashlib
 import multiprocessing as mp
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor,\
+    as_completed, wait
 from tqdm import tqdm
 
 from dynamics.IFU.Constants import Constants
@@ -922,6 +927,8 @@ def _init_hypercube_worker(T_fft, R_T, km, n_fft, T, phase_shift,
     os.environ["OMP_NUM_THREADS"] = str(blas_threads)
     os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
     os.environ["MKL_NUM_THREADS"] = str(blas_threads)
+    os.environ["BLIS_NUM_THREADS"] = str(blas_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
     global _HC_T_fft, _HC_R_T, _HC_km, _HC_n_fft, _HC_T, _HC_phase_shift
     _HC_T_fft = T_fft
@@ -972,7 +979,8 @@ def build_hypercube(
     vel_bias_kms: float = 0.0,
     processes: int | None = None,
     blas_threads: int | None = None,
-    worker_S: int = 8,
+    worker_S: int = 16,
+    max_pending: int | None = None,
 ) -> None:
     """
     Build /HyperCube/models with LOSVD convolution on the template grid,
@@ -996,6 +1004,9 @@ def build_hypercube(
         blas_threads = int(os.environ.get("CUBEFIT_GEN_BLAS_THREADS", "1"))
     blas_threads = max(1, int(blas_threads))
     worker_S = max(1, int(worker_S))
+    if max_pending is None:
+        max_pending = max(2*processes, processes+2)
+    max_pending = max(processes, int(max_pending))
 
     # -------- Fast preflight: exit early if fully complete (reader-only)
     with open_h5(base_h5, "reader") as f_rd:
@@ -1298,28 +1309,83 @@ def build_hypercube(
         print(f"[HyperCube] parallel build: {processes} processes", flush=True)
         pbar = tqdm(total=total_tiles, desc="[HyperCube] tiles",
             mininterval=2.0)
+        completed_since_flush = 0
+        flush_every = max(8, processes)
         with ProcessPoolExecutor(max_workers=processes, mp_context=ctx,
             initializer=_init_hypercube_worker,
             initargs=(T_fft, R_T, km, n_fft, T, phase_shift,
                 blas_threads)) as executor:
 
-            for (p0, p1, s0, s1, c0, c1, idx3) in _iter_all_tiles():
+            pending = {}
+            tile_state = {}
+
+            def _finish_future(future):
+                nonlocal completed_since_flush
+                meta = pending.pop(future)
+                idx3 = meta["idx3"]
+                state = tile_state[idx3]
+                results = future.result()
+
+                for s_idx, c_idx, pp0, pp1, Ycp in results:
+                    if masked_flag:
+                        Yv = Ycp[:, keep_idx]
+                    else:
+                        Yv = Ycp
+
+                    if w_lam_sqrt is not None:
+                        e_local = np.sum(np.square(Yv, dtype=np.float64)*
+                            w_lam_sqrt[None, :], axis=1)
+                    else:
+                        e_local = np.sum(np.square(Yv, dtype=np.float64), axis=1)
+
+                    state["energy"][c_idx-state["c0"],
+                        pp0-state["p0"]:pp1-state["p0"]] += e_local
+
+                    models[s_idx, c_idx, pp0:pp1, 0:L] = Ycp
+
+                state["remaining"] -= 1
+
+                if state["remaining"] == 0:
+                    tile_idx = state["s0"]//S_chunk
+                    E_tile_ds[tile_idx, state["c0"]:state["c1"],
+                        state["p0"]:state["p1"]] = state["energy"]
+
+                    _done_set(done, idx3)
+                    pbar.update(1)
+
+                    completed_since_flush += 1
+                    if completed_since_flush >= flush_every:
+                        models.id.flush()
+                        E_tile_ds.id.flush()
+                        done.id.flush()
+                        f.flush()
+                        completed_since_flush = 0
+
+                    del tile_state[idx3]
+
+            def _drain_one():
+                done_futures, _ = wait(tuple(pending),
+                    return_when=FIRST_COMPLETED)
+
+                for future in done_futures:
+                    _finish_future(future)
+
+            for p0, p1, s0, s1, c0, c1, idx3 in _iter_all_tiles():
                 if _done_get(done, idx3) != 0:
                     continue
-                tile_energy = np.zeros((c1 - c0, p1 - p0), dtype=np.float64)
 
-                jobs = []
+                n_jobs = int(math.ceil((s1-s0)/worker_S))
+                tile_state[idx3] = {"s0": s0, "s1": s1, "c0": c0, "c1": c1,
+                    "p0": p0, "p1": p1, "remaining": n_jobs, "complete": False,
+                    "energy": np.zeros((c1-c0, p1-p0), dtype=np.float64)}
 
-                # Split the storage S-tile into smaller independent compute
-                # subtiles so the process pool is actually occupied.
                 for ws0 in range(s0, s1, worker_S):
-                    ws1 = min(ws0 + worker_S, s1)
+                    ws1 = min(ws0+worker_S, s1)
 
-                    # Dense contiguous (dS,dC,V), rather than an object array.
                     H_tile = np.asarray(losvd_ds[ws0:ws1, :, c0:c1],
                         dtype=np.float64, order="C").transpose(0, 2, 1)
 
-                    scale_tile = np.zeros((ws1 - ws0, c1 - c0), dtype=np.float64)
+                    scale_tile = np.zeros((ws1-ws0, c1-c0), dtype=np.float64)
 
                     for i, s_idx in enumerate(range(ws0, ws1)):
                         a_sum = float(A_sum[s_idx])
@@ -1328,62 +1394,27 @@ def build_hypercube(
                             if norm_mode == "model":
                                 scale_tile[i, j] = float(A[s_idx, c_idx])
                             elif a_sum > 0.0 and L_vec[s_idx] > 0.0:
-                                frac = float(A[s_idx, c_idx]) / \
-                                    np.maximum(a_sum, eps)
-                                scale_tile[i, j] = float(L_vec[s_idx]) * frac
+                                frac = float(A[s_idx, c_idx])/max(a_sum, eps)
+                                scale_tile[i, j] = float(L_vec[s_idx])*frac
 
-                    jobs.append(executor.submit(_hypercube_worker,
-                        (ws0, ws1, c0, c1, p0, p1, H_tile, scale_tile)))
+                    future = executor.submit(_hypercube_worker,
+                        (ws0, ws1, c0, c1, p0, p1, H_tile, scale_tile))
 
-                # All compute subtiles belonging to this storage tile run
-                # concurrently. The parent remains the sole HDF5 writer.
-                for future in as_completed(jobs):
-                    results = future.result()
+                    pending[future] = {"idx3": idx3}
 
-                    for s_idx, c_idx, pp0, pp1, Ycp in results:
-                        if masked_flag:
-                            Yv = Ycp[:, keep_idx]
-                        else:
-                            Yv = Ycp
+                    if len(pending) >= max_pending:
+                        _drain_one()
 
-                        if w_lam_sqrt is not None:
-                            e_local = np.sum(np.square(Yv, dtype=np.float64) *
-                                w_lam_sqrt[None, :], axis=1)
-                        else:
-                            e_local = np.sum(
-                                np.square(Yv, dtype=np.float64), axis=1)
+            while pending:
+                _drain_one()
 
-                        tile_energy[c_idx - c0, pp0 - p0:pp1 - p0] += e_local
-                        models[s_idx, c_idx, pp0:pp1, 0:L] = Ycp
-
-                # Only mark the storage tile complete after every compute
-                # subtile has returned successfully and been written.
-                tile_idx = s0 // S_chunk
-                E_tile_ds[tile_idx, c0:c1, p0:p1] = tile_energy
-
-                try:
-                    models.id.flush()
-                    E_tile_ds.id.flush()
-                    f.flush()
-                except Exception:
-                    pass
-
-                _done_set(done, idx3)
-
-                try:
-                    models.id.flush()
-                except Exception:
-                    pass
-                try:
-                    done.id.flush()
-                except Exception:
-                    pass
-                try:
-                    f.flush()
-                except Exception:
-                    pass
-
-                pbar.update(1)
+            try:
+                models.id.flush()
+                E_tile_ds.id.flush()
+                done.id.flush()
+                f.flush()
+            except Exception:
+                pass
 
         pbar.close()
 

@@ -94,16 +94,22 @@ def main():
             [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 12.5, 13.0, 13.5, 14.0],
             [-0.2, 0.0, 0.2, 0.4, 0.6])
     if propDict['nCuts'] == 20:
-        propDict['validationPath'] = str(curdir/args.galaxy/
-            'hypercube_3_00_SSPoffset.h5')
-        propDict['validationError'] = 'stat'
-        propDict['runTag'] = 'stat.SSPoffset'
+        # propDict['validationPath'] = str(curdir/args.galaxy/
+            # 'hypercube_3_00_SSPoffset.h5')
+        # propDict['validationError'] = 'stat'
+        # propDict['runTag'] = 'stat.SSPoffset'
         # propDict['streaming'] = False
         # propDict['runTag'] = 'monolithic'
         # propDict['sspIdx'] = [[], [], []]
-        propDict['warm'] = 'saved_x'
+        # propDict['warm'] = 'resume'
+        propDict['runTag'] = 'memory'
+        # propDict['streaming'] = False
+        # propDict['runTag'] = 'monolithic'
+        # propDict['sspIdx'] = [[], [], []]
+        propDict['warm'] = 'zeros'
+        propDict['runnerKwargs']['spatial_mask'] = {'exclude_radius': 1.0}
         propDict['runnerKwargs']['minimum_l2_rss_rtol'] = 1e-6
-        propDict['runnerKwargs']['minimum_l2_at_zero'] = False
+        propDict['runnerKwargs']['minimum_l2_at_zero'] = True
         propDict['runnerKwargs']['regularisation_scale'] = 0.0
     elif propDict['nCuts'] == 3:
         # ########################### SSP library to generate mock-data fit
@@ -111,10 +117,10 @@ def main():
         #     [4.0, 5.0, 7.0, 10.5, 11.5, 12.5, 13.5],
         #     [0.0, 0.2, 0.4])
         propDict['warm'] = 'zeros'
-        propDict['runTag'] = 'lOrder1'
+        propDict['runnerKwargs']['spatial_mask'] = {'exclude_radius': 1.0}
+        propDict['runTag'] = 'errorcube'
         propDict['runnerKwargs']['minimum_l2_at_zero'] = False
         propDict['runnerKwargs']['regularisation_scale'] = 0.0
-        propDict['lOrder'] = 1
     propDict['spectraPicks'] = [1363, 1116, 1998, 1039][::-1]
     print(propDict)
 

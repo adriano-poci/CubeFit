@@ -228,6 +228,19 @@ v2.12:  Added population tying for poorly observed dynamical components while
             back to the original component layout;
         Added chunk-aware HyperCube operations for tied population fitting.
             13 November 2026
+v2.13:  Added inverse-variance weighting from ErrorCube throughout the streamed
+            and monolithic least-squares operators;
+        Added runtime spatial masking to streamed and monolithic fits without
+            modifying the stored HyperCube;
+        Added spatial-mask and ErrorCube compatibility to fused-product caching
+            and checkpoint resume;
+        Made the monolithic reference construct only the selected spatial and
+            spectral rows. 18 November 2026
+v2.14:  Reduced ATAz I/O to one HyperCube read per spatial tile by caching the
+            model tile between forward and transpose contractions;
+        Added process and cgroup memory reporting around ATAz operations;
+        Corrected y.T W y evaluation for the ErrorCube-weighted objective.
+            19 November 2026
 """
 
 from __future__ import annotations, print_function
@@ -319,6 +332,50 @@ def _support_stats_1d(vec: np.ndarray) -> dict:
         "top_share": top_share,
         "gini_proxy": gini_proxy,
     }
+
+# ------------------------------------------------------------------------------
+
+def _read_inv_sigma(f, s0: int, s1: int, keep_idx: np.ndarray | None
+    ) -> np.ndarray:
+    """
+    Read inverse observational uncertainties for one spatial tile.
+
+    Parameters
+    ----------
+    f : h5py.File
+        Open CubeFit HDF5 file.
+    s0, s1 : int
+        Spatial tile bounds.
+    keep_idx : ndarray or None
+        Retained wavelength indices.
+
+    Returns
+    -------
+    inv_sigma : ndarray
+        Inverse uncertainties with shape ``(s1-s0, L_keep)``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``/ErrorCube`` is absent or inconsistent.
+
+    Examples
+    --------
+    Called internally by the streamed solver workers.
+    """
+    if "/ErrorCube" not in f:
+        raise RuntimeError(
+            "Missing /ErrorCube; weighted CubeFit requires uncertainties.")
+
+    sigma = np.asarray(f["/ErrorCube"][s0:s1, :], dtype=np.float64)
+
+    if keep_idx is not None:
+        sigma = sigma[:, keep_idx]
+
+    if np.any(~np.isfinite(sigma)) or np.any(sigma <= 0.0):
+        raise RuntimeError("Invalid uncertainties in /ErrorCube.")
+
+    return 1.0/sigma
 
 # ------------------------------------------------------------------------------
 
@@ -454,6 +511,7 @@ def _worker_reduced(h5_path: str, batch: list, keep_idx,
         for s0, s1 in batch:
             L_keep = int(keep_idx.size) if keep_idx is not None else M.shape[3]
             A_act = np.zeros(((s1-s0)*L_keep, k), dtype=np.float64)
+            inv_sigma = _read_inv_sigma(f, s0, s1, keep_idx)
 
             for (c_id, p_id), chunk_requests in requests.items():
                 c0, p0 = c_id*C_chunk, p_id*P_chunk
@@ -467,12 +525,13 @@ def _worker_reduced(h5_path: str, batch: list, keep_idx,
 
                 for jj, cc, pp in chunk_requests:
                     lc, lp = cc-c0, pp-p0
-                    A_act[:, jj] += S_active[jj]*slab[:, lc, lp, :].reshape(-1)
+                    A_act[:, jj] += S_active[jj]*(slab[:, lc, lp, :]*
+                        inv_sigma).reshape(-1)
 
                 del slab
 
             ATA_loc += A_act.T@A_act
-            del A_act
+            del A_act, inv_sigma
 
     return ATA_loc, None
 
@@ -482,123 +541,174 @@ def _worker_ATAz(h5_path: str, batch: list, keep_idx, z: np.ndarray, CP: int,
     S_flat: np.ndarray, C: int, P: int, component_slot=None,
     C_physical=None):
     """
-    Compute the exact quantity A^T A (S z) for a batch of tiles, but with
-    much lower peak memory than the original implementation.
+    Compute exact scaled A.T W A z using one HyperCube read per model value.
 
-    This preserves the original mathematics:
-
-        z_s = (S_flat * z).reshape(C, P)
-
-        v = A @ z_s_flat
-        g = A.T @ v
-        partial += (S_flat.reshape(C, P) * g).reshape(-1)
-
-    The only difference is that the model cube is read orbit-by-orbit instead
-    of loading the full (Sblk, C, P, Lk) tile into memory.
+    Each spatial tile is cached as float32 after spectral masking. The forward
+    product is accumulated while the cache is filled, then the transpose uses
+    the resident cache without a second HDF5 traversal.
 
     Parameters
     ----------
     h5_path : str
-        Path to the HDF5 file.
-    batch : list[tuple[int, int]]
-        List of (s0, s1) tile ranges assigned to this worker.
+        HyperCube HDF5 path.
+    batch : list
+        Spatial ``(s0, s1)`` ranges assigned to this worker.
     keep_idx : ndarray or None
-        Wavelength indices to keep after masking, or None for full wavelength
-        coverage.
-    z : ndarray, shape (C * P,)
-        Current reduced NNLS variable in z-space.
+        Wavelength indices retained by the spectral mask.
+    z : ndarray
+        Current reduced variable in scaled z-space.
     CP : int
-        Total number of columns, equal to C * P.
-    S_flat : ndarray, shape (C * P,)
-        Column scaling vector.
+        Number of fitted columns, equal to ``C*P``.
+    S_flat : ndarray
+        Fitted-column scaling vector.
     C : int
-        Number of orbit components.
+        Number of independent fitted components.
     P : int
-        Number of populations per orbit.
+        Number of SSP populations.
+    component_slot : ndarray, optional
+        Fitted-component index for each physical component.
+    C_physical : int, optional
+        Number of physical HyperCube components.
 
     Returns
     -------
-    partial : ndarray, shape (C * P,)
-        Contribution of this worker to A^T A (S z).
-    """
-    t_read = 0.0
-    t_forward = 0.0
-    t_transpose = 0.0
+    partial : ndarray
+        Worker contribution to the exact scaled ``A.T W A z``.
 
+    Raises
+    ------
+    ValueError
+        If fitted or physical dimensions are inconsistent.
+    RuntimeError
+        If the stored HyperCube dimensions are inconsistent.
+
+    Examples
+    --------
+    Called internally by ``streamActiveSetNNLS``.
+    """
     z = np.asarray(z, dtype=np.float64).ravel(order="C")
     S_flat = np.asarray(S_flat, dtype=np.float64).ravel(order="C")
 
     if z.size != CP:
         raise ValueError(f"z has size {z.size}, expected CP={CP}.")
     if S_flat.size != CP:
-        raise ValueError(f"S_flat has size {S_flat.size}, expected CP={CP}.")
-    if CP != C * P:
-        raise ValueError(f"CP={CP} is inconsistent with C*P={C * P}.")
+        raise ValueError(
+            f"S_flat has size {S_flat.size}, expected CP={CP}.")
+    if CP != C*P:
+        raise ValueError(f"CP={CP} is inconsistent with C*P={C*P}.")
 
-    # Same scaling as the original code.
-    z_cp = (S_flat * z).reshape(C, P)
+    z_cp = (S_flat*z).reshape(C, P)
+    scale_cp = S_flat.reshape(C, P)
+    partial = np.zeros(CP, dtype=np.float64)
+    partial_cp = partial.reshape(C, P)
 
-    partial = np.zeros((CP,), dtype=np.float64)
+    t_read = 0.0
+    t_forward = 0.0
+    t_transpose = 0.0
+    cache_peak_gib = 0.0
 
     with open_h5(h5_path, role="reader") as f:
         M = f["/HyperCube/models"]
+        C_disk = int(M.shape[1])
 
         if int(M.shape[2]) != P:
             raise RuntimeError(
-                f"Model population dimension {M.shape[2]} != expected P={P}.")
+                f"HyperCube P={M.shape[2]} does not match P={P}.")
+
+        if C_physical is None:
+            C_physical = C_disk
+        else:
+            C_physical = int(C_physical)
+
+        if C_physical != C_disk:
+            raise RuntimeError(
+                f"HyperCube C={C_disk} != physical C={C_physical}.")
+
+        if component_slot is None:
+            component_slot = np.arange(C_physical, dtype=np.int64)
+        else:
+            component_slot = np.asarray(
+                component_slot, dtype=np.int64).ravel(order="C")
+
+        if component_slot.size != C_physical:
+            raise ValueError(
+                f"component_slot has size {component_slot.size}; "
+                f"expected {C_physical}.")
+        if np.any(component_slot < 0) or np.any(component_slot >= C):
+            raise ValueError(
+                "component_slot contains invalid fitted-component indices.")
 
         C_chunk = int(M.chunks[1]) if M.chunks else 1
         P_chunk = int(M.chunks[2]) if M.chunks else P
         Lk = int(keep_idx.size) if keep_idx is not None else int(M.shape[3])
 
         for s0, s1 in batch:
-            Sblk = s1-s0
+            Sblk = int(s1-s0)
             v = np.zeros((Sblk, Lk), dtype=np.float64)
+            inv_sigma = _read_inv_sigma(f, s0, s1, keep_idx)
+            weight2 = inv_sigma*inv_sigma
 
-            # v = A_group @ z.
-            for cc in range(C_physical):
-                gg = component_slot[cc]
+            # Cache only fitted wavelengths. This is the deliberate memory/I/O
+            # trade: one HDF5 pass, then the transpose runs from resident RAM.
+            A_tile = np.empty(
+                (Sblk, C_physical, P, Lk), dtype=np.float32, order="C")
+            cache_peak_gib = max(
+                cache_peak_gib, A_tile.nbytes/float(1024**3))
 
-                for p0 in range(0, P, P_chunk):
-                    p1 = min(p0+P_chunk, P)
-
-                    t1 = time.perf_counter()
-                    slab = np.asarray(M[s0:s1, cc, p0:p1, :], dtype=np.float32)
-                    if keep_idx is not None:
-                        slab = slab[:, :, keep_idx]
-                    t_read += time.perf_counter()-t1
-
-                    t1 = time.perf_counter()
-                    v += np.tensordot(slab, z_cp[gg, p0:p1], axes=([1], [0]))
-                    t_forward += time.perf_counter()-t1
-                    del slab
-
-            # A_group.T @ v.
-            partial_cp = partial.reshape(C, P)
-            scale_cp = S_flat.reshape(C, P)
-
-            for cc in range(C_physical):
-                gg = component_slot[cc]
+            for c0 in range(0, C_physical, C_chunk):
+                c1 = min(c0+C_chunk, C_physical)
 
                 for p0 in range(0, P, P_chunk):
                     p1 = min(p0+P_chunk, P)
 
-                    t1 = time.perf_counter()
-                    slab = np.asarray(M[s0:s1, cc, p0:p1, :],
-                        dtype=np.float32)
+                    t0 = time.perf_counter()
+                    slab = np.asarray(
+                        M[s0:s1, c0:c1, p0:p1, :],
+                        dtype=np.float32, order="C")
                     if keep_idx is not None:
-                        slab = slab[:, :, keep_idx]
-                    t_read += time.perf_counter()-t1
+                        slab = slab[..., keep_idx]
+                    t_read += time.perf_counter()-t0
 
-                    t1 = time.perf_counter()
-                    g = np.tensordot(slab, v, axes=([0, 2], [0, 1]))
-                    partial_cp[gg, p0:p1] += scale_cp[gg, p0:p1]*g
-                    t_transpose += time.perf_counter()-t1
+                    A_tile[:, c0:c1, p0:p1, :] = slab
+
+                    t0 = time.perf_counter()
+                    for lc, cc in enumerate(range(c0, c1)):
+                        gg = int(component_slot[cc])
+                        v += np.tensordot(
+                            slab[:, lc, :, :], z_cp[gg, p0:p1],
+                            axes=([1], [0]))
+                    t_forward += time.perf_counter()-t0
+
                     del slab
 
+            v *= weight2
+
+            t0 = time.perf_counter()
+            for c0 in range(0, C_physical, C_chunk):
+                c1 = min(c0+C_chunk, C_physical)
+
+                for p0 in range(0, P, P_chunk):
+                    p1 = min(p0+P_chunk, P)
+                    cached = A_tile[:, c0:c1, p0:p1, :]
+
+                    for lc, cc in enumerate(range(c0, c1)):
+                        gg = int(component_slot[cc])
+                        g = np.tensordot(
+                            cached[:, lc, :, :], v,
+                            axes=([0, 2], [0, 1]))
+                        partial_cp[gg, p0:p1] += (
+                            scale_cp[gg, p0:p1]*g)
+
+            t_transpose += time.perf_counter()-t0
+
+            del A_tile, v, inv_sigma, weight2
+
+    mem = cu.memory_telemetry()
     print(f"[ATAz worker {os.getpid()}] read={t_read:.1f}s "
-        f"forward={t_forward:.1f}s transpose={t_transpose:.1f}s",
-        flush=True)
+        f"forward={t_forward:.1f}s transpose={t_transpose:.1f}s "
+        f"cache={cache_peak_gib:.2f} GiB RSS={mem['rss_gib']:.2f} GiB "
+        f"peakRSS={mem['rss_peak_gib']:.2f} GiB", flush=True)
+
     return partial
 
 # ------------------------------------------------------------------------------
@@ -749,6 +859,9 @@ def _worker_build_products(h5_path: str, batch: list, keep_idx, C: int,
             if keep_idx is not None:
                 Y = Y[:, keep_idx]
 
+            inv_sigma = _read_inv_sigma(f, s0, s1, keep_idx)
+            weight2 = inv_sigma*inv_sigma
+
             # ----------------------------------------------------------
             # Main physical pass.
             #
@@ -769,11 +882,11 @@ def _worker_build_products(h5_path: str, batch: list, keep_idx, C: int,
                     if keep_idx is not None:
                         slab = slab[:, :, :, keep_idx]
 
-                    aty = np.einsum("scpl,sl->cp", slab, Y,
+                    aty = np.einsum("scpl,sl,sl->cp", slab, Y, weight2,
                         dtype=np.float64, optimize=True)
 
-                    energy = np.einsum("scpl,scpl->cp", slab, slab,
-                        dtype=np.float64, optimize=True)
+                    energy = np.einsum("scpl,scpl,sl->cp", slab, slab,
+                        weight2, dtype=np.float64, optimize=True)
 
                     # C_chunk is normally small. np.add.at is important here
                     # because multiple physical components in the same chunk
@@ -817,19 +930,20 @@ def _worker_build_products(h5_path: str, batch: list, keep_idx, C: int,
                         if keep_idx is not None:
                             grouped += slab[:, :, keep_idx]
 
-                            physical_energy += np.einsum("spl,spl->p",
+                            physical_energy += np.einsum("spl,spl,sl->p",
                                 slab[:, :, keep_idx], slab[:, :, keep_idx],
-                                dtype=np.float64, optimize=True)
+                                weight2, dtype=np.float64, optimize=True)
                         else:
                             grouped += slab
 
-                            physical_energy += np.einsum("spl,spl->p",
-                                slab, slab, dtype=np.float64, optimize=True)
+                            physical_energy += np.einsum("spl,spl,sl->p",
+                                slab, slab, weight2, dtype=np.float64,
+                                optimize=True)
 
                         del slab
 
-                    grouped_energy = np.einsum("spl,spl->p", grouped,
-                        grouped, dtype=np.float64, optimize=True)
+                    grouped_energy = np.einsum("spl,spl,sl->p", grouped,
+                        grouped, weight2, dtype=np.float64, optimize=True)
 
                     correction = grouped_energy-physical_energy
 
@@ -841,7 +955,7 @@ def _worker_build_products(h5_path: str, batch: list, keep_idx, C: int,
 
                     del grouped, physical_energy, grouped_energy, correction
 
-            del Y
+            del Y, inv_sigma, weight2
 
     # The effective grouped column energy must itself be non-negative. Allow
     # only floating-point-scale excursions below zero.
@@ -906,17 +1020,12 @@ def _pool_ok(pool, timeout: float = 5.0) -> bool:
 
 # ------------------------------------------------------------------------------
 
-def rmse_proxy_subset(
-    h5_path,
-    x_CP,
-    tile_ranges,
-    keep_idx,
-    inv_cp_flux_ref,
-    w_lam_sqrt,
-):
+def rmse_proxy_subset(h5_path, x_CP, tile_ranges, keep_idx, inv_cp_flux_ref):
     """
-    Compute RMSE proxy over a subset of tiles in the SAME weighted space
-    used by the gradient (i.e. apply √w_λ if present). Returns sqrt(ssq/n).
+    Compute an RMS proxy in the statistically whitened residual space.
+
+    Residuals are divided by the observational 1-sigma uncertainties before
+    accumulation. Returns ``sqrt(sum((r/sigma)**2)/N)``.
     """
 
     ssq = 0.0
@@ -964,14 +1073,12 @@ def rmse_proxy_subset(
             yhat = yhat_flat.reshape(Sblk, Lk)
 
             R = Y - yhat
+            inv_sigma = _read_inv_sigma(f, s0, s1, keep_idx)
+            R *= inv_sigma
             if not np.all(np.isfinite(R)):
                 R = np.nan_to_num(R, copy=False)
 
-            if w_lam_sqrt is not None:
-                R *= w_lam_sqrt[None, :]
-                ssq += float(np.sum(R * R))
-            else:
-                ssq += float(np.sum(R * R))
+            ssq += float(np.sum(R * R))
 
             nres += R.size
 
@@ -2303,23 +2410,47 @@ def _orbit_hard_constraint_solve(
 
 # ------------------------------------------------------------------------------
 
-def _compute_yty(
-    h5_path: str,
-    s_ranges: list,
-    keep_idx,
-) -> float:
-    """Compute y.T @ y once in the fitted data space."""
+def _compute_yty(h5_path: str, s_ranges: list, keep_idx) -> float:
+    """
+    Compute y.T W y once in the fitted, statistically weighted data space.
+
+    Parameters
+    ----------
+    h5_path : str
+        CubeFit HDF5 path.
+    s_ranges : list
+        Spatial ranges retained by the runtime spatial mask.
+    keep_idx : ndarray or None
+        Wavelength indices retained by the spectral mask.
+
+    Returns
+    -------
+    yty : float
+        Exact weighted squared norm ``y.T W y``.
+
+    Raises
+    ------
+    RuntimeError
+        If the stored ErrorCube is invalid.
+
+    Examples
+    --------
+    Called internally by ``streamActiveSetNNLS``.
+    """
     yty = 0.0
 
     with open_h5(h5_path, role="reader") as f:
         DC = f["/DataCube"]
 
         for s0, s1 in s_ranges:
-            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C",)
+            Yt = np.asarray(DC[s0:s1, :], dtype=np.float64, order="C")
 
             if keep_idx is not None:
                 Yt = Yt[:, keep_idx]
-            yty += float(np.sum(Yt * Yt))
+
+            inv_sigma = _read_inv_sigma(f, s0, s1, keep_idx)
+            Yt *= inv_sigma
+            yty += float(np.sum(Yt*Yt))
 
     return yty
 
@@ -3016,6 +3147,7 @@ def streamActiveSetNNLS(
 
         worker_args = [(h5_path, batch, keep_idx, x_cand, CP, S_flat, C, P,
             component_slot, C_physical) for batch in batches if len(batch) > 0]
+        cu.log_memory("before ATAz")
         it = executor.map(_worker_ATAz_from_tuple, worker_args)
 
         for r in tqdm(it, total=len(worker_args), desc="[MONO] ATAz tiles",
@@ -3026,6 +3158,7 @@ def streamActiveSetNNLS(
                 print("[ERROR] worker returned exception:", e, flush=True)
                 raise
 
+        cu.log_memory("after ATAz")
         cached_ATAz_z = x_cand.copy()
         cached_ATAz = ATAz.copy()
 
@@ -4413,7 +4546,7 @@ def streamActiveSetNNLS(
 
 # ------------------------------------------------------------------------------
 
-def _build_literal_Ab(h5_path: str, cfg: MPConfig):
+def _build_literal_Ab(h5_path: str, cfg: MPConfig, s_ranges=None):
     """
     Build the literal physical-space CubeFit design matrix and data vector.
 
@@ -4422,32 +4555,35 @@ def _build_literal_Ab(h5_path: str, cfg: MPConfig):
     h5_path : str
         Path to the CubeFit HDF5 file.
     cfg : MPConfig
-        Solver configuration controlling masking and spatial tile size.
+        Solver configuration controlling spectral masking and tile size.
+    s_ranges : sequence of tuple, optional
+        Spatial ``(s0, s1)`` ranges retained by the runtime spatial mask.
+        None retains every spatial aperture.
 
     Returns
     -------
     A : ndarray
-        Physical-space design matrix with shape (N, K), where K contains all
-        columns not excluded by ``known_zero_mask``.
+        Physical-space design matrix with shape ``(N, K)``.
     y : ndarray
-        Flattened observed spectra with shape (N,).
+        Flattened observed spectra with shape ``(N,)``.
     free_idx : ndarray
         Full ``C*P`` indices represented by the columns of ``A``.
     known_zero : ndarray
-        Persistent structural exclusion mask with shape (C, P).
+        Structural exclusion mask with shape ``(C, P)``.
     dims : tuple
-        ``(S, L, C, P)`` dimensions of the original problem.
+        Original ``(S, L, C, P)`` dimensions.
 
     Raises
     ------
     RuntimeError
-        If the HDF5 dimensions are inconsistent or no columns remain.
+        If HDF5 dimensions are inconsistent or no columns remain.
     ValueError
-        If the assembled matrix or data contain non-finite values.
+        If ranges or assembled arrays are invalid.
 
     Examples
     --------
-    >>> A, y, free_idx, known_zero, dims = _build_literal_Ab(h5_path, cfg)
+    >>> A, y, free_idx, known_zero, dims = _build_literal_Ab(
+    ...     h5_path, cfg, s_ranges=s_ranges)
     """
     with open_h5(h5_path, role="reader") as f:
         DC = f["/DataCube"]
@@ -4465,51 +4601,77 @@ def _build_literal_Ab(h5_path: str, cfg: MPConfig):
         keep_idx = np.flatnonzero(mask) if mask is not None else None
         chunks = M.chunks
 
+    s_tile = int(cfg.s_tile_override or
+        (chunks[0] if chunks and chunks[0] else 128))
+
+    if s_ranges is None:
+        s_ranges = [(s0, min(S, s0+s_tile))
+            for s0 in range(0, S, s_tile)]
+    else:
+        s_ranges = [(int(s0), int(s1)) for s0, s1 in s_ranges]
+
+    if not s_ranges:
+        raise ValueError("s_ranges contains no retained spatial apertures.")
+
+    for s0, s1 in s_ranges:
+        if s0 < 0 or s1 > S or s1 <= s0:
+            raise ValueError(
+                f"Invalid spatial range ({s0}, {s1}) for S={S}.")
+
     CP = int(C*P)
     known_zero = _get_known_zero_mask(h5_path, C, P)
-    free_idx = np.flatnonzero(~known_zero.ravel(order="C")).astype(np.int64)
+    free_idx = np.flatnonzero(
+        ~known_zero.ravel(order="C")).astype(np.int64)
 
     if free_idx.size == 0:
         raise RuntimeError("No allowed columns remain for monolithic solve.")
 
     Lk = int(keep_idx.size) if keep_idx is not None else L
-    n_rows = int(S*Lk)
-    s_tile = int(cfg.s_tile_override or
-        (chunks[0] if chunks and chunks[0] else 128))
+    n_spat_fit = sum(s1-s0 for s0, s1 in s_ranges)
+    n_rows = int(n_spat_fit*Lk)
 
     # A is intentionally materialized: this is the monolithic reference.
     A = np.empty((n_rows, free_idx.size), dtype=np.float64, order="F")
     y = np.empty(n_rows, dtype=np.float64)
 
     row0 = 0
+
     with open_h5(h5_path, role="reader") as f:
         DC = f["/DataCube"]
         M = f["/HyperCube/models"]
 
-        iterator = range(0, S, s_tile)
-        iterator = tqdm(iterator, desc="[MONOLITHIC] building A",
+        iterator = tqdm(s_ranges, desc="[MONOLITHIC] building A",
             disable=not getattr(cfg, "verbose", True))
 
-        for s0 in iterator:
-            s1 = min(S, s0+s_tile)
+        for s0, s1 in iterator:
             Y = np.asarray(DC[s0:s1, :], dtype=np.float64)
 
             if keep_idx is not None:
                 Y = Y[:, keep_idx]
 
+            inv_sigma = _read_inv_sigma(f, s0, s1, keep_idx)
+            Y *= inv_sigma
+
             rows = Y.size
             row1 = row0+rows
             y[row0:row1] = Y.ravel(order="C")
 
-            # Form the literal rows (s,l) x columns (c,p).
-            slab = np.asarray(M[s0:s1, :, :, :], dtype=np.float64)
+            slab = np.asarray(
+                M[s0:s1, :, :, :], dtype=np.float64)
+
             if keep_idx is not None:
                 slab = slab[:, :, :, keep_idx]
 
+            slab *= inv_sigma[:, None, None, :]
             A_tile = slab.transpose(0, 3, 1, 2).reshape(rows, CP)
             A[row0:row1, :] = A_tile[:, free_idx]
             row0 = row1
 
+            del Y, inv_sigma, slab, A_tile
+
+    if row0 != n_rows:
+        raise RuntimeError(
+            f"Literal row assembly produced {row0} rows; expected {n_rows}.")
     if not np.all(np.isfinite(A)):
         raise ValueError("Literal A contains non-finite values.")
     if not np.all(np.isfinite(y)):
@@ -4532,14 +4694,15 @@ def monolithicNNLS(
     regularisation_scale: float = 1.0,
     cache_path: str | None = None,
     reuse_cache: bool = True,
+    **solver_kwargs,
 ):
     """
     Solve the raw, unregularised CubeFit NNLS problem using literal A and y.
 
-    The complete masked physical-space design matrix and data vector are
-    materialized. No scientific regularisation, column scaling, streamed
-    normal equations, support heuristics, or reduced active-set machinery are
-    used.
+    The selected spectral and spatial rows of the physical-space design matrix
+    and data vector are materialized.No scientific regularisation, column
+    scaling, streamed normal equations, support heuristics, or reduced active-set
+    machinery are used.
 
     Without orbit constraints, this solves
 
@@ -4580,6 +4743,11 @@ def monolithicNNLS(
         Accepted for API compatibility and ignored.
     reuse_cache : bool, optional
         Accepted for API compatibility and ignored.
+    **solver_kwargs : dict
+        Runtime solver options. ``spatial_mask`` accepts a boolean aperture
+        mask with shape ``(S,)`` and ``True`` meaning retain the aperture.
+        ``component_donor`` is accepted only when it represents no actual
+        population tying.
 
     Returns
     -------
@@ -4603,6 +4771,18 @@ def monolithicNNLS(
     """
     del tracker, block_size, monolithic_max_active
     del cache_path, reuse_cache, regularisation_scale
+    spatial_mask_input = solver_kwargs.pop("spatial_mask", None)
+    component_donor = solver_kwargs.pop("component_donor", None)
+    if solver_kwargs:
+        raise TypeError('Unexpected monolithic solver options: '
+            f"{sorted(solver_kwargs)}.")
+    if component_donor is not None:
+        with open_h5(h5_path, role="reader") as f:
+            C_physical = int(f["/HyperCube/models"].shape[1])
+        donor = _canon_component_donor(component_donor, C_physical)
+        if np.any(donor != np.arange(C_physical, dtype=np.int64)):
+            raise NotImplementedError(
+                "Population tying is supported only by the streaming solver.")
 
     if resume_state:
         raise ValueError("monolithicNNLS does not support full-state resume.")
@@ -4610,8 +4790,21 @@ def monolithicNNLS(
     if not _HAS_SCIPY_OPTIMIZE:
         raise RuntimeError("SciPy optimize is required for monolithicNNLS.")
 
+    with open_h5(h5_path, role="reader") as f:
+        S = int(f["/DataCube"].shape[0])
+        chunks = f["/HyperCube/models"].chunks
+        s_tile = int(chunks[0]) if chunks and chunks[0] else 128
+    if cfg.s_tile_override is not None:
+        s_tile = int(cfg.s_tile_override)
+    spatial_mask, _ = cu.canonical_spatial_mask(spatial_mask_input, S)
+    s_ranges = cu.spatial_mask_ranges(spatial_mask, s_tile)
+    n_spat_fit = int(np.count_nonzero(spatial_mask))
+    print(f"[MONOLITHIC] spatial mask: {n_spat_fit}/{S} apertures retained "
+        f"({S-n_spat_fit} excluded)", flush=True)
+
     t0 = time.perf_counter()
-    A, y, free_idx, known_zero, dims = _build_literal_Ab(h5_path, cfg)
+    A, y, free_idx, known_zero, dims = _build_literal_Ab(h5_path, cfg,
+        s_ranges=s_ranges)
     S, L, C, P = dims
     CP = int(C*P)
 
@@ -4839,6 +5032,8 @@ def monolithicNNLS(
         "iterations": iterations,
         "optimality": optimality,
         "known_zero_mask": known_zero.copy(),
+        "n_spatial_total": int(S),
+        "n_spatial_fit": int(n_spat_fit),
     }
 
     print(f"[MONOLITHIC] done in {elapsed:.1f}s "
@@ -4849,9 +5044,7 @@ def monolithicNNLS(
 
 # ------------------------------------------------------------------------------
 
-def solve_streaming_nnls(
-    h5_path: str,
-    cfg: MPConfig,
+def solve_streaming_nnls(h5_path: str, cfg: MPConfig,
     *,
     orbit_weights: Optional[np.ndarray] = None,
     x0: Optional[np.ndarray] = None,
@@ -4874,6 +5067,7 @@ def solve_streaming_nnls(
     t0 = time.perf_counter()
 
     component_donor = active_set_kwargs.pop("component_donor", None)
+    spatial_mask_input = active_set_kwargs.pop("spatial_mask", None)
 
     # ---------------------------- metadata -----------------------------
     with open_h5(h5_path, role="reader") as f:
@@ -4881,18 +5075,36 @@ def solve_streaming_nnls(
         _, C, P, Lm = map(int, f["/HyperCube/models"].shape)
         if Lm != L:
             raise RuntimeError("Model / data wavelength mismatch")
+        if "/ErrorCube" not in f:
+            raise RuntimeError(
+                "Missing /ErrorCube; weighted CubeFit requires uncertainties.")
+
+        error_cube = f["/ErrorCube"]
+        if error_cube.shape != (S, L):
+            raise RuntimeError(
+                f"/ErrorCube has shape {error_cube.shape}; expected {(S, L)}.")
+
+        error_digest = str(error_cube.attrs.get("digest", ""))
+        if not error_digest:
+            raise RuntimeError("/ErrorCube is missing its digest.")
+
         mask = cu._get_mask(f) if cfg.apply_mask else None
         keep_idx = np.flatnonzero(mask) if mask is not None else None
         chunks = f["/HyperCube/models"].chunks
         s_tile = int(chunks[0]) if (chunks and chunks[0]) else 128
         if cfg.s_tile_override is not None:
             s_tile = int(cfg.s_tile_override)
+        spatial_mask, spatial_mask_digest = cu.canonical_spatial_mask(
+            spatial_mask_input, S)
 
     Lk_guess = None
     if keep_idx is not None:
         Lk_guess = int(keep_idx.size)
 
-    s_ranges = [(s0, min(S, s0+s_tile)) for s0 in range(0, S, s_tile)]
+    s_ranges = cu.spatial_mask_ranges(spatial_mask, s_tile)
+    n_spat_fit = int(np.count_nonzero(spatial_mask))
+    print(f"[MONO] spatial mask: {n_spat_fit}/{S} apertures retained "
+        f"({S-n_spat_fit} excluded)", flush=True)
 
     # Physical HyperCube dimensions and population-tying reduction.
     C_physical = C
@@ -4916,9 +5128,32 @@ def solve_streaming_nnls(
             raise ValueError(
                 "Cannot full-resume with a different component_donor. "
                 "Use warm_start='saved_x' instead.")
-
     print(f"[MONO] population tying: {C_physical} physical -> "
         f"{C_fit} independent components", flush=True)
+
+    # Full solver state is valid only for the likelihood that created it.
+    # Old x vectors remain usable through warm_start='saved_x'.
+    if resume_state:
+        saved_error_digest = resume_state.get("error_digest", None)
+        if saved_error_digest is None:
+            raise ValueError(
+                "Checkpoint predates ErrorCube-aware fitting. Use "
+                "warm_start='saved_x' instead.")
+        if str(saved_error_digest) != error_digest:
+            raise ValueError(
+                "Cannot full-resume with a different /ErrorCube. Use "
+                "warm_start='saved_x' instead.")
+
+        saved_spatial_digest = resume_state.get("spatial_mask_digest", None)
+        if saved_spatial_digest is None:
+            if not np.all(spatial_mask):
+                raise ValueError(
+                    "Checkpoint predates spatial masking. Use "
+                    "warm_start='saved_x' instead.")
+        elif str(saved_spatial_digest) != spatial_mask_digest:
+            raise ValueError(
+                "Cannot full-resume with a different spatial mask. Use "
+                "warm_start='saved_x' instead.")
 
     # Preserve the physical prior for final diagnostics, then reduce the solver.
     orbit_shape_outer = _canon_orbit_weights(
@@ -5006,6 +5241,8 @@ def solve_streaming_nnls(
         try:
             cache_npz = np.load(cache_path, allow_pickle=False)
 
+            cached_spatial_digest = (str(cache_npz["spatial_mask_digest"])
+                if "spatial_mask_digest" in cache_npz.files else None)
             ok = (int(cache_npz["S"]) == int(S) and int(cache_npz["L"]) == int(L)
                 and int(cache_npz["C_physical"]) == int(C_physical)
                 and int(cache_npz["C_fit"]) == int(C)
@@ -5015,7 +5252,10 @@ def solve_streaming_nnls(
                 and int(cache_npz["s_tile"]) == int(s_tile)
                 and int(cache_npz["apply_mask"]) == int(bool(cfg.apply_mask))
                 and np.array_equal(np.asarray(
-                    cache_npz["keep_idx"], dtype=np.int64), keep_idx_sig))
+                    cache_npz["keep_idx"], dtype=np.int64), keep_idx_sig)
+                and str(cache_npz["error_digest"]) == error_digest
+                and (cached_spatial_digest == spatial_mask_digest or (
+                        cached_spatial_digest is None and np.all(spatial_mask))))
 
             if ok:
                 cache_hit = True
@@ -5134,10 +5374,11 @@ def solve_streaming_nnls(
             try:
                 np.savez_compressed(cache_path, ATy_flat=ATy_flat,
                     inv_sqrt_energy_flat=inv_sqrt_energy_flat, D_tot=D_tot,
-                    keep_idx=keep_idx_sig,
+                    keep_idx=keep_idx_sig, error_digest=error_digest,
                     S=int(S), L=int(L), C_physical=int(C_physical),
                     C_fit=int(C), P=int(P), component_donor=component_donor,
-                    s_tile=int(s_tile), apply_mask=int(bool(cfg.apply_mask)))
+                    s_tile=int(s_tile), apply_mask=int(bool(cfg.apply_mask)),
+                    spatial_mask_digest=spatial_mask_digest)
                 print(f"[MONO][build] cache saved: {cache_path}", flush=True)
             except Exception as _e:
                 print(f"[MONO][build] cache save failed: {_e}", flush=True)
@@ -5222,9 +5463,12 @@ def solve_streaming_nnls(
                 "active": int(stats.get("active", -1)),
                 "stall_count": int(stats.get("stall_count", -1)),
             }
-        # Stamp the physical tying definition into new checkpoints. Absence
-        # remains valid for checkpoints written before population tying.
+
+        # Stamp external definitions that make full solver state meaningful.
         state["component_donor"] = component_donor.astype(np.int64).tolist()
+        state["error_digest"] = error_digest
+        state["spatial_mask_digest"] = spatial_mask_digest
+
         try:
             tracker.save_checkpoint(latest_ckpt["x"], state, block=True)
         except Exception as exc:
@@ -5250,8 +5494,8 @@ def solve_streaming_nnls(
             inv_sqrt_energy_flat=inv_sqrt_energy_flat, C=C, P=P,
             executor=executor, component_slot=component_slot,
             C_physical=C_physical, cfg=cfg, orbit_weights=orbit_weights,
-            known_zero_mask=known_zero,x0_flat=x.ravel(order="C"),
-            resume_state=resume_state,checkpoint_cb=_checkpoint_cb,
+            known_zero_mask=known_zero, x0_flat=x.ravel(order="C"),
+            resume_state=resume_state, checkpoint_cb=_checkpoint_cb,
             checkpoint_every=checkpoint_every, **active_set_kwargs)
 
         print("[MONO] finished streaming active-set NNLS", flush=True)
