@@ -38,7 +38,7 @@ def props(galaxy, **kwargs):
                 [-0.2, 0.0, 0.2, 0.4, 0.6]), runnerKwargs=dict(
                 regularisation_scale=0.0, minimum_l2_at_zero=True,
                 minimum_l2_rss_rtol=1e-6,
-                spatial_mask = {'exclude_radius': 2.0}), **kwargs)
+                spatial_mask = {'exclude_radius': 1.0}), **kwargs)
             # # old SSP
             # sspIdx=([-1.49, -0.96, -0.66, -0.3, 0.06, 0.15, 0.26],
             # [3.0, 6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],

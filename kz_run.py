@@ -136,6 +136,7 @@ def main():
         # propDict['runTag'] = 'monolithic'
         # propDict['sspIdx'] = [[], [], []]
         propDict['warm'] = 'zeros'
+        propDict['lOrder'] = 1
         propDict['runnerKwargs']['spatial_mask'] = {'exclude_radius': 1.0}
         propDict['runnerKwargs']['minimum_l2_rss_rtol'] = 1e-6
         propDict['runnerKwargs']['minimum_l2_at_zero'] = True

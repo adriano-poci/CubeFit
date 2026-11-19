@@ -428,7 +428,7 @@ def memory_telemetry() -> dict:
 
     return out
 
-def log_memory(label: str) -> None:
+def log_memory(label: str, level: int = 2) -> None:
     """
     Print compact process and Slurm cgroup memory telemetry.
 
@@ -436,6 +436,8 @@ def log_memory(label: str) -> None:
     ----------
     label : str
         Description of the measured execution point.
+    level : int, optional
+        Diagnostic verbosity level. Default is 2.
 
     Returns
     -------
@@ -456,10 +458,11 @@ def log_memory(label: str) -> None:
     frac = 100.0*mem["cgroup_fraction"]
     peak_frac = 100.0*mem["cgroup_peak_fraction"]
 
-    print(f"[MEM] {label}: RSS={mem['rss_gib']:.2f} GiB "
+    vprint(f"[MEM] {label}: RSS={mem['rss_gib']:.2f} GiB "
         f"peakRSS={mem['rss_peak_gib']:.2f} GiB "
         f"cgroup={current:.2f}/{limit:.2f} GiB ({frac:.1f}%) "
-        f"peak={peak:.2f} GiB ({peak_frac:.1f}%)", flush=True)
+        f"peak={peak:.2f} GiB ({peak_frac:.1f}%)", level=level,
+        flush=True)
 
 # ------------------------------------------------------------------------------
 

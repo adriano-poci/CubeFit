@@ -693,9 +693,11 @@ def _worker_ATAz(h5_path: str, batch: list, keep_idx, z: np.ndarray, CP: int,
                     del slab
 
             mem = cu.memory_telemetry()
-            print(f"[ATAz worker {os.getpid()}] cached={cache_peak_gib:.2f} GiB "
+            vprint(f"[ATAz worker {os.getpid()}] "
+                f"cached={cache_peak_gib:.2f} GiB "
                 f"RSS={mem['rss_gib']:.2f} GiB "
-                f"peakRSS={mem['rss_peak_gib']:.2f} GiB", flush=True)
+                f"peakRSS={mem['rss_peak_gib']:.2f} GiB",
+                level=5, flush=True)
 
             v *= weight2
 
@@ -720,10 +722,10 @@ def _worker_ATAz(h5_path: str, batch: list, keep_idx, z: np.ndarray, CP: int,
             del A_tile, v, inv_sigma, weight2
 
     mem = cu.memory_telemetry()
-    print(f"[ATAz worker {os.getpid()}] read={t_read:.1f}s "
+    vprint(f"[ATAz worker {os.getpid()}] read={t_read:.1f}s "
         f"forward={t_forward:.1f}s transpose={t_transpose:.1f}s "
         f"cache={cache_peak_gib:.2f} GiB RSS={mem['rss_gib']:.2f} GiB "
-        f"peakRSS={mem['rss_peak_gib']:.2f} GiB", flush=True)
+        f"peakRSS={mem['rss_peak_gib']:.2f} GiB", level=2, flush=True)
 
     return partial
 
@@ -3254,7 +3256,7 @@ def streamActiveSetNNLS(
 
         worker_args = [(h5_path, batch, keep_idx, x_cand, CP, S_flat, C, P,
             component_slot, C_physical) for batch in batches if len(batch) > 0]
-        cu.log_memory("before ATAz")
+        cu.log_memory("before ATAz", level=2)
         it = executor.map(_worker_ATAz_from_tuple, worker_args)
 
         for r in tqdm(it, total=len(worker_args), desc="[MONO] ATAz tiles",
@@ -3265,7 +3267,7 @@ def streamActiveSetNNLS(
                 print("[ERROR] worker returned exception:", e, flush=True)
                 raise
 
-        cu.log_memory("after ATAz")
+        cu.log_memory("after ATAz", level=2)
         cached_ATAz_z = x_cand.copy()
         cached_ATAz = ATAz.copy()
 
