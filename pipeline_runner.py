@@ -385,8 +385,13 @@ class PipelineRunner:
         spatial_mask, spatial_mask_digest = cu.canonical_spatial_mask(
             spatial_mask, self.nSpat)
         solver_kwargs["spatial_mask"] = spatial_mask
-
+        population_observability = solver_kwargs.get(
+            "population_observability", None)
         component_donor = solver_kwargs.get("component_donor", None)
+        if population_observability is not None and \
+            component_donor is not None:
+            raise ValueError('Specify population_observability or '
+                'component_donor, not both.')
         has_component_ties = False
 
         if component_donor is not None:
@@ -394,8 +399,7 @@ class PipelineRunner:
                 component_donor, dtype=np.int64).ravel(order="C")
 
             if donor.size != self.nComp:
-                raise ValueError(
-                    f"component_donor has size {donor.size}; "
+                raise ValueError(f"component_donor has size {donor.size}; "
                     f"expected {self.nComp}.")
 
             if np.any(donor < 0) or np.any(donor >= self.nComp):

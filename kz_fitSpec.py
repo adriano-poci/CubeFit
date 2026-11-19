@@ -131,7 +131,10 @@ v2.9:  Updated HyperCube construction settings for solve-optimised storage
             chunking and improved parallel generation;
         Improved parallel ModelCube reconstruction cache sizing and worker
             thread controls, and record the correct reconstruction generator in
-            output metadata. 19 November 2026
+            output metadata. 18 November 2026
+v2.10:  Added runtime aperture and fitted-energy thresholds for population tying
+            and pass preliminary observability information to the solver for
+            fitted-space finalization. 19 November 2026
 """
 
 # need to set up the logger before any other imports
@@ -767,13 +770,20 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
     if not np.all(np.isin(otypes, [0, 1, 2])):
         raise RuntimeError(
             f"Invalid intrinsic orbital types: {np.unique(otypes)}.")
+    min_aper_fraction = runnerKwargs.pop("min_aper_fraction", 5e-3)
+    min_energy_fraction = runnerKwargs.pop("min_energy_fraction", 5e-3)
     # Population observability is part of the fitted model definition.
     popMap = cu.population_observability_map(
         str(hdf5Path), aperMass, nzComp, pred, oDict, otypes, rM,
-        lZMSign, lXMSign, lLMSign, FWHM, dataMax)
+        lZMSign, lXMSign, lLMSign, FWHM, dataMax,
+        min_aper_fraction=min_aper_fraction,
+        min_energy_fraction=min_energy_fraction)
+    popMap["nzComp"] = np.asarray(nzComp, dtype=np.int64)
 
-    component_donor = np.asarray(popMap["donor"], dtype=np.int64)
-    runnerKwargs["component_donor"] = component_donor
+    runnerKwargs["population_observability"] = {"map": popMap,
+        "otypes": np.asarray(otypes, dtype=np.int64),
+        "min_aper_fraction": float(min_aper_fraction),
+        "min_energy_fraction": float(min_energy_fraction)}
 
     # Prepare only explicit non-runner warm starts here. saved_x remains a
     # physical solution and is reduced to anchor components by the solver.
@@ -788,28 +798,6 @@ def genCubeFit(galaxy, mPath, decDir=None, nCuts=None, proj='i', SN=90,
             str(hdf5Path), otypes, orbit_weights=cWeights)
 
         warm_start = None
-    print("\nPopulation tying map")
-    print(" comp donor  tied       R   lambda  aper.frac    E.frac  reason")
-    print("-"*78)
-
-    for cc in range(nComp):
-        reason = []
-        if popMap["unresolved"][cc]:
-            reason.append("PSF")
-        if popMap["outside"][cc]:
-            reason.append("FoV")
-        if popMap["low_aper"][cc]:
-            reason.append("low-M")
-        if popMap["low_energy"][cc]:
-            reason.append("low-E")
-
-        tied = component_donor[cc] != cc
-        print(f"{nzComp[cc]:5d} {nzComp[component_donor[cc]]:5d} "
-            f"{'yes' if tied else 'no':>5s} {popMap['radius'][cc]:7.2f} "
-            f"{popMap['circularity'][cc]:+7.3f} "
-            f"{popMap['aper_fraction'][cc]:10.3e} "
-            f"{popMap['energy_fraction'][cc]:10.3e} "
-            f"{','.join(reason) if reason else 'good'}")
 
     ###########################################
     # Multi-processing Batched Streaming NNLS #

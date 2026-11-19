@@ -38,7 +38,12 @@ v1.15:  Added runtime spatial-mask construction, canonicalisation, and contiguou
             aperture-range generation for spatially restricted fits. 18 November
             2026
 v1.16:  Added process and cgroup-v2 memory telemetry for monitoring large
-            HyperCube fitting operations. 19 November 2026
+            HyperCube fitting operations. 18 November 2026
+v1.17:  Added fitted-space population-observability finalization using weighted
+            component energies and configurable aperture and spectral-leverage
+            thresholds;
+        Tie poorly constrained outer components when either their aperture
+            contribution or fitted spectral leverage is low. 19 November 2026
 """
 from __future__ import annotations
 from contextlib import contextmanager
@@ -300,23 +305,27 @@ def cpuset_count():
 
 def memory_telemetry() -> dict:
     """
-    Return current process and cgroup-v2 memory telemetry in GiB.
+    Return current process and Slurm cgroup memory telemetry in GiB.
+
+    Supports cgroup v1 and v2. For cgroup v1 Slurm jobs, the parent step
+    cgroup is preferred over the task cgroup because the step carries the
+    enforced job-step memory limit on ARC.
 
     Returns
     -------
     stats : dict
-        Current process RSS, process high-water RSS, and current, peak, and
-        maximum memory charged to the process cgroup.
+        Current and peak process RSS, current and peak cgroup memory, the
+        cgroup memory limit, and current and peak cgroup utilization.
 
     Raises
     ------
     None
-        Unavailable Linux or cgroup-v2 fields are returned as NaN.
+        Unavailable Linux or cgroup fields are returned as NaN.
 
     Examples
     --------
     >>> mem = memory_telemetry()
-    >>> print(mem["rss_gib"], mem["cgroup_current_gib"])
+    >>> print(mem["cgroup_current_gib"], mem["cgroup_peak_gib"])
     """
     gib = float(1024**3)
     out = {
@@ -325,8 +334,11 @@ def memory_telemetry() -> dict:
         "cgroup_current_gib": np.nan,
         "cgroup_peak_gib": np.nan,
         "cgroup_max_gib": np.nan,
+        "cgroup_fraction": np.nan,
+        "cgroup_peak_fraction": np.nan,
     }
 
+    # Current and high-water RSS for this process only.
     try:
         with open("/proc/self/status", "r") as fh:
             for line in fh:
@@ -337,34 +349,88 @@ def memory_telemetry() -> dict:
     except (OSError, ValueError, IndexError):
         pass
 
+    # Discover the cgroup hierarchy containing this process.
     try:
         with open("/proc/self/cgroup", "r") as fh:
             entries = [line.strip().split(":", 2) for line in fh]
+    except OSError:
+        return out
 
-        rel = next(fields[2] for fields in entries
-            if len(fields) == 3 and fields[0] == "0")
-        root = os.path.join("/sys/fs/cgroup", rel.lstrip("/"))
+    # First try cgroup v2.
+    try:
+        entry = next(x for x in entries
+            if len(x) == 3 and x[0] == "0")
+        root = os.path.join(
+            "/sys/fs/cgroup", entry[2].lstrip("/"))
 
-        def _read_cgroup(name):
+        def _read_v2(name):
             with open(os.path.join(root, name), "r") as fh:
                 value = fh.read().strip()
             return np.inf if value == "max" else float(value)/gib
 
-        out["cgroup_current_gib"] = _read_cgroup("memory.current")
-        out["cgroup_max_gib"] = _read_cgroup("memory.max")
+        out["cgroup_current_gib"] = _read_v2("memory.current")
+        out["cgroup_max_gib"] = _read_v2("memory.max")
 
         try:
-            out["cgroup_peak_gib"] = _read_cgroup("memory.peak")
+            out["cgroup_peak_gib"] = _read_v2("memory.peak")
         except (OSError, ValueError):
             pass
-    except (OSError, ValueError, IndexError, StopIteration):
-        pass
+
+    except (OSError, ValueError, StopIteration):
+        # ARC currently uses cgroup v1. Locate the memory controller.
+        try:
+            entry = next(x for x in entries
+                if len(x) == 3 and "memory" in x[1].split(","))
+            rel = entry[2].lstrip("/")
+            task_root = os.path.join(
+                "/sys/fs/cgroup/memory", rel)
+
+            # Slurm places the enforced limit on step_*, while task_* may
+            # report an effectively unlimited memory.limit_in_bytes.
+            if os.path.basename(task_root).startswith("task_"):
+                step_root = os.path.dirname(task_root)
+            else:
+                step_root = task_root
+
+            def _read_v1(path, name):
+                with open(os.path.join(path, name), "r") as fh:
+                    return float(fh.read().strip())/gib
+
+            # Prefer the Slurm step cgroup, falling back to the task cgroup.
+            try:
+                out["cgroup_current_gib"] = _read_v1(
+                    step_root, "memory.usage_in_bytes")
+                out["cgroup_peak_gib"] = _read_v1(
+                    step_root, "memory.max_usage_in_bytes")
+                out["cgroup_max_gib"] = _read_v1(
+                    step_root, "memory.limit_in_bytes")
+            except (OSError, ValueError):
+                out["cgroup_current_gib"] = _read_v1(
+                    task_root, "memory.usage_in_bytes")
+                out["cgroup_peak_gib"] = _read_v1(
+                    task_root, "memory.max_usage_in_bytes")
+                out["cgroup_max_gib"] = _read_v1(
+                    task_root, "memory.limit_in_bytes")
+
+        except (OSError, ValueError, StopIteration):
+            pass
+
+    # Report fractions only for a meaningful finite cgroup limit.
+    limit = out["cgroup_max_gib"]
+    if np.isfinite(limit) and limit > 0.0:
+        current = out["cgroup_current_gib"]
+        peak = out["cgroup_peak_gib"]
+
+        if np.isfinite(current):
+            out["cgroup_fraction"] = current/limit
+        if np.isfinite(peak):
+            out["cgroup_peak_fraction"] = peak/limit
 
     return out
 
 def log_memory(label: str) -> None:
     """
-    Print compact process and cgroup memory telemetry.
+    Print compact process and Slurm cgroup memory telemetry.
 
     Parameters
     ----------
@@ -381,14 +447,19 @@ def log_memory(label: str) -> None:
 
     Examples
     --------
-    >>> log_memory("before ATAz")
+    >>> log_memory("after ATAz")
     """
     mem = memory_telemetry()
+    current = mem["cgroup_current_gib"]
+    peak = mem["cgroup_peak_gib"]
+    limit = mem["cgroup_max_gib"]
+    frac = 100.0*mem["cgroup_fraction"]
+    peak_frac = 100.0*mem["cgroup_peak_fraction"]
+
     print(f"[MEM] {label}: RSS={mem['rss_gib']:.2f} GiB "
         f"peakRSS={mem['rss_peak_gib']:.2f} GiB "
-        f"cgroup={mem['cgroup_current_gib']:.2f}/"
-        f"{mem['cgroup_max_gib']:.2f} GiB "
-        f"peak={mem['cgroup_peak_gib']:.2f} GiB", flush=True)
+        f"cgroup={current:.2f}/{limit:.2f} GiB ({frac:.1f}%) "
+        f"peak={peak:.2f} GiB ({peak_frac:.1f}%)", flush=True)
 
 # ------------------------------------------------------------------------------
 
@@ -6524,7 +6595,7 @@ def population_observability_map(
     FWHM: float,
     dataMax: float,
     *,
-    min_aper_fraction: float = 1e-3,
+    min_aper_fraction: float = 5e-3,
     min_energy_fraction: float = 1e-3,
     use_radius_fov: bool = True,
 ) -> dict:
@@ -6802,8 +6873,8 @@ def population_observability_map(
 
     # PSF confusion is intrinsically non-identifiable.
     #
-    # For the outer/weak case, require actual low spectral leverage rather
-    # than declaring every geometrically outer component unusable.
+    # Preliminary classification only. The streaming solver replaces the
+    # stored HyperCube energy with its exact fitted-space weighted energy.
     bad = unresolved | (outside & low_aper)
 
     anchor = ~bad
@@ -6864,6 +6935,143 @@ def population_observability_map(
         "energy_fraction": energy_fraction,
         "energy_relative_family": energy_relative_family,
     }
+
+# ------------------------------------------------------------------------------
+
+def finalize_population_observability_map(pop_map: dict,
+    component_energy: np.ndarray, otypes: np.ndarray,
+    min_aper_fraction: float = 1e-3,
+    min_energy_fraction: float = 1e-3) -> dict:
+    """
+    Finalize population observability using fitted-space component energies.
+
+    The supplied energies must use the same spatial mask, spectral mask, and
+    statistical weighting as the actual fit. Outer components are tied when
+    either their projected aperture contribution or fitted spectral leverage
+    falls below its configured threshold.
+
+    Parameters
+    ----------
+    pop_map : dict
+        Preliminary population-observability dictionary containing geometric
+        and projected-aperture diagnostics.
+    component_energy : ndarray
+        Fitted-space weighted component energies with shape ``(C,)``.
+    otypes : ndarray
+        Intrinsic orbital family of each physical component.
+    min_aper_fraction : float, optional
+        Minimum projected aperture fraction. Default is ``1e-3``.
+    min_energy_fraction : float, optional
+        Minimum fitted-space energy fraction. Default is ``1e-3``.
+
+    Returns
+    -------
+    result : dict
+        Updated observability map containing final energy diagnostics, tying
+        classification, anchors, and donor assignments.
+
+    Raises
+    ------
+    ValueError
+        If dimensions, energies, or thresholds are invalid.
+    RuntimeError
+        If a poorly observable component has no donor in its orbital family.
+
+    Examples
+    --------
+    >>> pop_map = finalize_population_observability_map(
+    ...     pop_map, component_energy, otypes)
+    """
+    result = dict(pop_map)
+    component_energy = np.asarray(
+        component_energy, dtype=np.float64).ravel(order="C")
+    otypes = np.asarray(otypes, dtype=np.int64).ravel(order="C")
+    C = int(otypes.size)
+
+    if component_energy.size != C:
+        raise ValueError(
+            f"component_energy has size {component_energy.size}; expected {C}.")
+    if np.any(~np.isfinite(component_energy)) or \
+        np.any(component_energy < 0.0):
+        raise ValueError(
+            "component_energy must contain finite non-negative values.")
+    if min_aper_fraction < 0.0 or min_energy_fraction < 0.0:
+        raise ValueError("Observability thresholds must be non-negative.")
+
+    energy_total = float(np.sum(component_energy))
+    if not np.isfinite(energy_total) or energy_total <= 0.0:
+        raise ValueError(
+            "Total fitted-space component energy must be positive.")
+
+    energy_fraction = component_energy/energy_total
+    energy_relative_family = np.full(C, np.nan, dtype=np.float64)
+
+    for family in (0, 1, 2):
+        family_idx = np.flatnonzero(otypes == family)
+        positive = component_energy[family_idx]
+        positive = positive[np.isfinite(positive) & (positive > 0.0)]
+
+        if positive.size == 0:
+            continue
+
+        reference = float(np.median(positive))
+        if reference > 0.0:
+            energy_relative_family[family_idx] = (
+                component_energy[family_idx]/reference)
+
+    radius = np.asarray(result["radius"], dtype=np.float64)
+    circ = np.asarray(result["circularity"], dtype=np.float64)
+    outside = np.asarray(result["outside"], dtype=bool)
+    unresolved = np.asarray(result["unresolved"], dtype=bool)
+    aper_fraction = np.asarray(result["aper_fraction"], dtype=np.float64)
+
+    low_aper = aper_fraction < float(min_aper_fraction)
+    low_energy = energy_fraction < float(min_energy_fraction)
+
+    # Outer components require sufficient projected mass AND fitted spectral
+    # leverage to justify an independent stellar-population solution.
+    bad = unresolved | (outside & (low_aper | low_energy))
+    anchor = ~bad
+    donor = np.arange(C, dtype=np.int64)
+
+    for cc in np.flatnonzero(bad):
+        candidates = np.flatnonzero(anchor & (otypes == otypes[cc]))
+
+        if candidates.size == 0:
+            raise RuntimeError(
+                f"No observable donor exists for component {cc} in orbital "
+                f"family {otypes[cc]}.")
+
+        candidate_radius = radius[candidates]
+        candidate_circ = circ[candidates]
+        log_radius = np.log10(np.maximum(candidate_radius, 1e-300))
+        log_target = np.log10(max(radius[cc], 1e-300))
+        rscale = max(float(np.ptp(log_radius)), 1e-12)
+        lscale = max(float(np.ptp(candidate_circ)), 1e-12)
+
+        phase_distance = (
+            ((log_radius-log_target)/rscale)**2
+            + ((candidate_circ-circ[cc])/lscale)**2)
+
+        candidate_energy = np.maximum(
+            energy_fraction[candidates], 1e-300)
+        strongest = float(np.max(candidate_energy))
+        leverage_penalty = (
+            0.10*np.log10(strongest/candidate_energy)**2)
+
+        donor[cc] = candidates[
+            int(np.argmin(phase_distance+leverage_penalty))]
+
+    result["component_energy"] = component_energy
+    result["energy_fraction"] = energy_fraction
+    result["energy_relative_family"] = energy_relative_family
+    result["low_aper"] = low_aper
+    result["low_energy"] = low_energy
+    result["bad"] = bad
+    result["anchor"] = anchor
+    result["donor"] = donor
+
+    return result
 
 # ------------------------------------------------------------------------------
 

@@ -20,7 +20,7 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --mem=220G
+#SBATCH --mem=350G
 #SBATCH --hint=nomultithread
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=adriano.poci@physics.ox.ac.uk

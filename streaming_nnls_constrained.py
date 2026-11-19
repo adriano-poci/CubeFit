@@ -240,6 +240,17 @@ v2.14:  Reduced ATAz I/O to one HyperCube read per spatial tile by caching the
             model tile between forward and transpose contractions;
         Added process and cgroup memory reporting around ATAz operations;
         Corrected y.T W y evaluation for the ErrorCube-weighted objective.
+            18 November 2026
+v2.15:  Made population observability use the exact ErrorCube-weighted,
+            spatially and spectrally masked component energies from the fit;
+        Finalize population tying after the physical build and tie outer
+            components with low aperture contribution or low spectral leverage;
+        Added exact tied-column energy cross terms after dynamic population
+            tying without repeating the full HyperCube build;
+        Made fused-product caching retain physical build products independently
+            of the dynamically finalized tying map;
+        Delayed solver-space reduction, orbit-weight reduction, diagnostics,
+            and warm-start projection until after dynamic tying is finalized.
             19 November 2026
 """
 
@@ -681,6 +692,11 @@ def _worker_ATAz(h5_path: str, batch: list, keep_idx, z: np.ndarray, CP: int,
 
                     del slab
 
+            mem = cu.memory_telemetry()
+            print(f"[ATAz worker {os.getpid()}] cached={cache_peak_gib:.2f} GiB "
+                f"RSS={mem['rss_gib']:.2f} GiB "
+                f"peakRSS={mem['rss_peak_gib']:.2f} GiB", flush=True)
+
             v *= weight2
 
             t0 = time.perf_counter()
@@ -980,6 +996,97 @@ def _worker_build_products(h5_path: str, batch: list, keep_idx, C: int,
             "Grouped column energy contains non-finite values.")
 
     return ATy_loc.ravel(order="C"), D_loc, int(len(batch))
+
+# ------------------------------------------------------------------------------
+
+def _worker_tied_cross_terms(h5_path: str, batch: list, keep_idx,
+    tied_groups: list, P: int):
+    """
+    Compute weighted column-energy cross terms for tied component groups.
+
+    Only physical components belonging to non-singleton tied groups are read.
+    The returned correction converts the sum of physical column energies into
+    the exact energy of each grouped model column.
+
+    Parameters
+    ----------
+    h5_path : str
+        CubeFit HDF5 path.
+    batch : list
+        Spatial ranges assigned to this worker.
+    keep_idx : ndarray or None
+        Retained spectral indices.
+    tied_groups : list
+        ``(group_index, members)`` pairs for non-singleton fitted groups.
+    P : int
+        Number of SSP populations.
+
+    Returns
+    -------
+    corrections : dict
+        Weighted grouped-energy corrections keyed by fitted-group index.
+
+    Raises
+    ------
+    RuntimeError
+        If a grouped correction becomes non-finite.
+
+    Examples
+    --------
+    Called internally after fitted-space observability classification.
+    """
+    corrections = {
+        int(gg): np.zeros(P, dtype=np.float64)
+        for gg, _ in tied_groups}
+
+    with open_h5(h5_path, role="reader") as f:
+        M = f["/HyperCube/models"]
+        P_chunk = int(M.chunks[2]) if M.chunks else P
+        P_cross = min(P_chunk, 16)
+
+        for s0, s1 in batch:
+            inv_sigma = _read_inv_sigma(f, s0, s1, keep_idx)
+            weight2 = inv_sigma*inv_sigma
+
+            for gg, members in tied_groups:
+                members = np.asarray(members, dtype=np.int64)
+
+                for p0 in range(0, P, P_cross):
+                    p1 = min(p0+P_cross, P)
+                    grouped = np.zeros(
+                        (s1-s0, p1-p0, weight2.shape[1]),
+                        dtype=np.float64)
+                    physical = np.zeros(p1-p0, dtype=np.float64)
+
+                    for cc in members:
+                        slab = np.asarray(
+                            M[s0:s1, int(cc), p0:p1, :],
+                            dtype=np.float32, order="C")
+
+                        if keep_idx is not None:
+                            slab = slab[:, :, keep_idx]
+
+                        grouped += slab
+                        physical += np.einsum(
+                            "spl,spl,sl->p", slab, slab, weight2,
+                            dtype=np.float64, optimize=True)
+
+                    grouped_energy = np.einsum(
+                        "spl,spl,sl->p", grouped, grouped, weight2,
+                        dtype=np.float64, optimize=True)
+
+                    corrections[int(gg)][p0:p1] += (
+                        grouped_energy-physical)
+
+                    del grouped, physical, grouped_energy
+
+            del inv_sigma, weight2
+
+    return corrections
+
+def _worker_tied_cross_terms_from_tuple(args):
+    """Tuple wrapper for tied-component cross-term workers."""
+    return _worker_tied_cross_terms(*args)
 
 # ------------------------------------------------------------------------------
 
@@ -5067,7 +5174,12 @@ def solve_streaming_nnls(h5_path: str, cfg: MPConfig,
     t0 = time.perf_counter()
 
     component_donor = active_set_kwargs.pop("component_donor", None)
+    population_observability = active_set_kwargs.pop(
+        "population_observability", None)
     spatial_mask_input = active_set_kwargs.pop("spatial_mask", None)
+    if component_donor is not None and population_observability is not None:
+        raise ValueError(
+            "Specify component_donor or population_observability, not both.")
 
     # ---------------------------- metadata -----------------------------
     with open_h5(h5_path, role="reader") as f:
@@ -5109,27 +5221,18 @@ def solve_streaming_nnls(h5_path: str, cfg: MPConfig,
     # Physical HyperCube dimensions and population-tying reduction.
     C_physical = C
     CP_physical = C_physical*P
-    component_donor = _canon_component_donor(component_donor, C_physical)
-    anchors = np.flatnonzero(component_donor == np.arange(C_physical))
-    C_fit = int(anchors.size)
-
-    anchor_slot = np.full(C_physical, -1, dtype=np.int64)
-    anchor_slot[anchors] = np.arange(C_fit, dtype=np.int64)
-    component_slot = anchor_slot[component_donor]
-    if np.any(component_slot < 0):
-        raise RuntimeError("Invalid component donor reduction.")
-    # A stored tying map is authoritative when present. Legacy checkpoints
-    # without tying metadata remain resumable under the current mapping.
-    if resume_state and "component_donor" in resume_state:
-        saved_donor = _canon_component_donor(
-            resume_state["component_donor"], C_physical)
-
-        if not np.array_equal(saved_donor, component_donor):
-            raise ValueError(
-                "Cannot full-resume with a different component_donor. "
-                "Use warm_start='saved_x' instead.")
-    print(f"[MONO] population tying: {C_physical} physical -> "
-        f"{C_fit} independent components", flush=True)
+    if population_observability is not None:
+        build_component_slot = np.arange(C_physical, dtype=np.int64)
+        build_C_fit = C_physical
+    else:
+        component_donor = _canon_component_donor(
+            component_donor, C_physical)
+        build_anchors = np.flatnonzero(
+            component_donor == np.arange(C_physical))
+        build_C_fit = int(build_anchors.size)
+        build_anchor_slot = np.full(C_physical, -1, dtype=np.int64)
+        build_anchor_slot[build_anchors] = np.arange(build_C_fit)
+        build_component_slot = build_anchor_slot[component_donor]
 
     # Full solver state is valid only for the likelihood that created it.
     # Old x vectors remain usable through warm_start='saved_x'.
@@ -5155,78 +5258,7 @@ def solve_streaming_nnls(h5_path: str, cfg: MPConfig,
                 "Cannot full-resume with a different spatial mask. Use "
                 "warm_start='saved_x' instead.")
 
-    # Preserve the physical prior for final diagnostics, then reduce the solver.
-    orbit_shape_outer = _canon_orbit_weights(
-        orbit_weights, C=C_physical, P=P)
-
-    if orbit_weights is not None:
-        orbit_weights_physical = np.asarray(
-            orbit_weights, dtype=np.float64).ravel(order="C")
-        if orbit_weights_physical.size == CP_physical:
-            orbit_weights_physical = orbit_weights_physical.reshape(
-                C_physical, P).sum(axis=1)
-        if orbit_weights_physical.size != C_physical:
-            raise ValueError("orbit_weights has incompatible physical dimensions.")
-
-        orbit_weights = np.empty(C_fit, dtype=np.float64)
-        for gg in range(C_fit):
-            orbit_weights[gg] = np.sum(
-                orbit_weights_physical[component_slot == gg])
-
-    # Everything below this point is in reduced solver space unless explicitly
-    # labelled physical.
-    C = C_fit
-    CP = C*P
-
-    # ---------------------------- diagnostics --------------------------
-    diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
-    diag_stride = max(1, int(os.environ.get("CUBEFIT_DIAG_STRIDE", "1")))
-    diag_jsonl_path = os.environ.get("CUBEFIT_DIAG_JSONL", "").strip() or None
-    diag_topk = max(1, int(os.environ.get("CUBEFIT_DIAG_TOPK", "12")))
-    diag_t0 = time.perf_counter()
-
-    def _emit_diag(record: dict) -> None:
-        if diag_level <= 0:
-            return
-        rec = dict(record)
-        rec.setdefault("t_sec", float(time.perf_counter() - diag_t0))
-        _diag_append_jsonl(diag_jsonl_path, rec)
-
-    _emit_diag(
-        {
-            "kind": "setup",
-            "source": "solve_streaming_nnls",
-            "S": int(S),
-            "L": int(L),
-            "C_physical": int(C_physical),
-            "C_fit": int(C),
-            "P": int(P),
-            "CP_fit": int(CP),
-            "keep_idx": int(keep_idx.size) if keep_idx is not None else None,
-            "s_tile": int(s_tile),
-            "n_ranges": int(len(s_ranges)),
-            "processes": int(cfg.processes),
-            "blas_threads": int(cfg.blas_threads),
-            "diag_level": int(diag_level),
-            "diag_stride": int(diag_stride),
-            "diag_topk": int(diag_topk),
-        }
-    )
-
-    # ---------------------------- initial x ----------------------------
-    # Public warm starts remain physical (C_physical, P); retain anchor rows.
-    if x0 is None:
-        x = np.zeros((C, P), dtype=np.float64)
-    else:
-        x0 = np.asarray(x0, dtype=np.float64).ravel(order="C")
-        if x0.size != CP_physical:
-            raise ValueError(f"x0 has size {x0.size}; expected {CP_physical}.")
-        x = x0.reshape(C_physical, P)[anchors].copy()
-
     verbose = getattr(cfg, "verbose", True)
-
-    best_x = x.copy()
-    best_proxy = np.inf 
 
     if cache_path is None:
         cache_path = f"{h5_path}.bcfused.npz"
@@ -5245,17 +5277,14 @@ def solve_streaming_nnls(h5_path: str, cfg: MPConfig,
                 if "spatial_mask_digest" in cache_npz.files else None)
             ok = (int(cache_npz["S"]) == int(S) and int(cache_npz["L"]) == int(L)
                 and int(cache_npz["C_physical"]) == int(C_physical)
-                and int(cache_npz["C_fit"]) == int(C)
                 and int(cache_npz["P"]) == int(P)
-                and np.array_equal(np.asarray(cache_npz["component_donor"],
-                    dtype=np.int64), component_donor)
                 and int(cache_npz["s_tile"]) == int(s_tile)
                 and int(cache_npz["apply_mask"]) == int(bool(cfg.apply_mask))
-                and np.array_equal(np.asarray(
-                    cache_npz["keep_idx"], dtype=np.int64), keep_idx_sig)
+                and np.array_equal(np.asarray(cache_npz["keep_idx"],
+                    dtype=np.int64), keep_idx_sig)
                 and str(cache_npz["error_digest"]) == error_digest
                 and (cached_spatial_digest == spatial_mask_digest or (
-                        cached_spatial_digest is None and np.all(spatial_mask))))
+                    cached_spatial_digest is None and np.all(spatial_mask))))
 
             if ok:
                 cache_hit = True
@@ -5281,6 +5310,12 @@ def solve_streaming_nnls(h5_path: str, cfg: MPConfig,
         D_tot = np.asarray(cache_npz["D_tot"], dtype=np.float64).copy()
         inv_sqrt_energy_flat = np.asarray(cache_npz["inv_sqrt_energy_flat"],
             dtype=np.float64).copy()
+        if ATy_flat.size != build_C_fit*P:
+            raise RuntimeError(
+                'Cached ATy has incompatible build-space dimensions.')
+        if D_tot.shape != (build_C_fit, P):
+            raise RuntimeError(
+                'Cached column energy has incompatible build-space dimensions.')
 
         try:
             cache_npz.close()
@@ -5306,15 +5341,15 @@ def solve_streaming_nnls(h5_path: str, cfg: MPConfig,
         for ii, tile in enumerate(s_ranges):
             batches[ii % n_workers].append(tile)
 
-        worker_args = [(h5_path, batch, keep_idx, C_physical, P, component_slot,
-            C_fit) for batch in batches if batch]
+        worker_args = [(h5_path, batch, keep_idx, C_physical, P,
+            build_component_slot, build_C_fit) for batch in batches if batch]
 
         print(f"[MONO][build] constructing ATy and column energies: "
             f"tiles={len(s_ranges)} workers={len(worker_args)}", flush=True)
 
         build_t0 = time.perf_counter()
-        ATy_flat = np.zeros(CP, dtype=np.float64)
-        D_tot = np.zeros((C, P), dtype=np.float64)
+        ATy_flat = np.zeros(build_C_fit*P, dtype=np.float64)
+        D_tot = np.zeros((build_C_fit, P), dtype=np.float64)
 
         ctx = mp.get_context("spawn")
 
@@ -5375,13 +5410,181 @@ def solve_streaming_nnls(h5_path: str, cfg: MPConfig,
                 np.savez_compressed(cache_path, ATy_flat=ATy_flat,
                     inv_sqrt_energy_flat=inv_sqrt_energy_flat, D_tot=D_tot,
                     keep_idx=keep_idx_sig, error_digest=error_digest,
-                    S=int(S), L=int(L), C_physical=int(C_physical),
-                    C_fit=int(C), P=int(P), component_donor=component_donor,
+                    S=int(S), L=int(L), C_physical=int(C_physical), P=int(P),
                     s_tile=int(s_tile), apply_mask=int(bool(cfg.apply_mask)),
                     spatial_mask_digest=spatial_mask_digest)
                 print(f"[MONO][build] cache saved: {cache_path}", flush=True)
             except Exception as _e:
                 print(f"[MONO][build] cache save failed: {_e}", flush=True)
+
+    if population_observability is not None:
+        if D_tot.shape != (C_physical, P):
+            raise RuntimeError(
+                f"Physical energy has shape {D_tot.shape}; expected "
+                f"{(C_physical, P)}.")
+
+        component_energy = np.sum(D_tot, axis=1)
+        pop_map = cu.finalize_population_observability_map(
+            population_observability["map"], component_energy,
+            population_observability["otypes"],
+            min_aper_fraction=population_observability["min_aper_fraction"],
+            min_energy_fraction=population_observability["min_energy_fraction"])
+
+        component_donor = np.asarray(pop_map["donor"], dtype=np.int64)
+        anchors = np.flatnonzero(component_donor == np.arange(C_physical))
+        C_fit = int(anchors.size)
+        anchor_slot = np.full(C_physical, -1, dtype=np.int64)
+        anchor_slot[anchors] = np.arange(C_fit)
+        component_slot = anchor_slot[component_donor]
+
+        if np.any(component_slot < 0):
+            raise RuntimeError("Invalid finalized component donor reduction.")
+
+        print("\nPopulation tying map")
+        print(" comp donor  tied       R   lambda  aper.frac    E.frac  reason")
+        print("-"*78)
+
+        for cc in range(C_physical):
+            reason = []
+
+            if pop_map["unresolved"][cc]:
+                reason.append("PSF")
+            if pop_map["outside"][cc]:
+                reason.append("FoV")
+            if pop_map["low_aper"][cc]:
+                reason.append("low-M")
+            if pop_map["low_energy"][cc]:
+                reason.append("low-E")
+
+            donor = int(component_donor[cc])
+            tied = donor != cc
+            nz = population_observability["map"].get("nzComp", None)
+            comp = cc+1 if nz is None else int(nz[cc])
+            donor_comp = donor+1 if nz is None else int(nz[donor])
+
+            print(f"{comp:5d} {donor_comp:5d} "
+                f"{'yes' if tied else 'no':>5s} "
+                f"{pop_map['radius'][cc]:7.2f} "
+                f"{pop_map['circularity'][cc]:+7.3f} "
+                f"{pop_map['aper_fraction'][cc]:10.3e} "
+                f"{pop_map['energy_fraction'][cc]:10.3e} "
+                f"{','.join(reason) if reason else 'good'}")
+        # ATy is linear in the physical model columns, so tying requires only
+        # summation into the finalized fitted-component groups.
+        ATy_physical = ATy_flat.reshape(C_physical, P)
+        ATy_grouped = np.zeros((C_fit, P), dtype=np.float64)
+        for cc in range(C_physical):
+            gg = int(component_slot[cc])
+            ATy_grouped[gg] += ATy_physical[cc]
+        ATy_flat = ATy_grouped.ravel(order="C")
+
+        # Begin the exact tied-column energy with the sum of the physical
+        # diagonal energies. Cross terms are added separately below.
+        D_physical = D_tot
+        D_grouped = np.zeros((C_fit, P), dtype=np.float64)
+        for cc in range(C_physical):
+            gg = int(component_slot[cc])
+            D_grouped[gg] += D_physical[cc]
+        tied_groups = [(gg, np.flatnonzero(component_slot == gg))
+            for gg in range(C_fit)
+            if np.count_nonzero(component_slot == gg) > 1]
+
+        if tied_groups:
+            n_workers = max(1, min(int(cfg.processes), len(s_ranges)))
+            batches = [[] for _ in range(n_workers)]
+
+            for ii, tile in enumerate(s_ranges):
+                batches[ii % n_workers].append(tile)
+
+            worker_args = [(h5_path, batch, keep_idx, tied_groups, P)
+                for batch in batches if batch]
+
+            print(f"[MONO][tying] computing exact cross terms: "
+                f"groups={len(tied_groups)} workers={len(worker_args)}",
+                flush=True)
+
+            ctx = mp.get_context("spawn")
+
+            with ProcessPoolExecutor(max_workers=len(worker_args),
+                mp_context=ctx, initializer=_init_worker,
+                initargs=(cfg.blas_threads,)) as build_executor:
+
+                results = build_executor.map(
+                    _worker_tied_cross_terms_from_tuple, worker_args)
+
+                iterator = results
+
+                if verbose:
+                    iterator = tqdm(results, total=len(worker_args),
+                        desc="[MONO] tying", dynamic_ncols=True)
+
+                for correction in iterator:
+                    for gg, values in correction.items():
+                        D_grouped[int(gg)] += values
+
+        D_tot = D_grouped
+        if np.any(~np.isfinite(D_tot)) or np.any(D_tot < 0.0):
+            raise RuntimeError('Final grouped column energy is invalid.')
+        inv_sqrt_energy = np.zeros_like(D_tot, dtype=np.float64)
+        positive = D_tot > 0.0
+        inv_sqrt_energy[positive] = 1.0/np.sqrt(D_tot[positive])
+        inv_sqrt_energy_flat = inv_sqrt_energy.ravel(order="C")
+
+    # Explicit tying is already known before the build. Dynamic observability
+    # obtains the same final reduction above from the physical fitted energies.
+    if population_observability is None:
+        component_donor = _canon_component_donor(
+            component_donor, C_physical)
+        anchors = np.flatnonzero(
+            component_donor == np.arange(C_physical))
+        C_fit = int(anchors.size)
+
+        anchor_slot = np.full(C_physical, -1, dtype=np.int64)
+        anchor_slot[anchors] = np.arange(C_fit, dtype=np.int64)
+        component_slot = anchor_slot[component_donor]
+
+    if np.any(component_slot < 0):
+        raise RuntimeError("Invalid component donor reduction.")
+
+    # A stored tying map is authoritative when present. Legacy checkpoints
+    # without tying metadata remain resumable under the current mapping.
+    if resume_state and "component_donor" in resume_state:
+        saved_donor = _canon_component_donor(
+            resume_state["component_donor"], C_physical)
+
+        if not np.array_equal(saved_donor, component_donor):
+            raise ValueError(
+                "Cannot full-resume with a different component_donor. "
+                "Use warm_start='saved_x' instead.")
+
+    print(f"[MONO] population tying: {C_physical} physical -> "
+        f"{C_fit} independent components", flush=True)
+
+    # Preserve the physical prior for final diagnostics, then reduce the solver.
+    orbit_shape_outer = _canon_orbit_weights(orbit_weights, C=C_physical, P=P)
+
+    if orbit_weights is not None:
+        orbit_weights_physical = np.asarray(
+            orbit_weights, dtype=np.float64).ravel(order="C")
+
+        if orbit_weights_physical.size == CP_physical:
+            orbit_weights_physical = orbit_weights_physical.reshape(
+                C_physical, P).sum(axis=1)
+
+        if orbit_weights_physical.size != C_physical:
+            raise ValueError(
+                "orbit_weights has incompatible physical dimensions.")
+
+        orbit_weights = np.empty(C_fit, dtype=np.float64)
+
+        for gg in range(C_fit):
+            orbit_weights[gg] = np.sum(
+                orbit_weights_physical[component_slot == gg])
+
+    # Everything below this point is in reduced solver space unless explicitly
+    # labelled physical.
+    C = C_fit
+    CP = C*P
 
     # Structural zeros refer to the actual grouped solver columns.
     known_zero = D_tot <= 0.0
@@ -5395,6 +5598,52 @@ def solve_streaming_nnls(h5_path: str, cfg: MPConfig,
     if inv_sqrt_energy_flat.size != CP:
         raise RuntimeError('Column scaling has size '
             f"{inv_sqrt_energy_flat.size}; expected {CP}.")
+
+    # ---------------------------- diagnostics --------------------------
+    diag_level = int(os.environ.get("CUBEFIT_DIAG_LEVEL", "1"))
+    diag_stride = max(1, int(os.environ.get("CUBEFIT_DIAG_STRIDE", "1")))
+    diag_jsonl_path = os.environ.get("CUBEFIT_DIAG_JSONL", "").strip() or None
+    diag_topk = max(1, int(os.environ.get("CUBEFIT_DIAG_TOPK", "12")))
+    diag_t0 = time.perf_counter()
+
+    def _emit_diag(record: dict) -> None:
+        if diag_level <= 0:
+            return
+        rec = dict(record)
+        rec.setdefault("t_sec", float(time.perf_counter()-diag_t0))
+        _diag_append_jsonl(diag_jsonl_path, rec)
+
+    _emit_diag({
+        "kind": "setup",
+        "source": "solve_streaming_nnls",
+        "S": int(S),
+        "L": int(L),
+        "C_physical": int(C_physical),
+        "C_fit": int(C),
+        "P": int(P),
+        "CP_fit": int(CP),
+        "keep_idx": int(keep_idx.size) if keep_idx is not None else None,
+        "s_tile": int(s_tile),
+        "n_ranges": int(len(s_ranges)),
+        "processes": int(cfg.processes),
+        "blas_threads": int(cfg.blas_threads),
+        "diag_level": int(diag_level),
+        "diag_stride": int(diag_stride),
+        "diag_topk": int(diag_topk),
+    })
+
+    # ---------------------------- initial x ----------------------------
+    # Public warm starts remain physical (C_physical, P); retain anchor rows.
+    if x0 is None:
+        x = np.zeros((C, P), dtype=np.float64)
+    else:
+        x0 = np.asarray(x0, dtype=np.float64).ravel(order="C")
+        if x0.size != CP_physical:
+            raise ValueError(f"x0 has size {x0.size}; expected {CP_physical}.")
+        x = x0.reshape(C_physical, P)[anchors].copy()
+
+    best_x = x.copy()
+    best_proxy = np.inf 
 
     # DIAGNOSTIC: report S statistics (helps find extreme scalings)
     S_sample = inv_sqrt_energy_flat
