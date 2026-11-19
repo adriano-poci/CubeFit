@@ -12,15 +12,15 @@
 #SBATCH -D "/data/phys-gal-dynamics/phys2603/muse"
 #SBATCH --output="/data/phys-gal-dynamics/phys2603/CubeFit/log_1Gen.log" --open-mode=append
 #SBATCH --error="/data/phys-gal-dynamics/phys2603/CubeFit/log_1Gen.log" --open-mode=append
-#SBATCH -p short
+#SBATCH -p medium
 # #SBATCH --qos=priority
 
 #SBATCH --job-name="CubeFit_1Gen"
-#SBATCH --time=0-12:00
+#SBATCH --time=0-24:00
 #SBATCH --cpus-per-task=24
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --mem=150G
+#SBATCH --mem=80G
 #SBATCH --hint=nomultithread
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=adriano.poci@physics.ox.ac.uk
